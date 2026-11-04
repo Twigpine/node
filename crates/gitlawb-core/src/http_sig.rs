@@ -116,7 +116,14 @@ impl HttpSignature {
     /// Reject if the `created` timestamp is more than 5 minutes from now.
     pub fn check_created(&self) -> Result<()> {
         let now = Utc::now().timestamp();
-        let skew = (now - self.created).abs();
+        // `created` is attacker-supplied i64: `now - created` overflows on
+        // i64::MIN, and `abs` itself wraps on i64::MIN, so compute the skew in
+        // checked arithmetic and treat an unrepresentable difference as the
+        // largest possible skew.
+        let skew = now
+            .checked_sub(self.created)
+            .map(i64::unsigned_abs)
+            .unwrap_or(u64::MAX);
         if skew > 300 {
             return Err(Error::HttpSignature(format!(
                 "clock skew too large: {skew}s (max 300s)"
@@ -341,6 +348,26 @@ mod tests {
         let headers = sign_request(&kp, "GET", "/api/v1/agents", b"");
         let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
         assert!(sig.check_created().is_ok());
+    }
+
+    #[test]
+    fn extreme_created_timestamps_reject_without_wrapping() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let parse = |created: i64| {
+            let sig_input =
+                format!(r#"sig1=("@method");keyid="{did}";alg="ed25519";created={created}"#);
+            HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap()
+        };
+        // i64::MIN used to panic in debug (subtraction overflow) and wrap to a
+        // passing skew in release; now - 2^63 wrapped to i64::MIN, whose abs()
+        // wrapped back to itself and read as fresh. Both must reject.
+        for created in [i64::MIN, i64::MAX, Utc::now().timestamp() - i64::MAX] {
+            assert!(
+                parse(created).check_created().is_err(),
+                "created={created} must not pass the freshness gate"
+            );
+        }
     }
 
     #[test]
