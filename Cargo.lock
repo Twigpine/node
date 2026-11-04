@@ -3480,6 +3480,7 @@ dependencies = [
  "libp2p-swarm",
  "mockito",
  "multiaddr",
+ "multibase",
  "prometheus",
  "reqwest",
  "serde",
