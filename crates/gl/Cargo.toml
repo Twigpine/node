@@ -27,6 +27,7 @@ dirs = "5"
 reqwest = { workspace = true }
 uuid = { workspace = true }
 urlencoding = "2"
+libc = "0.2"
 alloy = { version = "1", default-features = false, features = [
     "contract",
     "provider-http",

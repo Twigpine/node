@@ -1364,6 +1364,23 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
     let key_path = config.resolved_key_path();
 
     if key_path.exists() {
+        #[cfg(unix)]
+        let pem = {
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+            // O_NOFOLLOW so a planted symlink can't redirect the read to an
+            // attacker-chosen file presented as the node identity.
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&key_path)
+                .with_context(|| format!("failed to read key from {}", key_path.display()))?;
+            let mut pem = String::new();
+            f.read_to_string(&mut pem)
+                .with_context(|| format!("failed to read key from {}", key_path.display()))?;
+            pem
+        };
+        #[cfg(not(unix))]
         let pem = std::fs::read_to_string(&key_path)
             .with_context(|| format!("failed to read key from {}", key_path.display()))?;
         let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
@@ -1375,18 +1392,46 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
             .to_pem()
             .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
 
-        if let Some(parent) = key_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&key_path, pem.as_bytes())?;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            use std::io::Write;
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+            if let Some(parent) = key_path.parent() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+                // Re-pin a pre-existing permissive dir, but never through a
+                // symlink: chmod would land on the link's target.
+                if !std::fs::symlink_metadata(parent)?.file_type().is_symlink() {
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+                }
+            }
+
+            // Pin the mode at creation: a plain write then chmod leaves the
+            // key world-readable between the two syscalls, and O_NOFOLLOW
+            // refuses to write through a pre-planted symlink.
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&key_path)?;
+            // mode() only applies when the file is created; pin on the
+            // descriptor before truncating so a pre-existing loose file is
+            // tightened before the new contents land in it.
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.set_len(0)?;
+            f.write_all(pem.as_bytes())?;
         }
         #[cfg(not(unix))]
-        std::fs::write(&key_path, pem.as_bytes())?;
+        {
+            if let Some(parent) = key_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&key_path, pem.as_bytes())?;
+        }
 
         info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
         Ok(kp)
