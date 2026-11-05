@@ -3929,6 +3929,7 @@ mod tests {
                 node_did: owner.to_string(),
                 signature: "sig".to_string(),
                 issued_at: Utc::now().to_rfc3339(),
+                version: 1,
             })
             .await
             .expect("seed private cert");
@@ -16313,6 +16314,7 @@ mod tests {
             node_did: "did:key:zNode".into(),
             signature: "sig".into(),
             issued_at: "2026-01-01T00:00:00Z".into(),
+            version: 1,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -16348,6 +16350,7 @@ mod tests {
             node_did: "did:key:zNode".into(),
             signature: "sig".into(),
             issued_at: "2026-01-01T00:00:00Z".into(),
+            version: 1,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -16857,6 +16860,7 @@ mod tests {
             node_did: "did:key:zNode".into(),
             signature: "sig".into(),
             issued_at: "2026-01-01T00:00:00Z".into(),
+            version: 1,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -17713,6 +17717,7 @@ mod tests {
             node_did: "did:key:zNODE".into(),
             signature: "sig".into(),
             issued_at: issued_at.to_string(),
+            version: 1,
         }
     }
 
