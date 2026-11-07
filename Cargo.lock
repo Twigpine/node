@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-gitlawb"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "gitlawb-core",
@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-attest"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3502,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-core"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-node"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3587,7 +3587,7 @@ dependencies = [
 
 [[package]]
 name = "gl"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -4052,7 +4052,7 @@ dependencies = [
 
 [[package]]
 name = "icaptcha-client"
-version = "0.4.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "gitlawb-core",
