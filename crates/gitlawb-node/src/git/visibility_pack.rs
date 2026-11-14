@@ -2816,10 +2816,34 @@ mod tests {
     fn write_fake_git(dir: &Path, body: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let p = dir.join("fakegit");
+        // Every body starts with a shebang. The line inserted after it lets the
+        // settle exec below exit at once without running the body.
+        let (shebang, rest) = body
+            .split_once('\n')
+            .expect("a fake git body starts with a shebang line");
+        let body = format!("{shebang}\nif [ -n \"$FAKE_GIT_SETTLE\" ]; then exit 0; fi\n{rest}");
         std::fs::write(&p, body).unwrap();
         let mut perm = std::fs::metadata(&p).unwrap().permissions();
         perm.set_mode(0o755);
         std::fs::set_permissions(&p, perm).unwrap();
+        // A script written in this process cannot be exec'd while any process still
+        // holds a write descriptor to it. A concurrent test thread that forks while
+        // the descriptor above is open hands the child a copy until the child execs,
+        // so the first exec fails with "Text file busy" and the code under test
+        // reports a spawn failure. Run the script until that stops, which also
+        // proves later execs succeed: nothing reopens the file for writing.
+        for _ in 0..100 {
+            match std::process::Command::new(&p)
+                .env("FAKE_GIT_SETTLE", "1")
+                .status()
+            {
+                // ETXTBSY is 26 on Linux and macOS; std has no stable ErrorKind.
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => break,
+            }
+        }
         p.to_str().unwrap().to_string()
     }
 
