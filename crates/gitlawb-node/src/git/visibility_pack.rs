@@ -2809,6 +2809,17 @@ pub(crate) fn recipients_from_pairs(
 mod tests {
     use super::*;
 
+    /// Deadline for tests that run a fake `git` under the watchdog. The watchdog
+    /// tears the whole process group down at the deadline, so it has to sit far
+    /// above `/bin/sh` startup under load. Tighter, and the fake is killed before
+    /// it records its pid or installs its `trap`.
+    #[cfg(unix)]
+    const SH_STARTUP_HEADROOM: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// `errno` for "Text file busy". std has no stable `ErrorKind` for it.
+    #[cfg(unix)]
+    const ETXTBSY: i32 = 26;
+
     /// Write an executable fake `git` shell script into `dir` and return its path,
     /// so a test can drive the walk's process-group teardown without a real git and
     /// without mutating the process-global PATH (the crate's only injection seam).
@@ -2837,8 +2848,7 @@ mod tests {
                 .env("FAKE_GIT_SETTLE", "1")
                 .status()
             {
-                // ETXTBSY is 26 on Linux and macOS; std has no stable ErrorKind.
-                Err(e) if e.raw_os_error() == Some(26) => {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 _ => break,
@@ -2871,8 +2881,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let path = tmp.path().to_path_buf();
         std::thread::spawn(move || {
-            // Deadline sized well above `/bin/sh` startup, see the closes-stdout test below.
-            let _ = tx.send(blob_paths(&path, &git_bin, Duration::from_secs(2)));
+            let _ = tx.send(blob_paths(&path, &git_bin, SH_STARTUP_HEADROOM));
         });
         let result = rx.recv_timeout(Duration::from_secs(10)).expect(
             "blob_paths must return within the watchdog budget, not hang on a stuck git child",
@@ -2913,13 +2922,13 @@ mod tests {
     /// #174 (F1 status-gate, vetted by execution): a child that exits SUCCESSFULLY is
     /// never reported as a timeout even when the watchdog fires, so a walk finishing
     /// right at its deadline is not a spurious 504. The fake only exits when signalled
-    /// and exits 0 on SIGTERM, so with a deadline already elapsed the watchdog always
+    /// and exits 0 on SIGTERM, so once the deadline passes the watchdog always
     /// reaches its kill path (killed == true) yet the child's status is success.
     /// Drop the `!status.success()` guard and this returns GitServiceTimeout (RED).
     #[cfg(unix)]
     #[test]
     fn run_bounded_git_success_at_the_deadline_is_not_a_timeout() {
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         let tmp = TempDir::new().unwrap();
         let body = "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 30 &\nwait\n";
         let git_bin = write_fake_git(tmp.path(), body);
@@ -2928,9 +2937,7 @@ mod tests {
             &["rev-list"],
             tmp.path(),
             b"",
-            // Well above `/bin/sh` startup, so the `trap` is installed before the
-            // deadline SIGTERM (see the closes-stdout test below).
-            Instant::now() + Duration::from_secs(2),
+            Instant::now() + SH_STARTUP_HEADROOM,
         );
         assert!(
             out.is_ok(),
@@ -2959,8 +2966,7 @@ mod tests {
                 &["rev-list"],
                 &path,
                 b"",
-                // Well above `/bin/sh` startup (see the closes-stdout test below).
-                Instant::now() + Duration::from_secs(2),
+                Instant::now() + SH_STARTUP_HEADROOM,
             ));
         });
         let out = rx
@@ -3022,8 +3028,7 @@ esac\n";
                 &["rev-list"],
                 &path,
                 b"",
-                // Well above `/bin/sh` startup (see the closes-stdout test below).
-                Instant::now() + Duration::from_secs(2),
+                Instant::now() + SH_STARTUP_HEADROOM,
             ));
         });
         let _ = rx
