@@ -3230,6 +3230,36 @@ mod tests {
         );
     }
 
+    /// Run a freshly written fake `git` until it stops failing with ETXTBSY.
+    ///
+    /// A script written and chmodded in a test cannot be exec'd while any
+    /// process still holds a write descriptor to it. A concurrent test thread
+    /// that forks in that window hands the child a copy until the child execs,
+    /// so the first exec fails with "Text file busy" and the probe under test
+    /// reports a spawn failure instead of running. The window closes once the
+    /// child execs, and nothing reopens the file for writing, so one successful
+    /// exec here means later ones succeed too. The caller must clear any side
+    /// effects of this run (the fake appends to a log).
+    #[cfg(unix)]
+    fn wait_until_fake_execs(path: &std::path::Path) {
+        for _ in 0..100 {
+            match std::process::Command::new(path)
+                .stdout(std::process::Stdio::null())
+                .status()
+            {
+                // ETXTBSY is 26 on Linux and macOS; std has no stable ErrorKind.
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => return,
+            }
+        }
+        panic!(
+            "fake git still ETXTBSY after 100 attempts: {}",
+            path.display()
+        );
+    }
+
     /// Companion must-not-regress case for the affordability check above: with an ample
     /// budget the confirming re-probe MUST still run, so the #174 F5 disambiguation is
     /// intact and the check did not simply disable it. Two spawns, and a clean absence.
@@ -3253,6 +3283,8 @@ mod tests {
         let mut perm = std::fs::metadata(&fake).unwrap().permissions();
         perm.set_mode(0o755);
         std::fs::set_permissions(&fake, perm).unwrap();
+        wait_until_fake_execs(&fake);
+        let _ = std::fs::remove_file(&log);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let res = super::object_type_bounded(fake.to_str().unwrap(), &bare, "deadbeef", deadline);
