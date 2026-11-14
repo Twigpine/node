@@ -2847,7 +2847,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let path = tmp.path().to_path_buf();
         std::thread::spawn(move || {
-            let _ = tx.send(blob_paths(&path, &git_bin, Duration::from_millis(200)));
+            // Deadline sized well above `/bin/sh` startup, see the closes-stdout test below.
+            let _ = tx.send(blob_paths(&path, &git_bin, Duration::from_secs(2)));
         });
         let result = rx.recv_timeout(Duration::from_secs(10)).expect(
             "blob_paths must return within the watchdog budget, not hang on a stuck git child",
@@ -2903,7 +2904,9 @@ mod tests {
             &["rev-list"],
             tmp.path(),
             b"",
-            Instant::now() + Duration::from_millis(100),
+            // Well above `/bin/sh` startup, so the `trap` is installed before the
+            // deadline SIGTERM (see the closes-stdout test below).
+            Instant::now() + Duration::from_secs(2),
         );
         assert!(
             out.is_ok(),
@@ -2932,7 +2935,8 @@ mod tests {
                 &["rev-list"],
                 &path,
                 b"",
-                Instant::now() + Duration::from_millis(100),
+                // Well above `/bin/sh` startup (see the closes-stdout test below).
+                Instant::now() + Duration::from_secs(2),
             ));
         });
         let out = rx
@@ -2994,7 +2998,8 @@ esac\n";
                 &["rev-list"],
                 &path,
                 b"",
-                Instant::now() + Duration::from_millis(100),
+                // Well above `/bin/sh` startup (see the closes-stdout test below).
+                Instant::now() + Duration::from_secs(2),
             ));
         });
         let _ = rx
