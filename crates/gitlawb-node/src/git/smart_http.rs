@@ -1930,6 +1930,34 @@ mod tests {
         path
     }
 
+    /// Exec a freshly written fake `git` with `args` until it stops failing with
+    /// ETXTBSY.
+    ///
+    /// A script written and chmodded in a test cannot be exec'd while any process
+    /// still holds a write descriptor to it. A concurrent test thread that forks in
+    /// that window hands the child a copy until the child execs, so the first exec
+    /// fails with "Text file busy". The window closes once that child execs and
+    /// nothing reopens the file for writing, so one successful exec here means the
+    /// later ones succeed too. `args` must make the fake exit at once with no side
+    /// effects.
+    #[cfg(unix)]
+    fn wait_until_fake_execs(path: &std::path::Path, args: &[&str]) {
+        // std has no stable `ErrorKind` for ETXTBSY.
+        const ETXTBSY: i32 = 26;
+        for _ in 0..100 {
+            match std::process::Command::new(path).args(args).status() {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => return,
+            }
+        }
+        panic!(
+            "fake git still ETXTBSY after 100 attempts: {}",
+            path.display()
+        );
+    }
+
     /// Read a two-line `leader\ngrandchild` pidfile once both lines are present.
     #[cfg(unix)]
     fn read_two_pids(pidfile: &std::path::Path) -> Option<(i32, i32)> {
@@ -2500,6 +2528,7 @@ mod tests {
             pack = packfile.display()
         );
         let git_bin = write_fake_git(tmp.path(), &body);
+        wait_until_fake_execs(&git_bin, &["settle"]);
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
         let withheld = HashSet::new();
