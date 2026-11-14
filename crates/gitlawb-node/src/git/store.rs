@@ -2959,11 +2959,14 @@ mod tests {
         std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
         let log = td.path().join("spawns.log");
         let fake = td.path().join("fakegit");
-        // Burns 0.9s of a 1s budget, then reports the structured absence token cleanly.
+        // Burns 1.2s of a 2s budget, then reports the structured absence token cleanly.
+        // Past half the budget makes the re-probe unaffordable, and the remaining 0.8s
+        // is slack for exec and scheduling latency before the first probe itself times
+        // out (a 0.9s sleep in a 1s budget left 0.1s and flaked under load).
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\necho call >> {}\nsleep 0.9\necho 'deadbeef missing'\nexit 0\n",
+                "#!/bin/sh\necho call >> {}\nsleep 1.2\necho 'deadbeef missing'\nexit 0\n",
                 log.display()
             ),
         )
@@ -2972,7 +2975,7 @@ mod tests {
         perm.set_mode(0o755);
         std::fs::set_permissions(&fake, perm).unwrap();
 
-        let budget = std::time::Duration::from_millis(1000);
+        let budget = std::time::Duration::from_millis(2000);
         let deadline = std::time::Instant::now() + budget;
         let started = std::time::Instant::now();
         let res = super::object_type_bounded(fake.to_str().unwrap(), &bare, "deadbeef", deadline);
