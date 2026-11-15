@@ -1921,35 +1921,37 @@ mod tests {
     }
 
     /// Write an executable fake `git` (named `git`) into `dir`; return its path.
+    ///
+    /// Returns only once the script execs, so a caller can spawn it at once.
     #[cfg(unix)]
     fn write_fake_git(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
-        let path = dir.join("git");
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
-    /// Exec a freshly written fake `git` with `args` until it stops failing with
-    /// ETXTBSY.
-    ///
-    /// A script written and chmodded in a test cannot be exec'd while any process
-    /// still holds a write descriptor to it. A concurrent test thread that forks in
-    /// that window hands the child a copy until the child execs, so the first exec
-    /// fails with "Text file busy". The window closes once that child execs and
-    /// nothing reopens the file for writing, so one successful exec here means the
-    /// later ones succeed too. `args` must make the fake exit at once with no side
-    /// effects.
-    #[cfg(unix)]
-    fn wait_until_fake_execs(path: &std::path::Path, args: &[&str]) {
         // std has no stable `ErrorKind` for ETXTBSY.
         const ETXTBSY: i32 = 26;
+        let path = dir.join("git");
+        // Every body starts with a shebang. The line inserted after it lets the
+        // settle exec below exit at once without running the body.
+        let (shebang, rest) = body
+            .split_once('\n')
+            .expect("a fake git body starts with a shebang line");
+        let body = format!("{shebang}\nif [ -n \"$FAKE_GIT_SETTLE\" ]; then exit 0; fi\n{rest}");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A script written in this process cannot be exec'd while any process still
+        // holds a write descriptor to it. A concurrent test thread that forks while
+        // the descriptor above is open hands the child a copy until the child execs,
+        // so the first exec fails with "Text file busy" and the code under test
+        // reports a spawn failure. Run the script until that stops, which also
+        // proves later execs succeed: nothing reopens the file for writing.
         for _ in 0..100 {
-            match std::process::Command::new(path).args(args).status() {
+            match std::process::Command::new(&path)
+                .env("FAKE_GIT_SETTLE", "1")
+                .status()
+            {
                 Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                _ => return,
+                _ => return path,
             }
         }
         panic!(
@@ -2528,7 +2530,6 @@ mod tests {
             pack = packfile.display()
         );
         let git_bin = write_fake_git(tmp.path(), &body);
-        wait_until_fake_execs(&git_bin, &["settle"]);
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
         let withheld = HashSet::new();
