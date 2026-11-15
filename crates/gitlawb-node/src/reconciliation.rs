@@ -5551,7 +5551,12 @@ mod tests {
 
         // 1050 single-file commits: two discovery windows, so a held
         // cursor is observable (a single-window repo would delete it
-        // as exhausted either way).
+        // as exhausted either way). Every commit writes the same content, so
+        // the repo has one blob and one tree however many commits there are:
+        // the passes upload every object to both backends, and distinct blobs
+        // and trees would triple that work for no extra coverage, which a
+        // loaded box turns into a pin batch that runs out its 120s
+        // `PIN_BATCH_BUDGET` and leaves objects behind for the last pass.
         const COMMITS: usize = 1050;
         let tmp = tempfile::TempDir::new().unwrap();
         let work = tmp.path().join("gapfail");
@@ -5566,7 +5571,7 @@ mod tests {
         }
         let mut stream = String::new();
         for c in 0..COMMITS {
-            let body = format!("gapfail {c:04}\n");
+            let body = "gapfail\n";
             stream.push_str("commit refs/heads/main\n");
             stream.push_str(&format!("mark :{}\n", c + 1));
             stream.push_str("committer T <t@t> 1700000000 +0000\ndata 0\n");
@@ -5575,7 +5580,7 @@ mod tests {
             }
             stream.push_str("M 100644 inline f.txt\n");
             stream.push_str(&format!("data {}\n", body.len()));
-            stream.push_str(&body);
+            stream.push_str(body);
         }
         {
             use std::io::Write;
