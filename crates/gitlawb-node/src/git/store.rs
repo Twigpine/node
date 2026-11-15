@@ -1825,6 +1825,40 @@ mod tests {
 
     use super::{validate_git_ref, validate_git_ref_with_git, GitRefValidationError};
 
+    /// Write an executable fake `git` script at `path`, and return only once it execs.
+    ///
+    /// A script written in this process cannot be exec'd while any process still holds
+    /// a write descriptor to it. A concurrent test thread that forks while the
+    /// descriptor is open hands the child a copy until the child execs, so the first
+    /// exec fails with "Text file busy" and the code under test reports a spawn
+    /// failure. Run the script until that stops, which also proves later execs
+    /// succeed: nothing reopens the file for writing. The line inserted after the
+    /// shebang makes that settle exec exit at once without running the body.
+    #[cfg(unix)]
+    fn write_fake_git(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        // std has no stable `ErrorKind` for ETXTBSY.
+        const ETXTBSY: i32 = 26;
+        let (shebang, rest) = body
+            .split_once('\n')
+            .expect("a fake git body starts with a shebang line");
+        let body = format!("{shebang}\nif [ -n \"$FAKE_GIT_SETTLE\" ]; then exit 0; fi\n{rest}");
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..100 {
+            match Command::new(path).env("FAKE_GIT_SETTLE", "1").status() {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => return,
+            }
+        }
+        panic!(
+            "fake git still ETXTBSY after 100 attempts: {}",
+            path.display()
+        );
+    }
+
     #[test]
     fn validate_git_ref_accepts_normal_branch_names() {
         for good in [
@@ -2187,13 +2221,7 @@ mod tests {
             pidfile.display()
         );
         let git_path = tmp.path().join("fakegit");
-        std::fs::write(&git_path, &body).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
-            perm.set_mode(0o755);
-            std::fs::set_permissions(&git_path, perm).unwrap();
-        }
+        write_fake_git(&git_path, &body);
         let repo = tmp.path().to_path_buf();
         let git = git_path.to_str().unwrap().to_string();
 
@@ -3051,16 +3079,12 @@ mod tests {
     #[test]
     #[ignore]
     fn read_object_bounded_returns_by_deadline_with_a_hung_git() {
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
         let td = tempfile::TempDir::new().unwrap();
         let bare = td.path().join("bare.git");
         std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
         let fake = td.path().join("fakegit");
-        std::fs::write(&fake, "#!/bin/sh\ntrap '' TERM\necho $$ > pid\nsleep 30\n").unwrap();
-        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&fake, perm).unwrap();
+        write_fake_git(&fake, "#!/bin/sh\ntrap '' TERM\necho $$ > pid\nsleep 30\n");
         let git_bin = fake.to_str().unwrap().to_string();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3120,20 +3144,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn read_object_bounded_content_read_fault_is_classified() {
-        use std::os::unix::fs::PermissionsExt;
         let td = tempfile::TempDir::new().unwrap();
         let bare = td.path().join("bare.git");
         std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
         let fake = td.path().join("fakegit");
-        std::fs::write(
+        write_fake_git(
             &fake,
             "#!/bin/sh\nif [ \"$2\" = \"--batch-check\" ]; then read oid; echo \"$oid blob 6\"; exit 0; fi\n\
              echo 'error: unable to read object' >&2\nexit 128\n",
-        )
-        .unwrap();
-        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&fake, perm).unwrap();
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let res =
@@ -3159,21 +3178,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn read_object_bounded_content_stage_timeout_is_transient_not_deterministic() {
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
         let td = tempfile::TempDir::new().unwrap();
         let bare = td.path().join("bare.git");
         std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
         let fake = td.path().join("fakegit");
-        std::fs::write(
+        write_fake_git(
             &fake,
             "#!/bin/sh\nif [ \"$2\" = \"--batch-check\" ]; then read oid; echo \"$oid blob 6\"; exit 0; fi\n\
              trap '' TERM\necho $$ > pid\nsleep 30\n",
-        )
-        .unwrap();
-        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&fake, perm).unwrap();
+        );
         let git_bin = fake.to_str().unwrap().to_string();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3278,14 +3292,10 @@ mod tests {
     /// timeout (or `kill_on_drop`) hangs each assertion past its ceiling.
     #[cfg(unix)]
     fn write_hanging_fake_git(dir: &std::path::Path) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join("hanggit");
         // `sleep 30` bounds the worst case if the teardown ever breaks, so a
         // regression cannot wedge the suite.
-        std::fs::write(&p, "#!/bin/sh\nsleep 30\n").unwrap();
-        let mut perm = std::fs::metadata(&p).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&p, perm).unwrap();
+        write_fake_git(&p, "#!/bin/sh\nsleep 30\n");
         p.to_str().unwrap().to_string()
     }
 
