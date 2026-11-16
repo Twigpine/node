@@ -1837,8 +1837,10 @@ mod tests {
     #[cfg(unix)]
     fn write_fake_git(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
-        // std has no stable `ErrorKind` for ETXTBSY.
+        // std has no stable `ErrorKind` for ETXTBSY. EAGAIN is a transient spawn
+        // failure under process pressure; neither means the script ran.
         const ETXTBSY: i32 = 26;
+        const EAGAIN: i32 = 11;
         let (shebang, rest) = body
             .split_once('\n')
             .expect("a fake git body starts with a shebang line");
@@ -1847,10 +1849,11 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         for _ in 0..100 {
             match Command::new(path).env("FAKE_GIT_SETTLE", "1").status() {
-                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                Ok(_) => return,
+                Err(e) if matches!(e.raw_os_error(), Some(ETXTBSY | EAGAIN)) => {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                _ => return,
+                Err(e) => panic!("settle exec of fake git failed: {}: {e}", path.display()),
             }
         }
         panic!(
@@ -3247,61 +3250,24 @@ mod tests {
         );
     }
 
-    /// Run a freshly written fake `git` until it stops failing with ETXTBSY.
-    ///
-    /// A script written and chmodded in a test cannot be exec'd while any
-    /// process still holds a write descriptor to it. A concurrent test thread
-    /// that forks in that window hands the child a copy until the child execs,
-    /// so the first exec fails with "Text file busy" and the probe under test
-    /// reports a spawn failure instead of running. The window closes once the
-    /// child execs, and nothing reopens the file for writing, so one successful
-    /// exec here means later ones succeed too. The caller must clear any side
-    /// effects of this run (the fake appends to a log).
-    #[cfg(unix)]
-    fn wait_until_fake_execs(path: &std::path::Path) {
-        for _ in 0..100 {
-            match std::process::Command::new(path)
-                .stdout(std::process::Stdio::null())
-                .status()
-            {
-                // ETXTBSY is 26 on Linux and macOS; std has no stable ErrorKind.
-                Err(e) if e.raw_os_error() == Some(26) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                _ => return,
-            }
-        }
-        panic!(
-            "fake git still ETXTBSY after 100 attempts: {}",
-            path.display()
-        );
-    }
-
     /// Companion must-not-regress case for the affordability check above: with an ample
     /// budget the confirming re-probe MUST still run, so the #174 F5 disambiguation is
     /// intact and the check did not simply disable it. Two spawns, and a clean absence.
     #[cfg(unix)]
     #[test]
     fn absent_probe_still_reprobes_when_the_budget_allows() {
-        use std::os::unix::fs::PermissionsExt;
         let td = tempfile::TempDir::new().unwrap();
         let bare = td.path().join("bare.git");
         std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
         let log = td.path().join("spawns.log");
         let fake = td.path().join("fakegit");
-        std::fs::write(
+        write_fake_git(
             &fake,
-            format!(
+            &format!(
                 "#!/bin/sh\necho call >> {}\necho 'deadbeef missing'\nexit 0\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&fake, perm).unwrap();
-        wait_until_fake_execs(&fake);
-        let _ = std::fs::remove_file(&log);
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let res = super::object_type_bounded(fake.to_str().unwrap(), &bare, "deadbeef", deadline);
