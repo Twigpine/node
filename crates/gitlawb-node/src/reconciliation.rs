@@ -6444,9 +6444,11 @@ mod tests {
     /// The fake serves one request per accepted socket and drops it, so each
     /// response says `Connection: close`. Without it the client keeps the
     /// socket in its pool after the server has closed it, and the next request
-    /// can reuse a dead connection. The client has retries disabled, as in
-    /// production, so `sweep_restores_tigris_cache_miss_and_skips_missing`
-    /// failed with "repo acquire failed" on a loaded runner.
+    /// can reuse a dead connection. Tests build the client with
+    /// `for_testing_with_endpoint`, which disables retries (production keeps the
+    /// SDK default), so the dead connection fails the request on the first try
+    /// and `sweep_restores_tigris_cache_miss_and_skips_missing` failed with
+    /// "repo acquire failed" on a loaded runner.
     async fn s3_respond(
         sock: &mut tokio::net::TcpStream,
         status: &str,
