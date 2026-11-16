@@ -2887,7 +2887,10 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        assert!(marker.exists(), "ambient FAKE_GIT_SETTLE short-circuited the body");
+        assert!(
+            marker.exists(),
+            "ambient FAKE_GIT_SETTLE short-circuited the body"
+        );
     }
 
     /// The settle must fail closed: a spawn error that is not a transient
