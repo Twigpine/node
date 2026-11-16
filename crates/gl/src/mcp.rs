@@ -676,13 +676,12 @@ async fn call_tool(
         }
 
         "node_info" => {
-            let info = crate::http::read_json(client.get("/").await?, "node info").await?;
+            let info = json_ok("node_info", client.get("/").await?).await?;
             Ok(serde_json::to_string_pretty(&info)?)
         }
 
         "node_health" => {
-            let health =
-                crate::http::read_json(client.get("/health").await?, "node health").await?;
+            let health = json_ok("node_health", client.get("/health").await?).await?;
             Ok(serde_json::to_string_pretty(&health)?)
         }
 
@@ -693,22 +692,19 @@ async fn call_tool(
                 "description": args["description"],
                 "is_public": args["is_public"].as_bool().unwrap_or(true),
             }))?;
-            let resp =
-                crate::http::read_json(client.post("/api/v1/repos", &body).await?, "create repo")
-                    .await?;
+            let resp = json_ok("repo_create", client.post("/api/v1/repos", &body).await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "repo_list" => {
-            let repos =
-                crate::http::read_json(client.get("/api/v1/repos").await?, "list repos").await?;
+            let repos = json_ok("repo_list", client.get("/api/v1/repos").await?).await?;
             Ok(serde_json::to_string_pretty(&repos)?)
         }
 
         "repo_list_federated" => {
-            let result = crate::http::read_json(
+            let result = json_ok(
+                "repo_list_federated",
                 client.get("/api/v1/repos/federated").await?,
-                "list federated repos",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&result)?)
@@ -721,11 +717,11 @@ async fn call_tool(
             // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
             let owner = urlencoding::encode(&owner);
             let name = urlencoding::encode(name);
-            let repo = crate::http::read_json(
+            let repo = json_ok(
+                "repo_get",
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}"))
                     .await?,
-                "repo",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&repo)?)
@@ -738,11 +734,11 @@ async fn call_tool(
             // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
             let owner = urlencoding::encode(&owner);
             let name = urlencoding::encode(name);
-            let commits = crate::http::read_json(
+            let commits = json_ok(
+                "repo_commits",
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/commits"))
                     .await?,
-                "commits",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&commits)?)
@@ -752,11 +748,11 @@ async fn call_tool(
             let name = args["name"].as_str().context("missing 'name'")?;
             let path = args["path"].as_str().unwrap_or("");
             let owner = resolve_owner(&args, &client).await?;
-            let tree = crate::http::read_json(
+            let tree = json_ok(
+                "repo_tree",
                 client
                     .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
                     .await?,
-                "tree",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&tree)?)
@@ -764,7 +760,7 @@ async fn call_tool(
 
         "repo_clone_url" => {
             let name = args["name"].as_str().context("missing 'name'")?;
-            let info = crate::http::read_json(client.get("/").await?, "node info").await?;
+            let info = json_ok("repo_clone_url", client.get("/").await?).await?;
             let did = info["did"].as_str().context("node info missing DID")?;
             Ok(format!("gitlawb://{}/{}", did, name))
         }
@@ -780,11 +776,8 @@ async fn call_tool(
                 "capabilities": caps,
                 "model": args["model"],
             }))?;
-            let resp = crate::http::read_json(
-                client.post("/api/register", &body).await?,
-                "register agent",
-            )
-            .await?;
+            let resp =
+                json_ok("agent_register", client.post("/api/register", &body).await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -875,11 +868,37 @@ async fn call_tool(
                 .await?;
             let status = resp.status();
             if !status.is_success() {
-                anyhow::bail!("git refs failed ({status})");
+                let _ = crate::http::read_body_capped(resp, crate::http::DENIAL_BODY_CAP).await;
+                anyhow::bail!("git_refs failed ({status})");
             }
-            let bytes = resp.bytes().await?;
-            // Parse pkt-line refs
-            let refs = parse_info_refs(&bytes);
+            // Raw bytes end-to-end: git ref names need not be UTF-8, so the
+            // advertisement stays bytes through the read, the validation, and
+            // the pkt-line parse. Text appears only at the JSON output boundary
+            // inside parse_info_refs, where the decode is a deliberate choice.
+            let capped =
+                crate::http::read_body_capped_bytes(resp, crate::http::GIT_REFS_BODY_CAP).await;
+            // Completeness is part of the protocol boundary, checked BEFORE
+            // validation: a large valid advertisement can end exactly at the
+            // cap (or die mid-transit after a whole pkt-line), and the received
+            // prefix then validates and parses as a complete ref list. Agents
+            // treat git_refs as the full truth of the repo — branch, merge, and
+            // release decisions assume an omitted ref does not exist — so a
+            // bounded or failed read must fail the tool, never shrink the repo.
+            if capped.read_failed {
+                anyhow::bail!(
+                    "git_refs failed: the ref advertisement ended mid-read — the refs received \
+                     so far are not the full list; retry, or clone the repo to list refs locally"
+                );
+            }
+            if capped.truncated {
+                anyhow::bail!(
+                    "git_refs failed: the ref advertisement exceeded the {} KiB response cap, \
+                     so the ref list would be incomplete — clone the repo to list refs locally",
+                    crate::http::GIT_REFS_BODY_CAP / 1024
+                );
+            }
+            validate_git_advertisement(&capped.bytes)?;
+            let refs = parse_info_refs(&capped.bytes);
             Ok(serde_json::to_string_pretty(&refs)?)
         }
 
@@ -898,11 +917,11 @@ async fn call_tool(
                 "source_branch": head,
                 "target_branch": base,
             }))?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "pr_create",
                 client
                     .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &body)
                     .await?,
-                "create pull request",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -915,11 +934,11 @@ async fn call_tool(
             // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
             let owner = urlencoding::encode(&owner);
             let repo = urlencoding::encode(repo);
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "pr_list",
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
                     .await?,
-                "pull requests",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -933,20 +952,20 @@ async fn call_tool(
             // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
             let owner = urlencoding::encode(&owner);
             let repo = urlencoding::encode(repo);
-            let pr = crate::http::read_json(
+            let pr = json_ok(
+                "pr_view",
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
                     .await?,
-                "pull request",
             )
             .await?;
-            let reviews = crate::http::read_json(
+            let reviews = json_ok(
+                "pr_view",
                 client
                     .get_maybe_signed(&format!(
                         "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
                     ))
                     .await?,
-                "reviews",
             )
             .await?;
             Ok(serde_json::to_string_pretty(
@@ -962,11 +981,11 @@ async fn call_tool(
             // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
             let owner = urlencoding::encode(&owner);
             let repo = urlencoding::encode(repo);
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "pr_diff",
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
                     .await?,
-                "diff",
             )
             .await?;
             let diff = resp["diff"].as_str().unwrap_or("(empty diff)");
@@ -985,14 +1004,14 @@ async fn call_tool(
                 "status": status,
                 "body": args["body"],
             }))?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "pr_review",
                 client
                     .post(
                         &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"),
                         &body,
                     )
                     .await?,
-                "submit review",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1003,14 +1022,14 @@ async fn call_tool(
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "pr_merge",
                 client
                     .post(
                         &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"),
                         &body,
                     )
                     .await?,
-                "merge pull request",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1032,11 +1051,11 @@ async fn call_tool(
                 "secret": args["secret"],
                 "events": events,
             }))?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "webhook_create",
                 client
                     .post(&format!("/api/v1/repos/{owner}/{name}/hooks"), &body)
                     .await?,
-                "create webhook",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1073,11 +1092,11 @@ async fn call_tool(
             let id = args["id"].as_str().context("missing 'id'")?;
             let (owner, name) = resolve_owner_repo(&args, repo, &keypair, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "webhook_delete",
                 client
                     .delete(&format!("/api/v1/repos/{owner}/{name}/hooks/{id}"), &body)
                     .await?,
-                "delete webhook",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1099,15 +1118,15 @@ async fn call_tool(
                 }
                 u
             };
-            let resp = crate::http::read_json(client.get_authed(&url).await?, "bounties").await?;
+            let resp = json_ok("bounty_list", client.get_authed(&url).await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_show" => {
             let id = args["id"].as_str().context("missing 'id'")?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "bounty_show",
                 client.get_authed(&format!("/api/v1/bounties/{id}")).await?,
-                "bounty",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1122,14 +1141,14 @@ async fn call_tool(
                 "issue_id": args.get("issue_id").and_then(|v| v.as_str()),
                 "tx_hash": args.get("tx_hash").and_then(|v| v.as_str()),
             });
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "bounty_create",
                 client
                     .post(
                         &format!("/api/v1/repos/{owner}/{name}/bounties"),
                         &serde_json::to_vec(&body)?,
                     )
                     .await?,
-                "create bounty",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1138,14 +1157,14 @@ async fn call_tool(
         "bounty_claim" => {
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = json!({ "wallet": args.get("wallet").and_then(|v| v.as_str()) });
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "bounty_claim",
                 client
                     .post(
                         &format!("/api/v1/bounties/{id}/claim"),
                         &serde_json::to_vec(&body)?,
                     )
                     .await?,
-                "claim bounty",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1155,23 +1174,21 @@ async fn call_tool(
             let id = args["id"].as_str().context("missing 'id'")?;
             let pr_id = args["pr_id"].as_str().context("missing 'pr_id'")?;
             let body = json!({ "pr_id": pr_id });
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "bounty_submit",
                 client
                     .post(
                         &format!("/api/v1/bounties/{id}/submit"),
                         &serde_json::to_vec(&body)?,
                     )
                     .await?,
-                "submit bounty",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_stats" => {
-            let resp =
-                crate::http::read_json(client.get("/api/v1/bounties/stats").await?, "bounty stats")
-                    .await?;
+            let resp = json_ok("bounty_stats", client.get("/api/v1/bounties/stats").await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1217,9 +1234,7 @@ async fn call_tool(
                 "deadline": args.get("deadline").and_then(|v| v.as_str()),
                 "delegator_did": delegator_did,
             }))?;
-            let resp =
-                crate::http::read_json(client.post("/api/v1/tasks", &body).await?, "create task")
-                    .await?;
+            let resp = json_ok("task_create", client.post("/api/v1/tasks", &body).await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1228,11 +1243,11 @@ async fn call_tool(
             let assignee_did = kp.did().to_string();
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = serde_json::to_vec(&json!({ "assignee_did": assignee_did }))?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "task_claim",
                 client
                     .post(&format!("/api/v1/tasks/{id}/claim"), &body)
                     .await?,
-                "claim task",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1246,11 +1261,11 @@ async fn call_tool(
                 "result": args.get("result").and_then(|v| v.as_str()),
                 "by_did": by_did,
             }))?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "task_complete",
                 client
                     .post(&format!("/api/v1/tasks/{id}/complete"), &body)
                     .await?,
-                "complete task",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1358,11 +1373,11 @@ async fn call_tool(
                 let owner = resolve_owner(&args, &client).await?;
                 (owner, repo.to_string())
             };
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "issue_list",
                 client
                     .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
                     .await?,
-                "issues",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1384,11 +1399,11 @@ async fn call_tool(
                 "title": title,
                 "body": args.get("body").and_then(|v| v.as_str()),
             }))?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "issue_create",
                 client
                     .post(&format!("/api/v1/repos/{owner}/{name}/issues"), &body)
                     .await?,
-                "create issue",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1408,14 +1423,14 @@ async fn call_tool(
                 (owner, repo.to_string())
             };
             let body = serde_json::to_vec(&json!({ "body": comment_body }))?;
-            let resp = crate::http::read_json(
+            let resp = json_ok(
+                "issue_comment",
                 client
                     .post(
                         &format!("/api/v1/repos/{owner}/{name}/issues/{issue_id}/comments"),
                         &body,
                     )
                     .await?,
-                "comment on issue",
             )
             .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
@@ -1427,14 +1442,99 @@ async fn call_tool(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Deserialize a node response, failing the tool call when the node refused it.
+///
+/// Without the status check a 4xx/5xx JSON error body deserializes cleanly into
+/// a `Value` and goes back to the MCP caller as a successful tool result, so a
+/// denial (a replayed signature, a wrong owner, a missing repo) reads as
+/// success. `what` names the tool so the message says which call failed.
+async fn json_ok(what: &str, resp: reqwest::Response) -> Result<Value> {
+    let status = resp.status();
+    if !status.is_success() {
+        let capped = crate::http::read_body_capped(resp, crate::http::DENIAL_BODY_CAP).await;
+        let msg = serde_json::from_str::<Value>(&capped.text)
+            .ok()
+            .and_then(|body| {
+                body["message"]
+                    .as_str()
+                    .or_else(|| body["error"].as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or(capped.text);
+        anyhow::bail!(
+            "{what} failed ({status}): {}",
+            crate::http::sanitize_node_msg(&msg)
+        );
+    }
+    resp.json::<Value>()
+        .await
+        .with_context(|| format!("{what} failed ({status}): response was not JSON"))
+}
+
 /// Get the owner short-DID from args or default to the node's own DID.
 async fn resolve_owner(args: &Value, client: &NodeClient) -> Result<String> {
     if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
         return Ok(o.to_string());
     }
-    let info = crate::http::read_json(client.get("/").await?, "node info").await?;
+    let info = json_ok("owner lookup", client.get("/").await?).await?;
     let did = info["did"].as_str().context("node info missing DID")?;
     Ok(did.split(':').next_back().unwrap_or(did).to_string())
+}
+
+/// Reject JSON/HTML bodies masquerading as git advertisements, and pkt-line
+/// garbage that would parse as an empty ref list.
+fn validate_git_advertisement(bytes: &[u8]) -> Result<()> {
+    // Reject an empty body before the loop, whose zero-iteration path would
+    // otherwise accept it implicitly. Even an initialized empty bare repository
+    // advertises a non-empty upload-pack response (the service announcement,
+    // capabilities, and pkt-line framing), so a 200 with no data is a proxy or
+    // broken node making an unavailable ref set look empty — not an empty ref
+    // set, which stays valid because it still arrives inside real pkt-lines.
+    if bytes.is_empty() {
+        anyhow::bail!("git_refs failed (200): empty response is not a git ref advertisement");
+    }
+    if matches!(bytes.first(), Some(b'{') | Some(b'<')) {
+        anyhow::bail!("git_refs failed (200): response was not a git ref advertisement");
+    }
+    let mut pos = 0usize;
+    // Whether the last pkt-line seen was a flush. The ref stream must end on
+    // one, so a clean EOF after a complete data packet is a cut stream.
+    let mut closed = false;
+    while pos + 4 <= bytes.len() {
+        let hex = std::str::from_utf8(&bytes[pos..pos + 4])
+            .map_err(|_| anyhow::anyhow!("git_refs failed (200): invalid pkt-line length"))?;
+        let len = usize::from_str_radix(hex, 16)
+            .map_err(|_| anyhow::anyhow!("git_refs failed (200): invalid pkt-line length"))?;
+        if len == 0 {
+            pos += 4;
+            closed = true;
+            continue;
+        }
+        closed = false;
+        if len < 4 || pos + len > bytes.len() {
+            anyhow::bail!("git_refs failed (200): truncated pkt-line");
+        }
+        // An `ERR` pkt-line is Git's in-band failure and may appear wherever a
+        // pkt-line is expected. It frames cleanly, so without this it parses
+        // into a ref named after the error text.
+        if let Some(msg) = bytes[pos + 4..pos + len].strip_prefix(b"ERR ") {
+            anyhow::bail!(
+                "git_refs failed (200): {}",
+                crate::http::sanitize_node_msg(&String::from_utf8_lossy(msg))
+            );
+        }
+        pos += len;
+    }
+    if pos != bytes.len() {
+        anyhow::bail!("git_refs failed (200): response was not a valid git ref advertisement");
+    }
+    if !closed {
+        anyhow::bail!(
+            "git_refs failed (200): advertisement ended before the terminating flush, \
+             so the refs received are not the full list"
+        );
+    }
+    Ok(())
 }
 
 /// Owner for the owner-gated signed reads (`repo_get`, `repo_commits`,
@@ -1524,7 +1624,13 @@ fn parse_info_refs(bytes: &[u8]) -> Value {
             break;
         }
 
-        let line = std::str::from_utf8(&bytes[pos + 4..pos + len]).unwrap_or("");
+        // This is the byte→text boundary, and the decode is deliberate: the
+        // output is JSON, whose strings cannot carry raw bytes, so a non-UTF-8
+        // ref name surfaces with U+FFFD marking the undecodable bytes rather
+        // than the ref silently vanishing from the list (an omitted ref reads
+        // as a ref that does not exist). Everything before this point — read,
+        // completeness check, validation, pkt-line framing — ran on raw bytes.
+        let line = String::from_utf8_lossy(&bytes[pos + 4..pos + len]);
         let line = line.trim_end_matches('\n');
 
         // First line has capabilities after NUL: "<sha> <ref>\0<caps>"
@@ -3253,6 +3359,551 @@ mod tests {
         call_tool("task_list", json!({"cursor": null}), &server.url(), None)
             .await
             .unwrap();
+    }
+
+    // ── Node denials must never render as a successful tool result ──────────
+
+    /// Write an identity into a fresh temp dir so the signing path is exercised.
+    fn identity_dir() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_repo_create_replayed_signature_errors_and_is_not_retried() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = identity_dir();
+        let m = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_header("x-gitlawb-error", "signature_replayed")
+            .with_body(r#"{"error":"signature_replayed","message":"signature already spent"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_create",
+            json!({"name": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a replay rejection must fail the tool call, not return the body as success");
+        let msg = err.to_string();
+        assert!(msg.contains("signature_replayed"), "got: {msg}");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_issue_create_replayed_signature_errors_and_is_not_retried() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = identity_dir();
+        let m = server
+            .mock("POST", "/api/v1/repos/alice/myrepo/issues")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_header("x-gitlawb-error", "signature_replayed")
+            .with_body(r#"{"error":"signature_replayed","message":"signature already spent"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "issue_create",
+            json!({"repo": "alice/myrepo", "title": "New bug"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a replay rejection must fail the tool call");
+        let msg = err.to_string();
+        assert!(msg.contains("signature_replayed"), "got: {msg}");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_pr_create_denial_errors_not_success() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = identity_dir();
+        let _m = server
+            .mock("POST", "/api/v1/repos/alice/myrepo/pulls")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"forbidden","message":"not a collaborator"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "pr_create",
+            json!({"owner": "alice", "repo": "myrepo", "head": "feat", "title": "T"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a 403 must fail the tool call, not be returned as a success result");
+        let msg = err.to_string();
+        assert!(msg.contains("403"), "got: {msg}");
+        assert!(msg.contains("not a collaborator"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_repo_create_repo_exists_409_is_distinguishable_from_a_replay() {
+        // The pre-existing 409 carries no x-gitlawb-error header. It must still
+        // fail the tool call (a denial is not a success), but its message must
+        // not name a signature rejection.
+        let mut server = mockito::Server::new_async().await;
+        let dir = identity_dir();
+        let _m = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"repo_exists","message":"repository already exists"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_create",
+            json!({"name": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a 409 error body must not be returned as a successful tool result");
+        let msg = err.to_string();
+        assert!(msg.contains("repository already exists"), "got: {msg}");
+        assert!(
+            !msg.contains("signature_replayed"),
+            "a repo_exists 409 must not be reported as a replay, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_git_refs_denial_errors_not_empty_refs() {
+        // git_refs reads pkt-lines, not JSON: a denial body parses to zero refs,
+        // so without the status check it would look like an empty repository.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/alice/secret/info/refs?service=git-upload-pack")
+            .with_status(403)
+            .with_body(r#"{"error":"forbidden"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("a denied ref listing must error, not return an empty ref list");
+        assert!(err.to_string().contains("403"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_json_ok_denial_sanitizes_node_message() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/ghost")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"forbidden","message":"denied\u001b[31m"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "ghost"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("a denied repo_get must fail the tool call");
+        let msg = err.to_string();
+        assert!(msg.contains("403"), "got: {msg}");
+        assert!(msg.contains("denied"), "got: {msg}");
+        assert!(
+            !msg.contains('\u{001b}'),
+            "control bytes must be stripped, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_ok_denial_caps_oversized_body() {
+        let mut server = mockito::Server::new_async().await;
+        let huge = "x".repeat(80 * 1024);
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/ghost")
+            .with_status(429)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"error":"rate_limited","message":"{huge}"}}"#))
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "ghost"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("oversized denial must fail the tool call");
+        assert!(err.to_string().contains("429"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_json_ok_plain_text_denial_surfaces_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/ghost")
+            .with_status(429)
+            .with_header("content-type", "text/plain")
+            .with_body("rate limit exceeded")
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "ghost"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("plain-text denial must fail the tool call");
+        let msg = err.to_string();
+        assert!(msg.contains("429"), "got: {msg}");
+        assert!(msg.contains("rate limit"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_git_refs_fake_200_json_errors_not_empty_refs() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/alice/secret/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"forbidden"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("JSON on a 200 must not parse as an empty ref list");
+        assert!(
+            err.to_string().contains("not a git ref advertisement"),
+            "got: {err}"
+        );
+    }
+
+    /// A 200 with an EMPTY body must error, not become a successful empty ref
+    /// list. Even an initialized empty bare repository advertises a non-empty
+    /// upload-pack response (service announcement + capabilities in pkt-line
+    /// framing), so no data at all is a proxy or broken node hiding the ref
+    /// set, not a repo with no refs. MUTATION (RED): drop the `is_empty` check
+    /// in `validate_git_advertisement` and the zero-iteration pkt-line loop
+    /// accepts the body, returning `{"refs": []}`.
+    #[tokio::test]
+    async fn test_git_refs_empty_200_body_errors_not_empty_refs() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/alice/secret/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("an empty 200 body must not parse as an empty ref list");
+        assert!(
+            err.to_string().contains("empty response"),
+            "the refusal must name the empty body, got: {err}"
+        );
+    }
+
+    /// A 200 whose pkt-lines carry a Git `ERR` packet must error with the
+    /// node's message, not parse into a fabricated ref (`sha: "ERR"`). The
+    /// packet is well-framed, so only a payload check refuses it. MUTATION
+    /// (RED): drop the `ERR ` branch in `validate_git_advertisement` and the
+    /// body returns a ref named after the error text.
+    #[tokio::test]
+    async fn test_git_refs_err_packet_errors_not_fabricated_ref() {
+        let mut server = mockito::Server::new_async().await;
+        let mut body = pkt_line(b"# service=git-upload-pack\n");
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(&pkt_line(b"ERR repository unavailable\n"));
+        let _m = server
+            .mock("GET", "/alice/gone/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "gone"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("an ERR packet must not parse as a ref");
+        assert!(
+            err.to_string().contains("repository unavailable"),
+            "the refusal must carry the node's message, got: {err}"
+        );
+    }
+
+    /// A 200 that ends cleanly after a complete ref pkt-line but BEFORE the
+    /// terminating flush is an incomplete Git stream, not the full ref list: both
+    /// capped-read flags stay false and every pkt-line frames, so only the
+    /// missing `0000` shows the refs received are a prefix. MUTATION (RED): drop
+    /// the `closed` check in `validate_git_advertisement` and this returns one
+    /// ref as if the repo held nothing else.
+    #[tokio::test]
+    async fn test_git_refs_missing_terminating_flush_errors_not_partial_refs() {
+        let mut server = mockito::Server::new_async().await;
+        let sha = "d".repeat(40);
+        let mut body = pkt_line(b"# service=git-upload-pack\n");
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(&pkt_line(format!("{sha} refs/heads/main\n").as_bytes()));
+        let _m = server
+            .mock("GET", "/alice/noflush/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "noflush"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("an advertisement with no terminating flush must not parse as complete");
+        assert!(
+            err.to_string().contains("terminating flush"),
+            "the refusal must name the missing flush, got: {err}"
+        );
+    }
+
+    /// Frame one pkt-line: 4 hex length bytes followed by the content.
+    fn pkt_line(content: &[u8]) -> Vec<u8> {
+        let mut v = format!("{:04x}", content.len() + 4).into_bytes();
+        v.extend_from_slice(content);
+        v
+    }
+
+    /// Build a syntactically valid upload-pack advertisement measuring exactly
+    /// `total` bytes, every pkt-line boundary landing inside it. This is the
+    /// adversarial shape for the completeness check: a prefix of the response
+    /// that validates on its own, so only the `truncated`/`read_failed` flags
+    /// can reveal that it is not the whole answer.
+    fn advertisement_of_exactly(total: usize) -> Vec<u8> {
+        let mut body = pkt_line(b"# service=git-upload-pack\n");
+        body.extend_from_slice(b"0000");
+        let sha = "a".repeat(40);
+        let remaining = total - body.len();
+        // n-1 lines of 128 bytes plus one final line of 128 + the remainder
+        // (< 256, still 4 hex digits) lands the last boundary exactly on `total`.
+        let n = remaining / 128;
+        assert!(n >= 2, "total too small for the fixture");
+        for i in 0..n {
+            let line_len = if i == n - 1 {
+                128 + remaining % 128
+            } else {
+                128
+            };
+            // content = "<sha> refs/heads/<padded name>\n", padded to line_len - 4.
+            let name_len = line_len - 4 - 40 - 1 - 12 - 1; // sha, space, "refs/heads/b", newline
+            let content = format!("{sha} refs/heads/b{i:0name_len$}\n");
+            body.extend_from_slice(&pkt_line(content.as_bytes()));
+        }
+        assert_eq!(body.len(), total, "fixture must land exactly on total");
+        body
+    }
+
+    /// A valid advertisement cut EXACTLY at the response cap must error, not
+    /// return the prefix as the complete ref list. The prefix here validates
+    /// perfectly — every pkt-line closes on the boundary — so only the
+    /// `truncated` flag distinguishes it from a clean EOF, and agents act on
+    /// git_refs as the full truth of the repo (a ref omitted by the cap reads
+    /// as a ref that does not exist). MUTATION (RED): ignore `capped.truncated`
+    /// in the `git_refs` arm and this returns thousands of refs, successfully,
+    /// with the tail of the repo silently missing.
+    #[tokio::test]
+    async fn test_git_refs_valid_prefix_at_cap_errors_not_partial_refs() {
+        let mut server = mockito::Server::new_async().await;
+        // The full body extends past the cap; its first GIT_REFS_BODY_CAP bytes
+        // are themselves a well-formed advertisement ending on a pkt boundary.
+        let mut body = advertisement_of_exactly(crate::http::GIT_REFS_BODY_CAP);
+        let sha = "b".repeat(40);
+        body.extend_from_slice(&pkt_line(format!("{sha} refs/heads/omitted\n").as_bytes()));
+        body.extend_from_slice(b"0000");
+        let _m = server
+            .mock("GET", "/alice/big/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "big"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("a capped advertisement must error, not return a partial ref list");
+        assert!(
+            err.to_string().contains("response cap"),
+            "the refusal must name the cap so the caller knows the list was bounded, got: {err}"
+        );
+    }
+
+    /// A body that FAILS mid-read after a syntactically complete prefix must
+    /// error too — the transport, not the cap, is what cut this one. The
+    /// fixture is a raw listener that promises more body than it writes, then
+    /// closes; mockito cannot express that (it always completes the response it
+    /// advertises). The bytes that did arrive are whole pkt-lines, so without
+    /// the `read_failed` flag they validate and parse as a short-but-successful
+    /// ref list. MUTATION (RED): ignore `capped.read_failed` in the `git_refs`
+    /// arm and this returns one ref as if the repo held nothing else.
+    #[tokio::test]
+    async fn test_git_refs_read_failure_after_valid_prefix_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 2048];
+            let _ = sock.read(&mut scratch).await;
+            let mut prefix = pkt_line(b"# service=git-upload-pack\n");
+            prefix.extend_from_slice(b"0000");
+            let sha = "c".repeat(40);
+            prefix.extend_from_slice(&pkt_line(format!("{sha} refs/heads/main\n").as_bytes()));
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                // Promise more than gets written, so the close is a mid-body
+                // failure rather than a clean end of stream.
+                prefix.len() + 64
+            );
+            let _ = sock.write_all(header.as_bytes()).await;
+            let _ = sock.write_all(&prefix).await;
+            let _ = sock.flush().await;
+            // Drop closes the socket with 64 promised bytes never sent.
+        });
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "cut"}),
+            &format!("http://{addr}"),
+            None,
+        )
+        .await
+        .expect_err("a mid-read failure must error, not return the refs that made it through");
+        assert!(
+            err.to_string().contains("mid-read"),
+            "the refusal must say the read failed, not blame the advertisement, got: {err}"
+        );
+    }
+
+    /// Git ref names are byte strings that need not be UTF-8. The advertisement
+    /// must stay raw bytes through the read, validation, and pkt-line parse: a
+    /// lossy decode turns each invalid byte into the 3-byte U+FFFD, which both
+    /// corrupts the name and breaks the pkt-line length accounting, so a valid
+    /// repository fails validation. Text appears only at the JSON boundary,
+    /// where the replacement character is a deliberate rendering choice (JSON
+    /// strings cannot carry raw bytes) rather than silent data loss. MUTATION
+    /// (RED): route the body back through `read_body_capped(...).text.as_bytes()`
+    /// and this advertisement's second pkt-line length no longer matches, so
+    /// the whole call fails "truncated pkt-line".
+    #[tokio::test]
+    async fn test_git_refs_non_utf8_ref_name_survives_validation_and_parse() {
+        let mut server = mockito::Server::new_async().await;
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        let mut body = pkt_line(b"# service=git-upload-pack\n");
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(&pkt_line(format!("{sha_a} refs/heads/main\n").as_bytes()));
+        // 0xFF is not valid UTF-8 anywhere in a sequence; latin-1 branch names
+        // like this exist in the wild.
+        let mut raw_line = format!("{sha_b} refs/heads/caf").into_bytes();
+        raw_line.push(0xFF);
+        raw_line.push(b'\n');
+        body.extend_from_slice(&pkt_line(&raw_line));
+        body.extend_from_slice(b"0000");
+        let _m = server
+            .mock("GET", "/alice/latin/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let out = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "latin"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect("a non-UTF-8 ref name must not fail validation of a valid advertisement");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let refs = parsed["refs"].as_array().expect("refs array");
+        assert_eq!(
+            refs.len(),
+            2,
+            "the non-UTF-8 ref must be listed, not silently dropped: {parsed}"
+        );
+        assert_eq!(refs[0]["ref"], "refs/heads/main");
+        assert_eq!(refs[1]["sha"], sha_b.as_str());
+        assert_eq!(
+            refs[1]["ref"], "refs/heads/caf\u{FFFD}",
+            "the undecodable byte surfaces as U+FFFD at the JSON boundary, marked rather than lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repo_get_404_errors_not_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/ghost")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"not_found","message":"repository not found"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "ghost"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("a 404 must fail the tool call");
+        assert!(
+            err.to_string().contains("repository not found"),
+            "got: {err}"
+        );
     }
 
     #[test]
