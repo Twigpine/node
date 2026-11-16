@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -31,7 +31,11 @@ pub enum WebhookCmd {
         /// Optional HMAC secret for payload signing (sets X-Gitlawb-Signature-256)
         #[arg(long)]
         secret: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -40,7 +44,11 @@ pub enum WebhookCmd {
     List {
         /// Repository name
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -51,7 +59,11 @@ pub enum WebhookCmd {
         repo: String,
         /// Webhook ID
         id: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -102,13 +114,7 @@ async fn cmd_create(
         .post(&format!("/api/v1/repos/{owner}/{name}/hooks"), &payload)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let hook: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = hook["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create webhook failed ({status}): {msg}");
-    }
+    let hook: Value = json_or_denial("create webhook", resp).await?;
 
     let id = hook["id"].as_str().unwrap_or("?");
     let hook_events = hook["events"]
@@ -148,13 +154,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     let resp = client
         .get_signed(&format!("/api/v1/repos/{owner}/{name}/hooks"))
         .await?;
-    let status = resp.status();
-    let body: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("list webhooks failed ({status}): {msg}");
-    }
+    let body: Value = json_or_denial("list webhooks", resp).await?;
 
     let hooks = body
         .get("webhooks")
@@ -202,13 +202,8 @@ async fn cmd_delete(repo: String, id: String, node: String, dir: Option<PathBuf>
         )
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("delete webhook failed ({status}): {msg}");
-    }
+    // Parsed only to reject a denial; the success body carries nothing to print.
+    json_or_denial::<Value>("delete webhook", resp).await?;
 
     println!("✓ Webhook {id} deleted");
     Ok(())

@@ -1,19 +1,34 @@
-//! Signed HTTP client for gitlawb API calls (async).
+//! Signed HTTP client for Twigpine API calls (async).
 //!
 //! Writes are signed with RFC 9421 HTTP Signatures. When the node gates a write
 //! behind iCaptcha (HTTP 403 `icaptcha_proof_required`, advertised via the
 //! `x-icaptcha-url` / `x-icaptcha-level` headers), the client transparently
-//! solves the challenge and retries the same signed request with the
-//! `x-icaptcha-proof` header — see `crates/icaptcha-client`.
+//! solves the challenge and re-signs the write with the `x-icaptcha-proof`
+//! header attached (see `crates/icaptcha-client`).
 
 use anyhow::{Context, Result};
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
+use gitlawb_core::node_denial::NodeDenial;
 use icaptcha_client::IcaptchaCfg;
+use serde_json::Value;
 
 /// Max times we'll fetch a fresh proof and retry a 403-iCaptcha response
 /// (absorbs proof expiry / first-seen replay).
 const MAX_ICAPTCHA_RETRIES: usize = 2;
+
+/// Max bytes buffered from a denial body before we give up on parsing it. Node
+/// error bodies are a few hundred bytes of JSON; anything past this is not one,
+/// and reading it unbounded is exactly the allocation a hostile node would aim
+/// for.
+pub(crate) const DENIAL_BODY_CAP: usize = 64 * 1024;
+
+/// Max bytes read from a git smart-HTTP ref advertisement. Real ads are small;
+/// this bounds hostile 200 responses on the MCP `git_refs` path.
+pub(crate) const GIT_REFS_BODY_CAP: usize = 256 * 1024;
+
+/// Max characters of a node-supplied message we will echo to the terminal.
+const NODE_MSG_CHARS: usize = 200;
 
 /// Total request timeout: from the start of connecting through the end of the
 /// response body, so it bounds a slow download and not just a slow handshake.
@@ -147,6 +162,18 @@ impl NodeClient {
         self.send_signed("POST", path, body).await
     }
 
+    /// POST with JSON body + RFC 9421 signing and an optional user-provided
+    /// iCaptcha proof, sent on the initial request.
+    pub async fn post_with_proof(
+        &self,
+        path: &str,
+        body: &[u8],
+        initial_proof: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        self.send_signed_with_proof("POST", path, body, initial_proof)
+            .await
+    }
+
     /// PUT with RFC 9421 signing + transparent iCaptcha solve/retry.
     pub async fn put(&self, path: &str, body: &[u8]) -> Result<reqwest::Response> {
         self.send_signed("PUT", path, body).await
@@ -158,19 +185,37 @@ impl NodeClient {
     }
 
     /// Sign + send a write. On a 403 iCaptcha challenge (detected via the
-    /// `x-icaptcha-*` headers) solve it and retry the same signed request with
-    /// the proof header, up to [`MAX_ICAPTCHA_RETRIES`]. Emits an actionable
-    /// hint on a 401 "not an agent" (the old-CLI / unregistered failure mode).
+    /// `x-icaptcha-*` headers) attach the proof and send the write again, up to
+    /// [`MAX_ICAPTCHA_RETRIES`]. Each attempt goes through `send_once`, which
+    /// signs afresh, so the retry is a new signature over the same bytes, not a
+    /// resend of the original one. Emits an actionable hint on a 401 "not an
+    /// agent" (the old-CLI / unregistered failure mode), and converts every
+    /// denial the node names in `x-gitlawb-error` into an error.
     async fn send_signed(
         &self,
         method: &str,
         path: &str,
         body: &[u8],
     ) -> Result<reqwest::Response> {
-        let mut proof: Option<String> = None;
+        self.send_signed_with_proof(method, path, body, None).await
+    }
+
+    /// Sign + send a write. `initial_proof`, if provided, is attached to the
+    /// first request. On a 403 iCaptcha challenge advertised via
+    /// `x-icaptcha-*` headers, solve and retry up to MAX_ICAPTCHA_RETRIES.
+    async fn send_signed_with_proof(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        initial_proof: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let mut proof = initial_proof.map(str::to_owned);
         let mut attempts = 0;
+
         loop {
             let resp = self.send_once(method, path, body, proof.as_deref()).await?;
+
             let status = resp.status();
 
             if status == reqwest::StatusCode::UNAUTHORIZED
@@ -193,6 +238,10 @@ impl NodeClient {
                     proof = Some(obtain_proof(cfg).await?);
                     continue;
                 }
+            }
+
+            if let Some(rejection) = signature_rejection(&resp) {
+                return Err(rejection.into_error(method, path, resp).await);
             }
             return Ok(resp);
         }
@@ -249,6 +298,156 @@ impl NodeClient {
     }
 }
 
+/// A write the node refused with a code this build recognises.
+struct SignatureRejection {
+    /// Which denial it was. Its `as_str` is the `x-gitlawb-error` code, printed
+    /// verbatim so scripts can match on it.
+    denial: NodeDenial,
+    /// What the user should actually do next.
+    hint: &'static str,
+}
+
+impl SignatureRejection {
+    /// Consume the response to fold the node's own message into the error.
+    /// Called only after [`signature_rejection`] has decided from the status and
+    /// header, since reading the body takes the response by value.
+    ///
+    /// The message is attacker controlled (any node the user points `gl` at
+    /// wrote it), so the read is capped and the string is stripped of control
+    /// characters and bidi overrides before it can reach a terminal: without
+    /// that, the text whose whole job is to say "your write was REFUSED" can
+    /// clear the screen and print a fake success line.
+    async fn into_error(self, method: &str, path: &str, resp: reqwest::Response) -> anyhow::Error {
+        let status = resp.status();
+        let capped = read_body_capped(resp, DENIAL_BODY_CAP).await;
+        let node_msg = serde_json::from_str::<serde_json::Value>(&capped.text)
+            .ok()
+            .and_then(|b| b["message"].as_str().map(sanitize_node_msg))
+            .filter(|m| !m.is_empty());
+        let Self { denial, hint } = self;
+        let code = denial.as_str();
+        match node_msg {
+            Some(m) => anyhow::anyhow!("{method} {path} rejected ({status} {code}): {hint} ({m})"),
+            None => anyhow::anyhow!("{method} {path} rejected ({status} {code}): {hint}"),
+        }
+    }
+}
+
+/// Recognise a node rejection from the status and the
+/// `x-gitlawb-error` header, before anything reads the body.
+///
+/// Known limit: the node also puts the same code in the body's `error` field,
+/// and this does not look at it, so a proxy or CDN that strips unknown `X-`
+/// headers switches the detection off. Reading the body to recover the second
+/// signal is destructive, and handing the caller back a response it can still
+/// parse needs `http::Response::builder` (the only constructor
+/// `reqwest::Response::from` takes), which is a dependency this crate does not
+/// carry. The commands that must not mistake a denial for a success do not rely
+/// on this alone: `gl init` compares the structured error code from the body,
+/// and the `gl task` writes check the status before parsing.
+///
+/// None of these is ever retried. A `signature_replayed` 409 means the node
+/// already admitted a request carrying this signature, so re-sending the same
+/// bytes risks applying the mutation twice, which is the duplicate write the
+/// ledger exists to prevent. (The iCaptcha 403 retry above does not have that
+/// problem: `verify_request` runs inside the handler, so the ledger has already
+/// been charged by the time the challenge is returned, but `send_once` signs
+/// every attempt afresh and each signature carries its own nonce, so the retry
+/// arrives under a ledger key the node has never seen.) The 400, 429, 500 and
+/// 503 cases did not apply the write; 429 and 503 are retryable, but doing it
+/// automatically would only hammer a node that is already saying "not now", so
+/// they surface to the user instead.
+///
+/// The set of codes is [`NodeDenial`], shared with the node so both halves
+/// spell them the same way. The `match` below has no wildcard arm on purpose:
+/// adding a denial to the node stops this crate compiling until someone writes
+/// the caller's instructions for it. That is the whole point of the type, since
+/// the previous arrangement (a list of literals in each crate) silently missed
+/// `signature_nonce_too_short` for several commits and returned `Ok(400)` for it.
+fn signature_rejection(resp: &reqwest::Response) -> Option<SignatureRejection> {
+    let code = resp.headers().get("x-gitlawb-error")?.to_str().ok()?;
+    // A code this build does not know: not our denial to describe. The header
+    // came from a node the user chose, which may be newer, older, or hostile,
+    // so the response goes back to the caller untouched.
+    let denial = NodeDenial::from_code(code)?;
+    // The status has to agree with the code, so a stray header on a 200 cannot
+    // turn a success into a refusal.
+    if resp.status().as_u16() != denial.status() {
+        return None;
+    }
+    let hint = match denial {
+        NodeDenial::NonceRequired => {
+            "this node requires a nonce in the request signature and the request did not carry \
+             one. The write did not happen; upgrade `gl` and run the command again"
+        }
+        NodeDenial::NonceTooShort => {
+            "this node rejected the nonce in the request signature as too short to be unique. \
+             The write did not happen; upgrade `gl` and run the command again"
+        }
+        NodeDenial::Replayed => {
+            "the node already admitted a request with this signature and will not take it twice. \
+             Do not resend: check whether the change took effect before running the command again"
+        }
+        NodeDenial::LedgerFull => {
+            "this identity has too many unexpired signatures on the node, so it is refusing more \
+             signed writes for now. The write did not happen; wait a moment and run the command \
+             again"
+        }
+        NodeDenial::IdentityMissing => {
+            "the node reached its signature ledger without a verified identity and refused the \
+             write. The write did not happen; this is a fault on the node, so report it to the \
+             operator"
+        }
+        NodeDenial::LedgerUnavailable => {
+            "the node's signature ledger is unavailable, so it is refusing signed writes. \
+             The write did not happen; retry later or ask the node operator to check the node"
+        }
+        NodeDenial::RateLimited => {
+            "a rate limit on the node refused this request. The write did not happen; \
+             re-signing will not help, so wait and try again"
+        }
+    };
+    Some(SignatureRejection { denial, hint })
+}
+
+/// Read a node reply, turning a non-2xx into an error instead of handing the
+/// caller an error body that pretty-prints like a success. The message is read
+/// under a cap and sanitized, same as a signature denial.
+pub(crate) async fn json_or_denial<T: serde::de::DeserializeOwned>(
+    what: &str,
+    resp: reqwest::Response,
+) -> Result<T> {
+    let status = resp.status();
+    if !status.is_success() {
+        let capped = read_body_capped(resp, DENIAL_BODY_CAP).await;
+        let msg = serde_json::from_str::<serde_json::Value>(&capped.text)
+            .ok()
+            .and_then(|v| {
+                v.get("message")
+                    .or_else(|| v.get("error"))
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| match (capped.read_failed, capped.truncated) {
+                (true, _) if capped.text.is_empty() => {
+                    "(response body could not be read)".to_string()
+                }
+                (true, _) => {
+                    format!(
+                        "(response body cut short by a read failure) {}",
+                        capped.text
+                    )
+                }
+                (false, true) => format!("{} (truncated)", capped.text),
+                (false, false) => capped.text,
+            });
+        anyhow::bail!("{what} failed ({status}): {}", sanitize_node_msg(&msg));
+    }
+    resp.json::<T>()
+        .await
+        .with_context(|| format!("invalid JSON response from {what}"))
+}
+
 /// Run the (blocking) iCaptcha solve loop off the async runtime.
 async fn obtain_proof(cfg: IcaptchaCfg) -> Result<String> {
     tokio::task::spawn_blocking(move || icaptcha_client::obtain_proof(&cfg, None))
@@ -269,21 +468,41 @@ pub(crate) struct CappedBody {
     pub(crate) read_failed: bool,
 }
 
-/// Read at most `cap` bytes of a response body. Bounds the allocation from a
-/// hostile or broken node returning a huge error body — the display is capped
+/// The byte twin of [`CappedBody`]: the same completion flags, but the payload is
+/// left as the exact bytes that arrived. Byte-oriented protocol consumers (the git
+/// smart-HTTP ref advertisement on the MCP `git_refs` path) must read through this
+/// one: git ref names are byte strings that need not be UTF-8, so a lossy decode
+/// followed by `as_bytes()` is not a display nicety but corruption — each invalid
+/// byte becomes the 3-byte U+FFFD, changing both the ref name and the pkt-line
+/// length accounting, and a valid repository stops validating.
+pub(crate) struct CappedBytes {
+    /// The bytes read, exactly as they arrived.
+    pub(crate) bytes: Vec<u8>,
+    /// The cap cut the body short.
+    pub(crate) truncated: bool,
+    /// A chunk read FAILED part-way through, so the body is not merely short, it is
+    /// unfinished and the node may have had more to say.
+    pub(crate) read_failed: bool,
+}
+
+/// Read at most `cap` bytes of a response body, raw. Bounds the allocation from a
+/// hostile or broken node returning a huge body — the display is capped
 /// separately, but the read itself must not be unbounded (INV-6, read half).
 ///
 /// `truncated` reports whether the cap cut the body short. A caller that CLASSIFIES
 /// on the body needs it: a cut body fails JSON parse, and a parse failure is
 /// indistinguishable from a node that sent no code at all, so without this flag an
-/// oversized body silently picks a different arm.
+/// oversized body silently picks a different arm. A protocol consumer needs it even
+/// more: a cut pkt-line stream can still be a syntactically valid *prefix*, so
+/// without the flag a bounded read is indistinguishable from a clean EOF and the
+/// prefix parses as the complete answer.
 ///
 /// `read_failed` reports the other way a body can end early. A mid-body read error
 /// used to leave through the same exit as a clean end of stream, so a 500 whose body
 /// died in transit surfaced as an empty message and the caller was told
 /// `node returned 500: ` with nothing after the colon. That is a report of what the
 /// node said, and the node never got to say it.
-pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> CappedBody {
+pub(crate) async fn read_body_capped_bytes(mut resp: reqwest::Response, cap: usize) -> CappedBytes {
     let mut buf: Vec<u8> = Vec::new();
     let mut truncated = false;
     let mut read_failed = false;
@@ -309,24 +528,135 @@ pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) ->
     if buf.len() >= cap {
         truncated = true;
     }
-    CappedBody {
-        text: String::from_utf8_lossy(&buf).into_owned(),
+    CappedBytes {
+        bytes: buf,
         truncated,
         read_failed,
+    }
+}
+
+/// Text view of [`read_body_capped_bytes`], for callers that go on to display or
+/// JSON-parse node-supplied *messages* (denial bodies). The decode is lossy on
+/// purpose there — a denial is prose for a terminal, and a hostile byte becomes a
+/// visible U+FFFD instead of raw output. Anything that parses a byte protocol out
+/// of the body must take the bytes variant instead; see [`CappedBytes`].
+pub(crate) async fn read_body_capped(resp: reqwest::Response, cap: usize) -> CappedBody {
+    let raw = read_body_capped_bytes(resp, cap).await;
+    CappedBody {
+        text: String::from_utf8_lossy(&raw.bytes).into_owned(),
+        truncated: raw.truncated,
+        read_failed: raw.read_failed,
     }
 }
 
 /// Strip terminal-dangerous characters from (and cap the length of) a
 /// node-supplied error string before surfacing it. The node a caller talks to
 /// could be hostile and embed escape sequences in its error body; those must not
-/// reach the terminal verbatim (INV-6). We drop the C0/C1 control bytes (which
+/// reach the terminal verbatim. We drop the C0/C1 control bytes (which
 /// defangs ANSI/OSC escapes) AND the Unicode bidi/format controls (which
 /// `char::is_control` does not cover — they can reorder the displayed line).
 pub(crate) fn sanitize_node_msg(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !gitlawb_core::sanitize::is_bidi_format(*c))
-        .take(200)
+    gitlawb_core::sanitize::strip_terminal_controls(s)
+        .chars()
+        .take(NODE_MSG_CHARS)
         .collect()
+}
+
+/// Read a JSON response, surfacing a node denial/error instead of parsing it as
+/// the requested resource. On a non-2xx status it returns an `Err` carrying the
+/// node's sanitized `message` plus the status; on success it parses the
+/// body and propagates a parse error, so a truncated/garbage 2xx body is an error
+/// rather than a silently-empty success (the denial-as-success bug #123 fixes).
+/// `what` names the resource for the error text (e.g. "repo", "commits").
+///
+/// Callers must route gated reads through this rather than `resp.json().await?`:
+/// the bare parse renders a gated 404/5xx body back as the resource.
+/// Cap on the error body `read_json` reads before parsing a node's `message`.
+/// Matches the capped-read bound used on the sync error path; large enough for any
+/// legitimate error, small enough that a hostile node cannot exhaust memory.
+const ERROR_BODY_CAP: usize = 8 * 1024;
+
+pub(crate) async fn read_json(resp: reqwest::Response, what: &str) -> Result<Value> {
+    let status = resp.status();
+    if !status.is_success() {
+        // Bound the error read: `resp.json()` would buffer and parse the WHOLE
+        // body, so a hostile node could stream an arbitrarily large valid JSON
+        // error and exhaust this process's memory (#186). Read a small capped body
+        // first, then best-effort extract `message`. The error body may also be
+        // non-JSON (503 degraded, 413 body-limit from middleware), so a parse miss
+        // falls back to the capped raw text; an empty body to the status alone.
+        let raw = read_body_capped(resp, ERROR_BODY_CAP).await.text;
+        // Preserve the prior contract: surface the JSON `message` when present in
+        // the capped body, else the status alone ("request failed") — a non-JSON
+        // or message-less body (503 degraded, 413 body-limit) never surfaces raw
+        // node bytes. A body whose `message` sits past the cap parses as truncated
+        // garbage here and correctly falls back rather than being buffered whole.
+        //
+        // Fall back to `error` before giving up: the node's shared AppError
+        // envelope carries both keys, but the task API answers with `error` alone
+        // (`{"error":"task not found"}` in gitlawb-node/src/api/tasks.rs), so
+        // reading only `message` blanked every `gl task` denial to the generic
+        // "request failed". `sync.rs`'s hand-rolled reader already reads both; this
+        // matches it.
+        let msg = serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|b| {
+                b.get("message")
+                    .or_else(|| b.get("error"))
+                    .and_then(|m| m.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "request failed".to_owned());
+        anyhow::bail!("{what} failed ({status}): {}", sanitize_node_msg(&msg));
+    }
+    // Success: a truncated/garbage 2xx body must be an `Err`, not `Ok(Null)` that
+    // a caller then renders as an empty success.
+    resp.json()
+        .await
+        .with_context(|| format!("invalid JSON in {what} response"))
+}
+
+/// Test helper for the signed read call sites: true when the request's signature
+/// verifies over the target the server actually received. A signed target that
+/// differs from the wire target (an unencoded non-ASCII query value that reqwest
+/// then percent-encodes, say) makes the node 401 the request.
+#[cfg(test)]
+pub(crate) fn signature_binds_wire_target(req: &mockito::Request) -> bool {
+    use gitlawb_core::http_sig::{build_signing_string, HttpSignature};
+    use std::collections::HashMap;
+
+    let header = |name: &str| -> Option<String> {
+        req.header(name)
+            .first()
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (Some(input), Some(sig_header), Some(digest)) = (
+        header("signature-input"),
+        header("signature"),
+        header("content-digest"),
+    ) else {
+        return false;
+    };
+    let Ok(sig) = HttpSignature::parse(&input, &sig_header) else {
+        return false;
+    };
+    let Ok(vk) = sig.key_id.to_verifying_key() else {
+        return false;
+    };
+    let mut values = HashMap::new();
+    values.insert("@method".to_string(), "GET".to_string());
+    values.insert("@path".to_string(), req.path_and_query().to_string());
+    values.insert("content-digest".to_string(), digest);
+    let params = input.strip_prefix("sig1=").unwrap_or(&input);
+    let components: Vec<&str> = sig.components.iter().map(String::as_str).collect();
+    let Ok(signing_string) = build_signing_string(&components, params, &values) else {
+        return false;
+    };
+    let Ok(arr) = <[u8; 64]>::try_from(sig.signature_bytes.as_slice()) else {
+        return false;
+    };
+    gitlawb_core::identity::verify(&vk, signing_string.as_bytes(), &arr).is_ok()
 }
 
 #[cfg(test)]
@@ -563,6 +893,355 @@ mod tests {
         m.assert();
     }
 
+    // ── send_signed signature-ledger rejections ─────────────────────────
+
+    /// Mock one node reply and send a signed POST through `send_signed`,
+    /// asserting the node was called exactly once (i.e. nothing retried).
+    async fn send_signed_once(
+        status: usize,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (Result<reqwest::Response>, mockito::ServerGuard) {
+        let mut server = Server::new_async().await;
+        let mut m = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(status)
+            .with_header("content-type", "application/json");
+        for (k, v) in headers {
+            m = m.with_header(*k, v);
+        }
+        let m = m.with_body(body).expect(1).create_async().await;
+        let client = NodeClient::new(server.url(), Some(test_keypair()));
+        let resp = client.send_signed("POST", "/api/v1/repos", b"{}").await;
+        m.assert_async().await;
+        (resp, server)
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_replayed_signature_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            409,
+            &[("x-gitlawb-error", "signature_replayed")],
+            r#"{"error":"signature_replayed","message":"this signature was already used"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("a replayed signature must surface as an error, not Ok(409)")
+            .to_string();
+        assert!(err.contains("signature_replayed"), "got: {err}");
+        assert!(
+            err.contains("already"),
+            "message must tell the user the node already applied it, got: {err}"
+        );
+        assert!(
+            err.contains("this signature was already used"),
+            "must surface the node's message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_ledger_full_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            429,
+            &[("x-gitlawb-error", "signature_ledger_full")],
+            r#"{"error":"signature_ledger_full","message":"ledger at capacity"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("a full ledger must surface as an error")
+            .to_string();
+        assert!(err.contains("signature_ledger_full"), "got: {err}");
+        assert!(
+            !err.contains("already"),
+            "must not claim the write was applied, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_ledger_unavailable_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            503,
+            &[("x-gitlawb-error", "signature_ledger_unavailable")],
+            r#"{"error":"signature_ledger_unavailable","message":"ledger down"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("an unavailable ledger must surface as an error")
+            .to_string();
+        assert!(err.contains("signature_ledger_unavailable"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_nonce_required_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            400,
+            &[("x-gitlawb-error", "signature_nonce_required")],
+            r#"{"error":"signature_nonce_required","message":"this node requires a nonce"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("a nonce-less signature must surface as an error, not Ok(400)")
+            .to_string();
+        assert!(err.contains("signature_nonce_required"), "got: {err}");
+        assert!(
+            !err.contains("already"),
+            "must not claim the write was applied, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_identity_missing_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            500,
+            &[("x-gitlawb-error", "signature_identity_missing")],
+            r#"{"error":"signature_identity_missing","message":"no verified identity"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("a missing signature identity must surface as an error, not Ok(500)")
+            .to_string();
+        assert!(err.contains("signature_identity_missing"), "got: {err}");
+        assert!(
+            !err.contains("already"),
+            "must not claim the write was applied, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_nonce_too_short_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            400,
+            &[("x-gitlawb-error", "signature_nonce_too_short")],
+            r#"{"error":"signature_nonce_too_short","message":"the nonce must be at least 16 characters"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("a too-short nonce must surface as an error, not Ok(400)")
+            .to_string();
+        assert!(err.contains("signature_nonce_too_short"), "got: {err}");
+        assert!(
+            !err.contains("already"),
+            "must not claim the write was applied, got: {err}"
+        );
+        assert!(
+            err.contains("the nonce must be at least 16 characters"),
+            "must surface the node's message, got: {err}"
+        );
+    }
+
+    /// Two unrelated conditions now share 429: the node's per-client flood
+    /// brake and the spent-signature ledger's per-identity cap. They must reach
+    /// the user as different errors, and neither may be retried.
+    #[tokio::test]
+    async fn send_signed_tells_a_rate_limit_brake_apart_from_a_full_ledger() {
+        let (brake, _s1) = send_signed_once(
+            429,
+            &[("x-gitlawb-error", "rate_limited")],
+            r#"{"error":"rate_limited","message":"rate limit exceeded — try again later"}"#,
+        )
+        .await;
+        let brake = brake
+            .expect_err("a rate-limit brake must surface as an error, not Ok(429)")
+            .to_string();
+
+        let (ledger, _s2) = send_signed_once(
+            429,
+            &[("x-gitlawb-error", "signature_ledger_full")],
+            r#"{"error":"signature_ledger_full","message":"ledger at capacity"}"#,
+        )
+        .await;
+        let ledger = ledger
+            .expect_err("a full ledger must surface as an error")
+            .to_string();
+
+        assert!(brake.contains("rate_limited"), "got: {brake}");
+        assert!(
+            !brake.contains("signature_ledger_full"),
+            "a brake must not be described as a ledger denial: {brake}"
+        );
+        assert!(
+            brake.contains("a rate limit on the node"),
+            "the brake hint must say a rate limit fired: {brake}"
+        );
+        // The code is shared by the per-IP brake, the per-DID quota and the
+        // in-handler limits, so the hint must not claim which one fired.
+        assert!(
+            !brake.contains("network address") && !brake.contains("not about your identity"),
+            "the brake hint must stay neutral about which limiter fired: {brake}"
+        );
+        assert!(ledger.contains("signature_ledger_full"), "got: {ledger}");
+        assert!(
+            !ledger.contains("rate_limited"),
+            "a ledger denial must not be described as a brake: {ledger}"
+        );
+        assert!(
+            ledger.contains("unexpired signatures"),
+            "the ledger hint must say it is keyed on the identity: {ledger}"
+        );
+        assert_ne!(brake, ledger);
+    }
+
+    /// Every signature denial the node can return, as (status, code). Derived
+    /// from the shared enum rather than retyped, so it cannot drift from what
+    /// the node emits.
+    fn all_denials() -> Vec<(usize, &'static str)> {
+        NodeDenial::ALL
+            .iter()
+            .map(|d| (d.status() as usize, d.as_str()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_every_denial_carrying_the_header() {
+        for (status, code) in all_denials() {
+            let body = format!(r#"{{"error":"{code}","message":"node says no"}}"#);
+            let (resp, _server) =
+                send_signed_once(status, &[("x-gitlawb-error", code)], &body).await;
+            let err = match resp {
+                Ok(r) => panic!("{code} returned Ok({}) instead of an error", r.status()),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(code), "wrong code surfaced for {code}: {err}");
+            assert!(
+                err.contains("node says no"),
+                "node message dropped for {code}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_signed_does_not_see_a_denial_carried_only_in_the_body() {
+        // Documents a known limit rather than a wanted behaviour: detection is
+        // header-keyed, so a proxy stripping `x-gitlawb-error` leaves the denial
+        // to the caller (see `signature_rejection`). The callers that must not
+        // read one as a success handle it themselves: `gl init` compares
+        // `error` from the body, `gl task` checks the status before parsing.
+        for (status, code) in all_denials() {
+            let body = format!(r#"{{"error":"{code}","message":"node says no"}}"#);
+            let (resp, _server) = send_signed_once(status, &[], &body).await;
+            let resp = resp.unwrap_or_else(|e| panic!("{code} without the header: {e}"));
+            assert_eq!(resp.status().as_u16(), status as u16);
+            // The body is untouched, which is what lets the caller decide.
+            let payload: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(payload["error"], code);
+        }
+    }
+
+    #[tokio::test]
+    async fn send_signed_sanitizes_and_caps_a_hostile_denial_message() {
+        // The message that exists to say "your write was REFUSED" must not be
+        // able to clear the screen and print a fake success line.
+        let hostile = format!(
+            "\u{1b}[2J\u{1b}[31mSUCCESS: task created\u{202e}{}",
+            "A".repeat(5000)
+        );
+        let body = serde_json::json!({
+            "error": "signature_replayed",
+            "message": hostile,
+        })
+        .to_string();
+        let (resp, _server) =
+            send_signed_once(409, &[("x-gitlawb-error", "signature_replayed")], &body).await;
+        let err = resp.expect_err("a replay must error").to_string();
+        assert!(
+            !err.contains('\u{1b}'),
+            "ESC leaked to the terminal: {err:?}"
+        );
+        assert!(
+            !err.contains('\u{202e}'),
+            "RLO bidi override leaked: {err:?}"
+        );
+        assert!(err.contains("signature_replayed"), "got: {err}");
+        assert!(
+            err.chars().count() < 600,
+            "denial message not bounded: {} chars",
+            err.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_repo_exists_409_unchanged() {
+        // The pre-existing 409. Callers (`gl init`, `gl repo create`) inspect the
+        // status themselves, so it must keep returning Ok(resp).
+        let (resp, _server) = send_signed_once(
+            409,
+            &[("x-node-marker", "kept")],
+            r#"{"error":"repo_exists","message":"already exists"}"#,
+        )
+        .await;
+        let resp = resp.expect("a non-replay 409 must still return Ok");
+        assert_eq!(resp.status(), 409);
+        // Status, headers and body must all survive the denial check: `gl init`
+        // reads the code out of the body to decide "already exists, continue".
+        assert_eq!(resp.headers().get("x-node-marker").unwrap(), "kept");
+        let payload: serde_json::Value = resp.json().await.expect("body must survive intact");
+        assert_eq!(payload["error"], "repo_exists");
+        assert_eq!(payload["message"], "already exists");
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_409_with_other_error_header_unchanged() {
+        // Only the three signature_* codes are converted; any other
+        // x-gitlawb-error on a 409 is left to the caller.
+        let (resp, _server) = send_signed_once(
+            409,
+            &[("x-gitlawb-error", "repo_exists")],
+            r#"{"error":"repo_exists"}"#,
+        )
+        .await;
+        let resp = resp.expect("an unrelated 409 error code must still return Ok");
+        assert_eq!(resp.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_401_invalid_signature_unchanged() {
+        let (resp, _server) = send_signed_once(
+            401,
+            &[("x-gitlawb-error", "invalid_signature")],
+            r#"{"error":"invalid_signature"}"#,
+        )
+        .await;
+        let resp = resp.expect("a 401 must still return Ok, distinct from a replay error");
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_401_unsigned_request_unchanged() {
+        // An unsigned write is rejected with human_detected; the client prints a
+        // hint and returns the response, and must not be mistaken for a replay.
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_header("x-gitlawb-error", "human_detected")
+            .with_body(r#"{"error":"human_detected"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), None);
+        let resp = client
+            .send_signed("POST", "/api/v1/repos", b"{}")
+            .await
+            .expect("an unsigned-request rejection must still return Ok");
+        assert_eq!(resp.status(), 401);
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_signed_does_not_convert_a_409_on_another_status() {
+        // The header alone must not trigger the conversion: the status has to
+        // match too, so a 200 carrying a stray header stays a success.
+        let (resp, _server) = send_signed_once(
+            200,
+            &[("x-gitlawb-error", "signature_replayed")],
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let resp = resp.expect("a 200 must stay Ok regardless of headers");
+        assert_eq!(resp.status(), 200);
+    }
+
     // ── send_signed iCaptcha retry (full integration) ────────────────────
 
     /// Set GITLAWB_ICAPTCHA_URL and GITLAWB_ICAPTCHA_INSECURE so the iCaptcha
@@ -681,6 +1360,77 @@ mod tests {
         n2.assert();
         ic.challenge.assert();
         ic.answer.assert();
+    }
+
+    #[tokio::test]
+    async fn send_signed_signs_the_icaptcha_retry_afresh() {
+        // What makes the 403 retry safe is that it is a NEW signature, not a
+        // resend: `verify_request` runs inside the handler, so the ledger was
+        // already charged for the first attempt. Each `send_once` signs again
+        // and `sign_request` draws a fresh nonce, so the retry lands on a ledger
+        // key the node has not seen. Pin that: the two attempts must not carry
+        // the same `Signature-Input`.
+        let mut node = Server::new_async().await;
+        let mut icaptcha = Server::new_async().await;
+        let ic = MockIcaptcha::new(&mut icaptcha, 1).await;
+
+        let seen: std::sync::Arc<Mutex<Vec<String>>> = Default::default();
+        let record = {
+            let seen = seen.clone();
+            move |req: &mockito::Request| {
+                let v = req
+                    .header("signature-input")
+                    .first()
+                    .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned())
+                    .unwrap_or_default();
+                seen.lock().unwrap().push(v);
+                true
+            }
+        };
+
+        let n1 = node
+            .mock("POST", "/api/register")
+            .match_header("x-icaptcha-proof", mockito::Matcher::Missing)
+            .match_request(record.clone())
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_header("x-icaptcha-url", &ic.url)
+            .with_header("x-icaptcha-level", "3")
+            .with_body(r#"{"error":"icaptcha_proof_required"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let n2 = node
+            .mock("POST", "/api/register")
+            .match_header("x-icaptcha-proof", "mock.proof")
+            .match_request(record)
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":"created"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(test_keypair()));
+        let resp = client
+            .send_signed("POST", "/api/register", b"{}")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        n1.assert();
+        n2.assert();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "expected two attempts, got {seen:?}");
+        assert!(
+            !seen[0].is_empty() && !seen[1].is_empty(),
+            "both attempts must be signed: {seen:?}"
+        );
+        assert_ne!(
+            seen[0], seen[1],
+            "the retry reused the first signature, so it would land on the same \
+             ledger key the node already spent"
+        );
     }
 
     #[tokio::test]
@@ -1267,5 +2017,218 @@ mod tests {
         // against being widened into a blanket Cf stripper.
         let out = sanitize_node_msg("ok \u{0627}\u{200D}b");
         assert_eq!(out, "ok \u{0627}\u{200D}b");
+    }
+
+    // ── read_json (status-checked, bounded, sanitized read; #123) ────────
+
+    /// Drive a real `reqwest::Response` off a mockito mock so `read_json` sees an
+    /// actual HTTP status + body, the same shape the gated read arms produce.
+    async fn response_for(
+        server: &mut Server,
+        status: usize,
+        body: &str,
+        json: bool,
+    ) -> reqwest::Response {
+        let mut m = server.mock("GET", "/x").with_status(status).with_body(body);
+        if json {
+            m = m.with_header("content-type", "application/json");
+        }
+        let _m = m.create_async().await;
+        NodeClient::new(server.url(), None).get("/x").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_json_returns_body_on_2xx() {
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            200,
+            r#"{"name":"r","owner_did":"did:gitlawb:z"}"#,
+            true,
+        )
+        .await;
+        let v = read_json(resp, "repo").await.unwrap();
+        assert_eq!(v["name"], "r");
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_404_surfacing_message_and_status() {
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            404,
+            r#"{"message":"repository 'o/r' not found"}"#,
+            true,
+        )
+        .await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("404"), "err={err}");
+        assert!(err.contains("not found"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_500_surfacing_message() {
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 500, r#"{"message":"internal boom"}"#, true).await;
+        let err = read_json(resp, "commits").await.unwrap_err().to_string();
+        assert!(err.contains("500"), "err={err}");
+        assert!(err.contains("internal boom"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_non_json_error_body_with_fallback() {
+        // 503 with a plain-text (middleware) body: no `message` field to surface.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 503, "service unavailable", false).await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("503"), "err={err}");
+        assert!(err.contains("request failed"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_sanitizes_control_and_bidi_in_message() {
+        // A hostile node embeds ESC, BEL, and a right-to-left override in
+        // the error message; none may reach the terminal verbatim.
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            404,
+            r#"{"message":"a\u001b[31mb\u0007c\u202ed"}"#,
+            true,
+        )
+        .await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(!err.contains('\u{1b}'), "ESC leaked: {err:?}");
+        assert!(!err.contains('\u{7}'), "BEL leaked: {err:?}");
+        assert!(!err.contains('\u{202e}'), "bidi override leaked: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_garbage_2xx_body() {
+        // The #123 correctness point: a 200 with a non-JSON/truncated body must be
+        // an `Err`, NOT `Ok(Null)` that a caller renders as an empty success.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 200, "this is not json", false).await;
+        assert!(read_json(resp, "repo").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_empty_2xx_body() {
+        // A zero-byte 200 body must be an `Err`, not a silent `Ok(Null)`.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 200, "", false).await;
+        assert!(read_json(resp, "repo").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_non_2xx_json_without_message_or_error() {
+        // A non-2xx JSON body carrying NEITHER key is the real fallback case.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 403, r#"{"detail":"forbidden"}"#, true).await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("403"), "err={err}");
+        assert!(err.contains("request failed"), "err={err}");
+        // The body's own text must not leak when no recognised key carries it.
+        assert!(!err.contains("forbidden"), "raw body leaked: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_surfaces_error_key_when_message_absent() {
+        // The task API answers with `error` alone — see
+        // gitlawb-node/src/api/tasks.rs `{"error":"task not found"}`. Reading only
+        // `message` blanked those denials to the generic "request failed", so the
+        // user was told nothing about why the call failed.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 404, r#"{"error":"task not found"}"#, true).await;
+        let err = read_json(resp, "task show").await.unwrap_err().to_string();
+        assert!(err.contains("404"), "err={err}");
+        assert!(err.contains("task not found"), "reason not surfaced: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_prefers_message_over_error_key() {
+        // The shared AppError envelope carries both; `message` is the human text
+        // and must win over the machine code in `error`.
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            500,
+            r#"{"error":"db_error","message":"database unavailable"}"#,
+            true,
+        )
+        .await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("database unavailable"), "err={err}");
+        assert!(
+            !err.contains("db_error"),
+            "machine code won over message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_json_sanitizes_error_key_text() {
+        // The `error` fallback goes through the same sanitizer as `message`; a
+        // hostile node must not reach the terminal through the new path. The
+        // controls are JSON \u escapes so the body stays VALID JSON — embedding
+        // them raw would fail the parse and pass this test vacuously.
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            404,
+            r#"{"error":"a\u001b[31mb\u0007c\u202ed"}"#,
+            true,
+        )
+        .await;
+        let err = read_json(resp, "task show").await.unwrap_err().to_string();
+        // Proves the parse succeeded and the `error` key was read, not the
+        // "request failed" fallback (which would make the asserts below vacuous).
+        assert!(err.contains("task show failed (404"), "err={err}");
+        assert!(
+            !err.contains("request failed"),
+            "fell back, sanitizer untested: {err}"
+        );
+        assert!(
+            err.contains('a') && err.contains('d'),
+            "text dropped: {err}"
+        );
+        assert!(!err.contains('\u{1b}'), "ESC leaked: {err:?}");
+        assert!(!err.contains('\u{7}'), "BEL leaked: {err:?}");
+        assert!(!err.contains('\u{202e}'), "bidi override leaked: {err:?}");
+    }
+
+    /// #186 (F2): the non-2xx error path must read a CAPPED body, not buffer and
+    /// parse the whole thing — a hostile node can stream an arbitrarily large valid
+    /// JSON error. Place the `message` field AFTER more than the cap of padding: the
+    /// bounded read stops before it, so it must be ABSENT from the surfaced error.
+    /// RED before the fix (`resp.json()` parses the full body → the far message
+    /// appears), GREEN after (capped read truncates → fallback → far message gone).
+    /// The status is still surfaced, so a legitimate small error is unaffected.
+    #[tokio::test]
+    async fn read_json_bounds_the_error_body_read() {
+        let mut server = Server::new_async().await;
+        // >8 KiB of padding, then the marker message at the very end of the body.
+        let big = format!(
+            r#"{{"padding":"{}","message":"FARMARKER_BEYOND_CAP"}}"#,
+            "A".repeat(16 * 1024)
+        );
+        let resp = response_for(&mut server, 500, &big, true).await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("500"), "bounded read still errors: {err}");
+        assert!(
+            !err.contains("FARMARKER_BEYOND_CAP"),
+            "the error body read must be capped: a message beyond the cap must not be surfaced, err={err}"
+        );
+    }
+
+    /// #186 (F2): an EMPTY non-2xx body is its own input class — the capped read
+    /// yields "", the JSON parse fails, and it falls back to the status alone
+    /// ("request failed"), never a panic or a spurious success.
+    #[tokio::test]
+    async fn read_json_errs_on_empty_non_2xx_body() {
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 502, "", false).await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("502"), "err={err}");
+        assert!(err.contains("request failed"), "err={err}");
     }
 }
