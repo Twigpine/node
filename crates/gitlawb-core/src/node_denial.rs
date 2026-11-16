@@ -72,12 +72,13 @@ pub enum NodeDenial {
     IdentityMissing,
     /// 503 — the ledger backend is down and the node is failing closed.
     LedgerUnavailable,
-    /// 429 — the node's per-client flood brake refused the request before any
-    /// handler ran. Not a ledger outcome: it is keyed on the caller's resolved
-    /// network address, not on an identity or a signature, so it clears when
-    /// the address's window ages out and no amount of re-signing helps. Shares
-    /// its status with [`LedgerFull`](Self::LedgerFull), which is precisely why
-    /// it needs a code of its own.
+    /// 429 — a node rate limit refused the request. Not a ledger outcome, and
+    /// deliberately silent about which limiter fired: the per-IP brake, the
+    /// per-DID creation quota and the in-handler limits all answer with this
+    /// code, and it is not guaranteed to be raised before a handler ran. It
+    /// clears when the limiter's window ages out and no amount of re-signing
+    /// helps. Shares its status with [`LedgerFull`](Self::LedgerFull), which is
+    /// precisely why it needs a code of its own.
     RateLimited,
 }
 

@@ -184,6 +184,153 @@ pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body
         .expect("request builder")
 }
 
+/// Slice a region out of a module's own source (obtained with `include_str!`)
+/// and drop full-line `//` comments from it.
+///
+/// Several guards in `api/` assert that a piece of PRODUCTION code does or does
+/// not contain something: that the receive-pack handler really calls the
+/// push-event recorder, that the status module never acquires the repository.
+/// Each guard carried its own copy of this parse, and three copies of a parser
+/// is three places for the slicing to drift apart while every guard still reads
+/// green.
+///
+/// `start` and `end` are literal anchors. The region runs from the first
+/// occurrence of `start` (inclusive; the top of the file when `None`) to the
+/// next occurrence of `end` (exclusive; end of file when `None`).
+///
+/// Returns `None` when an anchor is missing, rather than silently falling back
+/// to a larger or empty region. Each caller supplies its own message for that
+/// case and keeps its own assertion that the region really covers what it claims
+/// to, which is what stops a bug in this one helper from turning every guard
+/// that uses it into a vacuous pass.
+///
+/// Comment lines are stripped so that a doc comment naming the very call a guard
+/// searches for cannot stand in for the call itself.
+pub(crate) fn scrape_source_region(
+    src: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Option<String> {
+    let from = match start {
+        Some(anchor) => src.find(anchor)?,
+        None => 0,
+    };
+    let rest = &src[from..];
+    let to = match end {
+        // Search past the first CHARACTER, so an `end` anchor that also matches
+        // at the very start of the region cannot collapse it to nothing. A fixed
+        // one-byte skip does the same job on ASCII and lands mid-character on a
+        // multibyte first character, where the slice fails and the helper answers
+        // `None`, which is indistinguishable, to every caller, from a missing
+        // anchor.
+        Some(anchor) => {
+            let skip = rest.chars().next().map_or(0, char::len_utf8);
+            rest.get(skip..)?.find(anchor)? + skip
+        }
+        None => rest.len(),
+    };
+    Some(
+        rest[..to]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+#[cfg(test)]
+mod scrape_source_region_tests {
+    use super::scrape_source_region;
+
+    const SRC: &str = "prelude line\nfn target() {\n    // calls_the_thing()\n    calls_the_thing();\n}\nfn later() {\n    calls_the_thing();\n}\n";
+
+    #[test]
+    fn stops_at_the_end_anchor_so_a_later_function_cannot_satisfy_a_guard() {
+        let body = scrape_source_region(SRC, Some("fn target()"), Some("\n}")).unwrap();
+        assert!(body.contains("calls_the_thing();"));
+        assert!(
+            !body.contains("fn later()"),
+            "the region must stop at the first column-zero brace, got: {body}"
+        );
+    }
+
+    #[test]
+    fn strips_full_line_comments_so_a_doc_comment_cannot_stand_in_for_code() {
+        let commented = "fn target() {\n    // calls_the_thing();\n}\n";
+        let body = scrape_source_region(commented, Some("fn target()"), Some("\n}")).unwrap();
+        assert!(
+            !body.contains("calls_the_thing"),
+            "a commented-out call must not survive the scrape, got: {body}"
+        );
+    }
+
+    #[test]
+    fn no_start_anchor_reads_from_the_top_of_the_file() {
+        let body = scrape_source_region(SRC, None, Some("fn later()")).unwrap();
+        assert!(body.starts_with("prelude line"));
+        assert!(!body.contains("fn later()"));
+    }
+
+    #[test]
+    fn no_end_anchor_reads_to_the_end_of_the_file() {
+        let body = scrape_source_region(SRC, Some("fn later()"), None).unwrap();
+        assert!(body.trim_end().ends_with('}'));
+    }
+
+    /// A missing anchor is None, never a silently wider or empty region: that is
+    /// what lets each caller keep its own "the thing I meant to scan is gone"
+    /// message instead of asserting against whatever the fallback produced.
+    #[test]
+    fn a_missing_anchor_is_none_rather_than_a_fallback_region() {
+        assert!(scrape_source_region(SRC, Some("fn absent()"), Some("\n}")).is_none());
+        assert!(scrape_source_region(SRC, Some("fn target()"), Some("~absent~")).is_none());
+    }
+
+    /// A region whose first character is multibyte is scraped, not reported
+    /// missing.
+    ///
+    /// The end-anchor search skips the region's first CHARACTER. Skipping a
+    /// fixed byte instead lands mid-character here, the slice fails, and the
+    /// helper answers `None`, which every caller reads as "the anchor is gone"
+    /// and reports as a missing region. A guard that says "not found"
+    /// for input that is present is worse than one that fails loudly, and the
+    /// five callers sharing this helper all inherit it.
+    #[test]
+    fn a_multibyte_first_character_does_not_read_as_a_missing_anchor() {
+        let src = "é prelude\nfn target() {\n    body();\n}\nfn later() {}\n";
+
+        let body = scrape_source_region(src, None, Some("\n}"))
+            .expect("a region starting on a multibyte character must be scraped");
+        assert!(
+            body.starts_with("é prelude") && body.contains("body();"),
+            "the region must cover the multibyte start through the end anchor, got: {body}"
+        );
+        assert!(
+            !body.contains("fn later()"),
+            "the region must still stop at the end anchor, got: {body}"
+        );
+
+        // The same through a multibyte START anchor, so the skip is measured
+        // from the region rather than from the top of the file.
+        let body = scrape_source_region(src, Some("é"), Some("\n}"))
+            .expect("a multibyte start anchor must be scraped");
+        assert!(body.starts_with('é'), "got: {body}");
+    }
+
+    /// The end anchor is searched past the region's first character, so a
+    /// region whose own start also matches the end anchor is not collapsed to
+    /// nothing.
+    #[test]
+    fn an_end_anchor_matching_at_the_start_does_not_collapse_the_region() {
+        let src = "\n}\nfn target() {\n    body();\n}\n";
+        let body = scrape_source_region(src, None, Some("\n}")).unwrap();
+        assert!(
+            body.contains("fn target()") && body.contains("body();"),
+            "got: {body}"
+        );
+    }
+}
+
 /// A local endpoint whose TCP accept succeeds instantly but that never writes an
 /// HTTP response, so any request against it stalls deterministically until the
 /// caller's own timeout. (A non-routable address hangs only if the network
@@ -191,7 +338,6 @@ pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body
 /// test pass for the wrong reason.) The accepted sockets are parked in the
 /// spawned task, which dies with the test's runtime, so the peer never sees a
 /// close mid-test.
-#[allow(dead_code)]
 pub(crate) async fn silent_http_endpoint() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -202,6 +348,71 @@ pub(crate) async fn silent_http_endpoint() -> String {
         }
     });
     endpoint
+}
+
+/// The response body decoded as JSON.
+#[allow(dead_code)] // shared response helper for api test mods
+pub(crate) async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    serde_json::from_slice(&bytes).expect("json body")
+}
+
+/// Status plus the full response body, for the byte-identical deny comparison.
+#[allow(dead_code)] // shared response helper for api test mods
+pub(crate) async fn status_and_bytes(
+    resp: axum::response::Response,
+) -> (axum::http::StatusCode, Vec<u8>) {
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, bytes)
+}
+
+/// A `PendingRefTransition` test row in `applied` state: the fields the
+/// commit-status effect writers read (`ref_name`, `new_sha`, `ordinal`,
+/// `repo_id`) are the parameters, the rest is inert filler matching the
+/// shape `insert_pending_ref_transitions` writes. `applied_at` stays None
+/// so the recorded event falls back to the per-push timestamp the writer
+/// computes once for the whole batch — the shape a real push produces.
+#[allow(dead_code)] // commit-status surface tests across api modules
+pub(crate) fn pending_child(
+    request_id: &str,
+    repo_id: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    ordinal: i32,
+) -> crate::db::PendingRefTransition {
+    crate::db::PendingRefTransition {
+        id: crate::db::deterministic_id(&[
+            "pending_ref_transition",
+            request_id,
+            repo_id,
+            ref_name,
+            old_sha,
+            new_sha,
+        ]),
+        request_id: request_id.to_string(),
+        repo_id: repo_id.to_string(),
+        ref_name: ref_name.to_string(),
+        old_sha: old_sha.to_string(),
+        new_sha: new_sha.to_string(),
+        pusher_did: "did:key:z6pusher".to_string(),
+        node_did: "did:key:z6node".to_string(),
+        signature_header: String::new(),
+        signature_input: String::new(),
+        content_digest: String::new(),
+        state: crate::db::pending_state::APPLIED.to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        applied_at: None,
+        cancelled_at: None,
+        ordinal,
+        git_target_kind: Some("update".to_string()),
+    }
 }
 
 /// Body of the `for-each-ref` arm of a fake-git fixture in the
@@ -2282,6 +2493,7 @@ mod tests {
 
         // Insert the poisoned row DIRECTLY, as a pre-fix row or an ungated writer would.
         let pr = crate::db::PullRequest {
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -2640,6 +2852,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -2758,6 +2971,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -2882,6 +3096,7 @@ mod tests {
             state.db.create_repo(&repo).await.expect("seed repo");
 
             let pr = crate::db::PullRequest {
+                head_commit: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 repo_id: repo.id.clone(),
                 number: 1,
@@ -2998,6 +3213,7 @@ mod tests {
             state.db.create_repo(&repo).await.expect("seed repo");
 
             let pr = crate::db::PullRequest {
+                head_commit: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 repo_id: repo.id.clone(),
                 number: 1,
@@ -3182,6 +3398,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3308,6 +3525,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3476,6 +3694,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3640,6 +3859,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3830,6 +4050,7 @@ mod tests {
         state.db.create_repo(&repo).await.expect("seed repo");
 
         let pr = crate::db::PullRequest {
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -3982,6 +4203,7 @@ mod tests {
         let _ = std::fs::remove_file(&pwn);
 
         let pr = crate::db::PullRequest {
+            head_commit: None,
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             number: 1,
@@ -22888,6 +23110,311 @@ mod tests {
                 StatusCode::TOO_MANY_REQUESTS,
                 "the first IP's budget is spent"
             );
+        }
+
+        /// The status route's exemption must not leak: a replay on an ordinary
+        /// write route of the production router is still refused by the ledger.
+        #[sqlx::test]
+        async fn ledger_exemption_does_not_reach_other_write_routes(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool.clone()).await;
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+            let router = crate::server::build_router(state);
+            let build = || {
+                let mut req = Request::builder()
+                    .method(Method::POST)
+                    .uri(PATH)
+                    .header("content-type", "application/json")
+                    .header("content-digest", &signed.content_digest)
+                    .header("signature-input", &signed.signature_input)
+                    .header("signature", &signed.signature)
+                    .body(Body::from(body.clone()))
+                    .expect("request builder");
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    "203.0.113.70:5000".parse::<std::net::SocketAddr>().unwrap(),
+                ));
+                req
+            };
+            assert_eq!(status_of(&router, build()).await, StatusCode::CREATED);
+            assert_eq!(status_of(&router, build()).await, StatusCode::CONFLICT);
+            assert_eq!(ledger_rows(&pool).await, 1);
+        }
+
+        // ── The two issue-write routes have no outer IP brake ───────────────
+        //
+        // `close_issue` and `create_issue_comment` debit the shared write bucket
+        // inside the handler, AFTER the read gate, so a 429 cannot tell a hidden
+        // repo from a missing one. A ledger row committed in the layer would sit
+        // ahead of that gate and ahead of the debit, so a source rotating signing
+        // keys against a missing repo would grow the ledger at request rate. These
+        // pin that the row is spent only once the request has cleared both.
+
+        struct IssueRepoGuard(std::path::PathBuf);
+        impl Drop for IssueRepoGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        const ISSUE_ID: &str = "ledger-issue-1";
+
+        /// A bare repo on disk with one open issue, plus its DB row.
+        async fn seed_issue_repo(
+            state: &AppState,
+            owner_did: &str,
+            name: &str,
+            is_public: bool,
+        ) -> IssueRepoGuard {
+            let slug = owner_did.replace([':', '/'], "_");
+            let repo_dir = std::path::PathBuf::from("/tmp")
+                .join(&slug)
+                .join(format!("{name}.git"));
+            let _ = std::fs::remove_dir_all(&repo_dir);
+            std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+            crate::git::store::init_bare(&repo_dir).unwrap();
+            let guard = IssueRepoGuard(repo_dir.clone());
+            let record = RepoRecord {
+                is_public,
+                ..seed_repo(owner_did, name)
+            };
+            state.db.create_repo(&record).await.unwrap();
+            let issue = serde_json::json!({
+                "id": ISSUE_ID,
+                "title": "ledger probe",
+                "body": "b",
+                "author": owner_did,
+                "created_at": "2026-01-01T00:00:00Z",
+                "status": "open",
+            });
+            crate::git::issues::create_issue(&repo_dir, ISSUE_ID, &issue.to_string()).unwrap();
+            guard
+        }
+
+        /// A genuinely signed request to `path`, from socket peer `ip`.
+        fn signed_to(
+            kp: &Keypair,
+            method: &str,
+            path: &str,
+            body: &[u8],
+            ip: &str,
+        ) -> Request<Body> {
+            let signed = sign_request(kp, method, path, body);
+            let mut req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("content-digest", &signed.content_digest)
+                .header("signature-input", &signed.signature_input)
+                .header("signature", &signed.signature)
+                .body(Body::from(body.to_vec()))
+                .expect("request builder");
+            req.extensions_mut().insert(axum::extract::ConnectInfo(
+                ip.parse::<std::net::SocketAddr>().expect("peer address"),
+            ));
+            req
+        }
+
+        fn issue_paths(owner_did: &str, repo: &str) -> [(String, Vec<u8>); 2] {
+            let seg = owner_did.strip_prefix("did:key:").unwrap_or(owner_did);
+            [
+                (
+                    format!("/api/v1/repos/{seg}/{repo}/issues/{ISSUE_ID}/close"),
+                    Vec::new(),
+                ),
+                (
+                    format!("/api/v1/repos/{seg}/{repo}/issues/{ISSUE_ID}/comments"),
+                    br#"{"body":"hello"}"#.to_vec(),
+                ),
+            ]
+        }
+
+        async fn status_of(router: &Router, req: Request<Body>) -> StatusCode {
+            router
+                .clone()
+                .oneshot(req)
+                .await
+                .expect("router response")
+                .status()
+        }
+
+        #[sqlx::test]
+        async fn issue_routes_spend_no_ledger_row_on_a_missing_repo(pool: PgPool) {
+            let state = with_write_limit(&test_state(pool.clone()).await, 1);
+            let router = crate::server::build_router(state);
+            let owner = Keypair::generate().did().to_string();
+            for (path, body) in issue_paths(&owner, "no-such-repo") {
+                for _ in 0..4 {
+                    let kp = Keypair::generate();
+                    let req = signed_to(&kp, "POST", &path, &body, "203.0.113.60:5000");
+                    assert_eq!(
+                        status_of(&router, req).await,
+                        StatusCode::NOT_FOUND,
+                        "{path}"
+                    );
+                }
+            }
+            assert_eq!(
+                ledger_rows(&pool).await,
+                0,
+                "a request the read gate refuses must not allocate a ledger row"
+            );
+        }
+
+        #[sqlx::test]
+        async fn issue_routes_spend_no_ledger_row_on_a_hidden_repo(pool: PgPool) {
+            let state = with_write_limit(&test_state(pool.clone()).await, 1);
+            let owner = Keypair::generate().did().to_string();
+            let _guard = seed_issue_repo(&state, &owner, "hidden-ledger", false).await;
+            let router = crate::server::build_router(state);
+            for (path, body) in issue_paths(&owner, "hidden-ledger") {
+                for _ in 0..3 {
+                    let stranger = Keypair::generate();
+                    let req = signed_to(&stranger, "POST", &path, &body, "203.0.113.61:5000");
+                    assert_eq!(
+                        status_of(&router, req).await,
+                        StatusCode::NOT_FOUND,
+                        "{path}: a hidden repo stays opaque"
+                    );
+                }
+            }
+            assert_eq!(ledger_rows(&pool).await, 0);
+        }
+
+        #[sqlx::test]
+        async fn issue_routes_spend_no_ledger_row_once_the_source_budget_is_gone(pool: PgPool) {
+            let owner_kp = Keypair::generate();
+            let owner = owner_kp.did().to_string();
+            // Budget of 1: the first request below takes it.
+            let state = with_write_limit(&test_state(pool.clone()).await, 1);
+            let _guard = seed_issue_repo(&state, &owner, "budget-ledger", true).await;
+            let router = crate::server::build_router(state);
+            let [(close_path, close_body), (comment_path, comment_body)] =
+                issue_paths(&owner, "budget-ledger");
+
+            let first = signed_to(
+                &owner_kp,
+                "POST",
+                &comment_path,
+                &comment_body,
+                "203.0.113.62:5000",
+            );
+            assert_eq!(status_of(&router, first).await, StatusCode::CREATED);
+            assert_eq!(
+                ledger_rows(&pool).await,
+                1,
+                "the admitted request spends one row"
+            );
+
+            for (path, body) in [(&close_path, &close_body), (&comment_path, &comment_body)] {
+                for _ in 0..3 {
+                    let kp = Keypair::generate();
+                    let req = signed_to(&kp, "POST", path, body, "203.0.113.62:5000");
+                    assert_eq!(
+                        status_of(&router, req).await,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "{path}"
+                    );
+                }
+            }
+            assert_eq!(
+                ledger_rows(&pool).await,
+                1,
+                "requests refused by the exhausted source budget must not allocate rows"
+            );
+        }
+
+        #[sqlx::test]
+        async fn issue_routes_spend_no_ledger_row_on_early_rejections(pool: PgPool) {
+            let owner_kp = Keypair::generate();
+            let owner = owner_kp.did().to_string();
+            let state = test_state(pool.clone()).await;
+            let _guard = seed_issue_repo(&state, &owner, "early-ledger", true).await;
+            let router = crate::server::build_router(state);
+            let [(close_path, close_body), (comment_path, _)] = issue_paths(&owner, "early-ledger");
+
+            // Malformed JSON and an empty comment body are refused before the
+            // read gate; a wrong method is refused by the route.
+            for body in [&b"{not json"[..], br#"{"body":"   "}"#] {
+                let req = signed_to(&owner_kp, "POST", &comment_path, body, "203.0.113.63:5000");
+                assert!(status_of(&router, req).await.is_client_error());
+            }
+            for path in [&close_path, &comment_path] {
+                let req = signed_to(&owner_kp, "DELETE", path, b"", "203.0.113.63:5000");
+                assert_eq!(
+                    status_of(&router, req).await,
+                    StatusCode::METHOD_NOT_ALLOWED
+                );
+            }
+            let _ = close_body;
+            assert_eq!(ledger_rows(&pool).await, 0);
+        }
+
+        #[sqlx::test]
+        async fn issue_routes_still_reject_a_replayed_signature(pool: PgPool) {
+            let owner_kp = Keypair::generate();
+            let owner = owner_kp.did().to_string();
+            let state = test_state(pool.clone()).await;
+            let _guard = seed_issue_repo(&state, &owner, "replay-ledger", true).await;
+            let router = crate::server::build_router(state.clone());
+            let [(close_path, close_body), (comment_path, comment_body)] =
+                issue_paths(&owner, "replay-ledger");
+
+            // Comment: serve once, then replay the exact bytes.
+            let signed = sign_request(&owner_kp, "POST", &comment_path, &comment_body);
+            let build = || {
+                let mut req = Request::builder()
+                    .method(Method::POST)
+                    .uri(&comment_path)
+                    .header("content-type", "application/json")
+                    .header("content-digest", &signed.content_digest)
+                    .header("signature-input", &signed.signature_input)
+                    .header("signature", &signed.signature)
+                    .body(Body::from(comment_body.clone()))
+                    .expect("request builder");
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    "203.0.113.64:5000".parse::<std::net::SocketAddr>().unwrap(),
+                ));
+                req
+            };
+            assert_eq!(status_of(&router, build()).await, StatusCode::CREATED);
+            let replay = router.clone().oneshot(build()).await.expect("response");
+            assert_eq!(replay.status(), StatusCode::CONFLICT);
+            assert_eq!(error_code(replay).await, "signature_replayed");
+            assert_eq!(ledger_rows(&pool).await, 1);
+            assert_eq!(
+                state.db.list_issue_comments(ISSUE_ID).await.unwrap().len(),
+                1,
+                "the replay must not have written a second comment"
+            );
+
+            // Close: same shape.
+            let signed = sign_request(&owner_kp, "POST", &close_path, &close_body);
+            let build_close = || {
+                let mut req = Request::builder()
+                    .method(Method::POST)
+                    .uri(&close_path)
+                    .header("content-type", "application/json")
+                    .header("content-digest", &signed.content_digest)
+                    .header("signature-input", &signed.signature_input)
+                    .header("signature", &signed.signature)
+                    .body(Body::empty())
+                    .expect("request builder");
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    "203.0.113.65:5000".parse::<std::net::SocketAddr>().unwrap(),
+                ));
+                req
+            };
+            assert_eq!(status_of(&router, build_close()).await, StatusCode::OK);
+            let replay = router
+                .clone()
+                .oneshot(build_close())
+                .await
+                .expect("response");
+            assert_eq!(replay.status(), StatusCode::CONFLICT);
+            assert_eq!(error_code(replay).await, "signature_replayed");
+            assert_eq!(ledger_rows(&pool).await, 2);
         }
     }
 

@@ -411,7 +411,6 @@ Important node settings:
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. Defaults to `false` during the staged rollout below. |
 | `GITLAWB_REQUIRE_SIGNATURE_NONCE` | Require a signed `nonce` on write routes. Default false; see the staged rollout note above. |
-<!-- verbatim -->
 | `GITLAWB_ENFORCE_OWNER_PUSH` | Require the pusher on `git-receive-pack` to be the repo owner, or to present an owner-rooted, time-bounded UCAN `git/push` capability naming the repository (`X-Ucan`). **Defaults to `true`.** A `did:key` signature is authentication, not authorization — anyone can mint a key and sign — so with this off every signed caller may push to every repository, private ones included. A CI or delegated key with no such delegation counts as a non-owner and cannot push while this is on. The delegation clears the push gate only; on a private repository the delegate must also be a reader. Set `false` only for a rolling upgrade; see [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_RECONCILIATION_SWEEP` | Enable the hourly durability sweep that re-pins/backstops missing objects (default `true`; disabled when no IPFS/Pinata backend is configured). Public pin repair runs against any configured backend (IPFS, Pinata, or both). Encrypted recovery repair requires local IPFS (`GITLAWB_IPFS_API`); Pinata-only nodes reconcile public pins only. |

@@ -57,6 +57,17 @@ pub enum AppError {
     #[error("too many requests: retry in {}s", .0.as_secs())]
     RateLimited(std::time::Duration),
 
+    /// The signature replay ledger refused a write whose handler spends the
+    /// signature itself (see `auth::LedgerTicket`). Carries the shared
+    /// [`NodeDenial`](gitlawb_core::node_denial::NodeDenial) so the status, the
+    /// `X-Gitlawb-Error` header and the body code are exactly what the
+    /// `consume_signature` layer answers on every other route.
+    #[error("signature ledger refused: {message}")]
+    LedgerDenial {
+        denial: gitlawb_core::node_denial::NodeDenial,
+        message: String,
+    },
+
     #[error("incomplete: {0}")]
     Incomplete(String),
 
@@ -221,6 +232,12 @@ impl IntoResponse for AppError {
                 gitlawb_core::node_denial::NodeDenial::RateLimited.as_str(),
                 crate::rate_limit::RATE_LIMIT_MESSAGE.to_string(),
             ),
+            AppError::LedgerDenial { denial, message } => (
+                StatusCode::from_u16(denial.status())
+                    .expect("NodeDenial status is a valid HTTP code"),
+                denial.as_str(),
+                message.clone(),
+            ),
             AppError::Incomplete(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }
@@ -327,6 +344,12 @@ impl IntoResponse for AppError {
                 resp.headers_mut().insert("X-Gitlawb-Error", v);
             }
         }
+        if let AppError::LedgerDenial { denial, .. } = &self {
+            use axum::http::HeaderValue;
+            if let Ok(v) = HeaderValue::from_str(denial.as_str()) {
+                resp.headers_mut().insert("X-Gitlawb-Error", v);
+            }
+        }
         // Both retryable 503s advertise when to retry: Overloaded (capacity shed) and
         // SearchIncomplete (a bounded CID search cut short by a cap — retry may complete
         // it). They ride the shared tail above for body/status, so the header is attached
@@ -417,6 +440,16 @@ mod tests {
             resp.headers().get("retry-after").unwrap().to_str().unwrap(),
             "1"
         );
+    }
+
+    /// A 429 does not advertise a retry interval: the status-claim caps behind
+    /// it are per-commit and append-only, so a client honoring a 1s hint would
+    /// retry a request that can never succeed.
+    #[test]
+    fn too_many_requests_carries_no_retry_after() {
+        let resp = AppError::TooManyRequests("x".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get("retry-after").is_none());
     }
 
     /// #226: raw sqlx/DB detail must never appear in the Internal 500 body.

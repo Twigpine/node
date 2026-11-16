@@ -52,6 +52,53 @@ pub struct SignatureIdentity {
     pub signing_string_hash: String,
 }
 
+/// The RFC 9421 material this request was actually verified against, injected
+/// alongside [`AuthenticatedDid`] by `require_signature`.
+///
+/// A handler that records a signed claim as history has to store it: the header
+/// values and the canonical signing string are gone once the request ends, and a
+/// stored claim nobody can re-verify is not history. `signing_string` is the exact
+/// byte sequence the Ed25519 verification succeeded over, not a rebuild — a
+/// handler reconstructing it from headers would be verifying a different string
+/// than the middleware did.
+#[derive(Clone, Debug)]
+pub struct SignatureMaterial {
+    /// The `Signature` header value.
+    pub signature: String,
+    /// The `Signature-Input` header value.
+    pub signature_input: String,
+    /// The canonical bytes the signature covered.
+    pub signing_string: String,
+    /// The buffered request body, on the routes that persist it. The signing
+    /// string covers it only through the content-digest, so without these bytes
+    /// a stored claim can be shown to carry *a* valid signature over *some*
+    /// digest and nothing more. Carried here because the body is consumed
+    /// downstream by the extractor and cannot be recovered afterwards.
+    ///
+    /// `Option`, and populated only behind [`PersistsSignedBody`], because a
+    /// route that never stores the body has no use for a second handle to it.
+    /// The unlike-sized field is this one: the three above are header-derived
+    /// and bounded by the server's header limit, while a receive-pack POST
+    /// carries up to GITLAWB_MAX_PACK_BYTES (2 GB by default). `Bytes`, not
+    /// `Vec<u8>`, so the handle the marked routes do take is a refcount bump
+    /// over the buffer the middleware already holds rather than a copy.
+    pub body: Option<axum::body::Bytes>,
+}
+
+/// Marks a route group whose handler persists the signed request body.
+///
+/// Applied as an extension layer OUTSIDE the auth layers, so it is on the
+/// request before [`require_signature`] decides whether to carry the body. A
+/// marker applied inside them is never seen, and the failure is silent: the
+/// handler still compiles, tests that inject material by hand still pass, and
+/// production stores nothing. The status write handler refuses an absent body
+/// for that reason.
+///
+/// A marker rather than a path check because `require_signature` must not learn
+/// which URL persists claims; that knowledge belongs at the route table.
+#[derive(Clone, Copy, Debug)]
+pub struct PersistsSignedBody;
+
 /// A UCAN that passed full chain validation, with the root issuer the chain
 /// rests on. Inserted into request extensions by [`require_ucan_chain`] when
 /// `X-Ucan` is present; absent when the header is.
@@ -411,6 +458,22 @@ async fn verify_signature(limit: usize, request: Request, next: Next) -> Respons
 
     tracing::info!(did = %sig.key_id, "✓ authenticated request");
 
+    // The body travels only where it is stored. On every other signed route the
+    // middleware's handle would keep the buffer alive for the rest of the layer
+    // chain, until the handler's own extractor consumes the request.
+    let body = parts
+        .extensions
+        .get::<PersistsSignedBody>()
+        .map(|_| body_bytes.clone());
+
+    let signing_string_hash = hex::encode(Sha256::digest(signing_string.as_bytes()));
+    let material = SignatureMaterial {
+        signature: sig_header,
+        signature_input: sig_input,
+        signing_string,
+        body,
+    };
+
     let mut request = Request::from_parts(parts, Body::from(body_bytes));
     request
         .extensions_mut()
@@ -422,8 +485,12 @@ async fn verify_signature(limit: usize, request: Request, next: Next) -> Respons
         keyid: sig.key_id.to_string(),
         key_fingerprint: hex::encode(verifying_key.to_bytes()),
         nonce: sig.nonce.clone(),
-        signing_string_hash: hex::encode(Sha256::digest(signing_string.as_bytes())),
+        signing_string_hash,
     });
+
+    // Carry the verified material forward for handlers that persist a signed
+    // claim; none of it can be recovered once the request is gone.
+    request.extensions_mut().insert(material);
     next.run(request).await
 }
 
@@ -672,6 +739,90 @@ fn ledger_rejection(denial: NodeDenial, message: &str) -> Response {
         .into_response()
 }
 
+/// Marks a route group whose handler owns a replay defense at least as strong as
+/// the ledger, so [`consume_signature`] passes it through.
+///
+/// Only the status claim write qualifies: `insert_status_claim_capped` takes a
+/// per-repo advisory lock, probes `request_digest`, and falls back to a unique
+/// index with `DO NOTHING`, so a replay is atomic, permanent (the claim row is
+/// the record, with no retention window) and answered 200 with the original
+/// claim. The ledger would instead answer 409 inside its 390s window and 200
+/// after the sweep, and would write a redundant row per request.
+///
+/// Applied OUTSIDE `add_auth_layers`, like [`PersistsSignedBody`].
+#[derive(Clone, Copy, Debug)]
+pub struct OwnsReplayDefense;
+
+/// Marks a route group whose handler spends the signature itself, through a
+/// [`LedgerTicket`], instead of leaving it to [`consume_signature`].
+///
+/// Applied as an extension layer OUTSIDE `add_auth_layers`, like
+/// [`PersistsSignedBody`], because the ledger layer reads it on the way in.
+///
+/// It exists for routes that have no outer per-IP brake because their handler
+/// must read-gate first, so a 429 cannot tell a hidden repo from a missing one.
+/// A row committed in the layer would sit ahead of both the read gate and the
+/// source-budget debit, and a source rotating signing keys could grow the ledger
+/// at request rate against repos that do not exist. Such a handler spends after
+/// both, still before any mutation.
+///
+/// A missing marker is safe: the layer spends as it does everywhere else, and the
+/// ticket the handler holds is then already spent.
+#[derive(Clone, Copy, Debug)]
+pub struct SpendsSignatureInHandler;
+
+/// The handler's half of the replay ledger on a [`SpendsSignatureInHandler`]
+/// route. Extract it as a handler argument and call [`LedgerTicket::spend`] after
+/// the checks that must precede a durable write and before the mutation.
+///
+/// `#[must_use]`: a handler that takes the ticket and never spends it would run
+/// its mutation with no replay defense, and nothing else would notice.
+#[derive(Debug)]
+#[must_use = "a LedgerTicket that is never spent leaves the route with no replay defense"]
+pub struct LedgerTicket(Option<SignatureIdentity>);
+
+impl LedgerTicket {
+    /// A ticket for a request whose signature the layer already spent. Used by
+    /// tests that call a handler directly, past the layers.
+    pub fn already_spent() -> Self {
+        Self(None)
+    }
+
+    /// Spend the signature. A replay, a full identity ledger and a ledger fault
+    /// each refuse with the same wire code the layer would have used.
+    pub async fn spend(self, state: &AppState) -> std::result::Result<(), crate::error::AppError> {
+        let Some(identity) = self.0 else {
+            return Ok(());
+        };
+        spend_signature(state, &identity)
+            .await
+            .map_err(|(denial, message)| crate::error::AppError::LedgerDenial { denial, message })
+    }
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for LedgerTicket {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        if parts.extensions.get::<SpendsSignatureInHandler>().is_none() {
+            return Ok(Self(None));
+        }
+        // Fail closed: on a deferred route the handler is the only spender, so a
+        // request that reaches it without a verified identity must not proceed
+        // as if it had been charged.
+        match parts.extensions.get::<SignatureIdentity>() {
+            Some(identity) => Ok(Self(Some(identity.clone()))),
+            None => Err(ledger_rejection(
+                NodeDenial::IdentityMissing,
+                "the request reached the signature ledger without a verified identity",
+            )),
+        }
+    }
+}
+
 /// Axum middleware that spends a verified HTTP signature exactly once.
 ///
 /// Layer it so it runs *after* [`require_signature`] (which publishes the
@@ -680,6 +831,9 @@ fn ledger_rejection(denial: NodeDenial, message: &str) -> Response {
 /// check spends its signature, so a valid signature paired with a rejected UCAN
 /// can be retried with the same bytes; consuming before the handler is what
 /// closes the concurrent-replay race.
+///
+/// A route group marked [`SpendsSignatureInHandler`] is passed through untouched
+/// and its handler spends instead.
 pub async fn consume_signature(
     State(state): State<AppState>,
     request: Request,
@@ -694,6 +848,20 @@ pub async fn consume_signature(
     // side effect to spend.
     if matches!(*request.method(), Method::GET | Method::HEAD) {
         crate::metrics::record_signature_ledger("skipped_read");
+        return next.run(request).await;
+    }
+
+    if request.extensions().get::<OwnsReplayDefense>().is_some() {
+        crate::metrics::record_signature_ledger("route_owns_replay_defense");
+        return next.run(request).await;
+    }
+
+    if request
+        .extensions()
+        .get::<SpendsSignatureInHandler>()
+        .is_some()
+    {
+        crate::metrics::record_signature_ledger("deferred_to_handler");
         return next.run(request).await;
     }
 
@@ -715,22 +883,35 @@ pub async fn consume_signature(
         }
     };
 
+    match spend_signature(&state, &identity).await {
+        Ok(()) => next.run(request).await,
+        Err((denial, message)) => ledger_rejection(denial, &message),
+    }
+}
+
+/// Charge one verified signature against the ledger: the nonce policy, then the
+/// atomic insert. Shared by [`consume_signature`] and [`LedgerTicket::spend`] so
+/// the two spenders cannot drift on policy, metrics or wire codes.
+async fn spend_signature(
+    state: &AppState,
+    identity: &SignatureIdentity,
+) -> std::result::Result<(), (NodeDenial, String)> {
     // Staged rollout of R6: once every client signs a nonce, an operator closes
-    // the signing-string fallback here. This runs after the method skip above,
-    // so it never reaches a signed read, and before the ledger is charged, so a
-    // refused request spends nothing.
-    if state.config.require_signature_nonce && unique_nonce(&identity).is_none() {
+    // the signing-string fallback here. This runs before the ledger is charged,
+    // so a refused request spends nothing.
+    if state.config.require_signature_nonce && unique_nonce(identity).is_none() {
         // A present-but-short nonce gets its own code. It is a different
         // client bug from a pre-nonce signer (the client already emits the
         // parameter, it just does not fill it), and the two need different
         // instructions.
-        return match identity.nonce {
+        return Err(match &identity.nonce {
             None => {
                 crate::metrics::record_signature_ledger("nonce_required");
                 tracing::warn!(did = %identity.keyid, "rejected a nonce-less signature: a nonce is required");
-                ledger_rejection(
+                (
                     NodeDenial::NonceRequired,
-                    "this node requires a `nonce` parameter in Signature-Input — upgrade your client",
+                    "this node requires a `nonce` parameter in Signature-Input — upgrade your client"
+                        .to_string(),
                 )
             }
             Some(nonce) => {
@@ -740,19 +921,19 @@ pub async fn consume_signature(
                     len = nonce.chars().count(),
                     "rejected a signature whose nonce is too short to be unique",
                 );
-                ledger_rejection(
+                (
                     NodeDenial::NonceTooShort,
-                    &format!(
+                    format!(
                         "the `nonce` parameter in Signature-Input must be at least \
                          {MIN_NONCE_CHARS} characters drawn from a CSPRNG — \
                          `gl` signs 32 hex characters",
                     ),
                 )
             }
-        };
+        });
     }
 
-    let key = ledger_key(&identity);
+    let key = ledger_key(identity);
     let now = chrono::Utc::now().timestamp();
     // Charge the cap against the RESOLVED key, never the wire DID: see
     // `SignatureIdentity::key_fingerprint`. This does not weaken single-use,
@@ -772,25 +953,25 @@ pub async fn consume_signature(
     {
         Ok(crate::db::ConsumeSignature::Inserted) => {
             crate::metrics::record_signature_ledger("admitted");
-            next.run(request).await
+            Ok(())
         }
         Ok(crate::db::ConsumeSignature::Replayed) => {
             crate::metrics::record_signature_ledger("replayed");
             tracing::warn!(did = %identity.keyid, "rejected a replayed HTTP signature");
-            ledger_rejection(
+            Err((
                 NodeDenial::Replayed,
-                "this signature has already been used — sign a fresh request",
-            )
+                "this signature has already been used — sign a fresh request".to_string(),
+            ))
         }
         Ok(crate::db::ConsumeSignature::IdentityLedgerFull) => {
             // A rate condition, not a permanent rejection: the caller's live
             // rows drain as they expire, so this is retryable.
             crate::metrics::record_signature_ledger("identity_ledger_full");
             tracing::warn!(did = %identity.keyid, "signature ledger full for this identity");
-            ledger_rejection(
+            Err((
                 NodeDenial::LedgerFull,
-                "too many unexpired signatures for this identity — retry shortly",
-            )
+                "too many unexpired signatures for this identity — retry shortly".to_string(),
+            ))
         }
         Err(e) => {
             // Fail closed (KTD5). An outage is exactly when a holder of a
@@ -798,10 +979,10 @@ pub async fn consume_signature(
             // the same database anyway.
             crate::metrics::record_signature_ledger("unavailable");
             tracing::error!(did = %identity.keyid, err = %e, "signature ledger unavailable");
-            ledger_rejection(
+            Err((
                 NodeDenial::LedgerUnavailable,
-                "the signature ledger is unavailable — retry shortly",
-            )
+                "the signature ledger is unavailable — retry shortly".to_string(),
+            ))
         }
     }
 }
@@ -1334,6 +1515,109 @@ mod tests {
 
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert!(ledger_metric("identity_ledger_full") > before);
+    }
+
+    /// Reports what the signature middleware put in `SignatureMaterial.body`,
+    /// so a test can tell "captured" from "deliberately not captured" apart
+    /// from "the middleware never ran".
+    async fn report_body(material: Option<axum::Extension<SignatureMaterial>>) -> String {
+        match material {
+            Some(axum::Extension(m)) => match m.body {
+                Some(bytes) => format!("captured:{}", bytes.len()),
+                None => "absent".to_string(),
+            },
+            None => "no-material".to_string(),
+        }
+    }
+
+    fn signed_post(path: &str, body: &[u8]) -> Request {
+        let kp = Keypair::generate();
+        let signed = gitlawb_core::http_sig::sign_request(&kp, "POST", path, body);
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(axum::body::Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    /// The body handle travels only on a route that asked for it.
+    ///
+    /// Both arms drive a genuinely signed request through `require_signature`;
+    /// the only difference is the [`PersistsSignedBody`] marker layer. A
+    /// middleware that captured unconditionally would make both arms read
+    /// `captured`, and one that never read the marker would make both read
+    /// `absent`, so the pair pins the decision rather than the mechanism.
+    #[tokio::test]
+    async fn the_body_is_carried_only_when_the_route_marks_itself_as_persisting_it() {
+        let body = br#"{"state":"success"}"#;
+
+        // The marker layer is added AFTER the middleware layer, which is what
+        // makes it the outer of the two and therefore the one that runs first.
+        // This is the same relative position `build_router` uses on the status
+        // write group, where the marker sits outside `add_auth_layers`.
+        let marked = Router::new()
+            .route("/", axum::routing::post(report_body))
+            .layer(middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(65536),
+                require_signature,
+            ))
+            .layer(axum::Extension(PersistsSignedBody));
+        let resp = marked.oneshot(signed_post("/", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        assert_eq!(
+            String::from_utf8(seen.to_vec()).unwrap(),
+            format!("captured:{}", body.len()),
+            "a route carrying the persist marker must receive the buffered body"
+        );
+
+        let unmarked = Router::new()
+            .route("/", axum::routing::post(report_body))
+            .layer(middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(65536),
+                require_signature,
+            ));
+        let resp = unmarked.oneshot(signed_post("/", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        assert_eq!(
+            String::from_utf8(seen.to_vec()).unwrap(),
+            "absent",
+            "a signed route that never persists the body must not be handed a handle to it"
+        );
+    }
+
+    /// The marker is read from the request the middleware was given, and the
+    /// request it hands downstream still carries it. Both halves matter: the
+    /// first is the capture decision, the second is that rebuilding the request
+    /// from its parts does not drop extensions a later layer may want.
+    #[tokio::test]
+    async fn the_marker_survives_the_request_rebuild() {
+        async fn report_marker(marker: Option<axum::Extension<PersistsSignedBody>>) -> String {
+            match marker {
+                Some(_) => "marked".to_string(),
+                None => "unmarked".to_string(),
+            }
+        }
+
+        let app = Router::new()
+            .route("/", axum::routing::post(report_marker))
+            .layer(middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(65536),
+                require_signature,
+            ))
+            .layer(axum::Extension(PersistsSignedBody));
+        let resp = app.oneshot(signed_post("/", b"{}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        assert_eq!(
+            String::from_utf8(seen.to_vec()).unwrap(),
+            "marked",
+            "the marker must reach the handler, so the middleware saw it too"
+        );
     }
 
     #[tokio::test]

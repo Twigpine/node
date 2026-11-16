@@ -403,9 +403,8 @@ fn signature_rejection(resp: &reqwest::Response) -> Option<SignatureRejection> {
              The write did not happen; retry later or ask the node operator to check the node"
         }
         NodeDenial::RateLimited => {
-            "the node is throttling requests from your network address, so it refused this one \
-             before running it. The write did not happen; this is not about your identity or \
-             your signature, so re-running immediately will not help — wait and try again"
+            "a rate limit on the node refused this request. The write did not happen; \
+             re-signing will not help, so wait and try again"
         }
     };
     Some(SignatureRejection { denial, hint })
@@ -1018,8 +1017,14 @@ mod tests {
             "a brake must not be described as a ledger denial: {brake}"
         );
         assert!(
-            brake.contains("network address"),
-            "the brake hint must say it is keyed on the client address: {brake}"
+            brake.contains("a rate limit on the node"),
+            "the brake hint must say a rate limit fired: {brake}"
+        );
+        // The code is shared by the per-IP brake, the per-DID quota and the
+        // in-handler limits, so the hint must not claim which one fired.
+        assert!(
+            !brake.contains("network address") && !brake.contains("not about your identity"),
+            "the brake hint must stay neutral about which limiter fired: {brake}"
         );
         assert!(ledger.contains("signature_ledger_full"), "got: {ledger}");
         assert!(
