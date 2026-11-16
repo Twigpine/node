@@ -1958,6 +1958,9 @@ mod corrupt_store_tests {
             State(state),
             Extension(AuthenticatedDid(owner.to_string())),
             Path((owner.to_string(), "corrupt-close".to_string(), issue_id)),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(Some("203.0.113.64:5000".parse().unwrap())),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await
         .expect_err("a corrupt store must error, not panic or 404");
