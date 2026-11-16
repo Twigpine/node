@@ -196,8 +196,15 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     let gl_node = sanitize_node_msg(&args.node);
 
     if transport_node == args.node {
-        // gl and the transport agree, so one row covers both.
-        checks.push(gitlawb_node_env_check(Some(&gl_node)));
+        // gl and the transport agree, so one row covers both. Classify the row from
+        // the variable itself: `--node` matching the transport default does not mean
+        // the user set `GITLAWB_NODE`.
+        let env_val = env_node
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(sanitize_node_msg);
+        checks.push(gitlawb_node_env_check(env_val.as_deref()));
     } else {
         let verdict = probe_transport(&transport_node).await;
         let detail = format!(

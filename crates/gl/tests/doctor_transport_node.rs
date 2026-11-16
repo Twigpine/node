@@ -184,6 +184,28 @@ fn agreeing_env_and_flag_produce_no_divergence_row() {
     );
 }
 
+/// `--node` equal to the transport default says nothing about whether the user
+/// set `GITLAWB_NODE`. With the variable unset the row must stay the advisory
+/// "not set" Warn, not a Pass describing a configured loopback node.
+#[test]
+fn unset_env_with_flag_equal_to_transport_default_still_warns_not_set() {
+    let r = doctor(None, "http://127.0.0.1:7545");
+    let row = r
+        .stdout
+        .lines()
+        .find(|l| l.contains("GITLAWB_NODE"))
+        .unwrap_or_else(|| panic!("no GITLAWB_NODE row in:\n{}", r.stdout));
+    assert!(
+        row.contains("not set"),
+        "unset env must report 'not set', got row {row:?} in:\n{}",
+        r.stdout
+    );
+    assert!(
+        !row.contains("intentional for self-hosting/dev"),
+        "unset env must not read as a configured loopback node: {row:?}"
+    );
+}
+
 /// The bug this check exists to prevent, one level down: something answering 200
 /// on the transport port is not proof a gitlawb node is there. Reporting it as a
 /// healthy transport is the same false green doctor already shipped once.
