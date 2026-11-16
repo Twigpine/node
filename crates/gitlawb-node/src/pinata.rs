@@ -1999,6 +1999,12 @@ mod tests {
         // Stall only the fenced record's `FOR UPDATE`: fence reads and the
         // skip check are plain SELECTs and proceed, the upload lands, then
         // the record elapses. The verify read proceeds too and finds no row.
+        //
+        // The 3.5s budget only has to outlast the git read and skip check that
+        // run before the upload: if a loaded box spends the budget first, the
+        // batch stops before the POST and the mock's expectation fails for a
+        // reason unrelated to the record. The record stalls on the lock
+        // whatever the budget, so a larger one costs only wall time.
         let mut lock = hold_repo_row_lock(&pool, repo_id).await;
 
         let client = reqwest::Client::new();
@@ -2014,7 +2020,7 @@ mod tests {
                 oids,
                 &db,
                 repo_id,
-                Duration::from_millis(1500),
+                Duration::from_millis(3500),
                 Some(&fence),
             ),
         )
