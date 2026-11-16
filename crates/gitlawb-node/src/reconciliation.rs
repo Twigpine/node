@@ -6445,6 +6445,15 @@ mod tests {
     /// Write one canned HTTP response on an accepted fake-S3 socket.
     /// A free function (not a closure) so the `&mut` socket borrow does
     /// not leak into a returned future's lifetime.
+    ///
+    /// The fake serves one request per accepted socket and drops it, so each
+    /// response says `Connection: close`. Without it the client keeps the
+    /// socket in its pool after the server has closed it, and the next request
+    /// can reuse a dead connection. Tests build the client with
+    /// `for_testing_with_endpoint`, which disables retries (production keeps the
+    /// SDK default), so the dead connection fails the request on the first try
+    /// and `sweep_restores_tigris_cache_miss_and_skips_missing` failed with
+    /// "repo acquire failed" on a loaded runner.
     async fn s3_respond(
         sock: &mut tokio::net::TcpStream,
         status: &str,
@@ -6453,7 +6462,7 @@ mod tests {
     ) {
         use tokio::io::AsyncWriteExt;
         let head = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}\r\n",
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n",
             payload.len()
         );
         let _ = sock.write_all(head.as_bytes()).await;
