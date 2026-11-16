@@ -326,6 +326,15 @@ fn write_response(mut stream: TcpStream, status: &str, content_type: &str, body:
 /// Run `git fetch` in `clone` through the helper, with a hard timeout so a
 /// regression to the deadlock fails fast instead of hanging the suite.
 fn fetch_with_helper(clone: &Path, node_url: &str) -> (bool, std::process::Output) {
+    fetch_with_helper_env(clone, node_url, &[])
+}
+
+/// [`fetch_with_helper`] with extra environment for the helper process.
+fn fetch_with_helper_env(
+    clone: &Path,
+    node_url: &str,
+    extra_env: &[(&str, &str)],
+) -> (bool, std::process::Output) {
     let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_git-remote-gitlawb"));
     let helper_dir = helper_bin.parent().unwrap().to_path_buf();
     let path_env = match std::env::var_os("PATH") {
@@ -348,7 +357,14 @@ fn fetch_with_helper(clone: &Path, node_url: &str) -> (bool, std::process::Outpu
         // machine/CI with git-l10n installed and LANG set to a translated locale.
         .env("LC_ALL", "C")
         .env("GITLAWB_NODE", node_url)
-        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-fetch");
+        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-fetch")
+        // The helper inherits this process's environment, so an operator or CI
+        // that exports the insecure-HTTP override would decide the transport
+        // policy for every test below. Clear it and let each test opt in.
+        .env_remove("GITLAWB_ALLOW_INSECURE_HTTP");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     run_bounded(cmd, Duration::from_secs(30))
 }
 
@@ -376,7 +392,8 @@ fn push_with_helper(local: &Path, node_url: &str, args: &[&str]) -> (bool, std::
         .env("PATH", path_env)
         .env("LC_ALL", "C")
         .env("GITLAWB_NODE", node_url)
-        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-push");
+        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-push")
+        .env_remove("GITLAWB_ALLOW_INSECURE_HTTP");
     run_bounded(cmd, Duration::from_secs(30))
 }
 
@@ -1350,6 +1367,108 @@ fn run_bounded_bounds_join_when_leader_exits_leaving_a_pipe_holder() {
          elapsed={elapsed:?} (expected <5s; the clean-exit path must close the \
          process group (unix) / terminate the job (windows) so the grandchild's \
          held pipes do not stall the joins)"
+    );
+}
+
+/// The plaintext-transport gate, proven at its CALL SITE rather than in
+/// isolation. `main.rs`'s unit tests cover `is_insecure_remote` and
+/// `check_transport_security` as functions; neither notices if the call in
+/// `main()` is deleted, which is the regression that would silently restore the
+/// cleartext hop. Only driving the built binary binds the wiring.
+///
+/// `192.0.2.1` is TEST-NET-1 (RFC 5737): non-loopback, reserved for
+/// documentation, and never routable, so the gate is what stops this. If the
+/// call in `main()` were deleted the helper would dial it and `run_bounded`
+/// would kill it after 30s, so a regression fails slowly, on the
+/// `plaintext http` assertion below.
+#[test]
+fn real_git_fetch_refuses_a_remote_plaintext_node() {
+    // A shallow fixture is enough: the gate fires before any negotiation.
+    let repos = build_divergent_repos(1);
+    let (ok, out) = fetch_with_helper(&repos.clone, "http://192.0.2.1:7545");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !ok || !out.status.success(),
+        "the fetch must not succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("plaintext http"),
+        "the helper must refuse the cleartext hop and say so; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+        "the refusal must name the escape hatch; stderr was: {stderr}"
+    );
+}
+
+/// The opt-in is read as a value, not as presence. `GITLAWB_ALLOW_INSECURE_HTTP`
+/// set to `0`, `false`, empty or a misspelling must leave the gate closed: the
+/// README and the refusal message both tell the operator to set it to `1`, so
+/// anything else reads as "not opting in". Drives the built binary because the
+/// parsing lives in `main()`, which a unit test on the gate function cannot see.
+#[test]
+fn real_git_fetch_still_refuses_a_remote_plaintext_node_when_override_is_not_truthy() {
+    let repos = build_divergent_repos(1);
+    for value in ["0", "false", "", "yes"] {
+        let (ok, out) = fetch_with_helper_env(
+            &repos.clone,
+            "http://192.0.2.1:7545",
+            &[("GITLAWB_ALLOW_INSECURE_HTTP", value)],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !ok || !out.status.success(),
+            "GITLAWB_ALLOW_INSECURE_HTTP={value:?} must not permit a remote plaintext node: {stderr}"
+        );
+        // The not-truthy warning also says "plaintext http", so match the text
+        // only the refusal itself emits.
+        assert!(
+            stderr.contains("refusing to send git data"),
+            "GITLAWB_ALLOW_INSECURE_HTTP={value:?} must leave the gate refusing; stderr was: {stderr}"
+        );
+    }
+}
+
+/// A proxy variable must not divert a LOOPBACK node off this machine.
+///
+/// reqwest's default client honours `HTTP_PROXY` for a loopback URL, so before
+/// the fix a proxy pointing off-machine carried the signed plaintext request to
+/// it, past the transport guard, which only ever inspected the URL. Observed
+/// directly: `proxy(http://...:9999/) intercepts 'http://127.0.0.1:7545/'`.
+///
+/// The proxy here is a black hole on TEST-NET-1, so if the bypass regresses this
+/// fetch cannot succeed: it either hangs to the harness timeout or fails to
+/// connect. Success is only possible when the request went straight to the shim.
+#[test]
+fn real_git_fetch_ignores_a_proxy_for_a_loopback_node() {
+    let repos = build_divergent_repos(1);
+    let (server, clone) = (repos.server.clone(), repos.clone.clone());
+    let shim = start_shim(server.clone(), ShimMode::Normal);
+
+    let (completed, out) = fetch_with_helper_env(
+        &clone,
+        &shim.base_url,
+        &[
+            ("HTTP_PROXY", "http://192.0.2.1:9999"),
+            ("http_proxy", "http://192.0.2.1:9999"),
+            ("ALL_PROXY", "http://192.0.2.1:9999"),
+            // An inherited exclusion naming loopback would let reqwest connect
+            // directly and mask a regressed bypass.
+            ("NO_PROXY", ""),
+            ("no_proxy", ""),
+        ],
+    );
+
+    assert!(
+        completed,
+        "the fetch did not finish; a proxied loopback request would stall here. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "a loopback fetch must ignore the proxy variables. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
