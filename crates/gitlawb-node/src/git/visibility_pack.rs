@@ -2875,9 +2875,11 @@ mod tests {
     #[test]
     fn fake_git_ignores_an_ambient_settle_env_var() {
         let tmp = TempDir::new().unwrap();
-        let body = "#!/bin/sh\necho ran > ran.marker\nexit 0\n";
-        let git_bin = write_fake_git(tmp.path(), body);
         let marker = tmp.path().join("ran.marker");
+        // Absolute, so the body writes where the assertions look no matter which
+        // working directory the settle exec or the normal exec inherits.
+        let body = format!("#!/bin/sh\necho ran > '{}'\nexit 0\n", marker.display());
+        let git_bin = write_fake_git(tmp.path(), &body);
         // The settle run itself must not have executed the body.
         assert!(!marker.exists(), "settle exec ran the fake body");
         let status = std::process::Command::new(&git_bin)
