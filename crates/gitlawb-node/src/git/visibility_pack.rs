@@ -2809,6 +2809,22 @@ pub(crate) fn recipients_from_pairs(
 mod tests {
     use super::*;
 
+    /// Deadline for tests that run a fake `git` under the watchdog. The watchdog
+    /// tears the whole process group down at the deadline, so it has to sit far
+    /// above `/bin/sh` startup under load. Tighter, and the fake is killed before
+    /// it records its pid or installs its `trap`.
+    #[cfg(unix)]
+    const SH_STARTUP_HEADROOM: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// `errno` for "Text file busy". std has no stable `ErrorKind` for it.
+    #[cfg(unix)]
+    const ETXTBSY: i32 = 26;
+
+    /// First argv of the settle exec. No test passes it to a fake git, and git has
+    /// no subcommand spelled this way.
+    #[cfg(unix)]
+    const SETTLE_ARG: &str = "--fake-git-settle";
+
     /// Write an executable fake `git` shell script into `dir` and return its path,
     /// so a test can drive the walk's process-group teardown without a real git and
     /// without mutating the process-global PATH (the crate's only injection seam).
@@ -2816,11 +2832,78 @@ mod tests {
     fn write_fake_git(dir: &Path, body: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let p = dir.join("fakegit");
+        // Every body starts with a shebang. The line inserted after it lets the
+        // settle exec below exit at once without running the body.
+        let (shebang, rest) = body
+            .split_once('\n')
+            .expect("a fake git body starts with a shebang line");
+        let body = format!("{shebang}\nif [ \"$1\" = \"{SETTLE_ARG}\" ]; then exit 0; fi\n{rest}");
         std::fs::write(&p, body).unwrap();
         let mut perm = std::fs::metadata(&p).unwrap().permissions();
         perm.set_mode(0o755);
         std::fs::set_permissions(&p, perm).unwrap();
-        p.to_str().unwrap().to_string()
+        // A script written in this process cannot be exec'd while any process still
+        // holds a write descriptor to it. A concurrent test thread that forks while
+        // the descriptor above is open hands the child a copy until the child execs,
+        // so the first exec fails with "Text file busy" and the code under test
+        // reports a spawn failure. Run the script until that stops, which also
+        // proves later execs succeed: nothing reopens the file for writing.
+        // The settle is selected by argv, not the environment, so an ambient variable
+        // in the test process cannot turn a fake git into a no-op. It fails closed:
+        // a persistent ETXTBSY or any other failed exec panics here instead of
+        // returning a path whose first real exec would fail.
+        let mut last = None;
+        for _ in 0..100 {
+            match std::process::Command::new(&p).arg(SETTLE_ARG).status() {
+                Ok(s) if s.success() => return p.to_str().unwrap().to_string(),
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    last = Some(e.to_string());
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => panic!("fake git settle failed for {}: {other:?}", p.display()),
+            }
+        }
+        panic!(
+            "fake git settle: {} still busy after 100 tries ({last:?}); persistent exec failure, not a transient parallel-runner miss",
+            p.display()
+        );
+    }
+
+    /// An ambient `FAKE_GIT_SETTLE` in the test process must not turn a fake git
+    /// into a no-op: the settle exec is selected by argv only the settle exec passes.
+    #[cfg(unix)]
+    #[test]
+    fn fake_git_ignores_an_ambient_settle_env_var() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("ran.marker");
+        // Absolute, so the body writes where the assertions look no matter which
+        // working directory the settle exec or the normal exec inherits.
+        let body = format!("#!/bin/sh\necho ran > '{}'\nexit 0\n", marker.display());
+        let git_bin = write_fake_git(tmp.path(), &body);
+        // The settle run itself must not have executed the body.
+        assert!(!marker.exists(), "settle exec ran the fake body");
+        let status = std::process::Command::new(&git_bin)
+            .env("FAKE_GIT_SETTLE", "1")
+            .current_dir(tmp.path())
+            .arg("rev-list")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            marker.exists(),
+            "ambient FAKE_GIT_SETTLE short-circuited the body"
+        );
+    }
+
+    /// The settle must fail closed: a spawn error that is not a transient
+    /// `ETXTBSY` (here an interpreter that does not exist) panics instead of
+    /// handing back a path whose first real exec would fail.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "fake git settle")]
+    fn write_fake_git_panics_when_the_settle_exec_fails() {
+        let tmp = TempDir::new().unwrap();
+        write_fake_git(tmp.path(), "#!/nonexistent/interpreter\nexit 0\n");
     }
 
     /// #174 U3: the withheld-blob walk is bounded at the shared `blob_paths` seam, so
@@ -2847,7 +2930,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let path = tmp.path().to_path_buf();
         std::thread::spawn(move || {
-            let _ = tx.send(blob_paths(&path, &git_bin, Duration::from_millis(200)));
+            let _ = tx.send(blob_paths(&path, &git_bin, SH_STARTUP_HEADROOM));
         });
         let result = rx.recv_timeout(Duration::from_secs(10)).expect(
             "blob_paths must return within the watchdog budget, not hang on a stuck git child",
@@ -2888,13 +2971,13 @@ mod tests {
     /// #174 (F1 status-gate, vetted by execution): a child that exits SUCCESSFULLY is
     /// never reported as a timeout even when the watchdog fires, so a walk finishing
     /// right at its deadline is not a spurious 504. The fake only exits when signalled
-    /// and exits 0 on SIGTERM, so with a deadline already elapsed the watchdog always
+    /// and exits 0 on SIGTERM, so once the deadline passes the watchdog always
     /// reaches its kill path (killed == true) yet the child's status is success.
     /// Drop the `!status.success()` guard and this returns GitServiceTimeout (RED).
     #[cfg(unix)]
     #[test]
     fn run_bounded_git_success_at_the_deadline_is_not_a_timeout() {
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         let tmp = TempDir::new().unwrap();
         let body = "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 30 &\nwait\n";
         let git_bin = write_fake_git(tmp.path(), body);
@@ -2903,7 +2986,7 @@ mod tests {
             &["rev-list"],
             tmp.path(),
             b"",
-            Instant::now() + Duration::from_millis(100),
+            Instant::now() + SH_STARTUP_HEADROOM,
         );
         assert!(
             out.is_ok(),
@@ -2932,7 +3015,7 @@ mod tests {
                 &["rev-list"],
                 &path,
                 b"",
-                Instant::now() + Duration::from_millis(100),
+                Instant::now() + SH_STARTUP_HEADROOM,
             ));
         });
         let out = rx
@@ -2994,7 +3077,7 @@ esac\n";
                 &["rev-list"],
                 &path,
                 b"",
-                Instant::now() + Duration::from_millis(100),
+                Instant::now() + SH_STARTUP_HEADROOM,
             ));
         });
         let _ = rx
