@@ -1497,6 +1497,9 @@ fn validate_git_advertisement(bytes: &[u8]) -> Result<()> {
         anyhow::bail!("git_refs failed (200): response was not a git ref advertisement");
     }
     let mut pos = 0usize;
+    // Whether the last pkt-line seen was a flush. The ref stream must end on
+    // one, so a clean EOF after a complete data packet is a cut stream.
+    let mut closed = false;
     while pos + 4 <= bytes.len() {
         let hex = std::str::from_utf8(&bytes[pos..pos + 4])
             .map_err(|_| anyhow::anyhow!("git_refs failed (200): invalid pkt-line length"))?;
@@ -1504,8 +1507,10 @@ fn validate_git_advertisement(bytes: &[u8]) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("git_refs failed (200): invalid pkt-line length"))?;
         if len == 0 {
             pos += 4;
+            closed = true;
             continue;
         }
+        closed = false;
         if len < 4 || pos + len > bytes.len() {
             anyhow::bail!("git_refs failed (200): truncated pkt-line");
         }
@@ -1522,6 +1527,12 @@ fn validate_git_advertisement(bytes: &[u8]) -> Result<()> {
     }
     if pos != bytes.len() {
         anyhow::bail!("git_refs failed (200): response was not a valid git ref advertisement");
+    }
+    if !closed {
+        anyhow::bail!(
+            "git_refs failed (200): advertisement ended before the terminating flush, \
+             so the refs received are not the full list"
+        );
     }
     Ok(())
 }
@@ -3657,6 +3668,40 @@ mod tests {
         assert!(
             err.to_string().contains("repository unavailable"),
             "the refusal must carry the node's message, got: {err}"
+        );
+    }
+
+    /// A 200 that ends cleanly after a complete ref pkt-line but BEFORE the
+    /// terminating flush is an incomplete Git stream, not the full ref list: both
+    /// capped-read flags stay false and every pkt-line frames, so only the
+    /// missing `0000` shows the refs received are a prefix. MUTATION (RED): drop
+    /// the `closed` check in `validate_git_advertisement` and this returns one
+    /// ref as if the repo held nothing else.
+    #[tokio::test]
+    async fn test_git_refs_missing_terminating_flush_errors_not_partial_refs() {
+        let mut server = mockito::Server::new_async().await;
+        let sha = "d".repeat(40);
+        let mut body = pkt_line(b"# service=git-upload-pack\n");
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(&pkt_line(format!("{sha} refs/heads/main\n").as_bytes()));
+        let _m = server
+            .mock("GET", "/alice/noflush/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "noflush"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("an advertisement with no terminating flush must not parse as complete");
+        assert!(
+            err.to_string().contains("terminating flush"),
+            "the refusal must name the missing flush, got: {err}"
         );
     }
 

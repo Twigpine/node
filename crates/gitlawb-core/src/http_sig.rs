@@ -156,8 +156,8 @@ impl HttpSignature {
     }
 
     /// Reject a `created` timestamp outside the acceptance window, which is
-    /// ASYMMETRIC: up to 5 minutes into the past, but only 60 seconds into the
-    /// future.
+    /// ASYMMETRIC: up to [`MAX_SIGNATURE_AGE_SECS`] into the past, but only
+    /// [`MAX_FUTURE_SKEW_SECS`] into the future.
     ///
     /// The two directions are two comparisons rather than one distance, because
     /// they are not the same event. A signature that arrives late is ordinary:
@@ -168,8 +168,8 @@ impl HttpSignature {
     /// `created = T + 300`, it stayed acceptable until roughly T + 600, so the
     /// effective window was double the one this function advertises. The
     /// forward tolerance exists only to absorb honest drift between two hosts,
-    /// and is [`MAX_FUTURE_SKEW_SECS`], the one constant the ledger's retention
-    /// window is derived from, so what the verifier accepts and what the
+    /// and is [`MAX_FUTURE_SKEW_SECS`]. The ledger's retention window is
+    /// derived from both bounds, so what the verifier accepts and what the
     /// ledger remembers cannot disagree.
     pub fn check_created(&self) -> Result<()> {
         const MAX_AGE_SECS: i64 = MAX_SIGNATURE_AGE_SECS;
