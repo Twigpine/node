@@ -1921,13 +1921,50 @@ mod tests {
     }
 
     /// Write an executable fake `git` (named `git`) into `dir`; return its path.
+    ///
+    /// Returns only once the script execs, so a caller can spawn it at once.
     #[cfg(unix)]
     fn write_fake_git(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
+        // std has no stable `ErrorKind` for ETXTBSY.
+        const ETXTBSY: i32 = 26;
         let path = dir.join("git");
+        // Every body starts with a shebang. The line inserted after it lets the
+        // settle exec below exit at once without running the body.
+        let (shebang, rest) = body
+            .split_once('\n')
+            .expect("a fake git body starts with a shebang line");
+        let body = format!("{shebang}\nif [ -n \"$FAKE_GIT_SETTLE\" ]; then exit 0; fi\n{rest}");
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        // A script written in this process cannot be exec'd while any process still
+        // holds a write descriptor to it. A concurrent test thread that forks while
+        // the descriptor above is open hands the child a copy until the child execs,
+        // so the first exec fails with "Text file busy" and the code under test
+        // reports a spawn failure. Run the script until that stops, which also
+        // proves later execs succeed: nothing reopens the file for writing.
+        for _ in 0..100 {
+            match std::process::Command::new(&path)
+                .env("FAKE_GIT_SETTLE", "1")
+                .status()
+            {
+                Ok(status) if status.success() => return path,
+                Err(e)
+                    if e.raw_os_error() == Some(ETXTBSY)
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => panic!(
+                    "fake git settle probe failed: {other:?}: {}",
+                    path.display()
+                ),
+            }
+        }
+        panic!(
+            "fake git still busy or unspawnable after 100 attempts: {}",
+            path.display()
+        );
     }
 
     /// Read a two-line `leader\ngrandchild` pidfile once both lines are present.
