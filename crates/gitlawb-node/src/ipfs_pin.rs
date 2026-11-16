@@ -3858,6 +3858,9 @@ mod tests {
     /// `r + 3.72s`) buys it. Unfloored, the bound is the 3s batch deadline and the
     /// blocked write is cancelled `r + 0.4s` before the lock lifts at `r + 3.4s`.
     ///
+    /// The locker also waits to see the record write blocked on `pinned_cids` before
+    /// holding to `r + 3.4s`, so a lock that lands after the write fails the test.
+    ///
     /// The lock is sequenced off the upload being received, not off a clock: a fixed
     /// delay let a loaded box take the lock while `is_pinned` was still reading, which
     /// makes the read block, time out, and break the batch, failing
@@ -3893,6 +3896,10 @@ mod tests {
             // the floored bound.
             let received = tokio::time::Instant::now();
             let mut conn = lock_table(&lock_pool, "pinned_cids").await;
+            // Require the record write to be seen blocked on the lock, so a lock taken
+            // after the write landed fails here instead of passing without
+            // exercising the floor. The release keeps its upload-relative bound.
+            wait_for_lock_waiter(&lock_pool, "pinned_cids").await;
             tokio::time::sleep_until(received + Duration::from_millis(3400)).await;
             rollback(&mut conn).await;
         };
@@ -4022,7 +4029,9 @@ mod tests {
     ///   1.5s batch deadline, so the bound is ~0 and the blocked UPDATE is cancelled at
     ///   once, leaving no marker;
     /// - T + 3s: the lock lifts, a full second after the write started and a full second
-    ///   before its floored bound expires, so the floored write lands.
+    ///   before its floored bound expires, so the floored write lands. The controller
+    ///   holds the lock for 1s after it sees the marker write blocked, so the release
+    ///   tracks the write and not the time `lock_table` took.
     ///
     /// Both margins are a full second on purpose. The proof only needs the release to
     /// fall strictly between zero and `DB_RECORD_GRACE`, so there is no reason to put
@@ -4052,7 +4061,12 @@ mod tests {
             // `is_pinned` and `provenance_for_oid` have long since read `pinned_cids`.
             wait_for_lock_waiter(&lock_pool, "pin_repo_sources").await;
             let mut cids_lock = lock_table(&lock_pool, "pinned_cids").await;
-            tokio::time::sleep(Duration::from_millis(3000)).await;
+            // Time the release from the marker write blocking, not from taking the
+            // lock: a slow `lock_table` must not push the release past the floored
+            // bound. This also fails loudly if the write never blocks, rather than
+            // passing without exercising the floor.
+            wait_for_lock_waiter(&lock_pool, "pinned_cids").await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
             rollback(&mut cids_lock).await;
         };
 
