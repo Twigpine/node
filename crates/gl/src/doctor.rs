@@ -469,14 +469,14 @@ async fn probe_transport(url: &str) -> TransportVerdict {
     // and reqwest supplies the `/` for an origin-only URL.
     match client.get(url).send().await {
         Ok(resp) if resp.status().is_success() => {
-            let body = crate::http::read_body_capped(resp, PROBE_BODY_CAP).await;
+            let body = crate::http::read_body_capped_bytes(resp, PROBE_BODY_CAP).await;
             if body.truncated || body.read_failed {
                 return TransportVerdict {
                     usable: false,
                     detail: "response too large or incomplete for a gitlawb node".to_string(),
                 };
             }
-            let info = serde_json::from_str::<serde_json::Value>(&body.text).unwrap_or_default();
+            let info = serde_json::from_slice::<serde_json::Value>(&body.bytes).unwrap_or_default();
             if info["did"].as_str().is_some() {
                 TransportVerdict {
                     usable: true,
@@ -540,7 +540,7 @@ fn effective_node_url(node: &str) -> &str {
     if node.trim().is_empty() {
         PUBLIC_NODE
     } else {
-        node
+        node.trim()
     }
 }
 

@@ -547,3 +547,55 @@ fn a_hostile_release_tag_cannot_reach_the_terminal_raw() {
         r.stdout
     );
 }
+
+/// The probe validates the bytes the endpoint sent, not a lossy rendering of them.
+/// A 200 whose JSON string carries invalid UTF-8 is not a document the helper's
+/// strict identity lookup can read, so it must not be called reachable. A valid
+/// control confirms the fixture reaches the identity check at all.
+#[test]
+fn invalid_utf8_in_the_identity_body_is_not_a_reachable_node() {
+    let cases: [(&[u8], bool); 3] = [
+        (br#"{"did":"did:key:z6MkTestNode","pad":"ok"}"#, true),
+        (
+            b"{\"did\":\"did:key:z6MkTestNode\",\"pad\":\"\xff\"}",
+            false,
+        ),
+        (b"{\"did\":\"did:key:z6Mk\xfeTestNode\"}", false),
+    ];
+    for (body, reachable) in cases {
+        let served = body.to_vec();
+        let (port, _) =
+            serve(move |_, _| http("200 OK", "Content-Type: application/json\r\n", &served));
+        let r = doctor(
+            Some(&format!("http://127.0.0.1:{port}")),
+            "http://127.0.0.1:1",
+        );
+        let line = r
+            .divergence_line()
+            .unwrap_or_else(|| panic!("no divergence row, got:\n{}", r.stdout));
+        assert_eq!(
+            line.contains("(reachable)"),
+            reachable,
+            "body {:?}: got: {line}",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
+/// A padded `GITLAWB_NODE` with no `--node` resolves to the trimmed URL for the
+/// transport, so the connectivity row must dial the trimmed URL too instead of
+/// failing to parse ` http://host:port /`.
+#[test]
+fn a_padded_env_node_is_dialed_trimmed_by_the_connectivity_row() {
+    let (port, _) = serve(|_, _| did_ok());
+    let r = doctor_with(Some(&format!(" http://127.0.0.1:{port} ")), None, &[]);
+    let node_row = r
+        .stdout
+        .lines()
+        .find(|l| l.contains("v0.0.0"))
+        .unwrap_or_else(|| panic!("no passing node row, got:\n{}", r.stdout));
+    assert!(
+        node_row.contains(&format!("http://127.0.0.1:{port}")),
+        "got: {node_row}"
+    );
+}
