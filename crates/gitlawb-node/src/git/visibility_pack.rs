@@ -2820,6 +2820,11 @@ mod tests {
     #[cfg(unix)]
     const ETXTBSY: i32 = 26;
 
+    /// First argv of the settle exec. No test passes it to a fake git, and git has
+    /// no subcommand spelled this way.
+    #[cfg(unix)]
+    const SETTLE_ARG: &str = "--fake-git-settle";
+
     /// Write an executable fake `git` shell script into `dir` and return its path,
     /// so a test can drive the walk's process-group teardown without a real git and
     /// without mutating the process-global PATH (the crate's only injection seam).
@@ -2832,7 +2837,7 @@ mod tests {
         let (shebang, rest) = body
             .split_once('\n')
             .expect("a fake git body starts with a shebang line");
-        let body = format!("{shebang}\nif [ -n \"$FAKE_GIT_SETTLE\" ]; then exit 0; fi\n{rest}");
+        let body = format!("{shebang}\nif [ \"$1\" = \"{SETTLE_ARG}\" ]; then exit 0; fi\n{rest}");
         std::fs::write(&p, body).unwrap();
         let mut perm = std::fs::metadata(&p).unwrap().permissions();
         perm.set_mode(0o755);
@@ -2843,18 +2848,57 @@ mod tests {
         // so the first exec fails with "Text file busy" and the code under test
         // reports a spawn failure. Run the script until that stops, which also
         // proves later execs succeed: nothing reopens the file for writing.
+        // The settle is selected by argv, not the environment, so an ambient variable
+        // in the test process cannot turn a fake git into a no-op. It fails closed:
+        // a persistent ETXTBSY or any other failed exec panics here instead of
+        // returning a path whose first real exec would fail.
+        let mut last = None;
         for _ in 0..100 {
-            match std::process::Command::new(&p)
-                .env("FAKE_GIT_SETTLE", "1")
-                .status()
-            {
+            match std::process::Command::new(&p).arg(SETTLE_ARG).status() {
+                Ok(s) if s.success() => return p.to_str().unwrap().to_string(),
                 Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    last = Some(e.to_string());
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                _ => break,
+                other => panic!("fake git settle failed for {}: {other:?}", p.display()),
             }
         }
-        p.to_str().unwrap().to_string()
+        panic!(
+            "fake git settle: {} still busy after 100 tries ({last:?}); persistent exec failure, not a transient parallel-runner miss",
+            p.display()
+        );
+    }
+
+    /// An ambient `FAKE_GIT_SETTLE` in the test process must not turn a fake git
+    /// into a no-op: the settle exec is selected by argv only the settle exec passes.
+    #[cfg(unix)]
+    #[test]
+    fn fake_git_ignores_an_ambient_settle_env_var() {
+        let tmp = TempDir::new().unwrap();
+        let body = "#!/bin/sh\necho ran > ran.marker\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let marker = tmp.path().join("ran.marker");
+        // The settle run itself must not have executed the body.
+        assert!(!marker.exists(), "settle exec ran the fake body");
+        let status = std::process::Command::new(&git_bin)
+            .env("FAKE_GIT_SETTLE", "1")
+            .current_dir(tmp.path())
+            .arg("rev-list")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(marker.exists(), "ambient FAKE_GIT_SETTLE short-circuited the body");
+    }
+
+    /// The settle must fail closed: a spawn error that is not a transient
+    /// `ETXTBSY` (here an interpreter that does not exist) panics instead of
+    /// handing back a path whose first real exec would fail.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "fake git settle")]
+    fn write_fake_git_panics_when_the_settle_exec_fails() {
+        let tmp = TempDir::new().unwrap();
+        write_fake_git(tmp.path(), "#!/nonexistent/interpreter\nexit 0\n");
     }
 
     /// #174 U3: the withheld-blob walk is bounded at the shared `blob_paths` seam, so
