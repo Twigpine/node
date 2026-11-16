@@ -392,7 +392,8 @@ fn push_with_helper(local: &Path, node_url: &str, args: &[&str]) -> (bool, std::
         .env("PATH", path_env)
         .env("LC_ALL", "C")
         .env("GITLAWB_NODE", node_url)
-        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-push");
+        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-push")
+        .env_remove("GITLAWB_ALLOW_INSECURE_HTTP");
     run_bounded(cmd, Duration::from_secs(30))
 }
 
@@ -1420,8 +1421,10 @@ fn real_git_fetch_still_refuses_a_remote_plaintext_node_when_override_is_not_tru
             !ok || !out.status.success(),
             "GITLAWB_ALLOW_INSECURE_HTTP={value:?} must not permit a remote plaintext node: {stderr}"
         );
+        // The not-truthy warning also says "plaintext http", so match the text
+        // only the refusal itself emits.
         assert!(
-            stderr.contains("plaintext http"),
+            stderr.contains("refusing to send git data"),
             "GITLAWB_ALLOW_INSECURE_HTTP={value:?} must leave the gate refusing; stderr was: {stderr}"
         );
     }
@@ -1450,6 +1453,10 @@ fn real_git_fetch_ignores_a_proxy_for_a_loopback_node() {
             ("HTTP_PROXY", "http://192.0.2.1:9999"),
             ("http_proxy", "http://192.0.2.1:9999"),
             ("ALL_PROXY", "http://192.0.2.1:9999"),
+            // An inherited exclusion naming loopback would let reqwest connect
+            // directly and mask a regressed bypass.
+            ("NO_PROXY", ""),
+            ("no_proxy", ""),
         ],
     );
 
