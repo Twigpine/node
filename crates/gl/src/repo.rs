@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::{sanitize_node_msg, NodeClient};
+use crate::http::{json_or_denial, sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -423,7 +423,7 @@ async fn cmd_create(
         .post("/api/v1/repos", &body)
         .await
         .context("failed to connect to node")?;
-    let payload = crate::http::read_json(resp, "create").await?;
+    let payload: Value = json_or_denial("create", resp).await?;
 
     let clone_url = payload["clone_url"].as_str().unwrap_or("");
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
@@ -656,7 +656,21 @@ pub(crate) async fn cmd_commits(
     node: String,
     dir: Option<PathBuf>,
 ) -> Result<()> {
-    let client = NodeClient::new(&node, None);
+    // Sign when an identity is available so a private repo's owner can read their
+    // own commits; `owner/name` against a public repo still works anonymously.
+    // An absent identity file falls back to an anonymous read; a file that is
+    // there but unreadable or unparseable is a local failure and propagates.
+    let keypair = match load_keypair_from_dir(dir.as_deref()) {
+        Ok(kp) => Some(kp),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    let client = NodeClient::new(&node, keypair);
 
     let (owner, name) = if repo.contains('/') {
         let (o, n) = repo.split_once('/').unwrap();
@@ -666,8 +680,15 @@ pub(crate) async fn cmd_commits(
         (short, repo)
     };
 
-    let url = format!("/api/v1/repos/{owner}/{name}/commits?branch={branch}&limit={limit}");
-    let resp = crate::http::read_json(client.get(&url).await?, "commits").await?;
+    // Signed as sent, so encode here: reqwest would otherwise percent-encode a
+    // non-ASCII branch after signing and the node would reject the signature.
+    let url = format!(
+        "/api/v1/repos/{}/{}/commits?branch={}&limit={limit}",
+        urlencoding::encode(&owner),
+        urlencoding::encode(&name),
+        urlencoding::encode(&branch)
+    );
+    let resp = crate::http::read_json(client.get_maybe_signed(&url).await?, "commits").await?;
 
     let commits = resp["commits"].as_array().cloned().unwrap_or_default();
     if commits.is_empty() {
@@ -720,7 +741,9 @@ async fn cmd_fork(
         .post(&format!("/api/v1/repos/{owner}/{repo_name}/fork"), &body)
         .await
         .context("failed to connect to node")?;
-    let result = crate::http::read_json(resp, "fork").await?;
+    // Status before body: a rate-limit brake or any other non-JSON denial must
+    // read as the denial, not as "invalid JSON response".
+    let result: Value = json_or_denial("fork", resp).await?;
 
     let fork_name = result["name"].as_str().unwrap_or(&repo_name);
     let owner_did = result["owner_did"].as_str().unwrap_or("?");
@@ -758,7 +781,7 @@ async fn cmd_label_add(
         .post(&format!("/api/v1/repos/{owner}/{name}/labels"), &body)
         .await
         .context("failed to connect to node")?;
-    let result = crate::http::read_json(resp, "add label").await?;
+    let result: Value = json_or_denial("add label", resp).await?;
 
     let added = result["added"].as_bool().unwrap_or(true);
     if added {
@@ -783,7 +806,8 @@ async fn cmd_label_remove(
         .delete(&format!("/api/v1/repos/{owner}/{name}/labels/{label}"), &[])
         .await
         .context("failed to connect to node")?;
-    let _ = crate::http::read_json(resp, "remove label").await?;
+    // Parsed only to reject a denial; the success body carries nothing to print.
+    json_or_denial::<Value>("remove label", resp).await?;
 
     println!("- Label removed: {label} from {owner}/{name}");
     Ok(())
@@ -944,6 +968,48 @@ mod tests {
         // Should be the key segment of a did:key DID — starts with 'z'
         assert!(owner.starts_with('z'));
         assert!(!owner.contains(':'));
+    }
+
+    async fn fork_against(status: usize, headers: &[(&str, &str)], body: &str) -> String {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let mut m = server
+            .mock("POST", "/api/v1/repos/alice/myrepo/fork")
+            .with_status(status);
+        for (k, v) in headers {
+            m = m.with_header(*k, v);
+        }
+        let _m = m.with_body(body).create_async().await;
+        let err = cmd_fork(
+            "alice/myrepo".to_string(),
+            None,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect_err("a 429 must not be reported as success");
+        format!("{err:#}")
+    }
+
+    /// Same shape as `gl profile set`: the fork route gained a per-IP brake, so
+    /// a 429 with a non-JSON body has to read as a rate limit rather than as a
+    /// parse failure.
+    #[tokio::test]
+    async fn fork_surfaces_a_rate_limit_brake_not_invalid_json() {
+        let err = fork_against(
+            429,
+            &[("x-gitlawb-error", "rate_limited")],
+            r#"{"error":"rate_limited","message":"rate limit exceeded — try again later"}"#,
+        )
+        .await;
+        assert!(!err.contains("invalid JSON"), "got: {err}");
+        assert!(err.contains("rate_limited"), "got: {err}");
+
+        let err = fork_against(429, &[], "rate limit exceeded — try again later").await;
+        assert!(!err.contains("invalid JSON"), "got: {err}");
+        assert!(err.contains("429"), "got: {err}");
+        assert!(err.contains("rate limit exceeded"), "got: {err}");
     }
 
     #[tokio::test]
@@ -1386,6 +1452,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/commits".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"commits":[]}"#)
@@ -1403,6 +1472,39 @@ mod tests {
         .unwrap();
     }
 
+    /// A valid non-ASCII branch name is percent-encoded on the wire by reqwest, so
+    /// the signature must be computed over the encoded target or the node 401s it.
+    #[tokio::test]
+    async fn test_cmd_commits_signs_the_encoded_branch() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                "/api/v1/repos/alice/myrepo/commits?branch=caf%C3%A9&limit=20",
+            )
+            .match_request(crate::http::signature_binds_wire_target)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"commits":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        cmd_commits(
+            "alice/myrepo".to_string(),
+            "café".to_string(),
+            20,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        m.assert_async().await;
+    }
+
     #[tokio::test]
     async fn test_cmd_commits_with_data() {
         let dir = TempDir::new().unwrap();
@@ -1414,6 +1516,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/commits".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"commits":[{"sha":"abc1234567","message":"initial commit","author_name":"alice","date":"2026-03-18T00:00:00Z"}]}"#)
@@ -1422,6 +1527,71 @@ mod tests {
 
         cmd_commits(
             "myrepo".to_string(),
+            "main".to_string(),
+            20,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    // An identity file that exists but will not parse is a local failure, not an
+    // absent identity: it must surface, not silently downgrade to an anonymous
+    // read whose private-repo denial hides the cause.
+    #[tokio::test]
+    async fn test_cmd_commits_corrupt_identity_is_an_error_not_anonymous() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), "not a pem").unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"commits":[]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = cmd_commits(
+            "alice/myrepo".to_string(),
+            "main".to_string(),
+            20,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect_err("a corrupt identity must fail the command");
+        assert!(
+            format!("{err:#}").contains("keypair"),
+            "the PEM error must surface, got: {err:#}"
+        );
+        m.assert_async().await;
+    }
+
+    // Empty dir → no identity → get_maybe_signed must fall back to an anonymous
+    // GET (the public-repo path). `owner/name` needs no local identity, so this
+    // is the negative twin of the #115 signing fix. Assert NO signature header.
+    #[tokio::test]
+    async fn test_cmd_commits_anonymous_when_no_identity() {
+        let dir = TempDir::new().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/pubrepo/commits".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Missing)
+            .match_header("signature-input", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"commits":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_commits(
+            "owner/pubrepo".to_string(),
             "main".to_string(),
             20,
             server.url(),

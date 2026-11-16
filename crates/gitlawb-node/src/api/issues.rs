@@ -166,6 +166,7 @@ pub async fn create_issue_comment(
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
     headers: axum::http::HeaderMap,
     crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    ticket: crate::auth::LedgerTicket,
     Json(req): Json<CreateIssueCommentRequest>,
 ) -> Result<(StatusCode, Json<IssueComment>)> {
     if req.body.trim().is_empty() {
@@ -188,6 +189,12 @@ pub async fn create_issue_comment(
             return Err(AppError::RateLimited(retry_after));
         }
     }
+
+    // Spend the signature only now. The route group has no outer brake, so a row
+    // committed in the layer would land before the read gate and the debit above,
+    // and a source rotating keys against missing repos would grow the ledger at
+    // request rate. Still ahead of every write, so replay arbitration is intact.
+    ticket.spend(&state).await?;
 
     let disk_path = state
         .repo_store
@@ -250,6 +257,7 @@ pub async fn close_issue(
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
     headers: axum::http::HeaderMap,
     crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    ticket: crate::auth::LedgerTicket,
 ) -> Result<Json<serde_json::Value>> {
     // READ-GATE before any snapshot work or rate charging, through the shared
     // authorize_repo_read gate so quarantined repos are opaque here too. The
@@ -307,6 +315,11 @@ pub async fn close_issue(
             ));
         }
     }
+
+    // Spend the signature only now, after the read gate and both debits, for the
+    // reason given in `create_issue_comment`. Still ahead of the author fallback,
+    // the write lock and every mutation.
+    ticket.spend(&state).await?;
 
     // AUTHORIZE BEFORE ACQUIRING. The per-repo advisory lock genuinely excludes
     // now, so taking it first would hand any caller with read access a way to hold
@@ -589,6 +602,7 @@ mod tests {
                 )),
                 axum::http::HeaderMap::new(),
                 crate::rate_limit::PeerAddr(Some("203.0.113.64:5000".parse().unwrap())),
+                crate::auth::LedgerTicket::already_spent(),
             ),
         )
         .await;
@@ -676,6 +690,7 @@ mod tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some("203.0.113.99:5000".parse().unwrap())),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -727,6 +742,7 @@ mod tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some("203.0.113.67:5000".parse().unwrap())),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -818,6 +834,7 @@ mod tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some("203.0.113.70:5000".parse().unwrap())),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -859,6 +876,7 @@ mod tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some("203.0.113.65:5000".parse().unwrap())),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -894,6 +912,7 @@ mod tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some("203.0.113.66:5000".parse().unwrap())),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -1029,6 +1048,7 @@ mod lock_pool_shed_tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(None),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -1086,6 +1106,7 @@ mod lock_pool_shed_tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(None),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -1120,6 +1141,7 @@ mod lock_pool_shed_tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(None),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         let err = shed.expect_err("an exhausted lock pool must fail the call");
@@ -1136,6 +1158,7 @@ mod lock_pool_shed_tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(None),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -1287,6 +1310,7 @@ mod lock_pool_shed_tests {
             Path((owner.to_string(), "priv-close".to_string(), "1".to_string())),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some(peer)),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
 
@@ -1329,6 +1353,7 @@ mod lock_pool_shed_tests {
             Path((owner.to_string(), "dual-close".to_string(), "1".to_string())),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some(peer)),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -1373,6 +1398,7 @@ mod lock_pool_shed_tests {
             Path((owner.to_string(), "dual-write".to_string(), "1".to_string())),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some(peer)),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         let resp = res
@@ -1441,6 +1467,7 @@ mod lock_pool_shed_tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some(peer)),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert_429_with_window_retry_after(
@@ -1478,6 +1505,7 @@ mod lock_pool_shed_tests {
             )),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(Some(peer)),
+            crate::auth::LedgerTicket::already_spent(),
             Json(CreateIssueCommentRequest {
                 body: "x".to_string(),
             }),
@@ -1713,6 +1741,7 @@ mod lock_pool_shed_tests {
             Path((owner.to_string(), repo_name.to_string(), prefix.to_string())),
             axum::http::HeaderMap::new(),
             crate::rate_limit::PeerAddr(None),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         let err = shed.expect_err("a refused publish must not report a closed issue");
@@ -1800,6 +1829,7 @@ mod lock_pool_shed_tests {
             axum::extract::Path(path()),
             headers.clone(),
             peer(),
+            crate::auth::LedgerTicket::already_spent(),
         )
         .await;
         assert!(
@@ -1813,6 +1843,7 @@ mod lock_pool_shed_tests {
             axum::extract::Path(path()),
             headers,
             peer(),
+            crate::auth::LedgerTicket::already_spent(),
             axum::Json(CreateIssueCommentRequest {
                 body: "x".to_string(),
             }),
