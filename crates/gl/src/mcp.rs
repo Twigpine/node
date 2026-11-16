@@ -223,7 +223,7 @@ fn tool_definitions() -> Value {
                 "required": ["name"],
                 "properties": {
                     "name": { "type": "string", "description": "Repository name" },
-                    "owner": { "type": "string", "description": "Owner DID or short DID (optional, defaults to node owner)" }
+                    "owner": { "type": "string", "description": "Owner DID or short DID (optional, defaults to the signing identity when one is configured, otherwise the node owner)" }
                 }
             }
         },
@@ -717,6 +717,10 @@ async fn call_tool(
         "repo_get" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
+            // Signed over the target as sent, so each caller-supplied component is
+            // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
+            let owner = urlencoding::encode(&owner);
+            let name = urlencoding::encode(name);
             let repo = crate::http::read_json(
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}"))
@@ -730,6 +734,10 @@ async fn call_tool(
         "repo_commits" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
+            // Signed over the target as sent, so each caller-supplied component is
+            // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
+            let owner = urlencoding::encode(&owner);
+            let name = urlencoding::encode(name);
             let commits = crate::http::read_json(
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/commits"))
@@ -903,6 +911,10 @@ async fn call_tool(
         "pr_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
+            // Signed over the target as sent, so each caller-supplied component is
+            // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
+            let owner = urlencoding::encode(&owner);
+            let repo = urlencoding::encode(repo);
             let resp = crate::http::read_json(
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
@@ -917,6 +929,10 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
+            // Signed over the target as sent, so each caller-supplied component is
+            // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
+            let owner = urlencoding::encode(&owner);
+            let repo = urlencoding::encode(repo);
             let pr = crate::http::read_json(
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
@@ -942,6 +958,10 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_signed_read_owner(&args, &keypair, &client).await?;
+            // Signed over the target as sent, so each caller-supplied component is
+            // percent-encoded: a raw `/` or `?` would retarget the owner-signed read.
+            let owner = urlencoding::encode(&owner);
+            let repo = urlencoding::encode(repo);
             let resp = crate::http::read_json(
                 client
                     .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
@@ -2789,6 +2809,73 @@ mod tests {
         .expect("pr_view must send signed requests");
         pr.assert_async().await;
         reviews.assert_async().await;
+    }
+
+    /// A `name`/`repo` argument carrying `/` or `?` must stay one encoded path
+    /// segment on the signed request. Raw interpolation let `myrepo/hooks` or
+    /// `myrepo/hooks?x=` retarget an owner-signed read at the webhook endpoint.
+    #[tokio::test]
+    async fn test_signed_mcp_reads_encode_path_segments() {
+        let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+            (
+                "repo_get",
+                json!({"name": "myrepo/hooks?x=", "owner": "alice"}),
+                vec!["/api/v1/repos/alice/myrepo%2Fhooks%3Fx%3D"],
+            ),
+            (
+                "repo_commits",
+                json!({"name": "myrepo/hooks?x=", "owner": "alice"}),
+                vec!["/api/v1/repos/alice/myrepo%2Fhooks%3Fx%3D/commits"],
+            ),
+            (
+                "pr_list",
+                json!({"repo": "myrepo/hooks?x=", "owner": "alice"}),
+                vec!["/api/v1/repos/alice/myrepo%2Fhooks%3Fx%3D/pulls"],
+            ),
+            (
+                "pr_diff",
+                json!({"repo": "myrepo/hooks?x=", "owner": "alice", "number": 1}),
+                vec!["/api/v1/repos/alice/myrepo%2Fhooks%3Fx%3D/pulls/1/diff"],
+            ),
+            (
+                "pr_view",
+                json!({"repo": "myrepo/hooks?x=", "owner": "alice", "number": 1}),
+                vec![
+                    "/api/v1/repos/alice/myrepo%2Fhooks%3Fx%3D/pulls/1",
+                    "/api/v1/repos/alice/myrepo%2Fhooks%3Fx%3D/pulls/1/reviews",
+                ],
+            ),
+        ];
+        for (tool, args, paths) in cases {
+            let mut server = mockito::Server::new_async().await;
+            let dir = tempfile::TempDir::new().unwrap();
+            let kp = gitlawb_core::identity::Keypair::generate();
+            std::fs::write(
+                dir.path().join("identity.pem"),
+                kp.to_pem().unwrap().as_bytes(),
+            )
+            .unwrap();
+            let mut mocks = Vec::new();
+            for path in &paths {
+                mocks.push(
+                    server
+                        .mock("GET", *path)
+                        .match_request(crate::http::signature_binds_wire_target)
+                        .with_status(200)
+                        .with_header("content-type", "application/json")
+                        .with_body(r#"{"diff":"d","reviews":[],"commits":[]}"#)
+                        .expect(1)
+                        .create_async()
+                        .await,
+                );
+            }
+            call_tool(tool, args, &server.url(), Some(dir.path()))
+                .await
+                .unwrap_or_else(|e| panic!("{tool} must sign the encoded target: {e:#}"));
+            for m in mocks {
+                m.assert_async().await;
+            }
+        }
     }
 
     /// With `owner` omitted and an identity present, the path owner must be the
