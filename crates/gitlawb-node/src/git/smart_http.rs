@@ -1948,14 +1948,21 @@ mod tests {
                 .env("FAKE_GIT_SETTLE", "1")
                 .status()
             {
-                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                Ok(status) if status.success() => return path,
+                Err(e)
+                    if e.raw_os_error() == Some(ETXTBSY)
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                _ => return path,
+                other => panic!(
+                    "fake git settle probe failed: {other:?}: {}",
+                    path.display()
+                ),
             }
         }
         panic!(
-            "fake git still ETXTBSY after 100 attempts: {}",
+            "fake git still busy or unspawnable after 100 attempts: {}",
             path.display()
         );
     }
