@@ -1,6 +1,6 @@
 //! HTTP Signatures (RFC 9421) for gitlawb.
 //!
-//! Every write request to a gitlawb node must be signed by the actor's
+//! Every write request to a Twigpine node must be signed by the actor's
 //! Ed25519 private key. The signature covers:
 //!   - `@method`         — HTTP method (uppercase)
 //!   - `@path`           — request path and query
@@ -8,30 +8,48 @@
 //!
 //! RFC 9421 headers produced by `sign_request`:
 //!   Content-Digest:   sha-256=:base64hash:
-//!   Signature-Input:  sig1=("@method" "@path" "content-digest");keyid="did:key:z6Mk...";alg="ed25519";created=<unix>
+//!   Signature-Input:  sig1=("@method" "@path" "content-digest");keyid="did:key:z6Mk...";alg="ed25519";created=<unix>;nonce="<32 hex chars>"
 //!   Signature:        sig1=:base64signature:
+//!
+//! The `nonce` is a per-request 128-bit value. It sits in the parameter tail,
+//! which is what `@signature-params` is built from, so it is covered by the
+//! signature without appearing in the covered-component list.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::Utc;
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::did::Did;
 use crate::identity::Keypair;
 use crate::{Error, Result};
 
-/// The component identifiers covered by every gitlawb signature.
+/// The component identifiers covered by every Twigpine signature.
 pub const COVERED_COMPONENTS: &[&str] = &["@method", "@path", "content-digest"];
+
+/// How old a signature may be and still verify.
+///
+/// Do not shrink this without measuring large-pack pushes: the verifier
+/// buffers the entire request body before checking `created`, so a multi-GB
+/// pack spends its upload time inside this budget.
+pub const MAX_SIGNATURE_AGE_SECS: i64 = 300;
+
+/// How far into the future a signature's `created` may sit. Absorbs ordinary
+/// clock skew without letting a signer pre-date its way to a wider window.
+pub const MAX_FUTURE_SKEW_SECS: i64 = 30;
 
 /// The three headers produced by RFC 9421 signing.
 #[derive(Debug, Clone)]
 pub struct SignedHeaders {
     /// `Content-Digest: sha-256=:base64:`
     pub content_digest: String,
-    /// `Signature-Input: sig1=(...);keyid="...";alg="ed25519";created=<unix>`
+    /// `Signature-Input: sig1=(...);keyid="...";alg="ed25519";created=<unix>;nonce="..."`
     pub signature_input: String,
     /// `Signature: sig1=:base64:`
     pub signature: String,
+    /// The per-request nonce carried in `Signature-Input`.
+    pub nonce: String,
 }
 
 /// A parsed RFC 9421 signature (from Signature-Input + Signature headers).
@@ -42,6 +60,8 @@ pub struct HttpSignature {
     pub created: i64,
     pub components: Vec<String>,
     pub signature_bytes: Vec<u8>,
+    /// The `nonce` param, absent on signatures from a pre-nonce signer.
+    pub nonce: Option<String>,
 }
 
 impl HttpSignature {
@@ -64,14 +84,32 @@ impl HttpSignature {
             .find(')')
             .ok_or_else(|| Error::HttpSignature("missing ')' in Signature-Input".into()))?;
 
+        // Both parentheses are located independently, so a header carrying them
+        // out of order (`sig1=)(`) would build a reversed range and panic. This
+        // runs on unauthenticated header text, so it has to be a rejection.
+        if close < open {
+            return Err(Error::HttpSignature(
+                "'(' must precede ')' in Signature-Input".into(),
+            ));
+        }
+
         let components_str = &rest[open + 1..close];
         let params_str = &rest[close + 1..]; // starts with ';'
 
-        // "\"@method\" \"@path\" \"content-digest\"" → ["@method", "@path", "content-digest"]
-        let components: Vec<String> = components_str
-            .split_whitespace()
-            .map(|s| s.trim_matches('"').to_string())
-            .collect();
+        // RFC 9421 §2.1: a component identifier appears at most once. Gitlawb
+        // only supports bare names; parameters are rejected so reordered
+        // equivalent forms cannot bypass duplicate detection as distinct strings.
+        let mut components = Vec::new();
+        let mut seen = HashSet::new();
+        for token in components_str.split_whitespace() {
+            let name = parse_covered_component(token)?;
+            if !seen.insert(name.clone()) {
+                return Err(Error::HttpSignature(format!(
+                    "duplicate covered component '{name}' in Signature-Input"
+                )));
+            }
+            components.push(name);
+        }
 
         let params = parse_params(params_str)?;
 
@@ -93,6 +131,9 @@ impl HttpSignature {
             .parse()
             .map_err(|_| Error::HttpSignature("invalid created timestamp".into()))?;
 
+        // Optional: absent on signatures from a signer that predates the nonce.
+        let nonce = params.get("nonce").map(|v| v.trim_matches('"').to_string());
+
         // Signature: sig1=:base64bytes:
         let sig_b64 = sig_header
             .trim()
@@ -110,18 +151,53 @@ impl HttpSignature {
             created,
             components,
             signature_bytes,
+            nonce,
         })
     }
 
-    /// Reject if the `created` timestamp is more than 5 minutes from now.
+    /// Reject a `created` timestamp outside the acceptance window, which is
+    /// ASYMMETRIC: up to [`MAX_SIGNATURE_AGE_SECS`] into the past, but only
+    /// [`MAX_FUTURE_SKEW_SECS`] into the future.
+    ///
+    /// The two directions are two comparisons rather than one distance, because
+    /// they are not the same event. A signature that arrives late is ordinary:
+    /// clocks run slow, requests queue, and networks are not instant, so the
+    /// past side keeps the full 300-second allowance. A signature stamped ahead
+    /// of this node's clock is not ordinary, and folding both sides into an
+    /// `abs()` let a signer extend its own validity: signed at T with
+    /// `created = T + 300`, it stayed acceptable until roughly T + 600, so the
+    /// effective window was double the one this function advertises. The
+    /// forward tolerance exists only to absorb honest drift between two hosts,
+    /// and is [`MAX_FUTURE_SKEW_SECS`]. The ledger's retention window is
+    /// derived from both bounds, so what the verifier accepts and what the
+    /// ledger remembers cannot disagree.
     pub fn check_created(&self) -> Result<()> {
+        const MAX_AGE_SECS: i64 = MAX_SIGNATURE_AGE_SECS;
+        const MAX_FUTURE_SECS: i64 = MAX_FUTURE_SKEW_SECS;
+
         let now = Utc::now().timestamp();
-        let skew = (now - self.created).abs();
-        if skew > 300 {
+
+        // Saturating, not plain subtraction. `created` is parsed as an
+        // unrestricted i64 straight from the Signature-Input header, so a
+        // sender picks it: at i64::MIN the past-side subtraction overflows,
+        // which panics a debug build and wraps a release one into an absurd
+        // value that can read as acceptable. Saturating gives the answer the
+        // check wants at both extremes, since a timestamp that far away is
+        // refused by whichever side it saturates toward.
+        let age = now.saturating_sub(self.created);
+        if age > MAX_AGE_SECS {
             return Err(Error::HttpSignature(format!(
-                "clock skew too large: {skew}s (max 300s)"
+                "clock skew too large: created {age}s in the past (max {MAX_AGE_SECS}s)"
             )));
         }
+
+        let ahead = self.created.saturating_sub(now);
+        if ahead > MAX_FUTURE_SECS {
+            return Err(Error::HttpSignature(format!(
+                "clock skew too large: created {ahead}s in the future (max {MAX_FUTURE_SECS}s)"
+            )));
+        }
+
         Ok(())
     }
 
@@ -158,6 +234,36 @@ pub fn build_signing_string(
     Ok(lines.join("\n"))
 }
 
+/// Render `COVERED_COMPONENTS` as the parenthesised component list that goes
+/// inside `Signature-Input`, e.g. `"@method" "@path" "content-digest"`.
+///
+/// Both the wire header and [`build_signing_string`]'s input are built from
+/// this one source. Writing the list out by hand in the header while passing
+/// the const to the signing-string builder lets a client sign over one set
+/// while advertising another, which no verifier can reconcile.
+fn covered_components_list() -> String {
+    COVERED_COMPONENTS
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The request-derived value for every component this signer knows how to
+/// cover. Kept alongside [`covered_components_list`] so the guard test can
+/// check the two agree without signing anything.
+fn request_values_for(
+    method: &str,
+    path_and_query: &str,
+    content_digest: &str,
+) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    values.insert("@method".to_string(), method.to_uppercase());
+    values.insert("@path".to_string(), path_and_query.to_string());
+    values.insert("content-digest".to_string(), content_digest.to_string());
+    values
+}
+
 /// Sign an HTTP request per RFC 9421 and return the three headers to inject.
 pub fn sign_request(
     keypair: &Keypair,
@@ -169,22 +275,32 @@ pub fn sign_request(
     let content_digest = compute_content_digest(body);
     let did = keypair.did();
 
-    // Full Signature-Input header value
+    // Full Signature-Input header value. The advertised component list is
+    // derived from COVERED_COMPONENTS rather than written out, so the wire
+    // header and the list we actually sign over cannot drift apart.
+    let advertised = covered_components_list();
+    // 128 bits from the OS CSPRNG, appended to the parameter tail. The tail is
+    // sliced into `sig_params_value` below and so lands in the
+    // `@signature-params` line, which puts the nonce under the signature
+    // (RFC 9421 §2.3) without touching COVERED_COMPONENTS. Verifiers that
+    // predate the nonce rebuild `@signature-params` from the received header
+    // text, so they keep verifying an unknown parameter unchanged.
+    let nonce = generate_nonce();
     let signature_input = format!(
-        r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+        r#"sig1=({advertised});keyid="{did}";alg="ed25519";created={created};nonce="{nonce}""#
     );
 
     // The @signature-params component value is the part after "sig1="
     let sig_params_value = &signature_input["sig1=".len()..];
 
-    let mut request_values = HashMap::new();
-    request_values.insert("@method".to_string(), method.to_uppercase());
-    request_values.insert("@path".to_string(), path_and_query.to_string());
-    request_values.insert("content-digest".to_string(), content_digest.clone());
+    let request_values = request_values_for(method, path_and_query, &content_digest);
 
+    // Guarded by `sign_request_supplies_every_covered_component`: that test
+    // fails cleanly if COVERED_COMPONENTS gains an entry `request_values_for`
+    // cannot supply, which is the only way this could fail.
     let signing_string =
         build_signing_string(COVERED_COMPONENTS, sig_params_value, &request_values)
-            .expect("required components always present when building");
+            .expect("request_values_for covers COVERED_COMPONENTS (see guard test)");
 
     let sig_bytes = keypair.sign(signing_string.as_bytes());
     let sig_b64 = STANDARD.encode(sig_bytes.to_bytes());
@@ -193,7 +309,15 @@ pub fn sign_request(
         content_digest,
         signature_input,
         signature: format!("sig1=:{sig_b64}:"),
+        nonce,
     }
+}
+
+/// Draw a fresh 128-bit nonce from the OS CSPRNG, hex-encoded.
+fn generate_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 /// Compute RFC 9421 Content-Digest value: `sha-256=:base64(sha256(body)):`
@@ -201,6 +325,33 @@ pub fn compute_content_digest(body: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(body);
     format!("sha-256=:{}:", STANDARD.encode(hasher.finalize()))
+}
+
+/// Parse one covered-component token from Signature-Input's parenthesized list.
+///
+/// Gitlawb only supports bare component names (`"@method"`, `"@path"`,
+/// `"content-digest"`). RFC 9421 permits parameters on identifiers; they are
+/// rejected rather than accepted in a form `missing_components()` and
+/// `build_signing_string()` cannot handle consistently.
+fn parse_covered_component(token: &str) -> Result<String> {
+    let token = token.trim();
+    let open = token
+        .strip_prefix('"')
+        .ok_or_else(|| Error::HttpSignature("component must be a quoted string".into()))?;
+    let close = open
+        .find('"')
+        .ok_or_else(|| Error::HttpSignature("unterminated component string".into()))?;
+    let name = &open[..close];
+    if name.is_empty() {
+        return Err(Error::HttpSignature("empty component name".into()));
+    }
+    let trailing = open[close + 1..].trim();
+    if !trailing.is_empty() {
+        return Err(Error::HttpSignature(format!(
+            "component parameters are not supported on '{name}'"
+        )));
+    }
+    Ok(name.to_string())
 }
 
 /// Parse `;key="value";key2=value` parameter string into a map.
@@ -272,6 +423,91 @@ mod tests {
         assert!(missing.contains(&"content-digest"));
     }
 
+    /// RFC 9421 §2.1: a component identifier must not appear twice in the
+    /// covered list. Repeating one is not a way to say anything, but it does
+    /// repeat a line in the signing string, so the size of what a verifier
+    /// builds (and what a node persists alongside a claim) is set by how many
+    /// times the caller chose to write the same name.
+    #[test]
+    fn parse_rejects_component_parameters() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "content-digest";sf);keyid="{did}";alg="ed25519";created=1000"#
+        );
+        let err = HttpSignature::parse(
+            &sig_input,
+            "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:",
+        )
+        .expect_err("parameterized components must be refused");
+        assert!(
+            err.to_string().contains("component parameters"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_reordered_equivalent_component_parameters() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("content-digest";sf;tr "content-digest";tr;sf "@method" "@path");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        let err = HttpSignature::parse(
+            &sig_input,
+            "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:",
+        )
+        .expect_err("reordered equivalent parameters must not bypass as distinct components");
+        assert!(
+            err.to_string().contains("component parameters"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_many_distinct_components_completes_quickly() {
+        use std::time::{Duration, Instant};
+
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let names: Vec<String> = (0..20_000).map(|i| format!("\"c{i}\"")).collect();
+        let inner = names.join(" ");
+        let sig_input = format!(r#"sig1=({inner});keyid="{did}";alg="ed25519";created=1000"#);
+        let start = Instant::now();
+        let result = HttpSignature::parse(
+            &sig_input,
+            "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:",
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "duplicate tracking must stay linear, took {elapsed:?}"
+        );
+        assert!(result.is_ok(), "distinct names should parse: {:?}", result);
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_components() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        let err = HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:")
+            .expect_err("a repeated component must be refused");
+        assert!(
+            err.to_string().contains("duplicate"),
+            "the error must name the duplication, got: {err}"
+        );
+
+        // The control: the same list without the repeat still parses.
+        let ok = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        HttpSignature::parse(&ok, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:")
+            .expect("a distinct component list must still parse");
+    }
+
     #[test]
     fn verify_signature_end_to_end() {
         use crate::identity::verify;
@@ -323,6 +559,95 @@ mod tests {
         assert!(d.len() > 12);
     }
 
+    /// U1 guard: the component list on the wire must be exactly what we sign
+    /// over. Load-bearing by mutation, not by red-then-green: adding a fourth
+    /// entry to COVERED_COMPONENTS turns this red.
+    #[test]
+    fn signature_input_advertises_exactly_covered_components() {
+        let kp = Keypair::generate();
+        let headers = sign_request(&kp, "POST", "/api/test", b"body");
+        let parsed = HttpSignature::parse(&headers.signature_input, &headers.signature)
+            .expect("emitted Signature-Input must parse");
+        assert_eq!(
+            parsed.components, COVERED_COMPONENTS,
+            "the advertised component list drifted from COVERED_COMPONENTS"
+        );
+    }
+
+    /// U1 guard: every covered component must have a request-derived value.
+    /// This is the check that fails *cleanly* when COVERED_COMPONENTS grows,
+    /// instead of letting sign_request panic inside build_signing_string.
+    #[test]
+    fn sign_request_supplies_every_covered_component() {
+        let values = request_values_for("POST", "/api/test", "sha-256=:abc:");
+        let missing: Vec<&str> = COVERED_COMPONENTS
+            .iter()
+            .copied()
+            .filter(|c| !values.contains_key(*c))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "COVERED_COMPONENTS entries with no value in request_values_for: {missing:?}. \
+             sign_request would panic on every call; add the value or drop the component."
+        );
+    }
+
+    /// U3 boundary: the forward bound is real and tight.
+    #[test]
+    fn future_dated_created_outside_skew_is_rejected() {
+        let kp = Keypair::generate();
+        let mut headers = sign_request(&kp, "GET", "/api/v1/agents", b"");
+        let future = Utc::now().timestamp() + MAX_FUTURE_SKEW_SECS + 1;
+        headers.signature_input = headers
+            .signature_input
+            .split(";created=")
+            .next()
+            .map(|head| format!("{head};created={future}"))
+            .expect("signature_input carries created");
+        let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert!(
+            sig.check_created().is_err(),
+            "created beyond the forward skew allowance must be rejected"
+        );
+    }
+
+    /// U3 boundary: just inside the forward allowance still verifies, so the
+    /// bound absorbs real clock skew rather than being effectively zero.
+    #[test]
+    fn future_dated_created_within_skew_is_accepted() {
+        let kp = Keypair::generate();
+        let mut headers = sign_request(&kp, "GET", "/api/v1/agents", b"");
+        let future = Utc::now().timestamp() + MAX_FUTURE_SKEW_SECS - 1;
+        headers.signature_input = headers
+            .signature_input
+            .split(";created=")
+            .next()
+            .map(|head| format!("{head};created={future}"))
+            .expect("signature_input carries created");
+        let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert!(sig.check_created().is_ok(), "within skew must be accepted");
+    }
+
+    /// U3 regression: the backward budget must not be narrowed. A large pack
+    /// spends this long uploading before check_created ever runs.
+    #[test]
+    fn backward_budget_still_accepts_a_nearly_stale_signature() {
+        let kp = Keypair::generate();
+        let mut headers = sign_request(&kp, "POST", "/api/test", b"body");
+        let old = Utc::now().timestamp() - (MAX_SIGNATURE_AGE_SECS - 20);
+        headers.signature_input = headers
+            .signature_input
+            .split(";created=")
+            .next()
+            .map(|head| format!("{head};created={old}"))
+            .expect("signature_input carries created");
+        let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert!(
+            sig.check_created().is_ok(),
+            "a signature well inside the age budget must still verify"
+        );
+    }
+
     #[test]
     fn clock_skew_rejection() {
         let kp = Keypair::generate();
@@ -335,12 +660,101 @@ mod tests {
         assert!(sig.check_created().is_err());
     }
 
+    /// Build a parseable signature whose `created` is `offset` seconds from now
+    /// (negative for the past), so a test can pin one side of the window.
+    fn sig_created_at_offset(offset: i64) -> HttpSignature {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let created = Utc::now().timestamp() + offset;
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+        );
+        HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap()
+    }
+
+    /// Build a signature at an ABSOLUTE `created`, so a test can drive the
+    /// extremes an offset from now cannot reach.
+    fn sig_created_absolute(created: i64) -> HttpSignature {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+        );
+        HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap()
+    }
+
+    /// `created` is parsed as an unrestricted i64 from a header the sender
+    /// writes, so the window check has to survive both ends of the type. Before
+    /// the saturating form this panicked with "attempt to subtract with
+    /// overflow" on the past side, which is a debug-build crash any client
+    /// could trigger by sending one header value.
+    #[test]
+    fn extreme_created_values_are_refused_rather_than_overflowing() {
+        for created in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+            let err = sig_created_absolute(created)
+                .check_created()
+                .expect_err("an extreme created must be refused, not accepted");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("past") || msg.contains("future"),
+                "created={created} must be refused by a named direction, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn created_301s_in_past_rejected() {
+        let err = sig_created_at_offset(-301).check_created().unwrap_err();
+        assert!(err.to_string().contains("past"), "{err}");
+    }
+
+    #[test]
+    fn created_299s_in_past_accepted() {
+        assert!(sig_created_at_offset(-299).check_created().is_ok());
+    }
+
+    #[test]
+    fn created_61s_in_future_rejected() {
+        let err = sig_created_at_offset(61).check_created().unwrap_err();
+        assert!(err.to_string().contains("future"), "{err}");
+    }
+
+    #[test]
+    fn created_30s_in_future_accepted() {
+        assert!(sig_created_at_offset(30).check_created().is_ok());
+    }
+
+    #[test]
+    fn created_exactly_now_accepted() {
+        assert!(sig_created_at_offset(0).check_created().is_ok());
+    }
+
     #[test]
     fn fresh_signature_passes_clock_skew() {
         let kp = Keypair::generate();
         let headers = sign_request(&kp, "GET", "/api/v1/agents", b"");
         let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
         assert!(sig.check_created().is_ok());
+    }
+
+    #[test]
+    fn extreme_created_timestamps_reject_without_wrapping() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let parse = |created: i64| {
+            let sig_input =
+                format!(r#"sig1=("@method");keyid="{did}";alg="ed25519";created={created}"#);
+            HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap()
+        };
+        // i64::MIN used to panic in debug (subtraction overflow) and wrap to a
+        // passing skew in release; now - 2^63 wrapped to i64::MIN, whose abs()
+        // wrapped back to itself and read as fresh. Both must reject.
+        for created in [i64::MIN, i64::MAX, Utc::now().timestamp() - i64::MAX] {
+            assert!(
+                parse(created).check_created().is_err(),
+                "created={created} must not pass the freshness gate"
+            );
+        }
     }
 
     #[test]
@@ -382,6 +796,172 @@ mod tests {
         let d1 = compute_content_digest(b"body one");
         let d2 = compute_content_digest(b"body two");
         assert_ne!(d1, d2);
+    }
+
+    /// U2: the nonce is per-call, so two signatures over an identical request
+    /// differ and so do the `Signature-Input` values they were computed over.
+    #[test]
+    fn two_signatures_over_an_identical_request_differ() {
+        let kp = Keypair::generate();
+        let a = sign_request(&kp, "POST", "/api/register", b"same body");
+        let b = sign_request(&kp, "POST", "/api/register", b"same body");
+
+        assert_ne!(
+            a.nonce, b.nonce,
+            "each sign_request call must draw a fresh nonce"
+        );
+        assert_ne!(
+            a.signature_input, b.signature_input,
+            "the nonce must reach the wire header, not just the struct"
+        );
+        assert_ne!(
+            a.signature, b.signature,
+            "a covered nonce must change the signature bytes"
+        );
+    }
+
+    /// U2: `parse` round-trips the nonce, and a nonce-less header still parses.
+    #[test]
+    fn parse_exposes_nonce_and_tolerates_its_absence() {
+        let kp = Keypair::generate();
+        let headers = sign_request(&kp, "POST", "/api/register", b"body");
+        let parsed = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert_eq!(
+            parsed.nonce.as_deref(),
+            Some(headers.nonce.as_str()),
+            "the parsed nonce must be the one that was signed, unquoted"
+        );
+
+        let did = kp.did();
+        let nonceless = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        let parsed = HttpSignature::parse(&nonceless, &headers.signature).unwrap();
+        assert_eq!(
+            parsed.nonce, None,
+            "a pre-U2 signer's header must parse with no nonce"
+        );
+    }
+
+    /// U2: 128 bits of entropy, hex-encoded.
+    #[test]
+    fn nonce_is_128_bits() {
+        let kp = Keypair::generate();
+        let headers = sign_request(&kp, "GET", "/api/v1/agents", b"");
+        let raw = hex::decode(&headers.nonce).expect("nonce must be hex");
+        assert_eq!(raw.len(), 16, "nonce must carry exactly 128 bits");
+    }
+
+    /// U2 backward compatibility, the load-bearing one: a nonce-bearing
+    /// signature still verifies through the same reconstruct-and-verify flow
+    /// the node runs, with no verifier change.
+    #[test]
+    fn nonce_bearing_signature_verifies_through_the_unchanged_flow() {
+        use crate::identity::verify;
+
+        let kp = Keypair::generate();
+        let body = b"{\"did\":\"did:key:z6Mk\"}";
+        let headers = sign_request(&kp, "POST", "/api/register", body);
+        assert!(
+            headers.signature_input.contains(";nonce=\""),
+            "this test is only meaningful once the header carries a nonce"
+        );
+
+        let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert_eq!(
+            sig.components, COVERED_COMPONENTS,
+            "the nonce must not disturb the covered-component list"
+        );
+
+        // Exactly what the node does: rebuild @signature-params from the
+        // received header text and verify over it.
+        let sig_params_value = headers.signature_input.strip_prefix("sig1=").unwrap();
+        let mut request_values = HashMap::new();
+        request_values.insert("@method".to_string(), "POST".to_string());
+        request_values.insert("@path".to_string(), "/api/register".to_string());
+        request_values.insert("content-digest".to_string(), headers.content_digest.clone());
+        let components_ref: Vec<&str> = sig.components.iter().map(String::as_str).collect();
+        let signing_string =
+            build_signing_string(&components_ref, sig_params_value, &request_values).unwrap();
+
+        let vk = sig.key_id.to_verifying_key().unwrap();
+        let sig_bytes: [u8; 64] = sig.signature_bytes.clone().try_into().unwrap();
+        assert!(
+            verify(&vk, signing_string.as_bytes(), &sig_bytes).is_ok(),
+            "a nonce-bearing signature must verify unchanged"
+        );
+
+        // And the nonce is genuinely covered: strip it and verification fails.
+        let without_nonce = sig_params_value
+            .split(";nonce=")
+            .next()
+            .unwrap()
+            .to_string();
+        let tampered =
+            build_signing_string(&components_ref, &without_nonce, &request_values).unwrap();
+        assert!(
+            verify(&vk, tampered.as_bytes(), &sig_bytes).is_err(),
+            "the nonce must be inside @signature-params, not decoration"
+        );
+    }
+
+    /// A `)` before the `(` must be rejected, not sliced backwards. The two
+    /// parentheses are found independently, so an out-of-order pair used to
+    /// build a reversed range and panic inside `parse` — reachable with two
+    /// headers and no credentials at all.
+    #[test]
+    fn reversed_parentheses_are_rejected_not_panicked() {
+        let err = HttpSignature::parse("sig1=)(", "sig1=:AAAA:")
+            .expect_err("reversed parentheses must return an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'(' must precede ')'"),
+            "expected the paren-ordering error, got: {msg}"
+        );
+    }
+
+    /// `parse` runs on attacker-controlled header text before any
+    /// authentication, so no input may reach a panic. Every entry here must
+    /// come back as `Err`; the test failing by panic is the case it exists for.
+    #[test]
+    fn malformed_signature_input_always_errors_never_panics() {
+        let did = Keypair::generate().did();
+        let long = format!("sig1=({}", "(".repeat(4096));
+        let cases: Vec<(&str, &str)> = vec![
+            ("", "sig1=:AAAA:"),
+            ("sig1=", "sig1=:AAAA:"),
+            ("sig1=()", "sig1=:AAAA:"),
+            ("sig1=)(", "sig1=:AAAA:"),
+            ("sig1=(", "sig1=:AAAA:"),
+            ("sig1=)", "sig1=:AAAA:"),
+            ("sig1=))((", "sig1=:AAAA:"),
+            ("sig1=;", "sig1=:AAAA:"),
+            (";", "sig1=:AAAA:"),
+            ("sig1=)(", ""),
+            ("sig1=)(", "sig1=:not base64!:"),
+            ("sig1=(\"@method\");created=notanumber", "sig1=:AAAA:"),
+            ("sig1=(\"@method\");created=", "sig1=:AAAA:"),
+            ("sig1=(é)é;created=1000", "sig1=:AAAA:"),
+            ("sig1=)é(", "sig1=:AAAA:"),
+            ("sig1=é)(é", "sig1=:AAAA:"),
+            (&long, "sig1=:AAAA:"),
+        ];
+
+        for (input, header) in cases {
+            let out = HttpSignature::parse(input, header);
+            assert!(
+                out.is_err(),
+                "malformed Signature-Input {input:?} parsed successfully"
+            );
+        }
+
+        // An unbalanced quote inside an otherwise well-formed header is still
+        // malformed: the component parser refuses an unterminated string.
+        let unbalanced = format!(r#"sig1=("@method);keyid="{did}";alg="ed25519";created=1000"#);
+        assert!(
+            HttpSignature::parse(&unbalanced, "sig1=:AAAA:").is_err(),
+            "an unterminated component string must be a parse error"
+        );
     }
 
     #[test]

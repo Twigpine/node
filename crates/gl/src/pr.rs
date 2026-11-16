@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -35,7 +35,11 @@ pub enum PrCmd {
         /// Repo owner DID short key (defaults to your DID — use when opening a PR on another user's repo)
         #[arg(long)]
         owner: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -44,7 +48,11 @@ pub enum PrCmd {
     List {
         /// Repository name
         repo: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -55,7 +63,11 @@ pub enum PrCmd {
         repo: String,
         /// PR number
         number: u64,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -66,7 +78,11 @@ pub enum PrCmd {
         repo: String,
         /// PR number
         number: u64,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -77,7 +93,11 @@ pub enum PrCmd {
         repo: String,
         /// PR number
         number: u64,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -94,7 +114,11 @@ pub enum PrCmd {
         /// Review body
         #[arg(long, short)]
         body: Option<String>,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -108,7 +132,11 @@ pub enum PrCmd {
         /// Comment body
         #[arg(long, short)]
         body: String,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -119,7 +147,11 @@ pub enum PrCmd {
         repo: String,
         /// PR number
         number: u64,
-        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        #[arg(
+            long,
+            default_value = "https://node.twigpine.com",
+            env = "GITLAWB_NODE"
+        )]
         node: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -233,13 +265,7 @@ async fn cmd_create(
         .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &payload)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let pr: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = pr["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create PR failed ({status}): {msg}");
-    }
+    let pr: Value = json_or_denial("create PR", resp).await?;
 
     let number = pr["number"].as_i64().unwrap_or(0);
     println!("✓ Opened PR #{number}: {title}");
@@ -252,14 +278,17 @@ async fn cmd_create(
 async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
+    // The target is signed as sent: keep a `/` or `?` in `repo` one path segment.
+    let repo_seg = urlencoding::encode(&repo);
 
-    let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo_seg}/pulls"))
+            .await?,
+        "pull requests",
+    )
+    .await?;
 
     let prs = resp["pulls"].as_array().cloned().unwrap_or_default();
     if prs.is_empty() {
@@ -278,7 +307,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         let author_short = author
             .split(':')
             .next_back()
-            .map(|s| &s[..s.len().min(8)])
+            .map(|s| crate::text::truncate(s, 8))
             .unwrap_or("?");
         let status_icon = match status {
             "open" => "○",
@@ -296,14 +325,17 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
+    // The target is signed as sent: keep a `/` or `?` in `repo` one path segment.
+    let repo_seg = urlencoding::encode(&repo);
 
-    let pr: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let pr = crate::http::read_json(
+        client
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo_seg}/pulls/{number}"))
+            .await?,
+        "pull request",
+    )
+    .await?;
 
     let title = pr["title"].as_str().unwrap_or("?");
     let status = pr["status"].as_str().unwrap_or("?");
@@ -321,15 +353,25 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     }
 
     // Show reviews
-    let reviews: Value = client
-        .get(&format!(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
-        ))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
-    let reviews = reviews["reviews"].as_array().cloned().unwrap_or_default();
+    // A denied sub-fetch degrades this section rather than aborting: the header
+    // above has already printed, so a bare `?` here leaves a half-rendered PR and
+    // skips the comments below it. Mirrors `gl status`'s unavailable-section line.
+    let reviews = match crate::http::read_json(
+        client
+            .get_maybe_signed(&format!(
+                "/api/v1/repos/{owner}/{repo_seg}/pulls/{number}/reviews"
+            ))
+            .await?,
+        "reviews",
+    )
+    .await
+    {
+        Ok(v) => v["reviews"].as_array().cloned().unwrap_or_default(),
+        Err(e) => {
+            println!("\nReviews unavailable ({e})");
+            Vec::new()
+        }
+    };
     if !reviews.is_empty() {
         println!("\nReviews ({}):", reviews.len());
         for r in &reviews {
@@ -337,7 +379,7 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
             let reviewer_short = reviewer
                 .split(':')
                 .next_back()
-                .map(|s| &s[..s.len().min(8)])
+                .map(|s| crate::text::truncate(s, 8))
                 .unwrap_or("?");
             let rstatus = r["status"].as_str().unwrap_or("?");
             let rbody = r["body"].as_str().unwrap_or("");
@@ -354,15 +396,22 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     }
 
     // Show comments
-    let comments: Value = client
-        .get(&format!(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
-        ))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
-    let comments = comments["comments"].as_array().cloned().unwrap_or_default();
+    let comments = match crate::http::read_json(
+        client
+            .get_maybe_signed(&format!(
+                "/api/v1/repos/{owner}/{repo_seg}/pulls/{number}/comments"
+            ))
+            .await?,
+        "comments",
+    )
+    .await
+    {
+        Ok(v) => v["comments"].as_array().cloned().unwrap_or_default(),
+        Err(e) => {
+            println!("\nComments unavailable ({e})");
+            Vec::new()
+        }
+    };
     if !comments.is_empty() {
         println!("\nComments ({}):", comments.len());
         for c in &comments {
@@ -370,10 +419,13 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
             let author_short = author
                 .split(':')
                 .next_back()
-                .map(|s| &s[..s.len().min(8)])
+                .map(|s| crate::text::truncate(s, 8))
                 .unwrap_or("?");
             let cbody = c["body"].as_str().unwrap_or("");
-            let created = c["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
+            let created = c["created_at"]
+                .as_str()
+                .map(|s| crate::text::truncate(s, 10))
+                .unwrap_or("?");
             println!("  · {author_short} ({created})");
             println!("    {cbody}");
         }
@@ -384,14 +436,19 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
 async fn cmd_diff(repo: String, number: u64, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
+    // The target is signed as sent: keep a `/` or `?` in `repo` one path segment.
+    let repo_seg = urlencoding::encode(&repo);
 
-    let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get_maybe_signed(&format!(
+                "/api/v1/repos/{owner}/{repo_seg}/pulls/{number}/diff"
+            ))
+            .await?,
+        "diff",
+    )
+    .await?;
 
     let diff = resp["diff"].as_str().unwrap_or("");
     if diff.is_empty() {
@@ -415,17 +472,11 @@ async fn cmd_merge(repo: String, number: u64, node: String, dir: Option<PathBuf>
         )
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("merge failed ({status}): {msg}");
-    }
+    let result: Value = json_or_denial("merge", resp).await?;
 
     let sha = result["merge_sha"].as_str().unwrap_or("?");
     println!("✓ Merged PR #{number}");
-    println!("  Merge commit: {}", &sha[..sha.len().min(12)]);
+    println!("  Merge commit: {}", crate::text::truncate(sha, 12));
     Ok(())
 }
 
@@ -453,13 +504,7 @@ async fn cmd_review(
         )
         .await
         .context("failed to connect to node")?;
-    let code = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !code.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("review failed ({code}): {msg}");
-    }
+    json_or_denial::<Value>("review", resp).await?;
 
     let icon = match status.as_str() {
         "approved" => "✓",
@@ -489,13 +534,7 @@ async fn cmd_comment(
         )
         .await
         .context("failed to connect to node")?;
-    let code = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON")?;
-
-    if !code.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("comment failed ({code}): {msg}");
-    }
+    json_or_denial::<Value>("comment", resp).await?;
 
     println!("· Comment posted on PR #{number}");
     Ok(())
@@ -504,16 +543,19 @@ async fn cmd_comment(
 async fn cmd_comments(repo: String, number: u64, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
+    // The target is signed as sent: keep a `/` or `?` in `repo` one path segment.
+    let repo_seg = urlencoding::encode(&repo);
 
-    let resp: Value = client
-        .get(&format!(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
-        ))
-        .await?
-        .json()
-        .await
-        .context("invalid JSON")?;
+    let resp = crate::http::read_json(
+        client
+            .get_maybe_signed(&format!(
+                "/api/v1/repos/{owner}/{repo_seg}/pulls/{number}/comments"
+            ))
+            .await?,
+        "comments",
+    )
+    .await?;
 
     let comments = resp["comments"].as_array().cloned().unwrap_or_default();
     if comments.is_empty() {
@@ -527,10 +569,13 @@ async fn cmd_comments(repo: String, number: u64, node: String, dir: Option<PathB
         let author_short = author
             .split(':')
             .next_back()
-            .map(|s| &s[..s.len().min(8)])
+            .map(|s| crate::text::truncate(s, 8))
             .unwrap_or("?");
         let cbody = c["body"].as_str().unwrap_or("");
-        let created = c["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
+        let created = c["created_at"]
+            .as_str()
+            .map(|s| crate::text::truncate(s, 10))
+            .unwrap_or("?");
         println!("  · {author_short} ({created})");
         println!("    {cbody}");
         println!();
@@ -568,6 +613,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"pulls":[]}"#)
@@ -594,6 +642,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"pulls":[{"number":1,"title":"Add feature","status":"open","source_branch":"feat","target_branch":"main","author_did":"did:key:z6MkTest"}]}"#)
@@ -607,6 +658,39 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A repo argument carrying `/` must stay one path segment on the signed
+    /// request, not retarget it to a different endpoint.
+    #[tokio::test]
+    async fn test_cmd_list_encodes_the_repo_segment() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo%2Fhooks%3Fx%3D/pulls$".to_string(),
+                ),
+            )
+            .match_request(crate::http::signature_binds_wire_target)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"pulls":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        cmd_list(
+            "myrepo/hooks?x=".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -654,6 +738,7 @@ mod tests {
             .with_status(422)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"branch not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -671,6 +756,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("branch not found"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -684,6 +771,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/1$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"number":1,"title":"Fix it","status":"open","source_branch":"fix","target_branch":"main","author_did":"did:key:z6MkTest","body":"some body"}"#)
@@ -696,6 +786,9 @@ mod tests {
                     r"^/api/v1/repos/[^/]+/myrepo/pulls/1/reviews$".to_string(),
                 ),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"reviews":[]}"#)
@@ -708,6 +801,9 @@ mod tests {
                     r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string(),
                 ),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"comments":[]}"#)
@@ -722,6 +818,10 @@ mod tests {
         )
         .await
         .unwrap();
+        // cmd_view tolerates a failed sub-fetch, so success alone proves nothing
+        // about whether the reviews and comments requests were signed.
+        _m2.assert_async().await;
+        _m3.assert_async().await;
     }
 
     #[tokio::test]
@@ -768,6 +868,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"PR not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -781,6 +882,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("PR not found"), "got: {err}");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -796,6 +899,9 @@ mod tests {
                     r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string(),
                 ),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"comments":[]}"#)
@@ -823,6 +929,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/2/comments$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"comments":[{"id":"c1","pr_id":"pr1","author_did":"did:key:z6MkTest","body":"nice work","created_at":"2026-03-23T00:00:00Z"}]}"#)
@@ -864,5 +973,285 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+    // ── Gated PR reads surface node denials, not empty/stub renders (#123) ──
+
+    #[tokio::test]
+    async fn cmd_list_surfaces_denial_not_empty() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/pulls$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "cmd_list must Err on 404, not print 'No pull requests'"
+        );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_view_surfaces_denial_not_stub() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        // The PR fetch is first; a 404 there errors before the reviews/comments reads.
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/pulls/1$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_view(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "cmd_view must Err on 404, not print a stub PR"
+        );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_diff_surfaces_denial_not_empty() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/diff$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_diff(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "cmd_diff must Err on 404, not print 'No diff'"
+        );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_comments_surfaces_denial_not_empty() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/comments$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_comments(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(result.is_err(), "cmd_comments must Err on a gated 404");
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    // cmd_diff had no signing coverage, so the unsigned read (#115) was invisible
+    // here. An identity is supplied, so the request must be signed.
+    #[tokio::test]
+    async fn test_cmd_diff_signs_request() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/1/diff$".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"diff":"diff --git a/x b/x"}"#)
+            .create_async()
+            .await;
+
+        cmd_diff(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A denied sub-fetch must not abort `gl pr view` after the header has
+    /// already printed. The header is fatal; reviews and comments degrade.
+    #[tokio::test]
+    async fn cmd_view_continues_when_reviews_are_denied() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _pr = server
+            .mock("GET", mockito::Matcher::Regex(r"/pulls/1$".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"number":1,"title":"T","status":"open","source_branch":"a","target_branch":"main","author_did":"did:key:z6MkTest"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _reviews = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/reviews$".to_string()),
+            )
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"forbidden"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // The load-bearing assertion: this mock is only hit if rendering
+        // continued past the denied reviews fetch.
+        let _comments = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/comments$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"comments":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let r = cmd_view(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "cmd_view must finish rendering when reviews are denied"
+        );
+        _comments.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_view_continues_when_comments_are_denied() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _pr = server
+            .mock("GET", mockito::Matcher::Regex(r"/pulls/1$".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"number":1,"title":"T","status":"open","source_branch":"a","target_branch":"main","author_did":"did:key:z6MkTest"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _reviews = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/reviews$".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"reviews":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _comments = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/pulls/1/comments$".to_string()),
+            )
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"forbidden"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let r = cmd_view(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "cmd_view must finish rendering when comments are denied"
+        );
+        _comments.assert_async().await;
+    }
+
+    /// The must-not case: with no header there is nothing to render partially,
+    /// so a denied header stays fatal. Softening it would resurrect
+    /// denial-as-success for the whole command.
+    #[tokio::test]
+    async fn cmd_view_header_denial_stays_fatal() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _pr = server
+            .mock("GET", mockito::Matcher::Regex(r"/pulls/1$".to_string()))
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let r = cmd_view(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(r.is_err(), "a denied PR header must stay fatal");
+        _pr.assert_async().await;
     }
 }
