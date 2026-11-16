@@ -861,7 +861,9 @@ pub async fn consume_signature(
         .get::<SpendsSignatureInHandler>()
         .is_some()
     {
-        crate::metrics::record_signature_ledger("deferred_to_handler");
+        // No outcome here: `LedgerTicket::spend` records `admitted`, `replayed`
+        // or a refusal itself, so counting at the layer too would put one
+        // request in the series twice.
         return next.run(request).await;
     }
 
@@ -1406,6 +1408,38 @@ mod tests {
         assert!(
             ledger_metric("skipped_read") > before,
             "the read skip must be counted, or the outcomes do not sum to the layer's traffic"
+        );
+    }
+
+    /// A deferred route's handler spends through `LedgerTicket::spend`, which
+    /// records `admitted`/`replayed` itself. If the layer also counted the
+    /// request, the series would sum past the request count. No code may emit
+    /// `deferred_to_handler`: the counter is process-wide and pollution only
+    /// adds, so a nonzero value anywhere in the binary is the defect.
+    /// MUTATION (RED): restore `record_signature_ledger("deferred_to_handler")`
+    /// in the `SpendsSignatureInHandler` branch of `consume_signature`.
+    #[tokio::test]
+    async fn ledger_metrics_do_not_double_count_a_deferred_request() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+
+        let app = Router::new()
+            .route("/probe", axum::routing::post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                make_test_state(Keypair::generate().did()),
+                consume_signature,
+            ))
+            .layer(axum::Extension(SpendsSignatureInHandler));
+        let status = app
+            .oneshot(ledger_request(None))
+            .await
+            .expect("router response")
+            .status();
+
+        assert_eq!(status, StatusCode::OK, "a deferred route passes through");
+        assert_eq!(
+            ledger_metric("deferred_to_handler"),
+            0,
+            "the layer must leave the outcome to the handler's spend"
         );
     }
 

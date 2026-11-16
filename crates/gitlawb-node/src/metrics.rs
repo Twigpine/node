@@ -441,17 +441,19 @@ pub fn record_auth_failure(route: &str, reason: &str) {
 
 /// Record one terminal outcome of the spent-signature replay ledger layer.
 ///
-/// Every request that enters the layer lands on exactly one outcome, so the
-/// series sum is the layer's request count and any one outcome is a rate over
-/// it. `outcome` is a fixed set of literals chosen at the call sites in
-/// `auth::consume_signature` — never a DID, keyid, or path, which would be
-/// attacker-controlled and unbounded.
+/// Each request lands on at most one outcome, so any one outcome is a rate
+/// over the series sum. A route whose handler spends through `LedgerTicket`
+/// records at that spend; one refused before it (a read gate, a body
+/// extractor) records nothing, so the sum can fall below the layer's request
+/// count. `outcome` is a fixed set of literals chosen at the call sites in
+/// `auth::consume_signature` and `auth::spend_signature`, never a DID, keyid,
+/// or path, which would be attacker-controlled and unbounded.
 ///
-/// The sum is the LAYER's request count, not the routes' traffic. The per-client
-/// flood brake (`rate_limit`) rejects upstream of this layer, so its 429s appear
-/// in no series here even though they are served on the same routes. An operator
-/// counting refusals has to read `rate_limited` responses separately; this
-/// counter answers "what is the ledger doing", not "how many 429s went out".
+/// The per-client flood brake (`rate_limit`) rejects upstream of this layer, so
+/// its 429s appear in no series here even though they are served on the same
+/// routes. An operator counting refusals has to read `rate_limited` responses
+/// separately; this counter answers "what is the ledger doing", not "how many
+/// 429s went out".
 pub fn record_signature_ledger(outcome: &str) {
     if let Some(c) = SIGNATURE_LEDGER.get() {
         c.with_label_values(&[outcome]).inc();

@@ -1487,6 +1487,15 @@ fn validate_git_advertisement(bytes: &[u8]) -> Result<()> {
         if len < 4 || pos + len > bytes.len() {
             anyhow::bail!("git_refs failed (200): truncated pkt-line");
         }
+        // An `ERR` pkt-line is Git's in-band failure and may appear wherever a
+        // pkt-line is expected. It frames cleanly, so without this it parses
+        // into a ref named after the error text.
+        if let Some(msg) = bytes[pos + 4..pos + len].strip_prefix(b"ERR ") {
+            anyhow::bail!(
+                "git_refs failed (200): {}",
+                crate::http::sanitize_node_msg(&String::from_utf8_lossy(msg))
+            );
+        }
         pos += len;
     }
     if pos != bytes.len() {
@@ -3303,6 +3312,38 @@ mod tests {
         assert!(
             err.to_string().contains("empty response"),
             "the refusal must name the empty body, got: {err}"
+        );
+    }
+
+    /// A 200 whose pkt-lines carry a Git `ERR` packet must error with the
+    /// node's message, not parse into a fabricated ref (`sha: "ERR"`). The
+    /// packet is well-framed, so only a payload check refuses it. MUTATION
+    /// (RED): drop the `ERR ` branch in `validate_git_advertisement` and the
+    /// body returns a ref named after the error text.
+    #[tokio::test]
+    async fn test_git_refs_err_packet_errors_not_fabricated_ref() {
+        let mut server = mockito::Server::new_async().await;
+        let mut body = pkt_line(b"# service=git-upload-pack\n");
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(&pkt_line(b"ERR repository unavailable\n"));
+        let _m = server
+            .mock("GET", "/alice/gone/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "gone"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("an ERR packet must not parse as a ref");
+        assert!(
+            err.to_string().contains("repository unavailable"),
+            "the refusal must carry the node's message, got: {err}"
         );
     }
 
