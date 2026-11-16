@@ -117,7 +117,9 @@ fn doctor_with(env_node: Option<&str>, node_flag: Option<&str>, extra_env: &[(&s
     let out = cmd.output().unwrap();
     // Under a configured proxy the lookup goes to the proxy fixture, not this one,
     // so the fixture-boundary check only applies to the unproxied runs.
-    let proxied = extra_env.iter().any(|(k, _)| *k == "HTTP_PROXY");
+    let proxied = extra_env
+        .iter()
+        .any(|(k, _)| *k == "HTTP_PROXY" || *k == "GITLAWB_GITHUB_API_URL");
     assert!(
         proxied || release_hits.load(Ordering::SeqCst) >= 1,
         "the release lookup never reached the fixture, so it went to the public API"
@@ -460,5 +462,66 @@ fn an_apostrophe_in_the_node_value_cannot_break_out_of_the_remedy() {
     assert!(
         fix.contains(r#"'http://127.0.0.1:1/x'\''; touch /tmp/pwned; #'\'''"#),
         "apostrophes must be escaped, got: {fix:?}"
+    );
+}
+
+/// `GITLAWB_NODE` may carry a path prefix (a reverse-proxied `https://host/mount`),
+/// with identity served at exactly that prefix and nothing at `/mount/`. The probe
+/// must request the configured base verbatim, as the helper does.
+#[test]
+fn a_path_prefixed_transport_node_is_probed_at_its_exact_base() {
+    let (port, _) = serve(|_, head| {
+        if head.starts_with("GET /mount HTTP/1.1") {
+            did_ok()
+        } else {
+            http("404 Not Found", "", b"{}")
+        }
+    });
+    let r = doctor(
+        Some(&format!("http://127.0.0.1:{port}/mount")),
+        "http://127.0.0.1:1",
+    );
+    let line = r
+        .divergence_line()
+        .unwrap_or_else(|| panic!("no divergence row, got:\n{}", r.stdout));
+    assert!(line.contains("(reachable)"), "got: {line}");
+}
+
+/// A release tag from the configurable API source is untrusted text bound for the
+/// terminal. Controls and line breaks in it must not reach stdout.
+#[test]
+fn a_hostile_release_tag_cannot_reach_the_terminal_raw() {
+    let body = r#"{"tag_name":"v999.0.0\u001b]0;RELEASE-CONTROL\u0007\nspoofed-row\u202e"}"#;
+    let (api, hits) = serve(move |_, _| {
+        http(
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            body.as_bytes(),
+        )
+    });
+    let r = doctor_with(
+        None,
+        Some("http://127.0.0.1:1"),
+        &[("GITLAWB_GITHUB_API_URL", &format!("http://127.0.0.1:{api}"))],
+    );
+    assert!(hits.load(Ordering::SeqCst) >= 1, "fixture never hit");
+    assert!(
+        r.stdout.contains("v999.0.0"),
+        "the version row must still show the tag:\n{}",
+        r.stdout
+    );
+    for bad in ['\u{1b}', '\u{7}', '\u{202e}'] {
+        assert!(
+            !r.stdout.contains(bad),
+            "control {bad:?} reached stdout:\n{:?}",
+            r.stdout
+        );
+    }
+    assert!(
+        !r.stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with("spoofed-row")),
+        "tag forged an output line:\n{}",
+        r.stdout
     );
 }

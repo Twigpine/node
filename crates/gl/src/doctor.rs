@@ -457,8 +457,10 @@ async fn probe_transport(url: &str) -> TransportVerdict {
             }
         }
     };
-    let target = format!("{}/", url.trim_end_matches('/'));
-    match client.get(&target).send().await {
+    // Request the configured base verbatim, as the helper's identity lookup does:
+    // a reverse-proxied `https://host/mount` serves identity at exactly `/mount`,
+    // and reqwest supplies the `/` for an origin-only URL.
+    match client.get(url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body = crate::http::read_body_capped(resp, PROBE_BODY_CAP).await;
             if body.truncated || body.read_failed {
@@ -679,7 +681,7 @@ async fn check_version(current: &'static str, github_api_base: &str) -> Check {
     if is_newer(tag, current) {
         Check::warn(
             "version",
-            format!("v{current} → v{tag} available"),
+            format!("v{current} → v{} available", sanitize_node_msg(tag)),
             "curl -sSf https://twigpine.com/install.sh | sh",
         )
     } else {
