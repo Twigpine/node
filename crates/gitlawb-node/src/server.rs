@@ -94,10 +94,27 @@ async fn graphql_playground() -> impl IntoResponse {
 /// to be accepted starts failing) and purely a memory fix.
 pub const SIGNED_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
-/// Applies the standard auth middleware pair to a router: HTTP Signature verification
-/// followed by UCAN chain validation. The two layers run in this order for every
-/// matched request: `require_signature` first (sets `AuthenticatedDid`), then
-/// `require_ucan_chain` (reads it).
+/// Applies the standard auth middleware stack to a router. Axum runs the LAST
+/// `.layer` first, so the three below run in this order for every matched
+/// request: `require_signature` (verifies the RFC 9421 signature, sets
+/// `AuthenticatedDid` and `SignatureIdentity`), then `require_ucan_chain`
+/// (reads the DID), then `consume_signature` (spends the signature).
+///
+/// The ledger runs last of the three on purpose. If it ran before
+/// `require_ucan_chain`, a request with a good signature but a rejected UCAN
+/// would burn its key and the client could not retry those exact bytes.
+/// Consuming before the handler, rather than inside it, is what closes the
+/// concurrent-replay race: two copies of the same signature race the ledger, not
+/// the handler.
+///
+/// It is not the last check overall, so some rejections do still cost a ledger
+/// row. Any layer added inside the router passed in runs AFTER the ledger
+/// (`creation_routes` puts `rate_limit_by_did` there), and every check the
+/// handler itself makes (the iCaptcha 403, ownership, existence) runs later
+/// still. A request refused by the per-DID throttle, by iCaptcha, or by the
+/// handler has already spent its signature and must re-sign to retry. Only a
+/// per-IP brake layered outside this stack rejects a request before the ledger
+/// is charged.
 ///
 /// `body_limit` bounds the request body `require_signature` buffers before it has
 /// authenticated anything (see [`auth::SignatureBodyLimit`]): `max_pack_bytes` for
@@ -108,6 +125,10 @@ fn add_auth_layers(
     body_limit: usize,
 ) -> Router<AppState> {
     router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::consume_signature,
+        ))
         .layer(middleware::from_fn_with_state(
             state,
             auth::require_ucan_chain,
@@ -195,6 +216,7 @@ pub fn build_router(state: AppState) -> Router {
     let task_read_limiter = rate_limit::IpRateLimiter {
         limiter: state.task_read_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        // Braking reads is this limiter's job; no write-only exemption.
     };
     let task_read_routes = Router::new()
         .route("/api/v1/tasks", get(tasks::list_tasks))
@@ -354,6 +376,10 @@ pub fn build_router(state: AppState) -> Router {
     // body rather than storing an empty column, so getting this order wrong
     // fails loudly instead of quietly writing unverifiable claims.
     .layer(axum::Extension(auth::PersistsSignedBody))
+    // The claim write dedups on a unique `request_digest` under a repo lock, which
+    // is atomic and permanent and answers a replay 200 with the original claim, so
+    // the ledger stands aside (see `auth::OwnsReplayDefense`).
+    .layer(axum::Extension(auth::OwnsReplayDefense))
     .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
     .layer(axum::Extension(rate_limit::IpRateLimiter {
         limiter: state.create_ip_rate_limiter.clone(),
@@ -537,7 +563,11 @@ pub fn build_router(state: AppState) -> Router {
             ),
         state.clone(),
         SIGNED_BODY_LIMIT,
-    );
+    )
+    // Both handlers spend the signature themselves, after the read gate and the
+    // source-budget debit (see `auth::SpendsSignatureInHandler`). Outside the
+    // auth layers, because the ledger layer reads this marker on the way in.
+    .layer(axum::Extension(auth::SpendsSignatureInHandler));
 
     // ── Peer discovery routes ─────────────────────────────────────────────
     // Peer writes accept signatures when present and can require them after a
@@ -596,6 +626,7 @@ pub fn build_router(state: AppState) -> Router {
                 .route_layer(axum::Extension(rate_limit::IpRateLimiter {
                     limiter: state.federated_rate_limiter.clone(),
                     trust: state.push_limiter_trust,
+                    // Braking reads is this limiter's job; no write-only exemption.
                 })),
         )
         .route("/api/v1/repos/{owner}/{repo}", get(repos::get_repo))
