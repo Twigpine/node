@@ -2971,8 +2971,10 @@ mod tests {
     #[cfg(unix)]
     fn write_script(path: &std::path::Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
-        // std has no stable `ErrorKind` for ETXTBSY.
+        // std has no stable `ErrorKind` for ETXTBSY. EAGAIN is a transient spawn
+        // failure under process pressure; neither means the script ran.
         const ETXTBSY: i32 = 26;
+        const EAGAIN: i32 = 11;
         // Every body starts with a shebang. The line inserted after it lets the
         // settle exec below exit at once without running the body.
         let (shebang, rest) = body
@@ -2994,16 +2996,28 @@ mod tests {
                 .env("FAKE_GIT_SETTLE", "1")
                 .status()
             {
-                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                Ok(_) => return,
+                Err(e) if matches!(e.raw_os_error(), Some(ETXTBSY | EAGAIN)) => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                _ => return,
+                Err(e) => panic!("settle exec of fake git failed: {}: {e}", path.display()),
             }
         }
         panic!(
             "fake git still ETXTBSY after 100 attempts: {}",
             path.display()
         );
+    }
+
+    /// A settle exec that fails for a reason other than ETXTBSY or EAGAIN is a broken
+    /// fixture, not a script that is ready to run. The interpreter below does not
+    /// exist, so the exec fails with ENOENT, which `write_script` must not swallow.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "settle exec of fake git failed")]
+    fn write_script_panics_when_the_settle_exec_fails_for_another_reason() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_script(&tmp.path().join("git"), "#!/nonexistent/interp\nexit 0\n");
     }
 
     /// A `git_bin` wrapper that records every invocation's arguments and then execs
@@ -3874,8 +3888,12 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(10), upload_received.notified())
                 .await
                 .expect("the add never reached the endpoint");
+            // The release is timed from the upload's arrival, not from acquiring the
+            // lock: a slow acquisition on a loaded box must not push the release past
+            // the floored bound.
+            let received = tokio::time::Instant::now();
             let mut conn = lock_table(&lock_pool, "pinned_cids").await;
-            tokio::time::sleep(Duration::from_millis(3400)).await;
+            tokio::time::sleep_until(received + Duration::from_millis(3400)).await;
             rollback(&mut conn).await;
         };
 
