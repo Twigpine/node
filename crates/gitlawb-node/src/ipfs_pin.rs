@@ -2478,9 +2478,22 @@ mod tests {
     /// The Hash is a fixed, real CID: the timing tests assert on pin counts,
     /// not on the recorded address.
     async fn delaying_endpoint(delays: Vec<Duration>) -> String {
+        delaying_endpoint_notifying(delays).await.0
+    }
+
+    /// `delaying_endpoint` plus a `Notify` that fires once per request, after the
+    /// full upload has been drained and before the delay starts. A test that must
+    /// act while an add is in flight waits on it instead of on a clock a loaded box
+    /// can outrun. `notify_one` stores a permit, so a request that lands before the
+    /// test starts waiting is not lost.
+    async fn delaying_endpoint_notifying(
+        delays: Vec<Duration>,
+    ) -> (String, std::sync::Arc<tokio::sync::Notify>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let received = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = received.clone();
         tokio::spawn(async move {
             let mut seen = 0usize;
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -2489,6 +2502,7 @@ mod tests {
                     .or_else(|| delays.last())
                     .unwrap_or(&Duration::ZERO);
                 seen += 1;
+                let signal = signal.clone();
                 tokio::spawn(async move {
                     let mut acc = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -2512,6 +2526,7 @@ mod tests {
                             }
                         }
                     }
+                    signal.notify_one();
                     tokio::time::sleep(delay).await;
                     let body = br#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4","Size":"12"}
 "#;
@@ -2525,7 +2540,7 @@ mod tests {
                 });
             }
         });
-        endpoint
+        (endpoint, received)
     }
 
     /// A `tracing` sink a test can read back, so the deadline warn can be
@@ -3820,21 +3835,23 @@ mod tests {
     /// floor the post-add record would then be failed by a spent deadline, leaving
     /// bytes in Kubo with no `pinned_cids` row and nothing able to resolve the CID.
     ///
-    /// Fixture: a 3s budget, a 1.7s add, and `pinned_cids` locked from 1s (well
-    /// after `is_pinned` has read it, and still before the add returns) until 3.4s.
-    /// The record therefore starts at ~1.72s with ~1.3s of budget left and blocks past
-    /// the end of the budget, so it needs ~1.7s of lock wait to land, which only the
-    /// `DB_RECORD_GRACE` floor (a bound of ~3.72s) buys it. Unfloored, the bound is the
-    /// 3s batch deadline and the blocked write is cancelled 0.4s before the lock lifts.
+    /// Fixture: a 3s budget, a 1.7s add, and `pinned_cids` locked the moment the
+    /// upload arrives (so `is_pinned` has already read it, and the add has not yet
+    /// returned) and held for 3.4s from that point. Call the upload's arrival `r`, the
+    /// git read plus `is_pinned` before it. The record starts at `r + 1.7s` with
+    /// `1.3s - r` of budget left and blocks past the end of the budget, so it needs
+    /// ~1.7s of lock wait to land, which only the `DB_RECORD_GRACE` floor (a bound of
+    /// `r + 3.72s`) buys it. Unfloored, the bound is the 3s batch deadline and the
+    /// blocked write is cancelled `r + 0.4s` before the lock lifts at `r + 3.4s`.
     ///
-    /// The times are MARGINS, not boundaries, sized so a loaded box does not change
-    /// which path runs. The lock lands at 1s because taking it at 100ms left
-    /// `is_pinned` racing it: losing that race makes the read block, time out, and
-    /// break the batch, which fails on `pinned.confirmed.len() == 1` for a reason that
-    /// has nothing to do with the floor. The 3s budget leaves 1.3s between the add's
-    /// return and the end of the budget for the git read before it (`r`): the add only
-    /// pins while `r + 1.7s` fits in the budget, and the release at 3.4s sits between
-    /// the budget (3s) and the floored bound (3.72s + `r`) for every `r` in range.
+    /// The lock is sequenced off the upload being received, not off a clock: a fixed
+    /// delay let a loaded box take the lock while `is_pinned` was still reading, which
+    /// makes the read block, time out, and break the batch, failing
+    /// `pinned.confirmed.len() == 1` for a reason that has nothing to do with the
+    /// floor. The upload only starts after `is_pinned` returns, so waiting for it
+    /// orders the lock after that read on any box. The times that remain are MARGINS
+    /// (the 3s budget against the 1.7s add, the 3.4s hold between the budget and the
+    /// floored bound), sized so a loaded box does not change which path runs.
     #[sqlx::test]
     async fn pin_add_with_spent_budget_still_records_row(pool: sqlx::PgPool) {
         let db = crate::db::Db::for_testing(pool.clone());
@@ -3843,7 +3860,8 @@ mod tests {
         let repo_path = tmp.path().join("spent_budget.git");
         let oids = seed_loose_blobs(&repo_path, 1);
         let sha = oids[0].clone();
-        let endpoint = delaying_endpoint(vec![Duration::from_millis(1700)]).await;
+        let (endpoint, upload_received) =
+            delaying_endpoint_notifying(vec![Duration::from_millis(1700)]).await;
         // Install a log capture even though nothing here asserts on it: `tracing`
         // caches a callsite's interest globally the first time it is hit, and a hit
         // from a thread with no subscriber caches it as never-interested for the whole
@@ -3853,9 +3871,11 @@ mod tests {
 
         let lock_pool = pool.clone();
         let locker = async move {
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::time::timeout(Duration::from_secs(10), upload_received.notified())
+                .await
+                .expect("the add never reached the endpoint");
             let mut conn = lock_table(&lock_pool, "pinned_cids").await;
-            tokio::time::sleep(Duration::from_millis(2400)).await;
+            tokio::time::sleep(Duration::from_millis(3400)).await;
             rollback(&mut conn).await;
         };
 
