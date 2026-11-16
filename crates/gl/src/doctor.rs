@@ -195,7 +195,9 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     let transport_node = resolve_transport_node(env_node.as_deref());
     let gl_node = sanitize_node_msg(&args.node);
 
-    if transport_node == args.node {
+    // clap binds `args.node` from the environment verbatim, while the resolver
+    // trims, so compare against the trimmed value or padding alone reads as a split.
+    if transport_node == args.node.trim() {
         // gl and the transport agree, so one row covers both. Classify the row from
         // the variable itself: `--node` matching the transport default does not mean
         // the user set `GITLAWB_NODE`.

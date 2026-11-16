@@ -599,3 +599,34 @@ fn a_padded_env_node_is_dialed_trimmed_by_the_connectivity_row() {
         "got: {node_row}"
     );
 }
+
+/// clap binds `--node` from `GITLAWB_NODE` verbatim, while the transport resolver
+/// trims it. A padded value therefore resolves to the same node on both sides, and
+/// doctor must not read the whitespace difference as a divergence: no divergence
+/// clause, and the env row classified as the configured loopback node (Pass),
+/// whether or not that node is up.
+#[test]
+fn a_padded_env_node_is_not_a_divergence() {
+    for up in [true, false] {
+        let port = if up { serve(|_, _| did_ok()).0 } else { 1 };
+        let r = doctor_with(Some(&format!(" http://127.0.0.1:{port} ")), None, &[]);
+        assert!(
+            r.divergence_line().is_none(),
+            "padding alone is not a divergence (node up: {up}), got:\n{}",
+            r.stdout
+        );
+        let row = r
+            .stdout
+            .lines()
+            .find(|l| l.contains("GITLAWB_NODE") && !l.trim_start().starts_with("GITLAWB_NODE:"))
+            .unwrap_or_else(|| panic!("no GITLAWB_NODE row, got:\n{}", r.stdout));
+        assert!(
+            !row.trim_start().starts_with('\u{2717}'),
+            "padding alone must not fail the env row (node up: {up}): {row}"
+        );
+        assert!(
+            row.contains("intentional for self-hosting/dev"),
+            "a padded loopback env must classify as the configured loopback node (node up: {up}): {row}"
+        );
+    }
+}
