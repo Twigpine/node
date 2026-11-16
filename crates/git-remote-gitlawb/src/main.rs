@@ -66,10 +66,7 @@ fn main() -> Result<()> {
     // v0.1: default to localhost. Override with GITLAWB_NODE env var.
     let node_base =
         std::env::var("GITLAWB_NODE").unwrap_or_else(|_| "http://127.0.0.1:7545".to_string());
-    check_transport_security(
-        &node_base,
-        std::env::var_os("GITLAWB_ALLOW_INSECURE_HTTP").is_some(),
-    )?;
+    check_transport_security(&node_base, allow_insecure_http_enabled())?;
     let repo_base = format!("{}/{}/{}", node_base, short_owner, repo_name);
     tracing::debug!("repo_base: {repo_base}");
 
@@ -131,6 +128,54 @@ fn is_insecure_remote(url: &str) -> bool {
         }
     }
     true
+}
+
+/// Fixed warning for a `GITLAWB_ALLOW_INSECURE_HTTP` value that is set but not
+/// truthy. The raw value is never logged.
+fn warn_allow_insecure_http_non_truthy() {
+    tracing::warn!(
+        "GITLAWB_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); plaintext http to a remote node remains refused"
+    );
+}
+
+/// Parse a possibly-present `GITLAWB_ALLOW_INSECURE_HTTP` value.
+///
+/// Only `1` or `true` (case-insensitive, after trim) opens the gate. Presence
+/// alone is not consent: `=0`, `=false` and an empty value read as "not opting
+/// in" to the operator, and the README and refusal message document `=1`. Any
+/// other non-empty value warns so a misspelling is not a silent yes or a silent
+/// no. Same contract as `icaptcha_insecure_from_str` in `icaptcha-client`.
+fn allow_insecure_http_from_str(raw: Option<&str>) -> bool {
+    let Some(v) = raw else {
+        return false;
+    };
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("1") || t.eq_ignore_ascii_case("true") {
+        true
+    } else {
+        if !t.is_empty() {
+            warn_allow_insecure_http_non_truthy();
+        }
+        false
+    }
+}
+
+/// Interpret the result of `std::env::var("GITLAWB_ALLOW_INSECURE_HTTP")`
+/// without reading the environment again. A non-UTF-8 value fails closed and
+/// warns, like a present non-truthy one.
+fn allow_insecure_http_from_var(result: Result<String, std::env::VarError>) -> bool {
+    match result {
+        Ok(v) => allow_insecure_http_from_str(Some(&v)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn_allow_insecure_http_non_truthy();
+            false
+        }
+        Err(std::env::VarError::NotPresent) => false,
+    }
+}
+
+fn allow_insecure_http_enabled() -> bool {
+    allow_insecure_http_from_var(std::env::var("GITLAWB_ALLOW_INSECURE_HTTP"))
 }
 
 /// Refuse a cleartext hop off this machine unless the operator has opted in.
@@ -1388,6 +1433,43 @@ mod insecure_transport_tests {
             .expect("the local default must keep working with no opt-in");
         check_transport_security("https://node.gitlawb.com", false)
             .expect("TLS must need no opt-in");
+    }
+
+    /// The opt-in is a value, not presence: only `1` / `true` (any case, trimmed)
+    /// opens the gate, and `0`, `false`, empty, a typo, or a non-UTF-8 value
+    /// leave it closed.
+    #[test]
+    fn insecure_http_opt_in_is_truthy_only() {
+        for on in ["1", "true", "TRUE", "True", " 1 ", "\ttrue\n"] {
+            assert!(allow_insecure_http_from_str(Some(on)), "{on:?} must enable");
+        }
+        for off in ["0", "false", "", " ", "yes", "on", "2", "11"] {
+            assert!(
+                !allow_insecure_http_from_str(Some(off)),
+                "{off:?} must not enable"
+            );
+        }
+        assert!(!allow_insecure_http_from_str(None), "unset must not enable");
+        assert!(allow_insecure_http_from_var(Ok("1".into())));
+        assert!(!allow_insecure_http_from_var(Ok("0".into())));
+        assert!(!allow_insecure_http_from_var(Err(
+            std::env::VarError::NotPresent
+        )));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+            assert!(
+                !allow_insecure_http_from_var(Err(std::env::VarError::NotUnicode(bad))),
+                "a non-UTF-8 value must fail closed"
+            );
+        }
+        // And through the gate: an off value must leave a remote node refused.
+        assert!(check_transport_security(
+            "http://node.example.com:7545",
+            allow_insecure_http_from_str(Some("0"))
+        )
+        .is_err());
     }
 
     /// The documented knob must appear in --help. A gate the operator cannot

@@ -1376,8 +1376,10 @@ fn run_bounded_bounds_join_when_leader_exits_leaving_a_pipe_holder() {
 /// cleartext hop. Only driving the built binary binds the wiring.
 ///
 /// `192.0.2.1` is TEST-NET-1 (RFC 5737): non-loopback, reserved for
-/// documentation, and never routable, so the gate is what stops this and no
-/// connection is attempted even if it regressed.
+/// documentation, and never routable, so the gate is what stops this. If the
+/// call in `main()` were deleted the helper would dial it and `run_bounded`
+/// would kill it after 30s, so a regression fails slowly, on the
+/// `plaintext http` assertion below.
 #[test]
 fn real_git_fetch_refuses_a_remote_plaintext_node() {
     // A shallow fixture is enough: the gate fires before any negotiation.
@@ -1397,6 +1399,32 @@ fn real_git_fetch_refuses_a_remote_plaintext_node() {
         stderr.contains("GITLAWB_ALLOW_INSECURE_HTTP"),
         "the refusal must name the escape hatch; stderr was: {stderr}"
     );
+}
+
+/// The opt-in is read as a value, not as presence. `GITLAWB_ALLOW_INSECURE_HTTP`
+/// set to `0`, `false`, empty or a misspelling must leave the gate closed: the
+/// README and the refusal message both tell the operator to set it to `1`, so
+/// anything else reads as "not opting in". Drives the built binary because the
+/// parsing lives in `main()`, which a unit test on the gate function cannot see.
+#[test]
+fn real_git_fetch_still_refuses_a_remote_plaintext_node_when_override_is_not_truthy() {
+    let repos = build_divergent_repos(1);
+    for value in ["0", "false", "", "yes"] {
+        let (ok, out) = fetch_with_helper_env(
+            &repos.clone,
+            "http://192.0.2.1:7545",
+            &[("GITLAWB_ALLOW_INSECURE_HTTP", value)],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !ok || !out.status.success(),
+            "GITLAWB_ALLOW_INSECURE_HTTP={value:?} must not permit a remote plaintext node: {stderr}"
+        );
+        assert!(
+            stderr.contains("plaintext http"),
+            "GITLAWB_ALLOW_INSECURE_HTTP={value:?} must leave the gate refusing; stderr was: {stderr}"
+        );
+    }
 }
 
 /// A proxy variable must not divert a LOOPBACK node off this machine.
