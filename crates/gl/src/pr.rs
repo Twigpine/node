@@ -278,11 +278,13 @@ async fn cmd_create(
 async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
+    // The target is signed as sent: keep a `/` or `?` in `repo` one path segment.
+    let repo_seg = urlencoding::encode(&repo);
 
     let resp = crate::http::read_json(
         client
-            .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo_seg}/pulls"))
             .await?,
         "pull requests",
     )
@@ -323,11 +325,13 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
+    // The target is signed as sent: keep a `/` or `?` in `repo` one path segment.
+    let repo_seg = urlencoding::encode(&repo);
 
     let pr = crate::http::read_json(
         client
-            .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+            .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo_seg}/pulls/{number}"))
             .await?,
         "pull request",
     )
@@ -354,8 +358,8 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     // skips the comments below it. Mirrors `gl status`'s unavailable-section line.
     let reviews = match crate::http::read_json(
         client
-            .get(&format!(
-                "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
+            .get_maybe_signed(&format!(
+                "/api/v1/repos/{owner}/{repo_seg}/pulls/{number}/reviews"
             ))
             .await?,
         "reviews",
@@ -394,8 +398,8 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     // Show comments
     let comments = match crate::http::read_json(
         client
-            .get(&format!(
-                "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
+            .get_maybe_signed(&format!(
+                "/api/v1/repos/{owner}/{repo_seg}/pulls/{number}/comments"
             ))
             .await?,
         "comments",
@@ -432,11 +436,15 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
 async fn cmd_diff(repo: String, number: u64, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
+    // The target is signed as sent: keep a `/` or `?` in `repo` one path segment.
+    let repo_seg = urlencoding::encode(&repo);
 
     let resp = crate::http::read_json(
         client
-            .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+            .get_maybe_signed(&format!(
+                "/api/v1/repos/{owner}/{repo_seg}/pulls/{number}/diff"
+            ))
             .await?,
         "diff",
     )
@@ -535,12 +543,14 @@ async fn cmd_comment(
 async fn cmd_comments(repo: String, number: u64, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, Some(keypair));
+    // The target is signed as sent: keep a `/` or `?` in `repo` one path segment.
+    let repo_seg = urlencoding::encode(&repo);
 
     let resp = crate::http::read_json(
         client
-            .get(&format!(
-                "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
+            .get_maybe_signed(&format!(
+                "/api/v1/repos/{owner}/{repo_seg}/pulls/{number}/comments"
             ))
             .await?,
         "comments",
@@ -603,6 +613,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"pulls":[]}"#)
@@ -629,6 +642,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"pulls":[{"number":1,"title":"Add feature","status":"open","source_branch":"feat","target_branch":"main","author_did":"did:key:z6MkTest"}]}"#)
@@ -642,6 +658,39 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A repo argument carrying `/` must stay one path segment on the signed
+    /// request, not retarget it to a different endpoint.
+    #[tokio::test]
+    async fn test_cmd_list_encodes_the_repo_segment() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo%2Fhooks%3Fx%3D/pulls$".to_string(),
+                ),
+            )
+            .match_request(crate::http::signature_binds_wire_target)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"pulls":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        cmd_list(
+            "myrepo/hooks?x=".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -722,6 +771,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/1$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"number":1,"title":"Fix it","status":"open","source_branch":"fix","target_branch":"main","author_did":"did:key:z6MkTest","body":"some body"}"#)
@@ -734,6 +786,9 @@ mod tests {
                     r"^/api/v1/repos/[^/]+/myrepo/pulls/1/reviews$".to_string(),
                 ),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"reviews":[]}"#)
@@ -746,6 +801,9 @@ mod tests {
                     r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string(),
                 ),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"comments":[]}"#)
@@ -760,6 +818,10 @@ mod tests {
         )
         .await
         .unwrap();
+        // cmd_view tolerates a failed sub-fetch, so success alone proves nothing
+        // about whether the reviews and comments requests were signed.
+        _m2.assert_async().await;
+        _m3.assert_async().await;
     }
 
     #[tokio::test]
@@ -837,6 +899,9 @@ mod tests {
                     r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string(),
                 ),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"comments":[]}"#)
@@ -864,6 +929,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/2/comments$".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"comments":[{"id":"c1","pr_id":"pr1","author_did":"did:key:z6MkTest","body":"nice work","created_at":"2026-03-23T00:00:00Z"}]}"#)
@@ -906,7 +974,6 @@ mod tests {
         .await
         .unwrap();
     }
-
     // ── Gated PR reads surface node denials, not empty/stub renders (#123) ──
 
     #[tokio::test]
@@ -916,6 +983,8 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("GET", mockito::Matcher::Regex(r"/pulls$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)
@@ -944,6 +1013,8 @@ mod tests {
         // The PR fetch is first; a 404 there errors before the reviews/comments reads.
         let _m = server
             .mock("GET", mockito::Matcher::Regex(r"/pulls/1$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository not found"}"#)
@@ -1022,6 +1093,37 @@ mod tests {
         assert!(result.is_err(), "cmd_comments must Err on a gated 404");
         // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
         _m.assert_async().await;
+    }
+
+    // cmd_diff had no signing coverage, so the unsigned read (#115) was invisible
+    // here. An identity is supplied, so the request must be signed.
+    #[tokio::test]
+    async fn test_cmd_diff_signs_request() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/1/diff$".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"diff":"diff --git a/x b/x"}"#)
+            .create_async()
+            .await;
+
+        cmd_diff(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     /// A denied sub-fetch must not abort `gl pr view` after the header has

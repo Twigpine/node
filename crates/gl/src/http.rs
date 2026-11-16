@@ -616,6 +616,49 @@ pub(crate) async fn read_json(resp: reqwest::Response, what: &str) -> Result<Val
         .with_context(|| format!("invalid JSON in {what} response"))
 }
 
+/// Test helper for the signed read call sites: true when the request's signature
+/// verifies over the target the server actually received. A signed target that
+/// differs from the wire target (an unencoded non-ASCII query value that reqwest
+/// then percent-encodes, say) makes the node 401 the request.
+#[cfg(test)]
+pub(crate) fn signature_binds_wire_target(req: &mockito::Request) -> bool {
+    use gitlawb_core::http_sig::{build_signing_string, HttpSignature};
+    use std::collections::HashMap;
+
+    let header = |name: &str| -> Option<String> {
+        req.header(name)
+            .first()
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (Some(input), Some(sig_header), Some(digest)) = (
+        header("signature-input"),
+        header("signature"),
+        header("content-digest"),
+    ) else {
+        return false;
+    };
+    let Ok(sig) = HttpSignature::parse(&input, &sig_header) else {
+        return false;
+    };
+    let Ok(vk) = sig.key_id.to_verifying_key() else {
+        return false;
+    };
+    let mut values = HashMap::new();
+    values.insert("@method".to_string(), "GET".to_string());
+    values.insert("@path".to_string(), req.path_and_query().to_string());
+    values.insert("content-digest".to_string(), digest);
+    let params = input.strip_prefix("sig1=").unwrap_or(&input);
+    let components: Vec<&str> = sig.components.iter().map(String::as_str).collect();
+    let Ok(signing_string) = build_signing_string(&components, params, &values) else {
+        return false;
+    };
+    let Ok(arr) = <[u8; 64]>::try_from(sig.signature_bytes.as_slice()) else {
+        return false;
+    };
+    gitlawb_core::identity::verify(&vk, signing_string.as_bytes(), &arr).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
