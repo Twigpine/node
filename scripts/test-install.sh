@@ -203,7 +203,7 @@ suite() {
   KEEP_HOME=""
 
   # A directory sitting on a name the installer writes: refuse, change nothing.
-  for blocked in twigpine twig git-remote-gitlawb; do
+  for blocked in twigpine twig git-remote-gitlawb twigpine.new; do
     reset_server
     rm -rf "${W:?}/home" && mkdir -p "$W/home/bin/$blocked"
     KEEP_HOME=yes

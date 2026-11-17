@@ -233,7 +233,9 @@ mkdir -p "$INSTALL_DIR"
 # Check every name this run will write before changing anything. A directory in
 # the way cannot be replaced by a file: mv and ln would put the program inside
 # it and report success.
-for NAME in twigpine twig gl git-remote-twigpine git-remote-gitlawb twigpine-node gitlawb-node; do
+# The same goes for the <name>.new staging files.
+for NAME in twigpine twig gl git-remote-twigpine git-remote-gitlawb twigpine-node gitlawb-node \
+  twigpine.new gl.new git-remote-twigpine.new git-remote-gitlawb.new twigpine-node.new gitlawb-node.new; do
   if [ -d "$INSTALL_DIR/$NAME" ] && [ ! -L "$INSTALL_DIR/$NAME" ]; then
     echo "error: ${INSTALL_DIR}/${NAME} is a directory, and the installer needs that name for a program." >&2
     echo "       Move it away or set GITLAWB_INSTALL_DIR. Nothing was installed." >&2
@@ -245,6 +247,8 @@ INSTALLED=""
 
 # install_file <name>: copy one binary from the archive into place.
 install_file() {
+  # A leftover staging link would be followed; start from nothing.
+  rm -f "$INSTALL_DIR/$1.new"
   install -m 755 "$PACKAGE_DIR/$1" "$INSTALL_DIR/$1.new"
   # A link left by an earlier install (or one pointing at a directory) is
   # removed first: mv would follow a link to a directory and move into it.
