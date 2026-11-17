@@ -53,7 +53,7 @@ case "$OS" in
   Darwin) OS_NAME="darwin" ;;
   *)
     echo "error: unsupported OS: $OS" >&2
-    echo "       please build from source: cargo install --git https://github.com/${REPO} gl" >&2
+    echo "       please build from source: cargo install --git https://github.com/${REPO} twigpine-cli git-remote-twigpine" >&2
     exit 1
     ;;
 esac
@@ -92,7 +92,7 @@ case "$TAG" in
   *)  VERSION="$TAG"; TAG="v$TAG" ;;
 esac
 
-PACKAGE_NAME="gitlawb-node-${VERSION}-${TARGET}"
+PACKAGE_NAME="twigpine-node-${VERSION}-${TARGET}"
 ARCHIVE="${PACKAGE_NAME}.tar.gz"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE}"
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
@@ -110,6 +110,9 @@ if ! curl -fSL --progress-bar -o "$TMP_DIR/$ARCHIVE" "$DOWNLOAD_URL"; then
   echo ""
   echo "error: download failed: $DOWNLOAD_URL" >&2
   echo "       Check https://github.com/${REPO}/releases for available builds." >&2
+  echo "       Older releases use different file names; install those with" >&2
+  echo "       the installer from their own tag:" >&2
+  echo "       https://raw.githubusercontent.com/${REPO}/${TAG}/install.sh" >&2
   exit 1
 fi
 
@@ -147,13 +150,30 @@ fi
 mkdir -p "$INSTALL_DIR"
 
 INSTALLED=()
-for BIN in gl git-remote-gitlawb gitlawb-node; do
+for BIN in twigpine git-remote-twigpine twigpine-node; do
   if [ -f "$PACKAGE_DIR/$BIN" ]; then
     install -m 755 "$PACKAGE_DIR/$BIN" "$INSTALL_DIR/$BIN.new"
     mv -f "$INSTALL_DIR/$BIN.new" "$INSTALL_DIR/$BIN"
     INSTALLED+=("$BIN")
   fi
 done
+
+# Other names for the binaries installed above: the short form of the command,
+# and the names used before the rename. Git picks its remote helper by URL
+# scheme, so existing remotes still run the old helper name, and scripts or
+# service units may still call the old command and daemon names.
+link_old_name() {
+  # Only when this archive shipped the binary: a leftover from an earlier
+  # install must not get a fresh link, or be listed as installed by this run.
+  if [ -f "$PACKAGE_DIR/$1" ]; then
+    ln -sfn "$1" "$INSTALL_DIR/$2"
+    INSTALLED+=("$2")
+  fi
+}
+link_old_name twigpine twig
+link_old_name twigpine gl
+link_old_name git-remote-twigpine git-remote-gitlawb
+link_old_name twigpine-node gitlawb-node
 
 if [ "${#INSTALLED[@]}" -eq 0 ]; then
   echo "error: no installable binaries found in $ARCHIVE" >&2
@@ -169,8 +189,8 @@ echo ""
 
 if echo ":$PATH:" | grep -q ":${INSTALL_DIR}:"; then
   echo "Run:"
-  echo "  gl doctor"
-  echo "  gl quickstart"
+  echo "  twigpine doctor"
+  echo "  twigpine quickstart"
 else
   SHELL_NAME=$(basename "${SHELL:-bash}")
   case "$SHELL_NAME" in
@@ -189,22 +209,8 @@ else
   fi
   echo ""
   echo "Then run:"
-  echo "  gl doctor"
-  echo "  gl quickstart"
-fi
-
-# oh-my-zsh's default git plugin aliases gl='git pull', which silently shadows
-# the gl binary in every interactive zsh (aliases beat PATH). Detect the common
-# setup and say so now, at install time, instead of letting the first `gl`
-# print git's baffling "fatal: not a git repository".
-if [ -f "$HOME/.zshrc" ] && [ -d "$HOME/.oh-my-zsh/plugins/git" ] \
-  && grep -Eq '^[[:space:]]*plugins=\(([^)]*[[:space:]])?git([[:space:]][^)]*)?\)' "$HOME/.zshrc" \
-  && ! grep -Eq '^([^#]*[[:space:];&|])?unalias[[:space:]]+([^;&|#]*[[:space:]])?gl([[:space:]]|$)' "$HOME/.zshrc"; then
-  echo ""
-  echo "NOTE: oh-my-zsh's git plugin aliases gl='git pull', which will shadow"
-  echo "the gl command in interactive shells. To use gl by name, run:"
-  echo ""
-  echo "  echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc"
+  echo "  twigpine doctor"
+  echo "  twigpine quickstart"
 fi
 
 echo ""

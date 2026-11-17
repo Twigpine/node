@@ -40,7 +40,7 @@ if ($Version -eq "latest") {
 }
 $ver = $tag.TrimStart("v")
 
-$archive = "gitlawb-node-$ver-$target.zip"
+$archive = "twigpine-node-$ver-$target.zip"
 $url = "https://github.com/$Repo/releases/download/$tag/$archive"
 
 Write-Host "Installing Twigpine $tag for windows/x64"
@@ -72,8 +72,8 @@ try {
 
   New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
   # The Windows archive always ships the two CLI binaries; the daemon is optional.
-  $requiredBins = @("gl.exe", "git-remote-gitlawb.exe")
-  $optionalBins = @("gitlawb-node.exe")
+  $requiredBins = @("twigpine.exe", "git-remote-twigpine.exe")
+  $optionalBins = @("twigpine-node.exe")
   $missing = $requiredBins | Where-Object {
     -not (Test-Path (Join-Path $pkgDir.FullName $_))
   }
@@ -87,6 +87,29 @@ try {
     if (Test-Path $src) {
       Copy-Item -Path $src -Destination (Join-Path $InstallDir $bin) -Force
       $installed += $bin
+    }
+  }
+
+  # Other names for the binaries installed above: the short form of the command,
+  # and the names used before the rename. Git picks its remote helper by URL
+  # scheme, so existing remotes still run the old helper name, and scripts may
+  # still call the old command. Windows has no dependable symlinks, so these are
+  # copies.
+  $oldNames = @{
+    "twig.exe" = "twigpine.exe"
+    "gl.exe" = "twigpine.exe"
+    "git-remote-gitlawb.exe" = "git-remote-twigpine.exe"
+    "gitlawb-node.exe" = "twigpine-node.exe"
+  }
+  foreach ($alias in $oldNames.Keys) {
+    $dst = Join-Path $InstallDir $alias
+    if ($installed -contains $oldNames[$alias]) {
+      Copy-Item -Path (Join-Path $InstallDir $oldNames[$alias]) -Destination $dst -Force
+      $installed += $alias
+    } elseif (Test-Path $dst) {
+      # This release did not ship the binary this name stood for; a leftover
+      # copy would keep running an older version.
+      Remove-Item -Path $dst -Force
     }
   }
 
@@ -118,7 +141,7 @@ if (($userPath -split ';') -notcontains $InstallDir) {
   Write-Host ""
   Write-Host "Run:"
 }
-Write-Host "  gl doctor"
-Write-Host "  gl quickstart"
+Write-Host "  twigpine doctor"
+Write-Host "  twigpine quickstart"
 Write-Host ""
 Write-Host "Docs: https://docs.gitlawb.com"

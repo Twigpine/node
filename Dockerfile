@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 #
-# gitlawb-node — production image for operators.
+# twigpine-node — production image for operators.
 # Multi-arch (linux/amd64, linux/arm64), non-root runtime, HEALTHCHECK.
 
 # ── Build stage ─────────────────────────────────────────────────────────────
@@ -14,31 +14,31 @@ WORKDIR /build
 # missing member's Cargo.toml (or a path dependency pointing at one) aborts the
 # layer before a single crate is fetched.
 COPY Cargo.toml Cargo.lock ./
-COPY crates/gitlawb-core/Cargo.toml crates/gitlawb-core/
-COPY crates/gitlawb-node/Cargo.toml crates/gitlawb-node/
-COPY crates/gl/Cargo.toml crates/gl/
-COPY crates/git-remote-gitlawb/Cargo.toml crates/git-remote-gitlawb/
-COPY crates/gitlawb-attest/Cargo.toml crates/gitlawb-attest/
+COPY crates/twigpine-core/Cargo.toml crates/twigpine-core/
+COPY crates/twigpine-node/Cargo.toml crates/twigpine-node/
+COPY crates/twigpine-cli/Cargo.toml crates/twigpine-cli/
+COPY crates/git-remote-twigpine/Cargo.toml crates/git-remote-twigpine/
+COPY crates/twigpine-attest/Cargo.toml crates/twigpine-attest/
 COPY crates/icaptcha-client/Cargo.toml crates/icaptcha-client/
 
 # Fetch deps (this layer caches until Cargo.{toml,lock} change).
 # No `|| true`: this layer is expected to succeed, and swallowing its exit code
-# is what let it sit dead from the moment gl gained a path dependency on
+# is what let it sit dead from the moment twigpine gained a path dependency on
 # icaptcha-client. A failure here should stop the build, not silently turn every
 # image build into a cold one.
-# gitlawb-node declares BOTH a [[bin]] and a [lib], so it needs both stubs:
+# twigpine-node declares BOTH a [[bin]] and a [lib], so it needs both stubs:
 # cargo resolves every declared target before it fetches anything, and a
 # missing src/lib.rs aborts the layer with a target resolution error.
-RUN mkdir -p crates/gitlawb-core/src crates/gitlawb-node/src crates/gl/src \
-        crates/git-remote-gitlawb/src crates/gitlawb-attest/src crates/icaptcha-client/src && \
-    echo 'fn main() {}' > crates/gitlawb-node/src/main.rs && \
-    echo 'fn main() {}' > crates/gl/src/main.rs && \
-    echo 'fn main() {}' > crates/git-remote-gitlawb/src/main.rs && \
-    echo '' > crates/gitlawb-node/src/lib.rs && \
-    echo '' > crates/gitlawb-core/src/lib.rs && \
-    echo '' > crates/gitlawb-attest/src/lib.rs && \
+RUN mkdir -p crates/twigpine-core/src crates/twigpine-node/src crates/twigpine-cli/src \
+        crates/git-remote-twigpine/src crates/twigpine-attest/src crates/icaptcha-client/src && \
+    echo 'fn main() {}' > crates/twigpine-node/src/main.rs && \
+    echo 'fn main() {}' > crates/twigpine-cli/src/main.rs && \
+    echo 'fn main() {}' > crates/git-remote-twigpine/src/main.rs && \
+    echo '' > crates/twigpine-node/src/lib.rs && \
+    echo '' > crates/twigpine-core/src/lib.rs && \
+    echo '' > crates/twigpine-attest/src/lib.rs && \
     echo '' > crates/icaptcha-client/src/lib.rs && \
-    cargo build --release --locked -p gitlawb-node -p gl -p git-remote-gitlawb
+    cargo build --release --locked -p twigpine-node -p twigpine-cli -p git-remote-twigpine
 
 # Now copy real sources and build for real.
 # Force-bump mtimes so cargo's fingerprint check rebuilds — without this,
@@ -47,12 +47,13 @@ RUN mkdir -p crates/gitlawb-core/src crates/gitlawb-node/src crates/gl/src \
 COPY crates/ crates/
 COPY bootstrap-peers.json ./
 RUN find crates -name "*.rs" -exec touch {} + && \
-    rm -f target/release/gitlawb-node target/release/gl target/release/git-remote-gitlawb && \
-    rm -rf target/release/.fingerprint/gitlawb-node-* \
-           target/release/.fingerprint/gl-* \
-           target/release/.fingerprint/git-remote-gitlawb-* && \
-    cargo build --release --locked -p gitlawb-node -p gl -p git-remote-gitlawb && \
-    strip target/release/gitlawb-node target/release/gl target/release/git-remote-gitlawb
+    rm -f target/release/twigpine-node target/release/twigpine target/release/git-remote-twigpine \
+          target/release/git-remote-gitlawb && \
+    rm -rf target/release/.fingerprint/twigpine-node-* \
+           target/release/.fingerprint/twigpine-cli-* \
+           target/release/.fingerprint/git-remote-twigpine-* && \
+    cargo build --release --locked -p twigpine-node -p twigpine-cli -p git-remote-twigpine && \
+    strip target/release/twigpine-node target/release/twigpine target/release/git-remote-twigpine
 
 # ── Runtime stage ───────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -70,9 +71,17 @@ RUN groupadd -r gitlawb --gid=1000 \
     && mkdir -p /data/repos /data/keys \
     && chown -R gitlawb:gitlawb /data
 
-COPY --from=builder /build/target/release/gitlawb-node /usr/local/bin/
-COPY --from=builder /build/target/release/gl /usr/local/bin/
-COPY --from=builder /build/target/release/git-remote-gitlawb /usr/local/bin/
+COPY --from=builder /build/target/release/twigpine-node /usr/local/bin/
+COPY --from=builder /build/target/release/twigpine /usr/local/bin/
+COPY --from=builder /build/target/release/git-remote-twigpine /usr/local/bin/
+# Other names for the same binaries: the short form of the command, and the
+# names used before the rename. Git picks its remote helper by URL scheme, so
+# existing remotes still run the old helper name, and a compose file or unit
+# that overrides the command may still call the old daemon name.
+RUN ln -s twigpine /usr/local/bin/twig \
+    && ln -s twigpine /usr/local/bin/gl \
+    && ln -s git-remote-twigpine /usr/local/bin/git-remote-gitlawb \
+    && ln -s twigpine-node /usr/local/bin/gitlawb-node
 
 USER gitlawb
 WORKDIR /data
@@ -98,4 +107,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # tini reaps them and forwards SIGTERM/SIGINT to the node, which runs its own
 # graceful shutdown. (No `-g`: the node manages its own children, so group-wide
 # signalling would only disturb in-flight git helpers during shutdown.)
-ENTRYPOINT ["tini", "--", "gitlawb-node"]
+ENTRYPOINT ["tini", "--", "twigpine-node"]

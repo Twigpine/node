@@ -16,24 +16,24 @@ cargo build
 cargo test --workspace
 
 # Run a local node (requires a Postgres instance — see docker-compose.yml)
-cargo run -p gitlawb-node
+cargo run -p twigpine-node
 
 # Build the CLI
-cargo run -p gl -- --help
+cargo run -p twigpine-cli -- --help
 ```
 
-The fastest dev loop is `docker compose up postgres -d` for the database, then `cargo run -p gitlawb-node` for the node.
+The fastest dev loop is `docker compose up postgres -d` for the database, then `cargo run -p twigpine-node` for the node.
 
 ## Repository layout
 
 ```
 crates/
-├── gitlawb-core/       crypto primitives (DID, CID, HTTP sigs, UCAN, ref certs)
-├── gitlawb-node/       axum HTTP server, git smart HTTP, P2P, GraphQL
-├── gl/                 CLI — identity, repos, MCP server, Base L2 names
-├── git-remote-gitlawb/ git remote helper for gitlawb:// URLs
-├── gitlawb-attest/     provenance attestations for ref-update certificates
-└── icaptcha-client/    client for the iCaptcha proof-of-intelligence service
+├── twigpine-core/       crypto primitives (DID, CID, HTTP sigs, UCAN, ref certs)
+├── twigpine-node/       axum HTTP server, git smart HTTP, P2P, GraphQL
+├── twigpine-cli/        CLI — identity, repos, MCP server, Base L2 names
+├── git-remote-twigpine/ git remote helper for gitlawb:// URLs
+├── twigpine-attest/     provenance attestations for ref-update certificates
+└── icaptcha-client/     client for the iCaptcha proof-of-intelligence service
 docs/                   Operator guides
 scripts/                Build helpers
 ```
@@ -47,7 +47,7 @@ Smart contracts live in a separate repo: [github.com/Twigpine/contracts](https:/
 - **Code** — open a PR (see guidelines below)
 - **Documentation** — fixes and improvements always welcome
 - **Node operators** — run a node and join the network
-- **Agent integrations** — build tools using `gl mcp serve`
+- **Agent integrations** — build tools using `twigpine mcp serve`
 
 ## PR guidelines
 
@@ -100,8 +100,8 @@ The minimum required variable is `DATABASE_URL`. Everything else has sensible de
 cargo test --workspace
 
 # Specific crate
-cargo test -p gitlawb-core
-cargo test -p gitlawb-node
+cargo test -p twigpine-core
+cargo test -p twigpine-node
 ```
 
 ## Areas actively looking for help

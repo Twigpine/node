@@ -1,0 +1,1393 @@
+use crate::db::{RepoRecord, VisibilityRule};
+use crate::error::{AppError, Result};
+use crate::state::AppState;
+use crate::visibility::{visibility_check, Decision};
+
+pub mod agents;
+pub mod arweave;
+pub mod bounties;
+pub mod certs;
+pub mod changelog;
+pub mod encrypted;
+pub mod events;
+pub mod ipfs;
+pub mod issues;
+pub mod labels;
+pub mod peers;
+pub mod profiles;
+pub mod protect;
+pub mod pulls;
+pub mod register;
+pub mod replicas;
+pub mod repos;
+pub mod resolve;
+pub mod stars;
+pub mod status;
+pub mod task_cursor;
+pub mod tasks;
+pub mod visibility;
+pub mod webhooks;
+
+/// Resolve a repo for a read request and enforce path-scoped visibility.
+///
+/// Returns 404 (`RepoNotFound`) if the repo does not exist or the caller may not
+/// read `path`, using the same opaque response the git serve path returns so
+/// existence is not confirmed. Returns the record and its visibility rules so a
+/// content handler can apply an extra per-path check without a second DB query.
+///
+/// Callers pass `"/"` for repo-level reads (listings); content endpoints pass the
+/// specific path so a withheld subtree is denied even on an otherwise-public repo.
+pub(crate) async fn authorize_repo_read(
+    state: &AppState,
+    owner: &str,
+    name: &str,
+    caller: Option<&str>,
+    path: &str,
+) -> Result<(RepoRecord, Vec<VisibilityRule>)> {
+    let record = state
+        .db
+        .get_repo(owner, name)
+        .await?
+        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // A quarantined mirror (admitted by the iCaptcha propagation gate but not
+    // validated) is hidden from every reader — serve/clone and fork alike — as if
+    // it did not exist, until an operator releases it. Checked before the
+    // visibility gate so its existence is never disclosed.
+    if state.db.is_repo_quarantined(&record.id).await? {
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
+    let rules = state.db.list_visibility_rules(&record.id).await?;
+    if visibility_check(&rules, record.is_public, &record.owner_did, caller, path) == Decision::Deny
+    {
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
+    Ok((record, rules))
+}
+
+/// Match a presented DID against a stored DID that may be the full `did:key:<id>`
+/// form or the bare `<id>` short form (mirror rows store the bare key). Collapse
+/// representation only within `did:key`; never let a bare id match across methods —
+/// `did:web` / `did:gitlawb` share the base58 space with `did:key`, so a
+/// trailing-segment compare would treat `did:key:X` and `did:gitlawb:X` as equal.
+///
+/// The collapse itself lives in exactly one place, [`crate::db::normalize_owner_key`],
+/// which is also the function the stored `owner_did` / `authorizing_did` columns
+/// are normalized through and which `OWNER_KEY_CASE_SQL` mirrors byte for byte.
+/// Two identities match when they normalize to the same key; a second copy of the
+/// rule here is how the Rust gate and the SQL filters would drift apart.
+pub(crate) fn did_matches(a: &str, b: &str) -> bool {
+    // One implementation, shared with `twigpine` and `git-remote-twigpine` through core:
+    // every boundary that compares a DID applies the same collapse rule.
+    twigpine_core::ucan::push::did_key_eq(a, b)
+}
+
+/// Client-facing denial shared by every repo-owner gate copy. `require_repo_owner`
+/// renders it as `AppError::Forbidden`; a handler that emits its own
+/// `(StatusCode, Json)` envelope instead of `AppError` (e.g.
+/// `api::tasks::create_task`) must use this constant too, so two copies of one
+/// gate cannot drift in observable output.
+pub(crate) const REPO_OWNER_ONLY_MESSAGE: &str = "only the repo owner can perform this action";
+
+/// 403 unless `caller` is the repo owner. Uses [`did_matches`] so the owner check
+/// and the author check (close policy) share one normalization.
+pub(crate) fn require_repo_owner(record: &RepoRecord, caller: &str) -> Result<()> {
+    if did_matches(caller, &record.owner_did) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(REPO_OWNER_ONLY_MESSAGE.into()))
+    }
+}
+
+/// Validate a branch name using the configured git binary (storage boundaries).
+pub(crate) fn validate_git_ref_with_git(
+    git_bin: &str,
+    name: &str,
+) -> std::result::Result<(), crate::git::store::GitRefValidationError> {
+    crate::git::store::validate_git_ref_with_git(git_bin, name)
+}
+
+/// Map ref-validation failures to the correct HTTP surface: malformed caller
+/// input stays 400; an inability to run git stays on the git/server-error path.
+pub(crate) fn map_git_ref_validation_error(
+    err: crate::git::store::GitRefValidationError,
+) -> AppError {
+    match err {
+        crate::git::store::GitRefValidationError::Invalid(msg) => AppError::BadRequest(msg),
+        crate::git::store::GitRefValidationError::GitUnavailable(msg) => AppError::Git(msg),
+    }
+}
+
+#[cfg(test)]
+mod did_tests {
+    use super::did_matches;
+
+    #[test]
+    fn full_matches_bare_same_key() {
+        assert!(did_matches("did:key:zABC", "zABC"));
+        assert!(did_matches("zABC", "did:key:zABC"));
+    }
+
+    #[test]
+    fn rejects_cross_method_collision() {
+        assert!(!did_matches("did:key:zABC", "did:gitlawb:zABC"));
+        assert!(!did_matches("did:key:zABC", "did:web:zABC"));
+    }
+
+    #[test]
+    fn exact_match_and_distinct_keys() {
+        assert!(did_matches("did:key:zABC", "did:key:zABC"));
+        assert!(!did_matches("did:key:zABC", "did:key:zXYZ"));
+        assert!(!did_matches("zABC", "zXYZ"));
+    }
+
+    #[test]
+    fn empty_did_matches() {
+        assert!(did_matches("", ""));
+        assert!(did_matches("", "did:key:"));
+    }
+}
+
+/// Drift guard (plan 002 §Gate-type table, Step 5). Every in-scope mutation
+/// handler must contain its expected gate marker in its own body; removing a
+/// gate fails this test. Source-level (no DB), so it runs everywhere. When a new
+/// route is added to an in-scope group, add its row here with a deliberate gate
+/// type — that forced decision is the point.
+///
+/// Markers are gate-SHAPED — a call (`require_repo_owner(`, `did_matches(`) or a
+/// binding/comparison expression (`caller != &record.owner_did`,
+/// `let owner_did = auth.0`) — never a bare identifier that could also appear in
+/// a log line. Full-line comments are stripped before matching, so a marker that
+/// survives only as a comment above a deleted gate does NOT satisfy a row.
+#[cfg(test)]
+mod authz_guard {
+    /// The body of `func` with full-line comments removed. Bounds the slice at the
+    /// next top-level fn item so a marker in a later handler can't leak in,
+    /// tolerating `pub async`, `pub(crate) async`, `async`, `pub`, and bare `fn`
+    /// declarations (the old single-`pub async fn` delimiter over-ran on any other
+    /// form).
+    fn fn_body(src: &str, func: &str) -> String {
+        let needle = format!("fn {func}(");
+        let start = src
+            .find(&needle)
+            .unwrap_or_else(|| panic!("handler `{func}` not found (renamed or removed?)"));
+        let rest = &src[start..];
+        let end = [
+            "\npub async fn ",
+            "\npub(crate) async fn ",
+            "\nasync fn ",
+            "\npub fn ",
+            "\nfn ",
+            "#[cfg(test)]",
+        ]
+        .iter()
+        .filter_map(|p| rest[1..].find(p).map(|i| i + 1))
+        .min()
+        .unwrap_or(rest.len());
+        // Strip block comments too: a marker surviving only inside /* */ would
+        // otherwise satisfy a row with the real gate deleted.
+        // Line comments first: a `//` line containing `/*` must not open a
+        // block range or real code (and gate markers) gets stripped with it.
+        let mut body = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        while let Some(open) = body.find("/*") {
+            match body[open..].find("*/").map(|i| open + i + 2) {
+                Some(close) => body.replace_range(open..close, ""),
+                None => break,
+            }
+        }
+        body
+    }
+
+    #[test]
+    fn every_in_scope_mutation_has_its_gate() {
+        let pulls = include_str!("pulls.rs");
+        let webhooks = include_str!("webhooks.rs");
+        let labels = include_str!("labels.rs");
+        let issues = include_str!("issues.rs");
+        let bounties = include_str!("bounties.rs");
+        let replicas = include_str!("replicas.rs");
+        let events = include_str!("events.rs");
+        let tasks = include_str!("tasks.rs");
+        let stars = include_str!("stars.rs");
+        let status = include_str!("status/mod.rs");
+        let protect = include_str!("protect.rs");
+        let visibility = include_str!("visibility.rs");
+        let profiles = include_str!("profiles.rs");
+        let repos = include_str!("repos.rs");
+        let register = include_str!("register.rs");
+        let ipfs = include_str!("ipfs.rs");
+
+        // (source, handler, expected gate marker)
+        let rows: &[(&str, &str, &str)] = &[
+            // Bucket A — owner-gate (require_repo_owner -> 403), now behind
+            // the shared read gate first so a hidden repo 404s for every
+            // caller class before the owner check can answer 403.
+            (pulls, "merge_pr", "authorize_repo_read("),
+            (pulls, "merge_pr", "require_repo_owner("),
+            (webhooks, "create_webhook", "authorize_repo_read("),
+            (webhooks, "create_webhook", "require_repo_owner("),
+            (webhooks, "delete_webhook", "authorize_repo_read("),
+            (webhooks, "delete_webhook", "require_repo_owner("),
+            // Bucket A/B hybrid — list_webhooks is read-visibility THEN owner:
+            // authorize_repo_read 404s a non-reader of a private repo, then
+            // require_repo_owner 403s a non-owner of a public one. Both halves
+            // are pinned: the authorize_repo_read marker guards the read half
+            // (existence hiding) and require_repo_owner guards the owner half.
+            (webhooks, "list_webhooks", "authorize_repo_read("),
+            (webhooks, "list_webhooks", "require_repo_owner("),
+            // Same two-half shape as list_webhooks: authorize_repo_read runs
+            // first (a quarantined or unreadable repo gets the missing-repo
+            // not-found, never a 403 that would confirm existence), then
+            // require_repo_owner 403s a non-owner of a readable repo. Both halves
+            // are pinned, because dropping either changes what a stranger learns.
+            (status, "create_status", "authorize_repo_read("),
+            (status, "create_status", "require_repo_owner("),
+            (labels, "add_label", "authorize_repo_read("),
+            (labels, "add_label", "require_repo_owner("),
+            (labels, "remove_label", "authorize_repo_read("),
+            (labels, "remove_label", "require_repo_owner("),
+            // Bucket A' — owner OR author (did_matches against the author),
+            // also behind the shared read gate first.
+            (pulls, "close_pr", "authorize_repo_read("),
+            (pulls, "close_pr", "did_matches("),
+            (issues, "close_issue", "authorize_repo_read("),
+            (issues, "close_issue", "did_matches("),
+            // Bucket B — read-gate (authorize_repo_read)
+            (pulls, "create_review", "authorize_repo_read("),
+            (pulls, "create_comment", "authorize_repo_read("),
+            (pulls, "create_pr", "authorize_repo_read("),
+            (issues, "create_issue_comment", "authorize_repo_read("),
+            (issues, "create_issue", "authorize_repo_read("),
+            (bounties, "create_bounty", "authorize_repo_read("),
+            (repos, "fork_repo", "authorize_repo_read("),
+            // get_by_cid resolves each candidate (provenance path + legacy scan) through
+            // the shared `gate_and_serve`; the gate markers themselves are asserted
+            // below. This row proves the delegation is real, so the gate is actually
+            // reached rather than dead code. The delegated gate still calls
+            // `visibility_check` directly and never `authorize_repo_read`, so it keeps
+            // the property the pre-merge marker enforced: no fuzzy re-resolve.
+            (ipfs, "get_by_cid", "gate_and_serve("),
+            // Sibling read surfaces: gate private-repo metadata on read visibility
+            // (public repos stay anonymous; private repos 404).
+            (replicas, "list_replicas", "authorize_repo_read("),
+            (protect, "list_protected_branches", "authorize_repo_read("),
+            (labels, "list_labels", "authorize_repo_read("),
+            (events, "list_repo_events", "authorize_repo_read("),
+            // The catch-up poll surface gates before any push-event row is read,
+            // so a stranger cannot use it to learn that a private repo exists or
+            // is being pushed to.
+            (events, "list_repo_push_events", "authorize_repo_read("),
+            // The status read gates before any claim data is loaded, so its deny
+            // is the repo's own not-found rather than an existence oracle over
+            // which commits were reported on.
+            (status, "commit_status", "authorize_repo_read("),
+            // The rollup gates on the same helper before the pull request row is
+            // loaded, so a caller who cannot read the repo cannot learn which
+            // pull request numbers exist on it — and the fallback's branch
+            // resolve and head persist sit behind that same gate.
+            (status, "pull_request_status", "authorize_repo_read("),
+            // Bucket C — signer-self: the acting DID is matched/bound to auth.0
+            (tasks, "create_task", "did_matches("),
+            // #496: create_task is signer-self AND owner-when-repo-scoped — a
+            // repo_id naming a hosted repo admits tasks only from its owner.
+            // Both halves are pinned: the did_matches row guards the signer
+            // binding, this one the repo-ownership gate.
+            (tasks, "create_task", "require_repo_owner("),
+            (tasks, "claim_task", "did_matches("),
+            (tasks, "complete_task", "did_matches("),
+            (tasks, "fail_task", "did_matches("),
+            (repos, "create_repo", "let owner_did = auth.0"),
+            (profiles, "set_profile", "let did = auth.0"),
+            (register, "register", "did_matches("),
+            (stars, "star_repo", "caller = &auth.0"),
+            (stars, "unstar_repo", "caller = &auth.0"),
+            // Bucket D — non-owner-by-design, positive per-route marker
+            (bounties, "claim_bounty", "claim_bounty(&id, &auth.0"),
+            (bounties, "submit_bounty", "did_matches("),
+            (bounties, "approve_bounty", "did_matches("),
+            (bounties, "cancel_bounty", "did_matches("),
+            (bounties, "dispute_bounty", "did_matches("),
+            (replicas, "register_replica", "did_matches("),
+            (replicas, "unregister_replica", "replica_did = &auth.0"),
+            // PRE-GATED — owner-gated behind the shared read gate; guard both
+            (protect, "protect_branch", "authorize_repo_read("),
+            (protect, "protect_branch", "did_matches("),
+            (protect, "unprotect_branch", "authorize_repo_read("),
+            (protect, "unprotect_branch", "did_matches("),
+            (visibility, "set_visibility", "authorize_repo_read("),
+            (visibility, "set_visibility", "require_owner("),
+            (visibility, "remove_visibility", "authorize_repo_read("),
+            (visibility, "remove_visibility", "require_owner("),
+            (visibility, "list_visibility", "authorize_repo_read("),
+            (visibility, "list_visibility", "require_owner("),
+        ];
+
+        // Rows above prove each visibility handler calls authorize_repo_read and
+        // require_owner; this proves the helper itself does DID-safe matching.
+        assert!(
+            fn_body(visibility, "require_owner").contains("did_matches("),
+            "visibility::require_owner must use did_matches for DID-safe owner matching"
+        );
+
+        // Order matters as much as presence: hoisting the owner/author check
+        // above the read gate would 403 a non-owner on a hidden repo, an
+        // existence oracle. Pin read-gate-then-owner on every handler that
+        // takes both; the owner marker differs per bucket (require_repo_owner
+        // for owner-only, require_owner for visibility, did_matches for the
+        // owner-or-author and protect paths).
+        for (src, func, owner_marker) in [
+            (visibility, "set_visibility", "require_owner("),
+            (visibility, "remove_visibility", "require_owner("),
+            (visibility, "list_visibility", "require_owner("),
+            (pulls, "merge_pr", "require_repo_owner("),
+            (webhooks, "list_webhooks", "require_repo_owner("),
+            (webhooks, "create_webhook", "require_repo_owner("),
+            (webhooks, "delete_webhook", "require_repo_owner("),
+            (labels, "add_label", "require_repo_owner("),
+            (labels, "remove_label", "require_repo_owner("),
+            (pulls, "close_pr", "did_matches("),
+            (issues, "close_issue", "did_matches("),
+            (protect, "protect_branch", "did_matches("),
+            (protect, "unprotect_branch", "did_matches("),
+        ] {
+            let body = fn_body(src, func);
+            let gate = body.find("authorize_repo_read(").expect("gate marker");
+            let owner = body.find(owner_marker).expect("owner marker");
+            assert!(
+                gate < owner,
+                "{func} must run authorize_repo_read before {owner_marker}"
+            );
+            // The owner-or-author and protect handlers also carry
+            // require_repo_owner: a hoist of that call above the read gate is
+            // the same 403-vs-404 oracle, so pin it too where it exists.
+            if func == "close_pr" || func == "close_issue" {
+                let owner_gate = body.find("require_repo_owner(").expect("owner marker");
+                assert!(
+                    gate < owner_gate,
+                    "{func} must run authorize_repo_read before require_repo_owner("
+                );
+            }
+        }
+
+        // The CID read surface (#173) enforces its gate inside the shared
+        // `gate_and_serve`, which BOTH the provenance path and the legacy scan call, so
+        // the markers must live there (the get_by_cid row above only proves delegation).
+        // The repo's own "/" visibility check (KTD2a — never authorize_repo_read's fuzzy
+        // re-resolve) and the quarantine hard-drop BEFORE visibility (INV-11) are both
+        // load-bearing: removing either re-opens a leak on the provenance path.
+        let gate_body = fn_body(ipfs, "gate_and_serve");
+        assert!(
+            gate_body.contains("visibility_check("),
+            "gate_and_serve must gate the CID read surface via visibility_check (KTD2a)"
+        );
+        assert!(
+            gate_body.contains("if quarantined"),
+            "gate_and_serve must hard-drop a quarantined repo before the visibility gate (INV-11)"
+        );
+
+        for (src, func, marker) in rows {
+            let body = fn_body(src, func);
+            assert!(
+                body.contains(marker),
+                "handler `{func}` is missing its gate marker `{marker}` — gate removed or route reclassified"
+            );
+        }
+    }
+
+    /// Completeness fence over the GraphQL mutation surface: the mirror of
+    /// `every_in_scope_mutation_has_its_gate` for `graphql/mutation.rs`. Kept a
+    /// SEPARATE guard with its own table (never folded into the REST rows above):
+    /// a guard over a heterogeneous set must classify per member, and these
+    /// same-named task rows belong to the GraphQL surface, not `api/tasks.rs`.
+    ///
+    /// COMPLETENESS comes from the engine's own SDL (`schema.sdl()`), parsed as a
+    /// structured AST (#219), NOT introspection and NOT a text parse of source.
+    /// This matters: async-graphql OMITS `#[graphql(visible = false)]` fields from
+    /// introspection while leaving them executable, so an introspection-sourced fence
+    /// could be defeated by a hidden mutation. SDL includes those fields, so no
+    /// visibility flag (and, via the AST parse, no brace-in-description quirk) can hide
+    /// a live mutation. The SDL field set must equal the registered set: a new field with
+    /// no row fails (a repo-write cannot slip in unlisted); a registered name absent from
+    /// the schema fails (renamed or removed). The set is also cross-checked against
+    /// introspection, so any field present in SDL but hidden from introspection fails
+    /// named as a forbidden hidden mutation.
+    ///
+    /// The MARKER check is the only source-scraped part, and it is not the
+    /// completeness guarantee. Three honest limits, so a green check is not misread
+    /// as full authorization coverage:
+    ///   1. A present marker is not load-bearingness (the gate may not redden on a
+    ///      hostile probe: the #203 present-but-vacuous case). The adversarial tests
+    ///      in `graphql/mutation.rs` are the load-bearing layer.
+    ///   2. A present marker is not gate-correctness (it may be the wrong bucket for
+    ///      the operation's resource: a repo-write registered as signer-self would
+    ///      pass, so INV-1 review remains the defense).
+    ///   3. The marker check scrapes the comment-masked, brace-bounded resolver body;
+    ///      a `{`/`}` or a `did_matches(` inside a STRING literal is not masked, so it
+    ///      could mis-slice that body or satisfy the marker vacuously (the same
+    ///      vacuous-marker class as limit 1). Completeness is unaffected: it comes
+    ///      from the SDL AST, not from this scrape.
+    #[test]
+    fn every_graphql_mutation_has_its_gate() {
+        // (Rust snake name, schema field in camelCase, expected gate markers). The
+        // four are Bucket C signer-self: `/graphql` uses optional_signature, so each
+        // resolver must call `require_signer(ctx)?` and bind the acting DID with
+        // `did_matches(`. A repo-write would be Bucket A (`require_repo_owner(`).
+        // Same-named REST rows live in the guard above against `api/tasks.rs`.
+        let registered: &[(&str, &str, &[&str])] = &[
+            (
+                "create_task",
+                "createTask",
+                &[
+                    "require_signer(ctx)?",
+                    "did_matches(",
+                    "require_repo_owner(",
+                ],
+            ),
+            (
+                "claim_task",
+                "claimTask",
+                &["require_signer(ctx)?", "did_matches("],
+            ),
+            (
+                "complete_task",
+                "completeTask",
+                &["require_signer(ctx)?", "did_matches("],
+            ),
+            (
+                "fail_task",
+                "failTask",
+                &["require_signer(ctx)?", "did_matches("],
+            ),
+        ];
+
+        // Completeness + hidden-mutation cross-check against the REAL schema (#219),
+        // delegated to the generic `assert_mutation_fence` so the SDL sourcing and the
+        // cross-check are ALSO exercised by a synthetic hidden schema in
+        // `fence_rejects_a_hidden_mutation` (INV-21). Because the real MutationRoot has no
+        // hidden field today, that synthetic test — not a hypothetical production canary —
+        // is what turns reverting the SDL source or deleting the cross-check RED.
+        {
+            use crate::graphql::mutation::MutationRoot;
+            use crate::graphql::query::QueryRoot;
+            use crate::graphql::subscription::SubscriptionRoot;
+            let schema =
+                async_graphql::Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+            let registered_camel: Vec<&str> = registered.iter().map(|(_, c, _)| *c).collect();
+            assert_mutation_fence(&schema, &registered_camel);
+        }
+
+        // Marker present (source scrape; the vacuity limit, backstopped by the
+        // adversarial tests): each resolver body carries every required gate marker.
+        let masked = mask_comments(include_str!("../graphql/mutation.rs"));
+        for (snake, _, markers) in registered {
+            let body = resolver_body(&masked, snake);
+            for marker in *markers {
+                assert!(
+                    body.contains(marker),
+                    "GraphQL mutation `{snake}` is missing its gate marker `{marker}`: gate removed"
+                );
+            }
+        }
+    }
+
+    /// Version-safety self-check (#219, INV-21): the fence's completeness guarantee rests
+    /// on `schema.sdl()` INCLUDING `visible = false` fields while introspection omits
+    /// them. That is observed async-graphql behavior, not a documented contract, so pin
+    /// it here: a synthetic schema with a hidden mutation must have that field in its
+    /// SDL-derived set and NOT in its introspection-derived set. If a future
+    /// async-graphql upgrade ever filters SDL by visibility, the first assertion flips
+    /// RED — the assumption is load-bearing, not trusted.
+    #[test]
+    fn sdl_source_sees_hidden_mutations_that_introspection_omits() {
+        use async_graphql::{EmptySubscription, Object, Schema};
+        struct Q;
+        #[Object]
+        impl Q {
+            async fn ping(&self) -> i32 {
+                0
+            }
+        }
+        struct M;
+        #[Object]
+        impl M {
+            async fn visible_mut(&self) -> i32 {
+                1
+            }
+            #[graphql(visible = false)]
+            async fn hidden_mut(&self) -> i32 {
+                2
+            }
+        }
+        let schema = Schema::build(Q, M, EmptySubscription).finish();
+
+        // SDL source (the fix): includes the hidden field.
+        let sdl_fields = mutation_field_names_from_sdl(&schema.sdl());
+        assert!(
+            sdl_fields.iter().any(|f| f == "hiddenMut"),
+            "SDL-sourced set MUST include the visible=false mutation; if this is RED, \
+             async-graphql started filtering SDL by visibility and the fence's \
+             completeness guarantee is broken: {sdl_fields:?}"
+        );
+
+        // Introspection (the fence's own helper): OMITS the hidden field. This is the
+        // exact gap the fix closes — an introspection-sourced fence never sees `hiddenMut`.
+        let introspected = introspection_mutation_fields(&schema);
+        assert!(
+            !introspected.iter().any(|f| f == "hiddenMut"),
+            "introspection is expected to OMIT the visible=false mutation (that is the \
+             gap the SDL source closes); got {introspected:?}"
+        );
+
+        // The exact diff the fence computes: hidden ∈ (sdl \ introspection).
+        let hidden: Vec<&String> = sdl_fields
+            .iter()
+            .filter(|f| !introspected.iter().any(|i| i == *f))
+            .collect();
+        assert_eq!(
+            hidden,
+            vec!["hiddenMut"],
+            "the SDL-vs-introspection diff must surface exactly the hidden mutation"
+        );
+    }
+
+    /// INV-21 wiring guard (#219): drives the generic `assert_mutation_fence` — the SAME
+    /// helper the real fence calls — against a synthetic schema whose mutation is
+    /// `visible = false` and IS registered, so completeness passes and ONLY the
+    /// hidden-from-introspection cross-check can fail. This is what makes the fence's SDL
+    /// sourcing load-bearing without a production canary: reverting the source to
+    /// introspection (the hidden field then absent from the SDL set) or deleting the
+    /// cross-check removes this panic (or changes its message), turning the
+    /// `should_panic` test RED. The real MutationRoot has no hidden field, so nothing on
+    /// the real schema could catch that regression.
+    #[test]
+    #[should_panic(expected = "hidden from introspection")]
+    fn fence_rejects_a_hidden_mutation() {
+        use async_graphql::{EmptySubscription, Object, Schema};
+        struct Q;
+        #[Object]
+        impl Q {
+            async fn ping(&self) -> i32 {
+                0
+            }
+        }
+        struct M;
+        #[Object]
+        impl M {
+            async fn visible_mut(&self) -> i32 {
+                1
+            }
+            #[graphql(visible = false)]
+            async fn hidden_mut(&self) -> i32 {
+                2
+            }
+        }
+        let schema = Schema::build(Q, M, EmptySubscription).finish();
+        // Both fields registered, so completeness passes and only the cross-check fires.
+        assert_mutation_fence(&schema, &["visibleMut", "hiddenMut"]);
+    }
+
+    /// Deprecated-mutation guard (#219): a `#[graphql(deprecation = "...")]` mutation is
+    /// executable and present in SDL, but GraphQL introspection omits it by default. The
+    /// fence's introspection helper uses `includeDeprecated: true`, so a deprecated (but
+    /// visible) mutation is NOT mistaken for a hidden one. With it registered, the fence
+    /// must NOT panic. Remove `includeDeprecated: true` and this goes RED — the deprecated
+    /// field would look hidden and false-red as a forbidden visible=false mutation.
+    #[test]
+    fn fence_admits_a_deprecated_mutation() {
+        use async_graphql::{EmptySubscription, Object, Schema};
+        struct Q;
+        #[Object]
+        impl Q {
+            async fn ping(&self) -> i32 {
+                0
+            }
+        }
+        struct M;
+        #[Object]
+        impl M {
+            async fn visible_mut(&self) -> i32 {
+                1
+            }
+            #[graphql(deprecation = "use visibleMut")]
+            async fn deprecated_mut(&self) -> i32 {
+                2
+            }
+        }
+        let schema = Schema::build(Q, M, EmptySubscription).finish();
+        // Must not panic: the deprecated field is visible (present in introspection with
+        // includeDeprecated) and registered, so it is neither hidden nor unclassified.
+        assert_mutation_fence(&schema, &["visibleMut", "deprecatedMut"]);
+    }
+
+    /// Completeness + hidden-mutation cross-check for a BUILT schema (#219). Generic over
+    /// the schema type so the real fence AND the synthetic `fence_rejects_a_hidden_mutation`
+    /// / `fence_admits_a_deprecated_mutation` tests drive the SAME sourcing and cross-check.
+    /// Completeness is sourced from SDL (which includes `visible = false` fields); the
+    /// cross-check fails any SDL field hidden from introspection. This genericity is the
+    /// INV-21 fix: because the real MutationRoot has no hidden field, only a synthetic
+    /// hidden schema through THIS helper makes reverting the SDL source or removing the
+    /// cross-check RED, rather than leaving the class latent behind a production canary.
+    fn assert_mutation_fence<Q, M, S>(
+        schema: &async_graphql::Schema<Q, M, S>,
+        registered_camel: &[&str],
+    ) where
+        Q: async_graphql::ObjectType + 'static,
+        M: async_graphql::ObjectType + 'static,
+        S: async_graphql::SubscriptionType + 'static,
+    {
+        let sdl_fields = mutation_field_names_from_sdl(&schema.sdl());
+        let introspected = introspection_mutation_fields(schema);
+        // No SDL field may be hidden from introspection (a visible=false mutation).
+        for f in &sdl_fields {
+            assert!(
+                introspected.iter().any(|i| i == f),
+                "GraphQL mutation `{f}` is in the schema but hidden from introspection \
+                 (a `#[graphql(visible = false)]` field): hidden mutations are forbidden \
+                 by this fence — make it visible so its classification is enforceable, or \
+                 remove it"
+            );
+        }
+        // Completeness both directions against the registered (camelCase) set.
+        for f in &sdl_fields {
+            assert!(
+                registered_camel.contains(&f.as_str()),
+                "unclassified GraphQL mutation `{f}`: add it to \
+                 every_graphql_mutation_has_its_gate with a deliberate gate \
+                 (`require_repo_owner(` for a repo-write, `did_matches(` for a task op)"
+            );
+        }
+        for c in registered_camel {
+            assert!(
+                sdl_fields.iter().any(|f| f == c),
+                "registered GraphQL mutation `{c}` is not in the schema \
+                 (renamed or removed); update the table"
+            );
+        }
+    }
+
+    /// The mutation field names via the engine's introspection, run against a passed
+    /// schema. STRUCTURED (names arrive as data). Uses `fields(includeDeprecated: true)`:
+    /// GraphQL's default omits `@deprecated` fields, but a `#[graphql(deprecation = "...")]`
+    /// mutation is still executable and present in SDL, so without this the cross-check
+    /// above would false-red a deprecated mutation as a hidden (visible=false) one. Only a
+    /// real visibility filter should trip that arm; deprecation is a lifecycle marker.
+    fn introspection_mutation_fields<Q, M, S>(
+        schema: &async_graphql::Schema<Q, M, S>,
+    ) -> Vec<String>
+    where
+        Q: async_graphql::ObjectType + 'static,
+        M: async_graphql::ObjectType + 'static,
+        S: async_graphql::SubscriptionType + 'static,
+    {
+        use async_graphql::Value;
+        let resp = tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(schema.execute(
+                "{ __schema { mutationType { fields(includeDeprecated: true) { name } } } }",
+            ));
+        assert!(
+            resp.errors.is_empty(),
+            "schema introspection failed: {:?}",
+            resp.errors
+        );
+        let mut names = Vec::new();
+        if let Value::Object(root) = &resp.data {
+            if let Some(Value::Object(sc)) = root.get("__schema") {
+                if let Some(Value::Object(mt)) = sc.get("mutationType") {
+                    if let Some(Value::List(field_list)) = mt.get("fields") {
+                        for field in field_list {
+                            if let Value::Object(fo) = field {
+                                if let Some(Value::String(n)) = fo.get("name") {
+                                    names.push(n.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// The mutation field names sourced from the built schema's SDL — the completeness
+    /// source (#219). Builds the same DB-free schema as the introspection helper and runs
+    /// its `.sdl()` (sync, no runtime needed) through [`mutation_field_names_from_sdl`].
+    /// SDL includes `#[graphql(visible = false)]` fields, so this source cannot be
+    /// defeated by hiding a mutation from introspection.
+    fn graphql_mutation_fields_from_sdl() -> Vec<String> {
+        use crate::graphql::mutation::MutationRoot;
+        use crate::graphql::query::QueryRoot;
+        use crate::graphql::subscription::SubscriptionRoot;
+        let schema =
+            async_graphql::Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+        mutation_field_names_from_sdl(&schema.sdl())
+    }
+
+    /// The mutation type's field names extracted from an async-graphql SDL string via
+    /// the engine's OWN parser AST (`async_graphql::parser::parse_schema`), NOT
+    /// introspection. This is the completeness source (#219): unlike introspection,
+    /// which async-graphql filters by `visible` (a `#[graphql(visible = false)]`
+    /// mutation is executable but ABSENT from introspection), `schema.sdl()` includes
+    /// every registered field, so a hidden mutation still appears here and must carry a
+    /// classified row. Parsing the AST (not a brace/line text scan) means a `}` inside a
+    /// field description cannot mis-slice the type block. camelCase, as async-graphql
+    /// emits. An empty result on a navigation miss is safe: the set-equality in
+    /// `every_graphql_mutation_has_its_gate` turns "no fields" into a loud failure for
+    /// every registered name, never a vacuous pass.
+    fn mutation_field_names_from_sdl(sdl: &str) -> Vec<String> {
+        use async_graphql::parser::parse_schema;
+        use async_graphql::parser::types::{TypeKind, TypeSystemDefinition};
+
+        let doc = parse_schema(sdl).expect("async-graphql SDL must parse");
+        // The mutation root type name: from the `schema { mutation: X }` block if
+        // present, else the GraphQL default "Mutation".
+        let mutation_type = doc
+            .definitions
+            .iter()
+            .find_map(|def| match def {
+                TypeSystemDefinition::Schema(s) => s
+                    .node
+                    .mutation
+                    .as_ref()
+                    .map(|m| m.node.as_str().to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "Mutation".to_string());
+        // The fields of that object type.
+        doc.definitions
+            .iter()
+            .find_map(|def| match def {
+                TypeSystemDefinition::Type(t) if t.node.name.node.as_str() == mutation_type => {
+                    match &t.node.kind {
+                        TypeKind::Object(obj) => Some(
+                            obj.fields
+                                .iter()
+                                .map(|f| f.node.name.node.as_str().to_string())
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn sdl_extractor_includes_a_hidden_visible_false_field() {
+        // A field that would be hidden from introspection must still be listed from SDL.
+        let sdl = "schema { query: QueryRoot mutation: MutationRoot }\n\
+                   type QueryRoot { ping: Int! }\n\
+                   type MutationRoot { createTask: Int! hiddenMut: Int! }\n";
+        let fields = mutation_field_names_from_sdl(sdl);
+        assert!(
+            fields.iter().any(|f| f == "createTask"),
+            "visible field must be listed: {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|f| f == "hiddenMut"),
+            "a visible=false field (present in SDL, hidden from introspection) MUST be \
+             listed by the completeness source: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn sdl_extractor_is_not_fooled_by_a_brace_in_a_field_description() {
+        // A `}` inside a field description must not truncate the type block (the AST
+        // parse is immune to the text-parse quirk the old design feared).
+        let sdl = "schema { query: QueryRoot mutation: MutationRoot }\n\
+                   type QueryRoot { ping: Int! }\n\
+                   type MutationRoot {\n\
+                     \"\"\"a description with a } brace and { another\"\"\"\n\
+                     createTask: Int!\n\
+                     claimTask: Int!\n\
+                   }\n";
+        let fields = mutation_field_names_from_sdl(sdl);
+        assert!(
+            fields.iter().any(|f| f == "createTask") && fields.iter().any(|f| f == "claimTask"),
+            "both fields must be extracted despite a brace in a description: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn sdl_extractor_returns_empty_for_a_query_only_schema() {
+        let sdl = "schema { query: QueryRoot }\ntype QueryRoot { ping: Int! }\n";
+        assert!(
+            mutation_field_names_from_sdl(sdl).is_empty(),
+            "a schema with no mutation root yields no mutation fields (no panic)"
+        );
+    }
+
+    /// The comment-masked body of `async fn <snake>` in `graphql/mutation.rs`, bounded
+    /// to the resolver's OWN braces (its `{ .. }`), for the marker check. Brace-matching
+    /// on the comment-masked source means a `}` in a trailing helper cannot extend the
+    /// body and a comment marker does not count. A `{`/`}` inside a STRING literal is
+    /// not masked, a documented marker-check-only residual (limit 3); completeness does
+    /// not use this.
+    fn resolver_body(masked_src: &str, snake: &str) -> String {
+        let needle = format!("async fn {snake}(");
+        let start = masked_src.find(&needle).unwrap_or_else(|| {
+            panic!("resolver `async fn {snake}(` not found in graphql/mutation.rs")
+        });
+        let open = start
+            + masked_src[start..]
+                .find('{')
+                .expect("resolver body opening brace");
+        let mut depth = 0i32;
+        let mut end = masked_src.len();
+        for (i, c) in masked_src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        masked_src[open..end].to_string()
+    }
+
+    /// `src` with `//` line comments and `/* */` block comments (nested) blanked to
+    /// spaces, WITHOUT opening a comment inside a `"..."` string (so a `"https://"` does
+    /// not erase the rest of its line). String CONTENTS are left intact, so a brace or
+    /// a gate marker inside a string is not masked; for the marker check that is a
+    /// documented vacuity residual (limit 3), and completeness does not use this at
+    /// all. Char literals and raw/byte strings are not tracked (absent in resolver
+    /// bodies); a `'"'` char or a raw string is the remaining narrow residual.
+    fn mask_comments(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        let mut block_depth = 0usize;
+        let mut in_string = false;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if block_depth > 0 {
+                if c == '/' && next == Some('*') {
+                    block_depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if c == '*' && next == Some('/') {
+                    block_depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else {
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+            } else if in_string {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(n) = next {
+                        out.push(n);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    if c == '"' {
+                        in_string = false;
+                    }
+                    i += 1;
+                }
+            } else if c == '"' {
+                in_string = true;
+                out.push('"');
+                i += 1;
+            } else if c == '/' && next == Some('/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(' ');
+                    i += 1;
+                }
+            } else if c == '/' && next == Some('*') {
+                block_depth = 1;
+                out.push_str("  ");
+                i += 2;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The SDL field set (the completeness source of truth, #219) is exactly the
+    /// registered mutations. If async-graphql adds or renames a field, this reddens
+    /// and forces the `every_graphql_mutation_has_its_gate` table to be updated. Uses
+    /// SDL, not introspection: introspection omits `visible = false` fields, so an
+    /// introspection-based pin here would go green while a hidden mutation existed.
+    #[test]
+    fn schema_lists_exactly_the_registered_mutations() {
+        let mut fields = graphql_mutation_fields_from_sdl();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec!["claimTask", "completeTask", "createTask", "failTask"],
+            "the SDL mutation field set is the authoritative discovered set"
+        );
+    }
+
+    /// The marker check is bounded to a resolver's OWN body and is comment- and
+    /// string-aware: a `//` inside a `"https://"` string does not erase a real gate on
+    /// that line (no false-red), and a trailing module helper's `did_matches(` does not
+    /// rescue a resolver whose own gate was removed (no false-green).
+    #[test]
+    fn resolver_body_is_bounded_and_comment_and_string_aware() {
+        let src = "\
+impl MutationRoot {
+    async fn ok(&self) -> Result<u32> {
+        let _ = (\"see https://x/y\", did_matches(a, b)); // URL string then gate, one line
+        Ok(0)
+    }
+    async fn last(&self) -> Result<u32> {
+        // did_matches( only in a comment
+        Ok(0)
+    }
+}
+fn helper() { let _ = did_matches(z, z); }
+#[cfg(test)]
+mod tests { async fn t() { let _ = did_matches(x, y); } }
+";
+        let masked = mask_comments(src);
+        assert!(
+            resolver_body(&masked, "ok").contains("did_matches("),
+            "a `//` inside a string must not erase the real gate on that line"
+        );
+        assert!(
+            !resolver_body(&masked, "last").contains("did_matches("),
+            "the marker check must be bounded to the resolver's own body (a trailing \
+             helper's marker must not rescue a resolver whose gate was removed)"
+        );
+    }
+
+    /// Proves the comment-stripping that GUARD-1 added: a marker that appears only
+    /// in a full-line comment (the real `replicas.rs` false-pass shape) must NOT
+    /// satisfy a row.
+    #[test]
+    fn comment_only_marker_does_not_satisfy_a_row() {
+        let src = "pub async fn demo() {\n    // did_matches( handles the owner form\n    do_thing();\n}\n";
+        assert!(
+            !fn_body(src, "demo").contains("did_matches("),
+            "a marker present only in a comment must not count as an enforced gate"
+        );
+    }
+
+    /// All `pub async fn` / `pub(crate) async fn` handler names declared in `src`.
+    /// Verb-agnostic on purpose: a repo-scoped read of any name is in scope, so a
+    /// handler named `fetch_*` / `replicate_*` / `info_refs` cannot escape the gate
+    /// check by not being called `list_*` / `get_*`.
+    fn handler_names(src: &str) -> Vec<String> {
+        ["pub async fn ", "pub(crate) async fn "]
+            .iter()
+            .flat_map(|decl| {
+                src.match_indices(decl).map(move |(i, _)| {
+                    src[i + decl.len()..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect::<String>()
+                })
+            })
+            .collect()
+    }
+
+    /// True when the handler's signature takes an owner+repo path
+    /// (`Path<(String, String...)>`), i.e. it is a repo-scoped read rather than a
+    /// node-wide aggregate (`/stats`, `/ipfs/pins`, the global feeds).
+    fn is_repo_scoped(body: &str) -> bool {
+        let header = &body[..body.find('{').unwrap_or(body.len())];
+        header.contains("Path<(String, String")
+    }
+
+    /// True when at least one gate marker runs for EVERY service — i.e. some
+    /// marker sits outside any `if service == ...` discriminator block. A gate
+    /// that appears ONLY inside such a block (as the info/refs advertisement gate
+    /// did before #119: `visibility_check` ran under `if service ==
+    /// "git-upload-pack"`, leaving `git-receive-pack` ungated) covers a subset of
+    /// services and must NOT count as a full gate. Other handlers carry no
+    /// `service ==` discriminator, so for them this matches the plain
+    /// substring check. NOTE: only `if service ==` is detected — a
+    /// `match service { .. }` discriminator is NOT tracked and a gate inside one
+    /// arm would pass as full; avoid that shape, or extend the span loop below.
+    fn gate_runs_unconditionally(body: &str, markers: &[&str]) -> bool {
+        // Brace-matched spans of each `if service == ...` block.
+        let mut cond_spans: Vec<(usize, usize)> = Vec::new();
+        let mut search = 0;
+        while let Some(rel) = body[search..].find("if service ==") {
+            let cond_start = search + rel;
+            let Some(brace_rel) = body[cond_start..].find('{') else {
+                break;
+            };
+            let open = cond_start + brace_rel;
+            let mut depth = 0i32;
+            let mut end = body.len();
+            for (i, c) in body[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cond_spans.push((open, end));
+            // On an unclosed block `end` stays at body.len() (the fail-safe
+            // direction: treat the rest as conditional rather than mask a gate);
+            // clamp so the next slice can't index past the end and panic.
+            search = (end + 1).min(body.len());
+        }
+        markers.iter().any(|m| {
+            body.match_indices(m)
+                .any(|(pos, _)| !cond_spans.iter().any(|(s, e)| pos >= *s && pos <= *e))
+        })
+    }
+
+    /// Collect `.rs` source files under `dir`. Recursive so the completeness scan
+    /// covers nested API modules (`api/<module>/mod.rs` and deeper), not only the
+    /// immediate `api/*.rs` children.
+    fn collect_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read api dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                out.extend(collect_rs_files(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// The `.rs` files under `api_root` (as paths RELATIVE to it) that the
+    /// completeness scan must inspect: everything except the top-level `mod.rs` (the
+    /// guard file itself) and the top-level files already covered by the per-handler
+    /// `sources` loop. A nested `api/<module>/<name>.rs` is a distinct source file
+    /// even when its basename matches a listed top-level file, so it stays in scope.
+    fn unlisted_source_files(
+        api_root: &std::path::Path,
+        listed: &std::collections::HashSet<&str>,
+    ) -> Vec<String> {
+        collect_rs_files(api_root)
+            .iter()
+            .filter_map(|path| {
+                let rel = path
+                    .strip_prefix(api_root)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel == "mod.rs" || listed.contains(rel.as_str()) {
+                    None
+                } else {
+                    Some(rel)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collect_rs_files_recurses_subdirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.rs"), "").unwrap();
+        std::fs::write(root.join("note.txt"), "").unwrap();
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::fs::write(root.join("sub/mod.rs"), "").unwrap();
+        std::fs::write(root.join("sub/deep/c.rs"), "").unwrap();
+        let names: std::collections::HashSet<String> = collect_rs_files(root)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(names.contains("a.rs"));
+        assert!(
+            names.contains("sub/mod.rs"),
+            "nested module file must be collected"
+        );
+        assert!(
+            names.contains("sub/deep/c.rs"),
+            "deeply nested file must be collected"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with(".txt")),
+            "non-rs files excluded"
+        );
+        assert_eq!(names.len(), 3);
+    }
+
+    // P3 (#119): the completeness scan must skip already-covered files by their path
+    // RELATIVE to api_root, not by basename. A nested api/<module>/repos.rs is a
+    // distinct source file from the covered top-level repos.rs and must still be
+    // scanned, or a new nested module could smuggle in an ungated repo-scoped handler
+    // behind a colliding filename.
+    #[test]
+    fn unlisted_source_files_scans_nested_file_with_colliding_basename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("repos.rs"), "").unwrap();
+        std::fs::write(root.join("mod.rs"), "").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/repos.rs"), "").unwrap();
+        std::fs::write(root.join("sub/fresh.rs"), "").unwrap();
+        let listed: std::collections::HashSet<&str> = ["repos.rs"].into_iter().collect();
+
+        let unlisted = unlisted_source_files(root, &listed);
+
+        assert!(
+            unlisted.contains(&"sub/repos.rs".to_string()),
+            "a nested file whose basename matches a listed top-level file must still be scanned"
+        );
+        assert!(
+            unlisted.contains(&"sub/fresh.rs".to_string()),
+            "a nested file with a unique name must be scanned"
+        );
+        assert!(
+            !unlisted.contains(&"repos.rs".to_string()),
+            "the listed top-level file is covered by the per-handler loop"
+        );
+        assert!(
+            !unlisted.contains(&"mod.rs".to_string()),
+            "the top-level guard file is skipped"
+        );
+    }
+
+    /// Egress gate guard: every repo-scoped handler (`Path<(String, String..)>`)
+    /// must carry an authz marker — a read gate (`authorize_repo_read` /
+    /// `visibility_check`), or a write gate (`require_repo_owner` / `require_owner`
+    /// / `did_matches` / a `&auth.0` self-binding) — or be listed in KNOWN_UNGATED
+    /// (the tracked, ungated reads). A new ungated handler of ANY verb trips this,
+    /// and a completeness scan over `src/api/` trips it for a whole new module that
+    /// adds a repo-scoped handler without being wired into `sources`. Mutations are
+    /// also checked precisely, per handler, by the mutation guard above; here they
+    /// only need *some* binding so the net stays verb-agnostic.
+    ///
+    /// Scope and limits (this is a source scrape; the runtime route guard covers
+    /// behaviour):
+    /// - It proves a gate is CALLED, not that it runs on the requested path: a
+    ///   content handler gating `"/"` instead of the subtree still passes here.
+    /// - It sees handlers taking the owner+repo tuple `Path<(String, String..)>`; a
+    ///   repo identified by a struct/custom extractor would be missed (the helper
+    ///   unit tests pin these boundaries).
+    /// - KNOWN_UNGATED entries need a real open issue and review; the staleness
+    ///   assert removes one only once its gate lands.
+    #[test]
+    fn every_repo_scoped_handler_is_gated() {
+        let sources: &[(&str, &str)] = &[
+            (include_str!("bounties.rs"), "bounties.rs"),
+            (include_str!("certs.rs"), "certs.rs"),
+            (include_str!("changelog.rs"), "changelog.rs"),
+            (include_str!("encrypted.rs"), "encrypted.rs"),
+            (include_str!("events.rs"), "events.rs"),
+            (include_str!("issues.rs"), "issues.rs"),
+            (include_str!("labels.rs"), "labels.rs"),
+            (include_str!("protect.rs"), "protect.rs"),
+            (include_str!("pulls.rs"), "pulls.rs"),
+            (include_str!("replicas.rs"), "replicas.rs"),
+            (include_str!("repos.rs"), "repos.rs"),
+            (include_str!("stars.rs"), "stars.rs"),
+            (include_str!("status/mod.rs"), "status/mod.rs"),
+            (include_str!("visibility.rs"), "visibility.rs"),
+            (include_str!("webhooks.rs"), "webhooks.rs"),
+        ];
+        let listed: std::collections::HashSet<&str> = sources.iter().map(|(_, f)| *f).collect();
+        assert!(!listed.is_empty(), "read-guard `sources` is empty");
+
+        // Completeness: every api/*.rs NOT already in `sources` must declare no
+        // repo-scoped handler, so a brand-new module cannot add an ungated handler
+        // the scrape never looks at. Reads the directory at test time (so the list
+        // cannot silently drift from the filesystem) and only inspects unlisted
+        // files — listed files are covered by the per-handler loop below.
+        let api_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/api");
+        for (_, f) in sources {
+            assert!(
+                std::path::Path::new(api_dir).join(f).exists(),
+                "read-guard `sources` lists {f} but the file does not exist"
+            );
+        }
+        let api_root = std::path::Path::new(api_dir);
+        for rel in unlisted_source_files(api_root, &listed) {
+            let src = std::fs::read_to_string(api_root.join(&rel)).expect("read api file");
+            let has_repo_handler = handler_names(&src)
+                .iter()
+                .any(|n| is_repo_scoped(&fn_body(&src, n)));
+            assert!(
+                !has_repo_handler,
+                "api/{rel} declares a repo-scoped handler but is not in the egress \
+                 guard `sources` list — add it so its handlers are gate-checked"
+            );
+        }
+
+        // Repo-scoped reads known to be ungated today, each tracked by an issue.
+        // Remove an entry the moment its gate lands (the staleness assert enforces it).
+        let known_ungated: &[(&str, &str)] = &[];
+        let is_known = |n: &str| known_ungated.iter().any(|(k, _)| *k == n);
+        // Any one of these = the handler binds the caller to an authz decision: the
+        // first two are read gates, the rest are the write/owner/self-binding forms.
+        // A repo-scoped mutation passes here on its write gate; the mutation guard
+        // above additionally verifies the exact gate type per handler. NOTE: a local
+        // rename of `caller`/`replica_did` must be paired with a marker update here.
+        let markers = [
+            "authorize_repo_read(",
+            "visibility_check(",
+            "require_repo_owner(",
+            "require_owner(",
+            "did_matches(",
+            "caller = &auth.0",
+            "replica_did = &auth.0",
+        ];
+
+        // Every KNOWN_UNGATED name must be a real handler (catch typos / renames).
+        let all: std::collections::HashSet<String> =
+            sources.iter().flat_map(|(s, _)| handler_names(s)).collect();
+        for (n, _) in known_ungated {
+            assert!(
+                all.contains(*n),
+                "KNOWN_UNGATED lists `{n}`, which is not a real handler (renamed or removed?)"
+            );
+        }
+
+        let mut checked = 0usize;
+        for (src, file) in sources {
+            for name in handler_names(src) {
+                let body = fn_body(src, &name);
+                if !is_repo_scoped(&body) {
+                    continue; // node-wide aggregate, not a repo-scoped surface
+                }
+                checked += 1;
+                let gated = gate_runs_unconditionally(&body, &markers);
+                assert!(
+                    gated || is_known(&name),
+                    "repo-scoped handler `{name}` ({file}) has no authz gate and is \
+                     not in KNOWN_UNGATED — add the visibility/owner gate with the \
+                     caller, or track it there"
+                );
+                assert!(
+                    !(gated && is_known(&name)),
+                    "handler `{name}` ({file}) is now gated — remove it from \
+                     KNOWN_UNGATED so the allowlist stays an accurate gap list"
+                );
+            }
+        }
+        // Tripwire: if the scrape silently stopped finding handlers (e.g. a parser
+        // regression in handler_names/is_repo_scoped), this floor fails loudly
+        // instead of the guard passing vacuously. Current count is ~54 repo-scoped
+        // handlers; 20 is a deliberate floor that trips only on a gross regression.
+        assert!(
+            checked >= 20,
+            "egress guard only checked {checked} repo-scoped handlers — the scrape likely broke"
+        );
+    }
+
+    /// Pins the `handler_names` boundary: it collects every `pub`/`pub(crate)
+    /// async fn` regardless of verb (so a `fetch_*` read cannot escape), and skips
+    /// private `async fn` and sync `fn` helpers.
+    #[test]
+    fn handler_names_finds_all_pub_async_and_skips_others() {
+        let src = "pub async fn list_things() {}\n\
+                   pub async fn fetch_thing() {}\n\
+                   pub(crate) async fn get_crate_thing() {}\n\
+                   async fn private_helper() {}\n\
+                   fn sync_helper() {}\n";
+        let names = handler_names(src);
+        // Verb-agnostic: a non-list/get read verb is still seen.
+        assert!(names.contains(&"list_things".to_string()));
+        assert!(names.contains(&"fetch_thing".to_string()));
+        // pub(crate) routed handlers are in scope too.
+        assert!(names.contains(&"get_crate_thing".to_string()));
+        // Private/sync helpers are not routed handlers and are skipped.
+        assert!(!names
+            .iter()
+            .any(|n| n == "private_helper" || n == "sync_helper"));
+    }
+
+    /// Pins the `is_repo_scoped` boundary: an owner+repo tuple Path is repo-scoped;
+    /// a single-segment or absent Path is a node-wide aggregate.
+    #[test]
+    fn is_repo_scoped_requires_owner_repo_path() {
+        let repo =
+            "fn get_x(s: State, Path((owner, name)): Path<(String, String)>) {\n  body();\n}";
+        let three = "fn get_y(Path((o, n, id)): Path<(String, String, String)>) {\n  body();\n}";
+        let node_wide = "fn list_z(s: State<AppState>) {\n  body();\n}";
+        let single = "fn get_w(Path(cid): Path<String>) {\n  body();\n}";
+        assert!(is_repo_scoped(repo), "owner+repo tuple is repo-scoped");
+        assert!(is_repo_scoped(three), "owner+repo+id tuple is repo-scoped");
+        assert!(!is_repo_scoped(node_wide), "no Path is node-wide");
+        assert!(
+            !is_repo_scoped(single),
+            "single-segment Path is not repo-scoped"
+        );
+    }
+
+    /// Pins `gate_runs_unconditionally`: a gate nested only inside an
+    /// `if service == ...` block is conditional (does NOT count), while the same
+    /// gate at the top level — or an additional unconditional one — does.
+    #[test]
+    fn conditional_service_gate_is_not_a_full_gate() {
+        let markers = ["visibility_check("];
+        // Gate runs only for one service: not a full gate.
+        let conditional = "fn f() {\n  \
+            if service == \"git-upload-pack\" {\n    \
+                visibility_check(rules, caller);\n  \
+            }\n  \
+            if service == \"git-receive-pack\" { acquire_fresh(); }\n}";
+        assert!(
+            !gate_runs_unconditionally(conditional, &markers),
+            "a gate only inside `if service ==` covers a subset of services"
+        );
+        // Same gate at top level: full gate.
+        let unconditional = "fn f() {\n  \
+            visibility_check(rules, caller);\n  \
+            if service == \"git-receive-pack\" { acquire_fresh(); }\n}";
+        assert!(
+            gate_runs_unconditionally(unconditional, &markers),
+            "an unconditional gate runs for every service"
+        );
+        // A gate inside EACH of two service blocks, none outside: still a
+        // subset (no service clears it unconditionally), so not a full gate.
+        let both_conditional = "fn f() {\n  \
+            if service == \"git-upload-pack\" { visibility_check(a); }\n  \
+            if service == \"git-receive-pack\" { visibility_check(b); }\n}";
+        assert!(
+            !gate_runs_unconditionally(both_conditional, &markers),
+            "a gate inside every service block is still conditional"
+        );
+        // A marker inside one block AND again unconditionally: the
+        // unconditional occurrence makes it a full gate (exercises the
+        // match_indices scan past the in-block hit).
+        let inside_and_outside = "fn f() {\n  \
+            if service == \"git-upload-pack\" { visibility_check(a); }\n  \
+            visibility_check(b);\n}";
+        assert!(
+            gate_runs_unconditionally(inside_and_outside, &markers),
+            "an unconditional occurrence counts even when another is conditional"
+        );
+        // No marker at all: not gated.
+        assert!(!gate_runs_unconditionally(
+            "fn f() { do_thing(); }",
+            &markers
+        ));
+        // An unclosed `if service ==` block (e.g. phantom brace from a string
+        // literal) must not panic on the slice advance; the span runs to EOF, so
+        // the in-block marker reads as conditional. Real Rust source is balanced,
+        // so this only guards the scraper against a future pathological body.
+        let unclosed = "fn f() { if service == \"x\" { visibility_check(a);";
+        assert!(
+            !gate_runs_unconditionally(unclosed, &markers),
+            "an unclosed service block must not panic and stays conditional"
+        );
+    }
+}

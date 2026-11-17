@@ -49,10 +49,10 @@ Owner focus: protocol/auth.
 
 Owner focus: developer experience.
 
-- Make public-node vs localhost behavior explicit across `gl`, `git-remote-gitlawb`, README, and quickstart docs.
-- Add `--version` support to `git-remote-gitlawb` so release smoke tests can validate it directly.
-- Improve `gl doctor` for live operators: check Docker, Postgres, public URL, node health, p2p port, and binary versions.
-- Add a compact `gl node doctor` command for self-hosted nodes.
+- Make public-node vs localhost behavior explicit across `twigpine`, `git-remote-twigpine`, README, and quickstart docs.
+- Add `--version` support to `git-remote-twigpine` so release smoke tests can validate it directly.
+- Improve `twigpine doctor` for live operators: check Docker, Postgres, public URL, node health, p2p port, and binary versions.
+- Add a compact `twigpine node doctor` command for self-hosted nodes.
 - Make errors from JSON API responses more consistent and actionable.
 
 ## UI direction

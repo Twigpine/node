@@ -7,7 +7,8 @@ on:
   # Manual backfill: republish an already-cut release to a channel that
   # missed it. Fill in only the channel(s) you want — an empty input leaves
   # that channel's jobs skipped. npm reuses the existing release's binary
-  # assets; docker rebuilds the image from the tag and re-tags the manifest.
+  # assets, so it only works for releases cut after the Twigpine rename (their
+  # archives are named twigpine-node-*); docker rebuilds the image from the tag and re-tags the manifest.
   workflow_dispatch:
     inputs:
       npm_backfill_tag:
@@ -270,7 +271,7 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           load: true
-          tags: gitlawb-node:smoke
+          tags: twigpine-node:smoke
           cache-from: type=gha,scope=docker-${{ matrix.arch }}
 
       # Native runner on both arches, so the built image can always execute.
@@ -280,7 +281,7 @@ jobs:
           VERSION: ${{ steps.rel.outputs.version }}
         run: |
           set -euo pipefail
-          out="$(docker run --rm gitlawb-node:smoke --version)"
+          out="$(docker run --rm twigpine-node:smoke --version)"
           echo "$out"
           grep -qF "$VERSION" <<<"$out" || {
             echo "::error::image --version did not report expected version $VERSION (got: $out)"
@@ -524,22 +525,30 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # The gitlawb-node daemon is a Linux/macOS service; on Windows we ship only
+      # The twigpine-node daemon is a Linux/macOS service; on Windows we ship only
       # the two CLI binaries. A Windows-only failure must not block the release.
       - name: Determine binaries
         shell: bash
         run: |
-          BINS="gl git-remote-gitlawb gitlawb-node"
-          case "${{ matrix.target }}" in *windows*) BINS="gl git-remote-gitlawb" ;; esac
+          BINS="twigpine git-remote-twigpine twigpine-node"
+          PKGS="-p twigpine-cli -p git-remote-twigpine -p twigpine-node"
+          case "${{ matrix.target }}" in
+            *windows*)
+              BINS="twigpine git-remote-twigpine"
+              PKGS="-p twigpine-cli -p git-remote-twigpine"
+              ;;
+          esac
           echo "BINS=$BINS" >> "$GITHUB_ENV"
+          echo "PKGS=$PKGS" >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash
         run: |
           set -euo pipefail
-          args=""
-          for b in $BINS; do args="$args -p $b"; done
-          cargo build --release --locked --target ${{ matrix.target }} $args
+          # Packages, not --bin: selecting by package keeps each build's feature
+          # set to what those crates ask for, so the Windows CLI build does not
+          # pull in the daemon's dependency features.
+          cargo build --release --locked --target ${{ matrix.target }} $PKGS
 
       # Run each packaged binary's --version so a broken release artifact fails the
       # build instead of shipping. Every target builds on a matching-arch runner,
@@ -568,7 +577,7 @@ jobs:
         run: |
           set -euo pipefail
           TARGET="${{ matrix.target }}"
-          NAME="gitlawb-node-${{ steps.rel.outputs.version }}-${TARGET}"
+          NAME="twigpine-node-${{ steps.rel.outputs.version }}-${TARGET}"
           BIN_DIR="target/${TARGET}/release"
           EXE=""
           case "$TARGET" in *windows*) EXE=".exe" ;; esac
@@ -702,7 +711,7 @@ jobs:
           for entry in $MAP; do
             pkg="${entry%%:*}"
             target="${entry#*:}"
-            archive="gitlawb-node-${VERSION}-${target}.tar.gz"
+            archive="twigpine-node-${VERSION}-${target}.tar.gz"
             echo "==> $pkg <- $archive"
             # Download by the asset id the resolver captured and uploader-
             # checked, not by name: release assets are mutable, and an id can
@@ -717,9 +726,9 @@ jobs:
             gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
               -H 'Accept: application/octet-stream' > "_dl/$archive"
             tar -xzf "_dl/$archive" -C _dl
-            src="_dl/gitlawb-node-${VERSION}-${target}"
-            cp "$src/gl" "npm/packages/$pkg/gl"
-            cp "$src/git-remote-gitlawb" "npm/packages/$pkg/git-remote-gitlawb"
+            src="_dl/twigpine-node-${VERSION}-${target}"
+            cp "$src/twigpine" "npm/packages/$pkg/gl"
+            cp "$src/git-remote-twigpine" "npm/packages/$pkg/git-remote-gitlawb"
             chmod +x "npm/packages/$pkg/gl" "npm/packages/$pkg/git-remote-gitlawb"
           done
 
@@ -850,7 +859,7 @@ jobs:
           # captured and uploader-checked. The *.sha256 sidecars are mutable
           # release assets too; trusting them would trust the same surface.
           sha() {
-            archive="gitlawb-node-${VERSION}-$1.tar.gz"
+            archive="twigpine-node-${VERSION}-$1.tar.gz"
             want="$(printf '%s' "$archive" | base64 -w0)"
             asset_id="$(printf '%s\n' "$ASSETS" | awk -v n="$want" '$1 == n {print $2; exit}')"
             if [ -z "$asset_id" ]; then
@@ -880,42 +889,38 @@ jobs:
 
             on_macos do
               on_arm do
-                url "${base}/gitlawb-node-${VERSION}-aarch64-apple-darwin.tar.gz"
+                url "${base}/twigpine-node-${VERSION}-aarch64-apple-darwin.tar.gz"
                 sha256 "${SHA_MAC_ARM}"
               end
               on_intel do
-                url "${base}/gitlawb-node-${VERSION}-x86_64-apple-darwin.tar.gz"
+                url "${base}/twigpine-node-${VERSION}-x86_64-apple-darwin.tar.gz"
                 sha256 "${SHA_MAC_X64}"
               end
             end
 
             on_linux do
               on_arm do
-                url "${base}/gitlawb-node-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+                url "${base}/twigpine-node-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
                 sha256 "${SHA_LNX_ARM}"
               end
               on_intel do
-                url "${base}/gitlawb-node-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+                url "${base}/twigpine-node-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
                 sha256 "${SHA_LNX_X64}"
               end
             end
 
             def install
-              bin.install "gl"
-              bin.install "git-remote-gitlawb"
-            end
-
-            def caveats
-              <<~CAVEATS
-                oh-my-zsh's git plugin aliases gl='git pull', which shadows this
-                binary in interactive shells. If \`gl\` prints "fatal: not a git
-                repository", run:
-                  echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc
-              CAVEATS
+              bin.install "twigpine"
+              bin.install "git-remote-twigpine"
+              # The short form, and the names used before the rename: existing
+              # clones and scripts still call them.
+              bin.install_symlink bin/"twigpine" => "twig"
+              bin.install_symlink bin/"twigpine" => "gl"
+              bin.install_symlink bin/"git-remote-twigpine" => "git-remote-gitlawb"
             end
 
             test do
-              assert_match version.to_s, shell_output("#{bin}/gl --version")
+              assert_match version.to_s, shell_output("#{bin}/twigpine --version")
             end
           end
           EOF
@@ -936,7 +941,7 @@ jobs:
             echo "Formula already up to date."
             exit 0
           fi
-          git commit -m "gl ${VERSION}"
+          git commit -m "twigpine ${VERSION}"
           # Credentials are not persisted in .git/config; supply the token only for the push.
           git push "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/Twigpine/homebrew-tap.git" HEAD:main
 
@@ -1010,8 +1015,8 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[].name' > /tmp/release-assets
           for asset in \
-            "gitlawb-node-${VERSION}-x86_64-pc-windows-msvc.zip" \
-            "gitlawb-node-${VERSION}-x86_64-pc-windows-msvc.zip.sha256"; do
+            "twigpine-node-${VERSION}-x86_64-pc-windows-msvc.zip" \
+            "twigpine-node-${VERSION}-x86_64-pc-windows-msvc.zip.sha256"; do
             grep -Fxq "$asset" /tmp/release-assets || {
               echo "::error::release asset missing: $asset (Windows build likely failed); not syncing web"
               exit 1
