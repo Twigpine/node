@@ -78,72 +78,30 @@ fn is_insecure_remote(url: &str) -> bool {
     true
 }
 
-/// True when `no_proxy` covers `host`: a `*` entry, an exact match, or a
-/// domain suffix match (`example.com` covers `a.example.com`). Entries match
-/// case-insensitively, as DNS names are.
-fn no_proxy_covers(host: &str, no_proxy: &str) -> bool {
-    no_proxy
-        .split(',')
-        .map(str::trim)
-        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
-        .filter(|e| !e.is_empty())
-        .any(|e| e == "*" || host == e || host.ends_with(&format!(".{e}")))
-}
-
-/// True when a plaintext request to a loopback `host` would still leave this
-/// machine under the proxy env the client was built with. A configured proxy
-/// without a NO_PROXY entry for the host carries the signed request
-/// off-machine in cleartext, which is the leak this module guards against.
-fn loopback_goes_off_machine(host: &str, proxy_env: &(bool, String)) -> bool {
-    proxy_env.0 && !no_proxy_covers(host, &proxy_env.1)
-}
-
-/// The normalized host when `url` is an `http://` loopback address, else None.
-/// Same loopback rules as [`is_insecure_remote`].
-fn loopback_http_host(url: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(url.trim()).ok()?;
-    if parsed.scheme() != "http" {
-        return None;
-    }
-    let host = parsed
-        .host_str()?
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    if host == "localhost" {
-        return Some(host);
-    }
-    let bare = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string();
-    let ip = bare.parse::<std::net::IpAddr>().ok()?;
-    if ip.is_loopback() {
-        return Some(bare);
-    }
-    if let std::net::IpAddr::V6(v6) = ip {
-        if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) {
-            return Some(bare);
-        }
-    }
-    None
+/// True when `url` is an `http://` address on this machine. Same loopback
+/// rules as [`is_insecure_remote`].
+///
+/// The client does not use the proxy environment for such a node: reqwest's
+/// own `NO_PROXY` matching differs from any string matcher written here (it
+/// parses addresses and CIDR blocks apart from domains, and a wildcard is only
+/// a domain entry), so deciding "would this go through the proxy" ourselves
+/// can disagree with where the request actually goes. Routing a loopback node
+/// directly makes the answer true by construction. See `NodeClient::with_timeout`.
+fn is_loopback_http(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    parsed.scheme() == "http" && parsed.host_str().is_some() && !is_insecure_remote(url)
 }
 
 /// Refuse to sign a request destined for a cleartext hop off this machine
 /// unless the operator has opted in. `GITLAWB_ALLOW_INSECURE_HTTP` exists for a
-/// private LAN where the operator has decided that is acceptable; its presence
-/// alone opts in, matching the variable git-remote-gitlawb's guard uses for
-/// the same hop. This guard is stricter than the helper's in one respect: the
-/// loopback exemption does not apply when a proxy would carry the request
-/// off-machine anyway. `proxy_env` is the proxy state the client was built
-/// with, so the guard judges the same routing the client will use.
-fn ensure_signing_transport(
-    node_base: &str,
-    allow_insecure: bool,
-    proxy_env: &(bool, String),
-) -> Result<()> {
-    let insecure = is_insecure_remote(node_base)
-        || loopback_http_host(node_base).is_some_and(|h| loopback_goes_off_machine(&h, proxy_env));
-    if allow_insecure || !insecure {
+/// private LAN where the operator has decided that is acceptable; any value,
+/// including `0`, opts in. A loopback node is never proxied (see
+/// [`is_loopback_http`]), so a proxy cannot carry its signed requests
+/// off-machine and the loopback exemption holds under any proxy environment.
+fn ensure_signing_transport(node_base: &str, allow_insecure: bool) -> Result<()> {
+    if allow_insecure || !is_insecure_remote(node_base) {
         return Ok(());
     }
     anyhow::bail!(
@@ -201,11 +159,6 @@ fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::red
 
 pub struct NodeClient {
     inner: reqwest::Client,
-    /// Proxy env state captured at client build, so the transport guard judges
-    /// the same routing the client was built with. `(proxied, no_proxy)` where
-    /// `proxied` means HTTP_PROXY/ALL_PROXY was set and `no_proxy` is the raw
-    /// NO_PROXY value.
-    proxy_env: (bool, String),
     pub node_url: String,
     keypair: Option<Keypair>,
 }
@@ -223,23 +176,23 @@ impl NodeClient {
         keypair: Option<Keypair>,
         timeout: std::time::Duration,
     ) -> Self {
-        let inner = reqwest::Client::builder()
+        let node_url = node_url.into();
+        let mut builder = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::custom(same_origin_redirect))
-            .user_agent(format!("gl/{} gitlawb-cli", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("failed to build HTTP client");
-        let proxied = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
-            .iter()
-            .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
-        let no_proxy = std::env::var("NO_PROXY")
-            .or_else(|_| std::env::var("no_proxy"))
-            .unwrap_or_default();
+            .user_agent(format!("gl/{} gitlawb-cli", env!("CARGO_PKG_VERSION")));
+        // A loopback node is reached directly, ignoring HTTP_PROXY/ALL_PROXY, so
+        // a proxy can never carry its signed requests off this machine and the
+        // guard needs no model of the proxy environment. Redirects cannot leave
+        // the origin (`same_origin_redirect`), so the direct route covers them.
+        if is_loopback_http(&node_url) {
+            builder = builder.no_proxy();
+        }
+        let inner = builder.build().expect("failed to build HTTP client");
         Self {
             inner,
-            node_url: node_url.into(),
+            node_url,
             keypair,
-            proxy_env: (proxied, no_proxy),
         }
     }
 
@@ -270,7 +223,7 @@ impl NodeClient {
             .keypair
             .as_ref()
             .context("get_signed requires an identity keypair")?;
-        ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
+        ensure_signing_transport(&self.node_url, insecure_http_allowed())?;
         let signed = sign_request(kp, "GET", path, b"");
         let req = self
             .inner
@@ -288,7 +241,7 @@ impl NodeClient {
     pub async fn get_maybe_signed(&self, path: &str) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);
         if self.keypair.is_some() {
-            ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
+            ensure_signing_transport(&self.node_url, insecure_http_allowed())?;
         }
         let mut req = self.inner.get(&url);
         if let Some(kp) = &self.keypair {
@@ -401,7 +354,7 @@ impl NodeClient {
     ) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);
         if self.keypair.is_some() {
-            ensure_signing_transport(&self.node_url, insecure_http_allowed(), &self.proxy_env)?;
+            ensure_signing_transport(&self.node_url, insecure_http_allowed())?;
         }
         let mut req = self
             .inner
@@ -2226,18 +2179,16 @@ mod tests {
 
     #[test]
     fn signing_transport_refuses_plaintext_remote() {
-        let no_proxy_env = (false, String::new());
-        let err =
-            ensure_signing_transport("http://10.0.0.36:7777", false, &no_proxy_env).unwrap_err();
+        let err = ensure_signing_transport("http://10.0.0.36:7777", false).unwrap_err();
         assert!(
             err.to_string().contains("plaintext http")
                 && err.to_string().contains("GITLAWB_ALLOW_INSECURE_HTTP"),
             "the refusal names the risk and the opt-in: {err}"
         );
         // Opted in, loopback, and https all pass.
-        assert!(ensure_signing_transport("http://10.0.0.36:7777", true, &no_proxy_env).is_ok());
-        assert!(ensure_signing_transport("http://localhost:7545", false, &no_proxy_env).is_ok());
-        assert!(ensure_signing_transport("https://node.gitlawb.com", false, &no_proxy_env).is_ok());
+        assert!(ensure_signing_transport("http://10.0.0.36:7777", true).is_ok());
+        assert!(ensure_signing_transport("http://localhost:7545", false).is_ok());
+        assert!(ensure_signing_transport("https://node.gitlawb.com", false).is_ok());
     }
 
     /// A signed call against a plaintext remote errors out before any request
@@ -2281,7 +2232,7 @@ mod tests {
         );
     }
 
-    /// The opt-in is presence-based, matching the remote helper's read.
+    /// The opt-in is presence-based: any value, including `0`, enables it.
     #[test]
     fn insecure_http_allowed_reads_the_env_var() {
         {
@@ -2292,18 +2243,6 @@ mod tests {
             let _env = InsecureHttpEnv::set(None);
             assert!(!insecure_http_allowed());
         }
-    }
-
-    #[test]
-    fn no_proxy_covers_matches_exact_suffix_and_star() {
-        assert!(no_proxy_covers("localhost", "localhost,127.0.0.1"));
-        assert!(no_proxy_covers("127.0.0.1", "localhost, 127.0.0.1"));
-        assert!(no_proxy_covers("a.example.com", ".example.com"));
-        assert!(no_proxy_covers("a.example.com", "example.com"));
-        assert!(no_proxy_covers("anything", "*"));
-        assert!(!no_proxy_covers("localhost", "127.0.0.1"));
-        assert!(!no_proxy_covers("127.0.0.1", ""));
-        assert!(!no_proxy_covers("notevil.com", "evil.com"));
     }
 
     /// Re-exec this test binary running exactly `child_test` under the given
@@ -2341,48 +2280,161 @@ mod tests {
         );
     }
 
-    /// A proxied loopback plaintext hop must be refused. The env plumbing is
-    /// checked in a re-execed child so the process-global proxy vars never
-    /// touch sibling tests' reqwest clients.
+    // ── #413 routing observed, not asserted ─────────────────────────────
+    //
+    // The guard and the client must agree on where a signed request goes. These
+    // tests put a real listener where a proxy would be and a real listener where
+    // the node is, run each signing site, and read off which one was contacted.
+
+    /// Accept connections on `listener` for the rest of the process, recording
+    /// each one's raw request head and answering `status_line` with an empty
+    /// JSON body. Returns the shared record.
+    fn serve_recording(
+        listener: std::net::TcpListener,
+        status_line: &'static str,
+    ) -> std::sync::Arc<Mutex<Vec<String>>> {
+        use std::io::{Read, Write};
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let rec = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                rec.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).to_ascii_lowercase());
+                let _ = conn.write_all(
+                    format!("{status_line}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}")
+                        .as_bytes(),
+                );
+            }
+        });
+        seen
+    }
+
+    /// Body of the child process: `GL_ROUTE_HOST` is the node host as written
+    /// in the URL, `GL_ROUTE_NO_PROXY` the NO_PROXY value (empty means unset).
+    /// A listener stands in for the proxy and another for the node; the proxy
+    /// env is pointed at the first before the client is built. Every signing
+    /// site must reach the node, signed, and never touch the proxy.
     #[tokio::test]
-    async fn proxied_loopback_http_is_refused() {
-        if std::env::var_os("GL_PROXY_CHILD").is_none() {
-            run_env_child(
-                "http::tests::proxied_loopback_http_is_refused",
-                &[
-                    ("GL_PROXY_CHILD", "1"),
-                    ("HTTP_PROXY", "http://10.9.9.9:3128"),
-                ],
-            );
-            return;
+    async fn route_child_signed_requests_stay_off_the_proxy() {
+        let Some(host) = std::env::var_os("GL_ROUTE_HOST") else {
+            return; // only meaningful as a re-execed child
+        };
+        let host = host.to_string_lossy().into_owned();
+        let no_proxy = std::env::var("GL_ROUTE_NO_PROXY").unwrap_or_default();
+
+        let bind = if host.starts_with('[') {
+            "[::1]:0"
+        } else {
+            "127.0.0.1:0"
+        };
+        let node = std::net::TcpListener::bind(bind).expect("bind node listener");
+        let node_port = node.local_addr().unwrap().port();
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let node_seen = serve_recording(node, "HTTP/1.1 200 OK");
+        let proxy_seen = serve_recording(proxy, "HTTP/1.1 502 Bad Gateway");
+
+        std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"));
+        if !no_proxy.is_empty() {
+            std::env::set_var("NO_PROXY", &no_proxy);
         }
-        let client = NodeClient::new("http://127.0.0.1:1", Some(test_keypair()));
-        let err = client.get_signed("/api/v1/x").await.unwrap_err();
+        let client = NodeClient::new(format!("http://{host}:{node_port}"), Some(test_keypair()));
+
+        let r = client.get_signed("/api/v1/a").await;
+        assert!(r.is_ok(), "get_signed: {:?}", r.err());
+        let r = client.get_maybe_signed("/api/v1/b").await;
+        assert!(r.is_ok(), "get_maybe_signed: {:?}", r.err());
+        let r = client.post("/api/v1/c", b"{}").await;
+        assert!(r.is_ok(), "send_once via post: {:?}", r.err());
+
+        let proxy_seen = proxy_seen.lock().unwrap();
         assert!(
-            err.to_string().contains("plaintext http"),
-            "a proxy without NO_PROXY carries the signed request off-machine: {err}"
+            proxy_seen.is_empty(),
+            "the proxy must see no request, got: {proxy_seen:?}"
+        );
+        let node_seen = node_seen.lock().unwrap();
+        assert_eq!(node_seen.len(), 3, "node requests: {node_seen:?}");
+        assert!(
+            node_seen.iter().all(|r| r.contains("\r\nsignature:")),
+            "every request to the node is signed: {node_seen:?}"
         );
     }
 
-    /// And NO_PROXY covering the host restores the loopback exemption.
-    #[tokio::test]
-    async fn proxied_loopback_with_no_proxy_is_allowed() {
-        if std::env::var_os("GL_PROXY_CHILD2").is_none() {
+    /// The table from the review, plus the bare proxied case. Each row is a
+    /// loopback node reached with `HTTP_PROXY` set, the override unset, and a
+    /// different `NO_PROXY`; every one must go straight to the node.
+    #[test]
+    fn signed_loopback_requests_never_reach_the_proxy() {
+        let rows: &[(&str, &str)] = &[
+            ("127.0.0.1", ""),
+            ("127.0.0.1", "*"),
+            ("localhost.", "localhost"),
+            ("127.0.0.1", ".127.0.0.1"),
+            ("127.0.0.1", "127.0.0.0/8"),
+            ("[::1]", "0:0:0:0:0:0:0:1"),
+            ("localhost.", "localhost."),
+            ("127.0.0.1", "127.0.0.1"),
+        ];
+        for (host, no_proxy) in rows {
+            if host.starts_with('[') && std::net::TcpListener::bind("[::1]:0").is_err() {
+                eprintln!("skipping {host}: no IPv6 loopback on this machine");
+                continue;
+            }
             run_env_child(
-                "http::tests::proxied_loopback_with_no_proxy_is_allowed",
-                &[
-                    ("GL_PROXY_CHILD2", "1"),
-                    ("HTTP_PROXY", "http://10.9.9.9:3128"),
-                    ("NO_PROXY", "localhost,127.0.0.1"),
-                ],
+                "http::tests::route_child_signed_requests_stay_off_the_proxy",
+                &[("GL_ROUTE_HOST", host), ("GL_ROUTE_NO_PROXY", no_proxy)],
             );
+        }
+    }
+
+    /// Body of the child process: a plaintext node that is NOT on this machine,
+    /// reached through a proxy. Without the override the guard refuses before
+    /// anything is sent; with it, the request goes via the proxy as configured.
+    #[tokio::test]
+    async fn route_child_remote_node_follows_the_override() {
+        if std::env::var_os("GL_ROUTE_REMOTE").is_none() {
             return;
         }
-        let client = NodeClient::new("http://127.0.0.1:1", Some(test_keypair()));
-        let err = client.get_signed("/api/v1/x").await.unwrap_err();
-        assert!(
-            !err.to_string().contains("plaintext http"),
-            "NO_PROXY covering the host keeps the request on this machine: {err}"
+        let allow = std::env::var_os("GL_ROUTE_ALLOW").is_some();
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let proxy_seen = serve_recording(proxy, "HTTP/1.1 502 Bad Gateway");
+        std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"));
+        let client = NodeClient::new("http://gl-remote-node.invalid:7777", Some(test_keypair()));
+        let r = client.get_signed("/api/v1/a").await;
+        let seen = proxy_seen.lock().unwrap();
+        if allow {
+            assert_eq!(seen.len(), 1, "the override sends via the proxy: {seen:?}");
+        } else {
+            let err = r.unwrap_err().to_string();
+            assert!(err.contains("plaintext http"), "refusal expected: {err}");
+            assert!(seen.is_empty(), "nothing may reach the proxy: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn signed_remote_plaintext_is_refused_unless_overridden() {
+        run_env_child(
+            "http::tests::route_child_remote_node_follows_the_override",
+            &[("GL_ROUTE_REMOTE", "1")],
+        );
+        run_env_child(
+            "http::tests::route_child_remote_node_follows_the_override",
+            &[
+                ("GL_ROUTE_REMOTE", "1"),
+                ("GL_ROUTE_ALLOW", "1"),
+                ("GITLAWB_ALLOW_INSECURE_HTTP", "1"),
+            ],
         );
     }
 
