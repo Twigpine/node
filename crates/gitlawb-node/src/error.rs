@@ -12,6 +12,9 @@ pub enum AppError {
     #[error("repo already exists: {0}")]
     RepoExists(String),
 
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("not found: {0}")]
     NotFound(String),
 
@@ -47,6 +50,24 @@ pub enum AppError {
     #[error("too many requests: {0}")]
     TooManyRequests(String),
 
+    /// A 429 from a per-IP limiter that knows when its window frees a slot, so
+    /// the response advertises that delay as `Retry-After` the way the router
+    /// middleware's 429s do. `TooManyRequests` stays for limiters that have no
+    /// such delay to give.
+    #[error("too many requests: retry in {}s", .0.as_secs())]
+    RateLimited(std::time::Duration),
+
+    /// The signature replay ledger refused a write whose handler spends the
+    /// signature itself (see `auth::LedgerTicket`). Carries the shared
+    /// [`NodeDenial`](gitlawb_core::node_denial::NodeDenial) so the status, the
+    /// `X-Gitlawb-Error` header and the body code are exactly what the
+    /// `consume_signature` layer answers on every other route.
+    #[error("signature ledger refused: {message}")]
+    LedgerDenial {
+        denial: gitlawb_core::node_denial::NodeDenial,
+        message: String,
+    },
+
     #[error("incomplete: {0}")]
     Incomplete(String),
 
@@ -68,6 +89,15 @@ pub enum AppError {
 
     #[error("server overloaded: {0}")]
     Overloaded(String),
+
+    #[error("repository is busy")]
+    RepoBusy,
+
+    #[error("repository is temporarily unavailable")]
+    RepoUnavailable,
+
+    #[error("repository write was fenced by a concurrent publish")]
+    RepoWriteFenced,
 
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
@@ -92,7 +122,7 @@ pub const DB_ERROR_MESSAGE: &str = "a database error occurred";
 
 /// Connection-level sqlx failures that mean the database is unreachable right
 /// now (retryable, 503), as opposed to server-reported query errors.
-fn db_unavailable(e: &sqlx::Error) -> bool {
+pub(crate) fn db_unavailable(e: &sqlx::Error) -> bool {
     matches!(
         e,
         sqlx::Error::PoolTimedOut
@@ -110,7 +140,31 @@ impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         match err.downcast::<sqlx::Error>() {
             Ok(sql) => AppError::Db(sql),
-            Err(err) => AppError::Internal(err),
+            // Lock contention is transient and ordinary, so it must not land as a
+            // 500. The internal message names the owner slug and repo, so the
+            // variant carries nothing: the detail stays in the log at the raise
+            // site and the client gets a fixed retryable body.
+            Err(err) => match err.downcast::<crate::git::repo_store::LockPoolBusy>() {
+                Ok(_) => AppError::Overloaded("git write locks at capacity, retry shortly".into()),
+                Err(err) => match err.downcast::<crate::git::repo_store::RepoBusy>() {
+                    Ok(_) => AppError::RepoBusy,
+                    // Same reasoning one rung down: a refused under-lock refresh is a
+                    // transient storage condition, and its internal message names the
+                    // owner slug and repo, so the variant carries nothing.
+                    Err(err) => match err.downcast::<crate::git::repo_store::RepoUnavailable>() {
+                        Ok(_) => AppError::RepoUnavailable,
+                        // And one more rung: a publish the store refused twice is
+                        // transient in the same way, and the retry is the client's
+                        // to make. The variant carries nothing for the same reason
+                        // as the two above.
+                        Err(err) => match err.downcast::<crate::git::repo_store::RepoWriteFenced>()
+                        {
+                            Ok(_) => AppError::RepoWriteFenced,
+                            Err(err) => AppError::Internal(err),
+                        },
+                    },
+                },
+            },
         }
     }
 }
@@ -156,6 +210,7 @@ impl IntoResponse for AppError {
                 "repo_exists",
                 format!("repository '{r}' already exists"),
             ),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "not_an_agent", msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
@@ -165,9 +220,24 @@ impl IntoResponse for AppError {
             AppError::UnresolvableDid(msg) => {
                 (StatusCode::BAD_REQUEST, "unresolvable_did", msg.clone())
             }
-            AppError::TooManyRequests(msg) => {
-                (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg.clone())
-            }
+            // Same wire code as the flood brake's `too_many_requests`, taken
+            // from the shared enum rather than retyped so the two cannot drift.
+            AppError::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                gitlawb_core::node_denial::NodeDenial::RateLimited.as_str(),
+                msg.clone(),
+            ),
+            AppError::RateLimited(_) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                gitlawb_core::node_denial::NodeDenial::RateLimited.as_str(),
+                crate::rate_limit::RATE_LIMIT_MESSAGE.to_string(),
+            ),
+            AppError::LedgerDenial { denial, message } => (
+                StatusCode::from_u16(denial.status())
+                    .expect("NodeDenial status is a valid HTTP code"),
+                denial.as_str(),
+                message.clone(),
+            ),
             AppError::Incomplete(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }
@@ -184,6 +254,32 @@ impl IntoResponse for AppError {
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.
             AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "git_timeout", msg.clone()),
+            // 503, retryable: a transient resource contention (e.g. the repo lock
+            // pool is pinned by a write burst or a purge holds the key), distinct
+            // from the 500 git_error so the client knows to back off and retry.
+            // 503 with a FIXED body: the caller should retry, and must not be told
+            // which repo is contended or for how long.
+            AppError::RepoBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_busy",
+                "repository is busy — retry".into(),
+            ),
+            // 503 with a FIXED body for the same reason: the caller should retry, and
+            // must not be told which repo could not be refreshed or why.
+            AppError::RepoUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_unavailable",
+                "repository is temporarily unavailable, retry".into(),
+            ),
+            // 503 with a FIXED body again, and its own code: the caller should
+            // retry, but the condition is not contention, so a client that
+            // distinguishes them should be able to. The body must not say which
+            // repo lost its publish or to whom.
+            AppError::RepoWriteFenced => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_write_fenced",
+                "repository changed underneath this write, retry".into(),
+            ),
             AppError::Db(e) if db_unavailable(e) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 DB_UNAVAILABLE_CODE,
@@ -238,17 +334,43 @@ impl IntoResponse for AppError {
         }
 
         let mut resp = (status, Json(body)).into_response();
+        if matches!(
+            self,
+            AppError::TooManyRequests(_) | AppError::RateLimited(_)
+        ) {
+            use axum::http::HeaderValue;
+            let code = gitlawb_core::node_denial::NodeDenial::RateLimited.as_str();
+            if let Ok(v) = HeaderValue::from_str(code) {
+                resp.headers_mut().insert("X-Gitlawb-Error", v);
+            }
+        }
+        if let AppError::LedgerDenial { denial, .. } = &self {
+            use axum::http::HeaderValue;
+            if let Ok(v) = HeaderValue::from_str(denial.as_str()) {
+                resp.headers_mut().insert("X-Gitlawb-Error", v);
+            }
+        }
         // Both retryable 503s advertise when to retry: Overloaded (capacity shed) and
         // SearchIncomplete (a bounded CID search cut short by a cap — retry may complete
         // it). They ride the shared tail above for body/status, so the header is attached
         // here rather than in bespoke early returns, keeping each variant handled once.
         if matches!(
             self,
-            AppError::Overloaded(_) | AppError::SearchIncomplete { .. }
+            AppError::Overloaded(_)
+                | AppError::SearchIncomplete { .. }
+                | AppError::RepoBusy
+                | AppError::RepoUnavailable
+                | AppError::RepoWriteFenced
         ) {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        if let AppError::RateLimited(retry_after) = &self {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(retry_after.as_secs().max(1)),
             );
         }
         resp
@@ -260,6 +382,16 @@ pub type Result<T> = std::result::Result<T, AppError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_maps_to_409() {
+        assert_eq!(
+            AppError::Conflict("task not claimable".into())
+                .into_response()
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
 
     #[test]
     fn timeout_maps_to_504_distinct_from_git_500() {
@@ -275,6 +407,32 @@ mod tests {
     }
 
     #[test]
+    fn too_many_requests_carries_rate_limited_header() {
+        use axum::http::HeaderValue;
+        let resp = AppError::TooManyRequests("slow down".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("X-Gitlawb-Error"),
+            Some(&HeaderValue::from_static("rate_limited"))
+        );
+    }
+
+    #[test]
+    fn rate_limited_carries_header_and_retry_after() {
+        use axum::http::HeaderValue;
+        let resp = AppError::RateLimited(std::time::Duration::from_secs(7)).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("X-Gitlawb-Error"),
+            Some(&HeaderValue::from_static("rate_limited"))
+        );
+        assert_eq!(
+            resp.headers().get("retry-after"),
+            Some(&HeaderValue::from_static("7"))
+        );
+    }
+
+    #[test]
     fn overloaded_maps_to_503_with_retry_after() {
         let resp = AppError::Overloaded("x".into()).into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -282,6 +440,16 @@ mod tests {
             resp.headers().get("retry-after").unwrap().to_str().unwrap(),
             "1"
         );
+    }
+
+    /// A 429 does not advertise a retry interval: the status-claim caps behind
+    /// it are per-commit and append-only, so a client honoring a 1s hint would
+    /// retry a request that can never succeed.
+    #[test]
+    fn too_many_requests_carries_no_retry_after() {
+        let resp = AppError::TooManyRequests("x".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get("retry-after").is_none());
     }
 
     /// #226: raw sqlx/DB detail must never appear in the Internal 500 body.
@@ -361,5 +529,32 @@ mod tests {
         let err: AppError = anyhow::Error::from(sqlx::Error::PoolClosed).into();
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn lock_pool_busy_via_anyhow_from_is_503_overloaded() {
+        let err: AppError = anyhow::Error::new(crate::git::repo_store::LockPoolBusy).into();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn repo_busy_unavailable_and_fenced_advertise_retry_after() {
+        for err in [
+            AppError::RepoBusy,
+            AppError::RepoUnavailable,
+            AppError::RepoWriteFenced,
+        ] {
+            let resp = err.into_response();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+                "1"
+            );
+        }
     }
 }
