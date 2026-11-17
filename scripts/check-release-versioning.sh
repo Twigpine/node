@@ -34,7 +34,7 @@ fi
 
 # Resolving can refresh Cargo.lock as a side effect, so snapshot and restore it:
 # this check must never leave the working tree dirty when run locally. Same
-# reasoning as scripts/check-gitlawb-core-deps.sh.
+# reasoning as scripts/check-twigpine-core-deps.sh.
 lock_backup="$(mktemp)"
 cp "$ROOT/Cargo.lock" "$lock_backup"
 restore_lock() { cp "$lock_backup" "$ROOT/Cargo.lock"; rm -f "$lock_backup"; }

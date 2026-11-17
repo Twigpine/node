@@ -18,7 +18,7 @@ Step-by-step guide to staking $GITLAWB, registering your node on-chain, and earn
 ```bash
 curl -fsSL https://twigpine.com/install.sh | sh
 # or build from source:
-cargo install --path crates/gl
+cargo install --path crates/twigpine-cli
 ```
 
 ## 2. Create a Twigpine identity
@@ -26,8 +26,8 @@ cargo install --path crates/gl
 Every node is identified by an Ed25519 DID keypair:
 
 ```bash
-gl identity new
-gl identity show
+twigpine identity new
+twigpine identity show
 # → did:key:z6Mk...
 ```
 
@@ -43,7 +43,7 @@ export GITLAWB_TOKEN=0x5F980Dcfc4c0fa3911554cf5ab288ed0eb13DBa3
 export GITLAWB_CONTRACT_NODE_STAKING=0xNODE_STAKING_ADDR
 export GITLAWB_CHAIN_RPC_URL=https://mainnet.base.org
 
-gl node register \
+twigpine node register \
   --stake 10000 \
   --http-url https://my-node.example.com
 ```
@@ -60,7 +60,7 @@ What this does:
 
 ```bash
 docker run -d \
-  --name gitlawb-node \
+  --name twigpine-node \
   -p 7545:7545 \
   -p 7546:7546/udp \
   -v gitlawb-data:/data \
@@ -80,7 +80,7 @@ See [`docker-compose.yml`](../docker-compose.yml) — bundles node + Postgres.
 ### Option C — From source
 
 ```bash
-cargo run -p gitlawb-node --release
+cargo run -p twigpine-node --release
 ```
 
 Required env for on-chain PoS mode:
@@ -96,7 +96,7 @@ Optional:
 ## 5. Verify
 
 ```bash
-gl node onchain-status
+twigpine node onchain-status
 ```
 
 Expected output:
@@ -122,7 +122,7 @@ The node's heartbeat loop runs every 20 hours. As long as you stay active:
 - Your share accrues as `pendingRewards` on-chain — claim anytime without unstaking.
 
 ```bash
-gl node claim
+twigpine node claim
 ```
 
 ## 7. Unstake (if you want out)
@@ -131,12 +131,12 @@ gl node claim
 
 ```bash
 # Step 1: request unstake (starts 7-day timer)
-gl node unstake-request
+twigpine node unstake-request
 
 # ... wait 7 days ...
 
 # Step 2: complete — returns stake + any pending rewards
-gl node unstake
+twigpine node unstake
 ```
 
 During the cooldown your node still earns rewards if it keeps heartbeating.
@@ -205,20 +205,20 @@ The owner issues a capability, the agent stores it, and the git helper presents 
 automatically on every push:
 
 Before anything below, set `GITLAWB_KEY` to an **absolute** path to the
-identity PEM (`gl identity new` prints it). `gl ucan import` and
-`git-remote-gitlawb` both resolve the delegation store from that key's parent
+identity PEM (`twigpine identity new` prints it). `twigpine ucan import` and
+`git-remote-twigpine` both resolve the delegation store from that key's parent
 directory, so do not pass `import --dir` pointing anywhere else: an import that
 succeeds elsewhere leaves the push unsigned. The README and `.env.example`
 cover the layout.
 
 ```bash
 # Owner, once per agent per repo:
-gl ucan delegate --to did:key:z6MkAgent… \
+twigpine ucan delegate --to did:key:z6MkAgent… \
   --cap gitlawb://repos/<owner-did>/<repo> --can git/push --expiry 168
 
 # Agent:
-gl ucan import <token-or-path>
-git push origin main          # git-remote-gitlawb attaches it as X-Ucan
+twigpine ucan import <token-or-path>
+git push origin main          # git-remote-twigpine attaches it as X-Ucan
 ```
 
 `--expiry` is measured in hours: 168 is 7 days, 720 is 30.
@@ -233,10 +233,10 @@ What the node requires, and why:
 | Requirement | Reason |
 |---|---|
 | The chain's **root issuer** is the repo owner | A `did:key` is self-certifying, so anyone can mint a chain. The owner is the only anchor the node holds independently of the token. |
-| **Every link** names this repository | A delegation's scope is fixed when it is issued. The node walks the whole proof chain, so a `*` resource authorizes nothing — not in the leaf and not in any proof behind it. Refusing only the leaf would not have been enough: attenuation permits narrowing a `*` parent to a concrete child, so one wildcard grant could otherwise reach every repository the owner has or later creates. `gl ucan delegate` therefore refuses to issue a push-class `*` at all. |
-| **Every link carries an expiry** | There is no revocation path yet. An unbounded delegation could never be withdrawn once leaked, so the node refuses one outright. `gl ucan delegate` defaults to 30 days. |
+| **Every link** names this repository | A delegation's scope is fixed when it is issued. The node walks the whole proof chain, so a `*` resource authorizes nothing — not in the leaf and not in any proof behind it. Refusing only the leaf would not have been enough: attenuation permits narrowing a `*` parent to a concrete child, so one wildcard grant could otherwise reach every repository the owner has or later creates. `twigpine ucan delegate` therefore refuses to issue a push-class `*` at all. |
+| **Every link carries an expiry** | There is no revocation path yet. An unbounded delegation could never be withdrawn once leaked, so the node refuses one outright. `twigpine ucan delegate` defaults to 30 days. |
 | No `nb` constraints | Constraints are reserved but not yet interpreted, so a capability carrying them authorizes nothing rather than silently granting more than the owner intended. |
-| The token is addressed to the pusher | The node requires the proof's audience to equal the invocation's issuer, and `gl ucan import` refuses a token addressed to another identity rather than storing one that can only fail. |
+| The token is addressed to the pusher | The node requires the proof's audience to equal the invocation's issuer, and `twigpine ucan import` refuses a token addressed to another identity rather than storing one that can only fail. |
 
 **Private repositories and `/` rules.** A delegation clears the push gate
 only. The `info/refs` advertisement that `git push` fetches first is read-gated,
@@ -247,12 +247,12 @@ rule, because a matching rule is an allow-list that replaces the public flag:
 ```bash
 # Owner: check the existing rules first — a `/` rule you already set has a mode
 # you want to keep, and `set` replaces its reader list wholesale.
-gl visibility list --repo <repo>
+twigpine visibility list --repo <repo>
 
 # Then grant read to the agent AND every existing reader on `/`. The mode
 # (`a`/`b`) must match what `list` showed; only reach for `b` when no `/`
 # rule exists yet.
-gl visibility set / --repo <repo> --mode <a|b> --readers did:key:z6MkReader1,did:key:z6MkAgent…
+twigpine visibility set / --repo <repo> --mode <a|b> --readers did:key:z6MkReader1,did:key:z6MkAgent…
 ```
 
 Without it the agent's push fails with a 404 — the same answer a stranger gets,
@@ -265,8 +265,8 @@ step is unnecessary. The two gates are
 independent in the other direction as well: a reader with no delegation is still
 refused on the push.
 
-**One repository per token.** `gl ucan delegate` issues one capability per token,
-and `gl ucan import` stores one repository per token. A hand-built token that
+**One repository per token.** `twigpine ucan delegate` issues one capability per token,
+and `twigpine ucan import` stores one repository per token. A hand-built token that
 names several repositories is refused at import rather than applied to some of
 them; ask the owner for one delegation per repository.
 
@@ -299,11 +299,11 @@ short lifetimes reissued often are safer than one long-lived grant.
 
 **"insufficient $GITLAWB balance"** — fund the operator wallet with at least 10,000 $GITLAWB.
 
-**Node refuses to start with "strict-mode operator check failed"** — either `gl node register` first, or unset `GITLAWB_OPERATOR_STRICT_MODE`.
+**Node refuses to start with "strict-mode operator check failed"** — either `twigpine node register` first, or unset `GITLAWB_OPERATOR_STRICT_MODE`.
 
 **Node refuses to start with "GITLAWB_DB_MAX_CONNECTIONS (20) must be at least max_concurrent_git_pushes (32) + 8 headroom"**: raise `GITLAWB_DB_MAX_CONNECTIONS` to at least the push cap plus 8 (40 with the default cap of 32; 48 is the shipped default and the recommended value), or lower `GITLAWB_MAX_CONCURRENT_GIT_PUSHES`. This bites a node upgraded in place that still sets the old pool size of 20. The check is deliberate: each concurrent push pins one pooled connection for its whole receive-pack, so a pool that does not clear the push cap lets a burst of slow pushes starve every other database path.
 
-**Rewards are 0 after a week** — run `gl node onchain-status`. If `currentlyActive: false`, check your heartbeat loop (node logs for `operator heartbeat sent`).
+**Rewards are 0 after a week** — run `twigpine node onchain-status`. If `currentlyActive: false`, check your heartbeat loop (node logs for `operator heartbeat sent`).
 
 **Want to rotate operator wallet** — requires unstake → re-register with new wallet. No in-place rotation in v1.
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build gl and git-remote-gitlawb binaries for all platforms.
+# Build twigpine and git-remote-twigpine binaries for all platforms.
 # Output goes to dist/bin/
 #
 # Usage:
@@ -32,13 +32,13 @@ build_linux() {
 
   local CONTAINER
   CONTAINER=$(docker create --platform "$DOCKER_PLATFORM" "gitlawb-bins-$PLATFORM")
-  docker cp "$CONTAINER:/gl" "$OUT/gl-$PLATFORM"
-  docker cp "$CONTAINER:/git-remote-gitlawb" "$OUT/git-remote-gitlawb-$PLATFORM"
+  docker cp "$CONTAINER:/twigpine" "$OUT/twigpine-$PLATFORM"
+  docker cp "$CONTAINER:/git-remote-twigpine" "$OUT/git-remote-twigpine-$PLATFORM"
   docker rm "$CONTAINER"
 
-  chmod +x "$OUT/gl-$PLATFORM" "$OUT/git-remote-gitlawb-$PLATFORM"
-  echo "  ✓ $OUT/gl-$PLATFORM"
-  echo "  ✓ $OUT/git-remote-gitlawb-$PLATFORM"
+  chmod +x "$OUT/twigpine-$PLATFORM" "$OUT/git-remote-twigpine-$PLATFORM"
+  echo "  ✓ $OUT/twigpine-$PLATFORM"
+  echo "  ✓ $OUT/git-remote-twigpine-$PLATFORM"
 }
 
 build_darwin_arm64() {
@@ -46,12 +46,12 @@ build_darwin_arm64() {
   echo "==> Building darwin-arm64 (native cargo)..."
   cd "$ROOT"
   export PATH="$HOME/.cargo/bin:$PATH"
-  cargo build --release --locked -p gl -p git-remote-gitlawb
-  cp target/release/gl "$OUT/gl-darwin-arm64"
-  cp target/release/git-remote-gitlawb "$OUT/git-remote-gitlawb-darwin-arm64"
-  chmod +x "$OUT/gl-darwin-arm64" "$OUT/git-remote-gitlawb-darwin-arm64"
-  echo "  ✓ $OUT/gl-darwin-arm64"
-  echo "  ✓ $OUT/git-remote-gitlawb-darwin-arm64"
+  cargo build --release --locked -p twigpine-cli -p git-remote-twigpine
+  cp target/release/twigpine "$OUT/twigpine-darwin-arm64"
+  cp target/release/git-remote-twigpine "$OUT/git-remote-twigpine-darwin-arm64"
+  chmod +x "$OUT/twigpine-darwin-arm64" "$OUT/git-remote-twigpine-darwin-arm64"
+  echo "  ✓ $OUT/twigpine-darwin-arm64"
+  echo "  ✓ $OUT/git-remote-twigpine-darwin-arm64"
 }
 
 PLATFORMS="${*:-linux-x86_64 linux-arm64}"

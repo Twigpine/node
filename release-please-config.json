@@ -8,11 +8,11 @@
       "include-v-in-tag": true,
       "include-component-in-tag": false,
       "extra-files": [
-        { "type": "generic", "path": "crates/gitlawb-core/Cargo.toml" },
-        { "type": "generic", "path": "crates/gitlawb-node/Cargo.toml" },
-        { "type": "generic", "path": "crates/gl/Cargo.toml" },
-        { "type": "generic", "path": "crates/git-remote-gitlawb/Cargo.toml" },
-        { "type": "generic", "path": "crates/gitlawb-attest/Cargo.toml" },
+        { "type": "generic", "path": "crates/twigpine-core/Cargo.toml" },
+        { "type": "generic", "path": "crates/twigpine-node/Cargo.toml" },
+        { "type": "generic", "path": "crates/twigpine-cli/Cargo.toml" },
+        { "type": "generic", "path": "crates/git-remote-twigpine/Cargo.toml" },
+        { "type": "generic", "path": "crates/twigpine-attest/Cargo.toml" },
         { "type": "generic", "path": "crates/icaptcha-client/Cargo.toml" }
       ]
     }

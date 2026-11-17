@@ -23,11 +23,11 @@ This is a Rust workspace with six crates:
 
 | Crate | Purpose |
 |---|---|
-| `gitlawb-node` | The node daemon: Axum HTTP server, git smart-HTTP, Postgres metadata, libp2p gossip, optional S3/Tigris/IPFS/Arweave/Base PoS hooks. |
-| `gl` | The Twigpine CLI for identity, repos, issues, PRs, bounties, tasks, peers, node status, MCP, and setup flows. |
-| `git-remote-gitlawb` | Git remote helper for `gitlawb://` URLs, so normal `git clone`, `git fetch`, and `git push` can talk to Twigpine nodes. |
-| `gitlawb-core` | Shared primitives: Ed25519 identities, `did:key`, CIDs, RFC 9421 HTTP signatures, certificates, and UCAN tokens. |
-| `gitlawb-attest` | Pluggable external provenance attestations for ref-update certificates. |
+| `twigpine-node` | The node daemon: Axum HTTP server, git smart-HTTP, Postgres metadata, libp2p gossip, optional S3/Tigris/IPFS/Arweave/Base PoS hooks. |
+| `twigpine` | The Twigpine CLI for identity, repos, issues, PRs, bounties, tasks, peers, node status, MCP, and setup flows. |
+| `git-remote-twigpine` | Git remote helper for `gitlawb://` URLs, so normal `git clone`, `git fetch`, and `git push` can talk to Twigpine nodes. |
+| `twigpine-core` | Shared primitives: Ed25519 identities, `did:key`, CIDs, RFC 9421 HTTP signatures, certificates, and UCAN tokens. |
+| `twigpine-attest` | Pluggable external provenance attestations for ref-update certificates. |
 | `icaptcha-client` | Client for the iCaptcha proof-of-intelligence flow used to protect spam-prone writes. |
 
 ---
@@ -39,7 +39,7 @@ Most git hosting today depends on a small number of centralized platforms. Twigp
 - **Own your identity**: every user, agent, and node is an Ed25519 keypair represented as `did:key:z6Mk...`.
 - **Signed writes by default**: write requests use RFC 9421 HTTP Signatures instead of passwords.
 - **Git-native transport**: repositories are still real git repositories served over smart HTTP.
-- **Agent-native workflows**: the `gl` CLI and MCP server expose repo, issue, task, PR, and UCAN flows to AI agents.
+- **Agent-native workflows**: the `twigpine` CLI and MCP server expose repo, issue, task, PR, and UCAN flows to AI agents.
 - **Peer-aware delivery**: nodes can announce, discover, gossip, and sync with each other.
 - **App CDN direction**: the network can evolve from decentralized code storage into code + asset + app delivery.
 
@@ -59,7 +59,7 @@ Good today:
 - RFC 9421-signed writes.
 - Repository and path-scoped visibility enforcement for repository and Git content reads, with 404-shaped repository denials.
 - DID identities.
-- `gl` CLI workflows.
+- `twigpine` CLI workflows.
 - libp2p peer discovery/gossip foundation.
 - Optional Tigris/S3 storage.
 - Optional IPFS/Pinata and Arweave/Irys hooks.
@@ -68,7 +68,7 @@ Good today:
 Known limitations:
 
 - Repository write authorization is one switch: `GITLAWB_ENFORCE_OWNER_PUSH`, which defaults to `true`. With it off — rolling upgrades only — a valid HTTP Signature identifies a pusher but does not authorize one, so every signed caller may push everywhere.
-- UCAN capabilities are consulted on the push path only. There, the chain's root issuer is anchored to the repository owner, so an owner-rooted, time-bounded delegation that names the repository grants scoped collaborator access for pushing to it, for the `git/push`, `*`, or `repo/admin` actions. A `*` *resource* is refused: a delegation must name the repository it applies to, so it cannot grow to cover repos created later. Push-only cuts the other way too: a delegation grants no read access, so on a private repository the delegate must also be a reader (`gl visibility set`) — the two gates a push crosses are described in [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). The rest is unchanged: there is no revocation path, `nb` constraints are refused rather than interpreted, and no other route — reads, pull requests, issues, agents — consults capabilities at all.
+- UCAN capabilities are consulted on the push path only. There, the chain's root issuer is anchored to the repository owner, so an owner-rooted, time-bounded delegation that names the repository grants scoped collaborator access for pushing to it, for the `git/push`, `*`, or `repo/admin` actions. A `*` *resource* is refused: a delegation must name the repository it applies to, so it cannot grow to cover repos created later. Push-only cuts the other way too: a delegation grants no read access, so on a private repository the delegate must also be a reader (`twigpine visibility set`) — the two gates a push crosses are described in [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). The rest is unchanged: there is no revocation path, `nb` constraints are refused rather than interpreted, and no other route — reads, pull requests, issues, agents — consults capabilities at all.
 - Agent lifecycle revocation is not enforced by HTTP Signature authorization; do not rely on removing or revoking an agent record to block a compromised signer.
 - Task list/get reads (REST and GraphQL) are repository/task-gated and omit `ucan_token`. Slash-form `repo_id` rows (mirror-hosted tasks) can appear on list for the delegator or trimmed assignee, but `GET /api/v1/tasks/{id}` and GraphQL `task` fail closed for every caller because there is no local repository backing to serve. Read visibility is not a blanket data-classification boundary: IPFS-pin and Arweave-anchor listings are not repository-gated; withheld path names can be visible to a root reader; and later visibility changes cannot retract content already announced or externally anchored.
 - Peer writes are signed by upgraded nodes, but strict signed-peer enforcement is opt-in during rolling upgrades.
@@ -130,7 +130,7 @@ docker compose down
 npm install -g @gitlawb/gl
 
 # Homebrew (macOS / Linux)
-brew install gitlawb/tap/gl
+brew install twigpine/tap/gl
 
 # curl (macOS / Linux)
 curl -fsSL https://twigpine.com/install.sh | sh
@@ -142,21 +142,22 @@ irm https://twigpine.com/install.ps1 | iex
 Or build from source:
 
 ```bash
-cargo build --release -p gl -p git-remote-gitlawb -p gitlawb-node
+cargo build --release -p twigpine-cli -p git-remote-twigpine -p twigpine-node
 ```
 
 Put these binaries on your `PATH`:
 
 ```txt
-target/release/gl
+target/release/twigpine
+target/release/git-remote-twigpine
 target/release/git-remote-gitlawb
-target/release/gitlawb-node
+target/release/twigpine-node
 ```
 
 Check your setup:
 
 ```bash
-gl doctor
+twigpine doctor
 ```
 
 ---
@@ -166,20 +167,20 @@ gl doctor
 Create an identity:
 
 ```bash
-gl identity new
-gl identity show
+twigpine identity new
+twigpine identity show
 ```
 
 Register against your local node:
 
 ```bash
-gl register --node http://localhost:7545
+twigpine register --node http://localhost:7545
 ```
 
 Create a repo:
 
 ```bash
-gl repo create my-repo --description "My first Twigpine repo" --node http://localhost:7545
+twigpine repo create my-repo --description "My first Twigpine repo" --node http://localhost:7545
 ```
 
 Use the git remote helper:
@@ -200,28 +201,28 @@ overrides that for a trusted private network.
 
 Public nodes (e.g. `node.twigpine.com`) require two things on writes:
 
-1. **RFC 9421 HTTP Signatures**: every write is signed by your identity key. `gl`
-   and the `git-remote-gitlawb` helper do this automatically. An old/unsigned CLI
-   fails with `401 not_an_agent`; `gl` will tell you to upgrade and register.
+1. **RFC 9421 HTTP Signatures**: every write is signed by your identity key. `twigpine`
+   and the `git-remote-twigpine` helper do this automatically. An old/unsigned CLI
+   fails with `401 not_an_agent`; `twigpine` will tell you to upgrade and register.
 2. **An iCaptcha proof** on the spam-gated writes (**repo create, fork, register**).
-   `gl` solves this for you: on the node's `403 icaptcha_proof_required` it reads the
+   `twigpine` solves this for you: on the node's `403 icaptcha_proof_required` it reads the
    `x-icaptcha-url` / `x-icaptcha-level` hints, requests a challenge, solves it
    locally (arithmetic / algebra / sequence), and **retries the same signed request**
    with the `x-icaptcha-proof` header. No manual steps, no env vars.
 
 ```bash
-gl identity new                                   # create did:key identity
-gl register      --node https://node.twigpine.com  # signed + auto-solves iCaptcha
-gl repo create memlawb --node https://node.twigpine.com   # signed + auto-solves iCaptcha
+twigpine identity new                                   # create did:key identity
+twigpine register      --node https://node.twigpine.com  # signed + auto-solves iCaptcha
+twigpine repo create memlawb --node https://node.twigpine.com   # signed + auto-solves iCaptcha
 git push  origin2 main                            # origin2 = gitlawb://<your-did>/memlawb (signed)
 git clone gitlawb://<your-did>/memlawb            # public read, no proof needed
-gl doctor                                         # preflight: identity, node, version, iCaptcha
+twigpine doctor                                         # preflight: identity, node, version, iCaptcha
 ```
 
 Notes:
 
 - **`requesterId` is always your DID.** The proof's `sub` claim must equal the
-  authenticated signer; `gl`/helper set this automatically and the node enforces
+  authenticated signer; `twigpine`/helper set this automatically and the node enforces
   `sub == authenticated DID` (so a proof minted for another identity is rejected).
 - **Proofs are short-lived (~5 min TTL) and single-use.** If one expires between
   solving and use, the client transparently solves a fresh one and retries.
@@ -238,14 +239,14 @@ Notes:
 ### Fetching an object by CID
 
 ```bash
-gl ipfs list                                  # CIDs this node has pinned
-gl ipfs get bafkrei... > object.bin           # object bytes on stdout
+twigpine ipfs list                                  # CIDs this node has pinned
+twigpine ipfs get bafkrei... > object.bin           # object bytes on stdout
 ```
 
 Objects that were pinned before the node started recording which repo they came
 from are found by scanning its repo inventory, and that scan stops at the
 per-request ceilings in the [Configuration](#configuration) table. A stopped scan
-answers 503 with a resume token instead of a false "not found", and `gl ipfs get`
+answers 503 with a resume token instead of a false "not found", and `twigpine ipfs get`
 follows the token automatically: up to 8 resumes after the first request, so at
 most 9 calls to the node, waiting between attempts for as long as the node's
 `Retry-After` asks and never longer than 5 seconds.
@@ -274,7 +275,7 @@ When a bound stops the ladder with a usable token in hand, the command prints th
 token and the invocation that continues from it before exiting nonzero:
 
 ```txt
-resume from where this stopped: gl ipfs get bafkrei... --scan <token>
+resume from where this stopped: twigpine ipfs get bafkrei... --scan <token>
 ```
 
 Run that to carry on from where the scan stopped. Re-running without `--scan`
@@ -287,13 +288,13 @@ are valid for an hour.
 ## Architecture
 
 ```txt
-┌──────────────────────────┐
-│ gl CLI / git / AI agents │
-└────────────┬─────────────┘
+┌────────────────────────────────┐
+│ twigpine CLI / git / AI agents │
+└────────────┬───────────────────┘
              │ signed HTTP writes / git smart-HTTP
              ↓
 ┌──────────────────────────┐
-│ gitlawb-node             │
+│ twigpine-node            │
 │ Axum API + git routes    │
 └────────────┬─────────────┘
              │
@@ -317,7 +318,7 @@ metadata        local disk / optional S3
 | DID | A user, agent, or node identity derived from an Ed25519 public key. |
 | HTTP Signature | RFC 9421 signature proving control of the DID key for write requests. |
 | Ref certificate | Signed record of a ref update. Useful for audit and replication. |
-| Ref certificate versioning | The wire format is versioned; new certificates are currently issued as v1. `gl cert show <repo> <id> --verify` requires `--expect-node <did>`, and the queried node's self-reported DID is **not** accepted as a trust anchor. v2 is reserved for a future payload shape that carries the version inside the signed bytes; this client refuses to verify v2+ rather than guessing. |
+| Ref certificate versioning | The wire format is versioned; new certificates are currently issued as v1. `twigpine cert show <repo> <id> --verify` requires `--expect-node <did>`, and the queried node's self-reported DID is **not** accepted as a trust anchor. v2 is reserved for a future payload shape that carries the version inside the signed bytes; this client refuses to verify v2+ rather than guessing. |
 | UCAN | Capability token. An owner delegates `git/push` on a repo to another DID; the node honors it when the proof chain roots at that owner. See [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
 | Peer announce | Node-to-node HTTP announcement of DID + public URL. |
 | Gossipsub | libp2p topic for ref-update events. |
@@ -503,7 +504,7 @@ Use a dedicated low-balance operator wallet. Do not use a treasury wallet as the
 Requires Rust 1.91+.
 
 ```bash
-cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb
+cargo build --release -p twigpine-node -p twigpine-cli -p git-remote-twigpine
 ```
 
 Run tests:
@@ -518,7 +519,7 @@ Run the node from source:
 
 ```bash
 DATABASE_URL=postgresql://gitlawb:changeme@localhost:5432/gitlawb \
-  cargo run -p gitlawb-node --release
+  cargo run -p twigpine-node --release
 ```
 
 ---
@@ -543,7 +544,7 @@ Output:
 
 ```txt
 dist/Twigpine Node.app
-dist/GitlawbNode-macOS.dmg
+dist/TwigpineNode-macOS.dmg
 ```
 
 Features:
@@ -570,7 +571,7 @@ Short-term priorities:
 
 1. Keep CI green: fmt, clippy, tests, release build.
 2. Add Docker and installer smoke tests.
-3. Improve operator docs and `gl doctor` checks.
+3. Improve operator docs and `twigpine doctor` checks.
 4. Harden peer writes and publish the signed-peer rollout plan.
 5. Wire trusted UCAN delegation into repository write authorization.
 6. Add threaded, line-level pull-request discussions and enforce approval requirements on merges.
@@ -606,7 +607,7 @@ Good first contribution areas:
 - docs and install polish
 - Docker smoke tests
 - CLI error messages
-- `gl doctor` checks
+- `twigpine doctor` checks
 - operator dashboard UX
 - test coverage for peer sync and signed writes
 

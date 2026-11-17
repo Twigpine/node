@@ -92,12 +92,12 @@ run_jq() {
   jq -r "$expr"
 }
 case "$*" in
-  "release view "*" --repo Gitlawb/node --json author,targetCommitish "*)
+  "release view "*" --repo Twigpine/node --json author,targetCommitish "*)
     [ "${STUB_RELEASE_EXISTS:-0}" = "1" ] || exit 1
     printf '%s\n' '{"author":{"login":"'"${STUB_RELEASE_AUTHOR:-github-actions[bot]}"'"},"targetCommitish":"'"${STUB_TARGET:-0000000000000000000000000000000000000000}"'"}' \
       | run_jq "$@"
     ;;
-  "api repos/Gitlawb/node/releases/tags/"*" "*)
+  "api repos/Twigpine/node/releases/tags/"*" "*)
     # STUB_EVIL_NAME simulates an attacker-crafted asset name carrying a fake
     # uploader inside it; base64 keeps it a single first field and the real
     # uploader stays in $3, while a raw name lets the smuggled field through.
@@ -107,27 +107,27 @@ case "$*" in
     uploader='"uploader":{"login":"'"${STUB_UPLOADERS:-github-actions[bot]}"'"}'
     if [ -n "${STUB_UPLOADER_JSON:-}" ]; then uploader='"uploader":'"$STUB_UPLOADER_JSON"; fi
     if [ "${STUB_NO_UPLOADER:-0}" = "1" ]; then uploader='"x":0'; fi
-    fixture='{"assets":[{"name":"gitlawb-node-9.9.9-x86_64-unknown-linux-musl.tar.gz","id":11,'"$uploader"'}'
+    fixture='{"assets":[{"name":"twigpine-node-9.9.9-x86_64-unknown-linux-musl.tar.gz","id":11,'"$uploader"'}'
     if [ "${STUB_EXTRA_BOT:-0}" = "1" ]; then
-      fixture="$fixture"',{"name":"gitlawb-node-9.9.9-aarch64-unknown-linux-musl.tar.gz","id":12,"uploader":{"login":"github-actions[bot]"}}'
+      fixture="$fixture"',{"name":"twigpine-node-9.9.9-aarch64-unknown-linux-musl.tar.gz","id":12,"uploader":{"login":"github-actions[bot]"}}'
     fi
     if [ "${STUB_EVIL_NAME:-0}" = "1" ]; then
-      fixture="$fixture"',{"name":"gitlawb-node-9.9.9-x86_64-unknown-linux-musl.tar.gz 999 github-actions[bot]","id":999,"uploader":{"login":"collaborator"}}'
+      fixture="$fixture"',{"name":"twigpine-node-9.9.9-x86_64-unknown-linux-musl.tar.gz 999 github-actions[bot]","id":999,"uploader":{"login":"collaborator"}}'
     fi
     printf '%s\n' "$fixture"']}' | run_jq "$@"
     ;;
-  "api repos/Gitlawb/node/commits/refs/tags/"*" "*)
+  "api repos/Twigpine/node/commits/refs/tags/"*" "*)
     printf '%s\n' '{"sha":"0000000000000000000000000000000000000000"}' \
       | run_jq "$@"
     ;;
-  "api repos/Gitlawb/node/commits/"*" "*)
+  "api repos/Twigpine/node/commits/"*" "*)
     # A bare tag name resolves through refs/heads before refs/tags. Return a
     # different SHA so a resolver that dropped the refs/tags/ qualification
     # reads the same-named branch's commit and the tag-moved check fires.
     printf '%s\n' '{"sha":"1111111111111111111111111111111111111111"}' \
       | run_jq "$@"
     ;;
-  "api repos/Gitlawb/node/compare/main..."*" "*)
+  "api repos/Twigpine/node/compare/main..."*" "*)
     printf '%s\n' '{"status":"'"${STUB_STATUS:?STUB_STATUS unset}"'"}' \
       | run_jq "$@"
     ;;
@@ -142,7 +142,7 @@ chmod +x "$stub_bin/gh"
 run_resolver_ci() {
   PATH="$stub_bin:$PATH" \
   GH_TOKEN=test-token \
-  GITHUB_REPOSITORY=Gitlawb/node \
+  GITHUB_REPOSITORY=Twigpine/node \
   STUB_STATUS="$1" STUB_RELEASE_EXISTS="$2" \
   STUB_RELEASE_AUTHOR="${4:-github-actions[bot]}" \
   STUB_UPLOADERS="${5:-github-actions[bot]}" \
@@ -165,7 +165,7 @@ if ! grep -qx 'tag_commit=0000000000000000000000000000000000000000' \
   printf '%s\n' "provenance: tag_commit output missing" >&2
   exit 1
 fi
-want_b64="$(printf '%s' 'gitlawb-node-9.9.9-x86_64-unknown-linux-musl.tar.gz' | base64 -w0)"
+want_b64="$(printf '%s' 'twigpine-node-9.9.9-x86_64-unknown-linux-musl.tar.gz' | base64 -w0)"
 if ! grep -q 'assets<<GHAE' "$test_tmp/prov-output" \
     || ! grep -qx "$want_b64 11" "$test_tmp/prov-output"; then
   printf '%s\n' "provenance: assets output missing" >&2
@@ -236,8 +236,8 @@ if ! STUB_EXTRA_BOT=1 run_resolver_ci behind 1 v9.9.9; then
   exit 1
 fi
 expected_map="$(printf '%s\n' \
-  "$(printf '%s' gitlawb-node-9.9.9-x86_64-unknown-linux-musl.tar.gz | base64 -w0) 11" \
-  "$(printf '%s' gitlawb-node-9.9.9-aarch64-unknown-linux-musl.tar.gz | base64 -w0) 12")"
+  "$(printf '%s' twigpine-node-9.9.9-x86_64-unknown-linux-musl.tar.gz | base64 -w0) 11" \
+  "$(printf '%s' twigpine-node-9.9.9-aarch64-unknown-linux-musl.tar.gz | base64 -w0) 12")"
 actual_map="$(sed -n '/^assets<<GHAE$/,/^GHAE$/p' "$test_tmp/prov-output" | sed '1d;$d')"
 if [ "$actual_map" != "$expected_map" ]; then
   printf '%s\n' "provenance: all-bot assets map changed" >&2
@@ -260,12 +260,12 @@ fi
 # The stub's contract is loud failure: a call it does not recognize must exit
 # non-zero and name the command line on stderr, so a resolver that gains a new
 # gh call cannot pass on a silently empty stubbed answer.
-if "$stub_bin/gh" api repos/Gitlawb/node/rate_limit >"$test_tmp/unexp-out" \
+if "$stub_bin/gh" api repos/Twigpine/node/rate_limit >"$test_tmp/unexp-out" \
     2>"$test_tmp/unexp-err"; then
   printf '%s\n' "stub accepted an unrecognized gh call" >&2
   exit 1
 fi
-if ! grep -qF 'unexpected gh call: api repos/Gitlawb/node/rate_limit' \
+if ! grep -qF 'unexpected gh call: api repos/Twigpine/node/rate_limit' \
     "$test_tmp/unexp-err"; then
   printf '%s\n' "stub's unrecognized-call stderr did not name the command line" >&2
   exit 1
@@ -538,7 +538,7 @@ job=npm-publish
           for entry in $MAP; do
             pkg="${entry%%:*}"
             target="${entry#*:}"
-            archive="gitlawb-node-${VERSION}-${target}.tar.gz"
+            archive="twigpine-node-${VERSION}-${target}.tar.gz"
             echo "==> $pkg <- $archive"
             # Download by the asset id the resolver captured and uploader-
             # checked, not by name: release assets are mutable, and an id can
@@ -553,9 +553,9 @@ job=npm-publish
             gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
               -H 'Accept: application/octet-stream' > "_dl/$archive"
             tar -xzf "_dl/$archive" -C _dl
-            src="_dl/gitlawb-node-${VERSION}-${target}"
-            cp "$src/gl" "npm/packages/$pkg/gl"
-            cp "$src/git-remote-gitlawb" "npm/packages/$pkg/git-remote-gitlawb"
+            src="_dl/twigpine-node-${VERSION}-${target}"
+            cp "$src/twigpine" "npm/packages/$pkg/gl"
+            cp "$src/git-remote-twigpine" "npm/packages/$pkg/git-remote-gitlawb"
             chmod +x "npm/packages/$pkg/gl" "npm/packages/$pkg/git-remote-gitlawb"
           done
 
@@ -639,7 +639,7 @@ job=homebrew-bump
           # captured and uploader-checked. The *.sha256 sidecars are mutable
           # release assets too; trusting them would trust the same surface.
           sha() {
-            archive="gitlawb-node-${VERSION}-$1.tar.gz"
+            archive="twigpine-node-${VERSION}-$1.tar.gz"
             want="$(printf '%s' "$archive" | base64 -w0)"
             asset_id="$(printf '%s\n' "$ASSETS" | awk -v n="$want" '$1 == n {print $2; exit}')"
             if [ -z "$asset_id" ]; then
@@ -669,42 +669,38 @@ job=homebrew-bump
 
             on_macos do
               on_arm do
-                url "${base}/gitlawb-node-${VERSION}-aarch64-apple-darwin.tar.gz"
+                url "${base}/twigpine-node-${VERSION}-aarch64-apple-darwin.tar.gz"
                 sha256 "${SHA_MAC_ARM}"
               end
               on_intel do
-                url "${base}/gitlawb-node-${VERSION}-x86_64-apple-darwin.tar.gz"
+                url "${base}/twigpine-node-${VERSION}-x86_64-apple-darwin.tar.gz"
                 sha256 "${SHA_MAC_X64}"
               end
             end
 
             on_linux do
               on_arm do
-                url "${base}/gitlawb-node-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+                url "${base}/twigpine-node-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
                 sha256 "${SHA_LNX_ARM}"
               end
               on_intel do
-                url "${base}/gitlawb-node-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+                url "${base}/twigpine-node-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
                 sha256 "${SHA_LNX_X64}"
               end
             end
 
             def install
-              bin.install "gl"
-              bin.install "git-remote-gitlawb"
-            end
-
-            def caveats
-              <<~CAVEATS
-                oh-my-zsh's git plugin aliases gl='git pull', which shadows this
-                binary in interactive shells. If \`gl\` prints "fatal: not a git
-                repository", run:
-                  echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc
-              CAVEATS
+              bin.install "twigpine"
+              bin.install "git-remote-twigpine"
+              # The short form, and the names used before the rename: existing
+              # clones and scripts still call them.
+              bin.install_symlink bin/"twigpine" => "twig"
+              bin.install_symlink bin/"twigpine" => "gl"
+              bin.install_symlink bin/"git-remote-twigpine" => "git-remote-gitlawb"
             end
 
             test do
-              assert_match version.to_s, shell_output("#{bin}/gl --version")
+              assert_match version.to_s, shell_output("#{bin}/twigpine --version")
             end
           end
           EOF

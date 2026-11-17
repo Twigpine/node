@@ -65,9 +65,9 @@ These are documented limitations of the current live release. They should be pri
 - **Mitigation:** Keep sensitive deployments behind operational network controls and enable owner-only push enforcement where it fits the deployment until trusted delegation and authorization-aware revocation are implemented.
 
 ### git-receive-pack authentication
-- The `git-receive-pack` endpoint enforces HTTP Signature auth. Plain Git smart-HTTP clients do not generate those headers, so the `git-remote-gitlawb` helper is required for pushes.
+- The `git-receive-pack` endpoint enforces HTTP Signature auth. Plain Git smart-HTTP clients do not generate those headers, so the `git-remote-twigpine` helper is required for pushes.
 - **Impact:** Direct HTTP pushes without RFC 9421 headers are rejected; users need `gitlawb://` remotes or equivalent signed clients.
-- **Mitigation:** Use `gitlawb://` remote URLs and keep `git-remote-gitlawb` on the user's `PATH`.
+- **Mitigation:** Use `gitlawb://` remote URLs and keep `git-remote-twigpine` on the user's `PATH`.
 - **Fix target:** v0.2
 
 ### Private repository reads

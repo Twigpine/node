@@ -9,7 +9,7 @@
 #   scripts/ci-surfaces.sh --all      # every surface, whole workspace
 #
 # Input is NUL-terminated paths (`git diff -z`). Without -z, git C-quotes any
-# path with non-ASCII, tab, quote or newline characters ("crates/gl/\303\251.rs"),
+# path with non-ASCII, tab, quote or newline characters ("crates/twigpine-cli/\303\251.rs"),
 # which would match no surface and skip every job; newline-delimited input
 # also cannot carry a path that contains a newline. Input that does not end in
 # NUL (e.g. a plain `git diff --name-only`) is rejected rather than misread.
@@ -66,7 +66,7 @@ done
 # run. Candidates (keep those that resolve outside crates/<dir>/):
 #   git grep -nE 'include_(str|bytes)!\("(\.\./){2,}' crates
 declare -A embedded_in=(
-  [bootstrap-peers.json]=gitlawb-node
+  [bootstrap-peers.json]=twigpine-node
 )
 
 # Mark a crate dir as touched; a dir this checkout does not know (removed or
@@ -119,8 +119,8 @@ for path in "${changed[@]}"; do
     Cargo.lock | .cargo/audit.toml) audit=true ;;
   esac
   case "$path" in
-    Cargo.toml | Cargo.lock | crates/gitlawb-core/Cargo.toml \
-      | ci/gitlawb-core-allowed-deps.txt | scripts/check-gitlawb-core-deps.sh)
+    Cargo.toml | Cargo.lock | crates/twigpine-core/Cargo.toml \
+      | ci/twigpine-core-allowed-deps.txt | scripts/check-twigpine-core-deps.sh)
       core_deps=true ;;
   esac
   case "$path" in
@@ -157,7 +157,7 @@ if [ "$all" = true ]; then
 fi
 
 # Affected crates: the touched ones plus everything that depends on them,
-# transitively, so a gitlawb-core change still tests every consumer.
+# transitively, so a twigpine-core change still tests every consumer.
 declare -A affected=()
 for dir in "${!touched[@]}"; do affected[$dir]=1; done
 grew=true
@@ -184,12 +184,12 @@ rust_packages=""
 windows_packages=""
 if [ "$full_rust" = true ]; then
   rust_packages="--workspace"
-  windows_packages="-p gl -p git-remote-gitlawb"
+  windows_packages="-p twigpine-cli -p git-remote-twigpine"
 elif [ "$rust" = true ]; then
   for dir in $(printf '%s\n' "${!affected[@]}" | sort); do
     rust_packages+="${rust_packages:+ }-p ${pkg_of[$dir]}"
     case "${pkg_of[$dir]}" in
-      gl | git-remote-gitlawb) windows_packages+="${windows_packages:+ }-p ${pkg_of[$dir]}" ;;
+      twigpine-cli | git-remote-twigpine) windows_packages+="${windows_packages:+ }-p ${pkg_of[$dir]}" ;;
     esac
   done
 fi
