@@ -391,6 +391,72 @@ mod tests {
         std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
     }
 
+    /// A failed listing must be a command error, never the "No issues" success
+    /// path (#426): the node's error body carries no `issues` key.
+    #[tokio::test]
+    async fn test_cmd_list_http_error_is_command_error() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues$".to_string()),
+            )
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"git_error","message":"unreadable issue object"}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("500"), "status missing from error: {msg}");
+        assert!(
+            msg.contains("unreadable issue object"),
+            "node message missing from error: {msg}"
+        );
+    }
+
+    /// A non-success status with a non-JSON body must fail too, so body
+    /// parsing cannot turn an HTTP failure into an empty listing.
+    #[tokio::test]
+    async fn test_cmd_list_http_error_non_json_body_is_command_error() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues$".to_string()),
+            )
+            .with_status(502)
+            .with_header("content-type", "text/html")
+            .with_body("<html>bad gateway</html>")
+            .create_async()
+            .await;
+
+        let err = cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("502"),
+            "status missing from error: {err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn test_cmd_list_empty() {
         let dir = TempDir::new().unwrap();
