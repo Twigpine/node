@@ -25,6 +25,7 @@
 use anyhow::{bail, Context, Result};
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
+use gitlawb_core::transport_policy::{allow_insecure_http_value, is_http, is_insecure_remote};
 use gitlawb_core::{resolve_transport_node, DEFAULT_LOCAL_NODE};
 use std::io::{self, BufRead, Read, Write};
 
@@ -86,57 +87,6 @@ fn node_base_from_env() -> String {
     resolve_transport_node(std::env::var("GITLAWB_NODE").ok().as_deref())
 }
 
-/// Whether `url` is plaintext http, regardless of where it points.
-fn is_http(url: &str) -> bool {
-    reqwest::Url::parse(url.trim())
-        .map(|u| u.scheme() == "http")
-        .unwrap_or(false)
-}
-
-/// Whether `url` would send git data off this machine in cleartext.
-///
-/// True only for `http://` to a non-loopback host. RFC 9421 signs the request
-/// but does not encrypt it, so on a plaintext hop the pack contents and the
-/// `Signature` header are both readable, and a captured signature is replayable
-/// for its freshness window against any host.
-///
-/// Loopback is decided from the parsed address rather than a string match, so
-/// `127.0.0.2`, `[::1]` and an IPv4-mapped `[::ffff:127.0.0.1]` are all
-/// recognised as this machine. A value that does not parse, or that is not
-/// http(s), is not this guard's business and returns false: it fails later with
-/// its own error, and naming it a TLS problem would misdirect the reader.
-fn is_insecure_remote(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
-        return false;
-    };
-    if parsed.scheme() != "http" {
-        return false;
-    }
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host == "localhost" {
-        return false;
-    }
-    // host_str() keeps the brackets on an IPv6 literal.
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        if ip.is_loopback() {
-            return false;
-        }
-        // An IPv4-mapped IPv6 literal hides a v4 loopback from is_loopback().
-        if let std::net::IpAddr::V6(v6) = ip {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                if v4.is_loopback() {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
 /// Fixed warning for a `GITLAWB_ALLOW_INSECURE_HTTP` value that is set but not
 /// truthy. The raw value is never logged.
 fn warn_allow_insecure_http_non_truthy() {
@@ -156,11 +106,10 @@ fn allow_insecure_http_from_str(raw: Option<&str>) -> bool {
     let Some(v) = raw else {
         return false;
     };
-    let t = v.trim();
-    if t.eq_ignore_ascii_case("1") || t.eq_ignore_ascii_case("true") {
+    if allow_insecure_http_value(v) {
         true
     } else {
-        if !t.is_empty() {
+        if !v.trim().is_empty() {
             warn_allow_insecure_http_non_truthy();
         }
         false

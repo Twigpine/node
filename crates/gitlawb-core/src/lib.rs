@@ -17,6 +17,8 @@ pub mod node_denial;
 pub mod redirect;
 pub mod sanitize;
 pub mod scan_token;
+#[cfg(any(feature = "redirect", test))]
+pub mod transport_policy;
 pub mod ucan;
 
 /// Node URL the git transport falls back to when `GITLAWB_NODE` is unset.

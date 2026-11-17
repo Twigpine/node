@@ -14,6 +14,7 @@ use clap::Args;
 use std::path::PathBuf;
 
 use gitlawb_core::resolve_transport_node;
+use gitlawb_core::transport_policy;
 
 use crate::http::{sanitize_node_msg, NodeClient};
 
@@ -443,15 +444,34 @@ fn recovery_target(node: &str) -> String {
 
 /// Probe `url` and describe what is actually there.
 ///
-/// This models the git helper, so it takes the helper's network policy: the shared
-/// same-origin redirect decision and chain bound, and reqwest's default environment
-/// proxy discovery (the helper does not opt out of it either, so a node reachable
-/// only through the configured proxy is reachable here, and a loopback node behind a
-/// dead proxy is not). It is deliberately not `NodeClient`, because it must not
-/// inherit the 30s request timeout, which stalls every stock `gl doctor` run behind
-/// a hung listener, and it sends no credentials.
+/// This models the git helper, so it takes the helper's transport policy: a
+/// plaintext http node off this machine is refused without a request unless
+/// `GITLAWB_ALLOW_INSECURE_HTTP` opts in; a loopback http node is dialed directly,
+/// never through a proxy; every other node uses reqwest's default environment proxy
+/// discovery, as the helper does; redirects follow the shared same-origin decision
+/// and chain bound; and the identity must parse as a DID, which the helper requires
+/// before it builds a delegation. It is deliberately not `NodeClient`, because it
+/// must not inherit the 30s request timeout, which stalls every stock `gl doctor`
+/// run behind a hung listener, and it sends no credentials.
 async fn probe_transport(url: &str) -> TransportVerdict {
-    let client = match reqwest::Client::builder()
+    let allow_insecure = std::env::var("GITLAWB_ALLOW_INSECURE_HTTP")
+        .is_ok_and(|v| transport_policy::allow_insecure_http_value(&v));
+    if !allow_insecure && transport_policy::is_insecure_remote(url) {
+        return TransportVerdict {
+            usable: false,
+            detail: "refused: plaintext http to a remote node (use https://, or set \
+                     GITLAWB_ALLOW_INSECURE_HTTP=1 for a trusted private network)"
+                .to_string(),
+        };
+    }
+    let builder = reqwest::Client::builder();
+    // The helper's own condition: a loopback http node is never proxied.
+    let builder = if transport_policy::is_http(url) && !transport_policy::is_insecure_remote(url) {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    let client = match builder
         .redirect(reqwest::redirect::Policy::custom(
             crate::http::same_origin_redirect,
         ))
@@ -479,7 +499,10 @@ async fn probe_transport(url: &str) -> TransportVerdict {
                 };
             }
             let info = serde_json::from_slice::<serde_json::Value>(&body.bytes).unwrap_or_default();
-            if info["did"].as_str().is_some() {
+            if info["did"]
+                .as_str()
+                .is_some_and(|d| d.parse::<gitlawb_core::did::Did>().is_ok())
+            {
                 TransportVerdict {
                     usable: true,
                     detail: "reachable".to_string(),
@@ -715,6 +738,7 @@ fn is_newer(latest: &str, current: &str) -> bool {
 mod tests {
     /// The quoted word must reach a real shell as exactly one value and run nothing
     /// else, for the inputs that break naive single-quoting.
+    #[cfg(unix)]
     #[test]
     fn shell_single_quote_round_trips_through_sh() {
         let marker = std::env::temp_dir().join(format!("gl-doctor-quote-{}", std::process::id()));

@@ -53,6 +53,21 @@ fn did_ok() -> Vec<u8> {
     )
 }
 
+/// A proxy fixture that answers every request with a DID and counts only the
+/// requests naming `target`. Doctor's other rows go through the same proxy
+/// variable, so a raw hit count cannot tell the transport probe apart.
+fn counting_proxy(target: String) -> (u16, Arc<AtomicUsize>) {
+    let to_target = Arc::new(AtomicUsize::new(0));
+    let counter = to_target.clone();
+    let (port, _) = serve(move |_, head| {
+        if head.lines().next().is_some_and(|l| l.contains(&target)) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        did_ok()
+    });
+    (port, to_target)
+}
+
 /// Substring that marks the divergence clause. Present only when gl and the git
 /// transport resolve different nodes.
 const DIVERGENCE: &str = "git push/clone will use";
@@ -211,9 +226,7 @@ fn unset_env_with_flag_equal_to_transport_default_still_warns_not_set() {
 /// healthy transport is the same false green doctor already shipped once.
 #[test]
 fn a_non_gitlawb_200_is_not_a_healthy_transport() {
-    let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
-        return;
-    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming().take(1) {
@@ -398,11 +411,14 @@ fn a_request_target_changing_redirect_is_refused() {
 /// reachable here.
 #[test]
 fn a_node_reachable_only_through_the_configured_proxy_is_reachable() {
-    let (proxy, proxy_hits) = serve(|_, _| did_ok());
+    let (proxy, proxy_hits) = counting_proxy("node.invalid".to_string());
     let r = doctor_with(
         Some("http://node.invalid:7545"),
         Some("http://127.0.0.1:1"),
-        &[("HTTP_PROXY", &format!("http://127.0.0.1:{proxy}"))],
+        &[
+            ("HTTP_PROXY", &format!("http://127.0.0.1:{proxy}")),
+            ("GITLAWB_ALLOW_INSECURE_HTTP", "1"),
+        ],
     );
     let line = r
         .divergence_line()
@@ -414,11 +430,12 @@ fn a_node_reachable_only_through_the_configured_proxy_is_reachable() {
     );
 }
 
-/// Loopback is not exempt from a configured proxy for the helper, so a listener
-/// that answers directly but sits behind a dead proxy fails clone/push and must
-/// not read as healthy here.
+/// The helper builds its client with `no_proxy()` for a loopback http node, so
+/// clone/push dial it directly whatever proxy is configured. Doctor must take the
+/// same path: a dead proxy cannot make a reachable loopback node read as down, and
+/// a live proxy that answers with a DID cannot make an unreachable one read as up.
 #[test]
-fn a_loopback_node_behind_a_dead_proxy_is_not_reported_healthy() {
+fn a_loopback_node_is_probed_directly_behind_a_dead_proxy() {
     let (node, node_hits) = serve(|_, _| did_ok());
     let r = doctor_with(
         Some(&format!("http://127.0.0.1:{node}")),
@@ -428,12 +445,139 @@ fn a_loopback_node_behind_a_dead_proxy_is_not_reported_healthy() {
     let line = r
         .divergence_line()
         .unwrap_or_else(|| panic!("no row:\n{}", r.stdout));
-    assert!(line.contains("unreachable"), "got: {line}");
-    assert_eq!(
-        node_hits.load(Ordering::SeqCst),
-        0,
-        "the probe bypassed the proxy"
+    assert!(line.contains("(reachable)"), "got: {line}");
+    assert!(
+        node_hits.load(Ordering::SeqCst) >= 1,
+        "the probe never reached the loopback node directly"
     );
+}
+
+#[test]
+fn a_loopback_node_is_never_sent_through_a_live_proxy() {
+    let (node, node_hits) = serve(|_, _| did_ok());
+    let (proxy, proxy_hits) = counting_proxy(format!("127.0.0.1:{node}"));
+    let r = doctor_with(
+        Some(&format!("http://127.0.0.1:{node}")),
+        Some("http://127.0.0.1:1"),
+        &[("HTTP_PROXY", &format!("http://127.0.0.1:{proxy}"))],
+    );
+    assert!(
+        r.divergence_line()
+            .is_some_and(|l| l.contains("(reachable)")),
+        "got:\n{}",
+        r.stdout
+    );
+    assert_eq!(
+        proxy_hits.load(Ordering::SeqCst),
+        0,
+        "a loopback probe went through the proxy"
+    );
+    assert!(node_hits.load(Ordering::SeqCst) >= 1);
+}
+
+/// The helper refuses a non-loopback `http://` node before sending anything unless
+/// `GITLAWB_ALLOW_INSECURE_HTTP` is truthy. Doctor must report that refusal, as a
+/// failure because the user set the variable, and must not contact the node.
+#[test]
+fn a_plaintext_remote_node_is_refused_like_the_helper_and_never_probed() {
+    let (proxy, proxy_hits) = counting_proxy("node.invalid".to_string());
+    let proxy_env = format!("http://127.0.0.1:{proxy}");
+    let r = doctor_with(
+        Some("http://node.invalid:7545"),
+        Some("http://127.0.0.1:1"),
+        &[("HTTP_PROXY", &proxy_env)],
+    );
+    let line = r
+        .divergence_line()
+        .unwrap_or_else(|| panic!("no row:\n{}", r.stdout));
+    assert!(
+        line.trim_start().starts_with('\u{2717}'),
+        "a refused configured node must fail, got: {line}"
+    );
+    assert!(line.contains("plaintext"), "got: {line}");
+    assert!(!line.contains("(reachable)"), "got: {line}");
+    assert_eq!(
+        proxy_hits.load(Ordering::SeqCst),
+        0,
+        "a refused node must not be contacted"
+    );
+}
+
+/// Must-not case for the refusal: an explicit opt-in (and only a truthy one) lifts it.
+#[test]
+fn the_plaintext_refusal_follows_the_helpers_opt_in_parsing() {
+    let (proxy, _) = serve(|_, _| did_ok());
+    let proxy_env = format!("http://127.0.0.1:{proxy}");
+    for (val, allowed) in [
+        ("1", true),
+        (" TRUE ", true),
+        ("0", false),
+        ("false", false),
+        ("", false),
+        ("yes", false),
+    ] {
+        let r = doctor_with(
+            Some("http://node.invalid:7545"),
+            Some("http://127.0.0.1:1"),
+            &[
+                ("HTTP_PROXY", &proxy_env),
+                ("GITLAWB_ALLOW_INSECURE_HTTP", val),
+            ],
+        );
+        let line = r
+            .divergence_line()
+            .unwrap_or_else(|| panic!("no row for {val:?}:\n{}", r.stdout));
+        assert_eq!(
+            line.contains("(reachable)"),
+            allowed,
+            "opt-in {val:?} gave: {line}"
+        );
+        assert_eq!(
+            line.contains("plaintext"),
+            !allowed,
+            "opt-in {val:?}: {line}"
+        );
+    }
+}
+
+/// An unset variable stays advisory even when the default would be refused, which
+/// cannot happen today (the default is loopback), so the tier is pinned on the
+/// configured case only; a TLS remote must never trip the refusal.
+#[test]
+fn an_https_remote_node_is_not_refused() {
+    let r = doctor_with(
+        Some("https://node.invalid:7545"),
+        Some("http://127.0.0.1:1"),
+        &[],
+    );
+    let line = r
+        .divergence_line()
+        .unwrap_or_else(|| panic!("no row:\n{}", r.stdout));
+    assert!(!line.contains("plaintext"), "got: {line}");
+}
+
+/// The helper parses the node DID before it will build a UCAN invocation, so an
+/// empty or malformed `did` is not a usable identity.
+#[test]
+fn an_empty_or_malformed_did_is_not_a_healthy_transport() {
+    for body in [
+        r#"{"did":""}"#,
+        r#"{"did":"not-a-did"}"#,
+        r#"{"did":"did:unknown:abc"}"#,
+    ] {
+        let (port, _) = serve(move |_, _| http("200 OK", "", body.as_bytes()));
+        let r = doctor(
+            Some(&format!("http://127.0.0.1:{port}")),
+            "http://127.0.0.1:1",
+        );
+        let line = r
+            .divergence_line()
+            .unwrap_or_else(|| panic!("no row for {body}:\n{}", r.stdout));
+        assert!(
+            line.contains("not a gitlawb node"),
+            "{body} must not read as healthy, got: {line}"
+        );
+    }
 }
 
 /// A valid-looking identity at the head of an oversized body is still an
