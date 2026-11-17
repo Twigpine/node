@@ -58,7 +58,7 @@ function install() {
     console.error(
       `@gitlawb/gl: Platform package ${packageName} not found.\n` +
         `This can happen if optional dependencies were skipped.\n` +
-        `Install manually: curl -sSf https://twigpine.com/install.sh | sh`
+        `Install manually: curl -fsSL https://twigpine.com/install.sh | sh`
     );
     process.exit(1);
   }

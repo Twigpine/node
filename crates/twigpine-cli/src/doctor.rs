@@ -263,7 +263,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
                         "node is v{version} but twigpine is v{gl_ver} — your CLI may be missing \
                          features (signing / iCaptcha) this node requires"
                     ),
-                    "upgrade twigpine: curl -sSf https://twigpine.com/install.sh | sh",
+                    "upgrade twigpine: curl -fsSL https://twigpine.com/install.sh | sh",
                 ));
             }
         }
@@ -320,7 +320,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         checks.push(Check::fail(
             "git-remote-gitlawb",
             "not found in PATH — gitlawb:// clone/push will not work",
-            "curl -sSf https://twigpine.com/install.sh | sh",
+            "curl -fsSL https://twigpine.com/install.sh | sh",
         ));
     }
 
@@ -644,7 +644,7 @@ async fn check_version(current: &'static str, github_api_base: &str) -> Check {
         Check::warn(
             "version",
             format!("v{current} → v{} available", sanitize_node_msg(tag)),
-            "curl -sSf https://twigpine.com/install.sh | sh",
+            "curl -fsSL https://twigpine.com/install.sh | sh",
         )
     } else {
         Check::pass("version", format!("v{current} (up to date)"))

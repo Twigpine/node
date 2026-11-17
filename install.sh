@@ -1,12 +1,23 @@
-#!/usr/bin/env bash
-# Twigpine installer - downloads pre-built binaries from GitHub Releases.
+#!/bin/sh
+# Twigpine installer (macOS / Linux): twigpine, git-remote-twigpine and
+# twigpine-node.
+#
+# Downloads a pre-built release archive from GitHub and installs it only if its
+# SHA-256 is listed at https://twigpine.com/install-checksums.txt. That list is
+# served by twigpine.com, not by GitHub, so a hijacked, renamed or look-alike
+# GitHub repository cannot get a different binary installed on its own. The
+# list also names the latest version, so no GitHub API call is needed.
 #
 # Usage:
 #   curl -fsSL https://twigpine.com/install.sh | sh
-#   curl -fsSL https://twigpine.com/install.sh | sh -s -- --version v0.3.9
-set -euo pipefail
+#   curl -fsSL https://twigpine.com/install.sh | sh -s -- --version v0.7.1
+#
+# Plain POSIX sh on purpose: `curl ... | sh` runs dash on Debian and Ubuntu.
+set -eu
 
 REPO="${GITLAWB_RELEASE_REPO:-Twigpine/node}"
+DOWNLOAD_BASE="${GITLAWB_DOWNLOAD_BASE:-https://github.com/${REPO}/releases/download}"
+CHECKSUMS_URL="${GITLAWB_CHECKSUMS_URL:-https://twigpine.com/install-checksums.txt}"
 INSTALL_DIR="${GITLAWB_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION_ARG="latest"
 
@@ -15,12 +26,16 @@ usage() {
 Twigpine installer
 
 Options:
-  --version <tag>   Install a specific release tag, for example v0.3.9.
+  --version <tag>   Install a specific release tag, for example v0.7.1.
   -h, --help        Show this help.
 
 Environment:
-  GITLAWB_INSTALL_DIR   Install directory (default: $HOME/.local/bin)
-  GITLAWB_RELEASE_REPO  GitHub repo to download from (default: Twigpine/node)
+  GITLAWB_INSTALL_DIR    Install directory (default: $HOME/.local/bin)
+  GITLAWB_RELEASE_REPO   GitHub repo to download from (default: Twigpine/node)
+  GITLAWB_DOWNLOAD_BASE  Release download base URL, for mirrors
+                         (default: https://github.com/<repo>/releases/download)
+  GITLAWB_CHECKSUMS_URL  Checksum list every download must match
+                         (default: https://twigpine.com/install-checksums.txt)
 EOF
 }
 
@@ -74,13 +89,24 @@ case "${OS_NAME}-${ARCH_NAME}" in
   darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
 esac
 
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# The checksum list comes first: it names the latest version and is the only
+# thing that can vouch for an archive.
+echo "Fetching checksums from ${CHECKSUMS_URL}"
+SUMS="$TMP_DIR/install-checksums.txt"
+if ! curl -fsSL -o "$SUMS.raw" "$CHECKSUMS_URL"; then
+  echo "error: could not download the checksum list: $CHECKSUMS_URL" >&2
+  echo "       Nothing was installed." >&2
+  exit 1
+fi
+tr -d '\r' < "$SUMS.raw" > "$SUMS"
+
 if [ "$VERSION_ARG" = "latest" ]; then
-  echo "Fetching latest release version..."
-  TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep '"tag_name"' \
-    | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+  TAG=$(sed -n 's/^# latest: *\(v[0-9][0-9A-Za-z.+-]*\) *$/\1/p' "$SUMS" | head -n 1)
   if [ -z "$TAG" ]; then
-    echo "error: could not determine latest release. Check https://github.com/${REPO}/releases" >&2
+    echo "error: the checksum list does not name a latest version: $CHECKSUMS_URL" >&2
     exit 1
   fi
 else
@@ -91,50 +117,92 @@ case "$TAG" in
   v*) VERSION="${TAG#v}" ;;
   *)  VERSION="$TAG"; TAG="v$TAG" ;;
 esac
+case "$VERSION" in
+  "" | *[!0-9A-Za-z.+-]*)
+    echo "error: not a release version: $TAG" >&2
+    exit 1
+    ;;
+esac
 
-PACKAGE_NAME="twigpine-node-${VERSION}-${TARGET}"
+# "<sha256>  <file>" (or "<sha256> *<file>"), as sha256sum writes it.
+listed_sha() {
+  awk -v f="$1" '
+    ($2 == f || $2 == "*" f) && length($1) == 64 && $1 ~ /^[0-9A-Fa-f]+$/ { print tolower($1); exit }
+  ' "$SUMS"
+}
+
+# Releases before the rename to Twigpine named their archives gitlawb-node-*.
+# Take whichever name the list vouches for, new name first.
+PACKAGE_NAME=""
+EXPECTED=""
+for PREFIX in twigpine-node gitlawb-node; do
+  EXPECTED=$(listed_sha "${PREFIX}-${VERSION}-${TARGET}.tar.gz")
+  if [ -n "$EXPECTED" ]; then
+    PACKAGE_NAME="${PREFIX}-${VERSION}-${TARGET}"
+    break
+  fi
+done
+if [ -z "$EXPECTED" ]; then
+  echo "error: twigpine-node-${VERSION}-${TARGET}.tar.gz is not in the checksum list at ${CHECKSUMS_URL}" >&2
+  echo "       Refusing to install a build the list does not vouch for." >&2
+  LISTED=$(awk -v suf="-${TARGET}.tar.gz" '
+    { n = $2; sub(/^\*/, "", n) }
+    {
+      pre = ""
+      if (index(n, "twigpine-node-") == 1) pre = "twigpine-node-"
+      else if (index(n, "gitlawb-node-") == 1) pre = "gitlawb-node-"
+    }
+    pre != "" && length(n) > length(pre) + length(suf) &&
+      substr(n, length(n) - length(suf) + 1) == suf {
+      printf "%s v%s", sep, substr(n, length(pre) + 1, length(n) - length(pre) - length(suf)); sep = ","
+    }' "$SUMS")
+  if [ -n "$LISTED" ]; then
+    echo "       Listed for ${TARGET}:${LISTED}" >&2
+  fi
+  exit 1
+fi
 ARCHIVE="${PACKAGE_NAME}.tar.gz"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE}"
-CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+DOWNLOAD_URL="${DOWNLOAD_BASE}/${TAG}/${ARCHIVE}"
 
 echo "Installing Twigpine ${TAG} for ${OS_NAME}/${ARCH_NAME}"
 echo "  Archive:  ${ARCHIVE}"
 echo "  Into:     ${INSTALL_DIR}"
 echo ""
 
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
-
 echo "Downloading..."
 if ! curl -fSL --progress-bar -o "$TMP_DIR/$ARCHIVE" "$DOWNLOAD_URL"; then
   echo ""
   echo "error: download failed: $DOWNLOAD_URL" >&2
   echo "       Check https://github.com/${REPO}/releases for available builds." >&2
-  echo "       Older releases use different file names; install those with" >&2
-  echo "       the installer from their own tag:" >&2
-  echo "       https://raw.githubusercontent.com/${REPO}/${TAG}/install.sh" >&2
   exit 1
 fi
 
-if curl -fsSL -o "$TMP_DIR/$ARCHIVE.sha256" "$CHECKSUM_URL" 2>/dev/null; then
-  echo "Verifying checksum..."
-  EXPECTED=$(awk '{print $1}' "$TMP_DIR/$ARCHIVE.sha256")
+sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
-    ACTUAL=$(sha256sum "$TMP_DIR/$ARCHIVE" | awk '{print $1}')
+    sha256sum "$1" | awk '{print $1}'
   elif command -v shasum >/dev/null 2>&1; then
-    ACTUAL=$(shasum -a 256 "$TMP_DIR/$ARCHIVE" | awk '{print $1}')
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
   else
-    echo "warning: no sha256 tool found, skipping checksum verification"
-    ACTUAL="$EXPECTED"
+    return 1
   fi
-  if [ "$EXPECTED" != "$ACTUAL" ]; then
-    echo "error: checksum mismatch!" >&2
-    echo "  expected: $EXPECTED" >&2
-    echo "  actual:   $ACTUAL" >&2
-    exit 1
-  fi
-  echo "  checksum OK"
+}
+
+echo "Verifying checksum..."
+if ! ACTUAL=$(sha256_of "$TMP_DIR/$ARCHIVE"); then
+  echo "error: no SHA-256 tool found (need sha256sum, shasum or openssl). Nothing was installed." >&2
+  exit 1
 fi
+ACTUAL=$(printf '%s' "$ACTUAL" | tr 'A-F' 'a-f')
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+  echo "error: checksum mismatch for ${ARCHIVE}" >&2
+  echo "  expected: $EXPECTED (${CHECKSUMS_URL})" >&2
+  echo "  actual:   $ACTUAL (${DOWNLOAD_URL})" >&2
+  echo "The download is corrupted or is not the published build. Nothing was installed." >&2
+  exit 1
+fi
+echo "  checksum OK"
 
 echo "Extracting..."
 tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
@@ -147,42 +215,91 @@ if [ ! -d "$PACKAGE_DIR" ]; then
   exit 1
 fi
 
-mkdir -p "$INSTALL_DIR"
-
-INSTALLED=()
-for BIN in twigpine git-remote-twigpine twigpine-node; do
-  if [ -f "$PACKAGE_DIR/$BIN" ]; then
-    install -m 755 "$PACKAGE_DIR/$BIN" "$INSTALL_DIR/$BIN.new"
-    mv -f "$INSTALL_DIR/$BIN.new" "$INSTALL_DIR/$BIN"
-    INSTALLED+=("$BIN")
+# The CLI and the helper always ship together. An archive with only one of
+# them would leave a mixed-version install behind.
+for PAIR in "twigpine gl" "git-remote-twigpine git-remote-gitlawb"; do
+  FOUND=""
+  for NAME in $PAIR; do
+    if [ -f "$PACKAGE_DIR/$NAME" ]; then FOUND="$NAME"; fi
+  done
+  if [ -z "$FOUND" ]; then
+    echo "error: $ARCHIVE is missing a required program: ${PAIR%% *}. Nothing was installed." >&2
+    exit 1
   fi
 done
 
-# Other names for the binaries installed above: the short form of the command,
-# and the names used before the rename. Git picks its remote helper by URL
-# scheme, so existing remotes still run the old helper name, and scripts or
-# service units may still call the old command and daemon names.
-link_old_name() {
-  # Only when this archive shipped the binary: a leftover from an earlier
-  # install must not get a fresh link, or be listed as installed by this run.
+mkdir -p "$INSTALL_DIR"
+
+# Check every name this run will write before changing anything. A directory in
+# the way cannot be replaced by a file: mv and ln would put the program inside
+# it and report success.
+# The same goes for the <name>.new staging files.
+for NAME in twigpine twig gl git-remote-twigpine git-remote-gitlawb twigpine-node gitlawb-node \
+  twigpine.new gl.new git-remote-twigpine.new git-remote-gitlawb.new twigpine-node.new gitlawb-node.new; do
+  if [ -d "$INSTALL_DIR/$NAME" ] && [ ! -L "$INSTALL_DIR/$NAME" ]; then
+    echo "error: ${INSTALL_DIR}/${NAME} is a directory, and the installer needs that name for a program." >&2
+    echo "       Move it away or set GITLAWB_INSTALL_DIR. Nothing was installed." >&2
+    exit 1
+  fi
+done
+
+INSTALLED=""
+
+# install_file <name>: copy one binary from the archive into place.
+install_file() {
+  # A leftover staging link would be followed; start from nothing.
+  rm -f "$INSTALL_DIR/$1.new"
+  install -m 755 "$PACKAGE_DIR/$1" "$INSTALL_DIR/$1.new"
+  # A link left by an earlier install (or one pointing at a directory) is
+  # removed first: mv would follow a link to a directory and move into it.
+  if [ -L "$INSTALL_DIR/$1" ]; then rm -f "$INSTALL_DIR/$1"; fi
+  mv -f "$INSTALL_DIR/$1.new" "$INSTALL_DIR/$1"
+  INSTALLED="$INSTALLED $1"
+}
+
+# link_name <target> <name>: make <name> run <target>. -n replaces a link to a
+# directory instead of linking inside it.
+link_name() {
+  ln -sfn "$1" "$INSTALL_DIR/$2"
+  INSTALLED="$INSTALLED $2"
+}
+
+# install_pair <name> <old-name>: every program has the name it carries now and
+# the one it had before the rename. The archive ships one of them; the other
+# becomes a link to it, so both names always run the same build. The old names
+# matter: git picks its remote helper by URL scheme, so gitlawb:// remotes run
+# git-remote-gitlawb, and scripts or service units may still call gl and
+# gitlawb-node. When the archive ships neither, both names are removed.
+install_pair() {
   if [ -f "$PACKAGE_DIR/$1" ]; then
-    ln -sfn "$1" "$INSTALL_DIR/$2"
-    INSTALLED+=("$2")
+    install_file "$1"
+    link_name "$1" "$2"
+  elif [ -f "$PACKAGE_DIR/$2" ]; then
+    install_file "$2"
+    link_name "$2" "$1"
+  else
+    # Not shipped (the daemon is optional): drop a leftover from an earlier
+    # install, so an upgrade never leaves a stale, mixed-version program.
+    rm -f "$INSTALL_DIR/$1" "$INSTALL_DIR/$2"
   fi
 }
-link_old_name twigpine twig
-link_old_name twigpine gl
-link_old_name git-remote-twigpine git-remote-gitlawb
-link_old_name twigpine-node gitlawb-node
 
-if [ "${#INSTALLED[@]}" -eq 0 ]; then
+install_pair twigpine gl
+install_pair git-remote-twigpine git-remote-gitlawb
+install_pair twigpine-node gitlawb-node
+# twig is the short form of the command.
+if [ -f "$PACKAGE_DIR/twigpine" ] || [ -f "$PACKAGE_DIR/gl" ]; then
+  link_name twigpine twig
+fi
+
+if [ -z "$INSTALLED" ]; then
   echo "error: no installable binaries found in $ARCHIVE" >&2
   exit 1
 fi
 
 echo ""
 echo "Installed Twigpine ${TAG}"
-for BIN in "${INSTALLED[@]}"; do
+for BIN in $INSTALLED; do
   echo "  ${BIN} -> ${INSTALL_DIR}/${BIN}"
 done
 echo ""
@@ -214,4 +331,4 @@ else
 fi
 
 echo ""
-echo "Docs: https://docs.gitlawb.com"
+echo "Docs: https://explorer.twigpine.com/docs"
