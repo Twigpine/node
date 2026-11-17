@@ -35,7 +35,7 @@ sha() {
 }
 
 # make_release <ver> [marker] [style]: fake archives (+ .sha256) for every
-# target. style "cli-only" ships no helper; style "old" builds a release from before the rename to Twigpine:
+# target. style "no-daemon" ships no daemon, "cli-only" no helper either; style "old" builds a release from before the rename to Twigpine:
 # gitlawb-node-* archives holding gl, git-remote-gitlawb and gitlawb-node.
 make_release() {
   ver=$1
@@ -44,6 +44,9 @@ make_release() {
   if [ "$style" = old ]; then
     prefix=gitlawb-node
     bins="gl git-remote-gitlawb gitlawb-node"
+  elif [ "$style" = no-daemon ]; then
+    prefix=twigpine-node
+    bins="twigpine git-remote-twigpine"
   elif [ "$style" = cli-only ]; then
     prefix=twigpine-node
     bins="twigpine"
@@ -221,6 +224,21 @@ suite() {
     ok "replaces a link to a directory instead of installing into it"
   else bad "replaces a link to a directory instead of installing into it"; fi
   KEEP_HOME=""
+
+  # An archive without the daemon removes the one an earlier install left.
+  reset_server
+  make_release 9.6.1 genuine no-daemon
+  sh "$UPDATE" "$W/srv/web/install-checksums.txt" v9.6.1 "$W/srv/gh/v9.6.1"/*.sha256 > /dev/null
+  if run_installer "$shell" --version v9.7.0 && installed_old 9.7.0; then
+    KEEP_HOME=yes
+    if run_installer "$shell" --version v9.6.1 && runs twigpine "twigpine 9.6.1 genuine" \
+      && runs git-remote-gitlawb "git-remote-twigpine 9.6.1 genuine" \
+      && [ ! -e "$W/home/bin/twigpine-node" ] && [ ! -L "$W/home/bin/twigpine-node" ] \
+      && [ ! -e "$W/home/bin/gitlawb-node" ] && [ ! -L "$W/home/bin/gitlawb-node" ]; then
+      ok "removes a daemon the new archive no longer ships"
+    else bad "removes a daemon the new archive no longer ships"; fi
+    KEEP_HOME=""
+  else bad "removes a daemon the new archive no longer ships"; fi
 
   # An archive without the helper would leave a mixed-version install.
   reset_server

@@ -265,7 +265,7 @@ link_name() {
 # becomes a link to it, so both names always run the same build. The old names
 # matter: git picks its remote helper by URL scheme, so gitlawb:// remotes run
 # git-remote-gitlawb, and scripts or service units may still call gl and
-# gitlawb-node. Does nothing when the archive ships neither.
+# gitlawb-node. When the archive ships neither, both names are removed.
 install_pair() {
   if [ -f "$PACKAGE_DIR/$1" ]; then
     install_file "$1"
@@ -273,6 +273,10 @@ install_pair() {
   elif [ -f "$PACKAGE_DIR/$2" ]; then
     install_file "$2"
     link_name "$2" "$1"
+  else
+    # Not shipped (the daemon is optional): drop a leftover from an earlier
+    # install, so an upgrade never leaves a stale, mixed-version program.
+    rm -f "$INSTALL_DIR/$1" "$INSTALL_DIR/$2"
   fi
 }
 
