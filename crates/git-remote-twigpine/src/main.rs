@@ -1,0 +1,4155 @@
+//! git-remote-twigpine — git remote helper for gitlawb:// URLs
+//!
+//! Git calls this binary when it encounters a remote URL with the "gitlawb://" scheme.
+//! It implements the git remote helper protocol, translating gitlawb:// URLs into
+//! HTTP smart-protocol requests against a twigpine-node.
+//!
+//! # URL format
+//!   gitlawb://did:key:z6Mk.../repo-name
+//!
+//! # v0.1 resolution
+//!   DID → http://127.0.0.1:7545  (hardcoded; v0.2 will use DHT)
+//!   Override with: GITLAWB_NODE=http://my-node:7545
+//!
+//! # Protocol flow (connect capability)
+//!   capabilities → "connect\n\n"
+//!   connect git-upload-pack  → GET /info/refs | POST /git-upload-pack
+//!   connect git-receive-pack → GET /info/refs | POST /git-receive-pack
+//! Push (git-receive-pack) is RFC-9421 signed from the first request when an
+//! identity keypair is present, since a push can never be anonymous. Fetch
+//! (git-upload-pack) stays anonymous and is signed only on a single retry, after
+//! the node denies the anonymous advertisement with 404 — so a public clone never
+//! discloses the caller's DID, while a private repo's owner (or an authorized
+//! reader) still authenticates when the node demands it.
+
+use anyhow::{bail, Context, Result};
+use std::io::{self, BufRead, Read, Write};
+use twigpine_core::http_sig::sign_request;
+use twigpine_core::identity::Keypair;
+use twigpine_core::transport_policy::{allow_insecure_http_value, is_http, is_insecure_remote};
+use twigpine_core::{resolve_transport_node, DEFAULT_LOCAL_NODE};
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Handle informational flags before anything else. Git always invokes a
+    // remote helper as `git-remote-twigpine <remote-name> <url>`, so these flags
+    // only ever appear on direct user or release-smoke-test invocations. Print
+    // to stdout and exit before tracing init so the output stays clean.
+    match classify_args(&args) {
+        Invocation::Version => {
+            println!("{}", version_line());
+            return Ok(());
+        }
+        Invocation::Help => {
+            print!("{}", help_text());
+            return Ok(());
+        }
+        Invocation::Helper => {}
+    }
+
+    // All logging goes to stderr so it doesn't corrupt the git protocol on stdout
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(std::env::var("GITLAWB_LOG").unwrap_or_else(|_| "warn".to_string()))
+        .init();
+
+    if args.len() < 3 {
+        eprintln!("usage: git-remote-twigpine <remote-name> <url>");
+        eprintln!("try 'git-remote-twigpine --help' for more information");
+        std::process::exit(1);
+    }
+
+    let url = &args[2];
+    tracing::debug!("remote url: {url}");
+
+    let (_, short_owner, repo_name) = parse_gitlawb_url(url)?;
+
+    // v0.1: default to localhost. Override with GITLAWB_NODE env var. Shared with
+    // `twigpine doctor` so the diagnostic reports the URL this actually resolves.
+    let node_base = node_base_from_env();
+    check_transport_security(&node_base, allow_insecure_http_enabled())?;
+    let repo_base = format!("{}/{}/{}", node_base, short_owner, repo_name);
+    tracing::debug!("repo_base: {repo_base}");
+
+    // Load keypair for signing requests (optional). Push always signs when a key is
+    // present; fetch signs only if the node 404s the anonymous advertisement, so
+    // public fetches stay anonymous. Absent a key, public fetch still works and push
+    // falls back to unsigned (v0.1 local alpha only).
+    let keypair = load_keypair();
+
+    run_helper(&repo_base, keypair.as_ref())
+}
+
+/// The node base URL this helper will contact, resolved through the same function
+/// `twigpine doctor` reports on so the diagnostic cannot describe a different node.
+fn node_base_from_env() -> String {
+    resolve_transport_node(std::env::var("GITLAWB_NODE").ok().as_deref())
+}
+
+/// Fixed warning for a `GITLAWB_ALLOW_INSECURE_HTTP` value that is set but not
+/// truthy. The raw value is never logged.
+fn warn_allow_insecure_http_non_truthy() {
+    tracing::warn!(
+        "GITLAWB_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); plaintext http to a remote node remains refused"
+    );
+}
+
+/// Parse a possibly-present `GITLAWB_ALLOW_INSECURE_HTTP` value.
+///
+/// Only `1` or `true` (case-insensitive, after trim) opens the gate. Presence
+/// alone is not consent: `=0`, `=false` and an empty value read as "not opting
+/// in" to the operator, and the README and refusal message document `=1`. Any
+/// other non-empty value warns so a misspelling is not a silent yes or a silent
+/// no. Same contract as `icaptcha_insecure_from_str` in `icaptcha-client`.
+fn allow_insecure_http_from_str(raw: Option<&str>) -> bool {
+    let Some(v) = raw else {
+        return false;
+    };
+    if allow_insecure_http_value(v) {
+        true
+    } else {
+        if !v.trim().is_empty() {
+            warn_allow_insecure_http_non_truthy();
+        }
+        false
+    }
+}
+
+/// Interpret the result of `std::env::var("GITLAWB_ALLOW_INSECURE_HTTP")`
+/// without reading the environment again. A non-UTF-8 value fails closed and
+/// warns, like a present non-truthy one.
+fn allow_insecure_http_from_var(result: Result<String, std::env::VarError>) -> bool {
+    match result {
+        Ok(v) => allow_insecure_http_from_str(Some(&v)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn_allow_insecure_http_non_truthy();
+            false
+        }
+        Err(std::env::VarError::NotPresent) => false,
+    }
+}
+
+fn allow_insecure_http_enabled() -> bool {
+    allow_insecure_http_from_var(std::env::var("GITLAWB_ALLOW_INSECURE_HTTP"))
+}
+
+/// Refuse a cleartext hop off this machine unless the operator has opted in.
+///
+/// Fail closed: the alternative is signing a request and then handing it, and
+/// the pack it carries, to anyone on the path. `GITLAWB_ALLOW_INSECURE_HTTP`
+/// exists for a private LAN where the operator has decided that is acceptable.
+fn check_transport_security(node_base: &str, allow_insecure: bool) -> Result<()> {
+    if allow_insecure || !is_insecure_remote(node_base) {
+        return Ok(());
+    }
+    bail!(
+        "refusing to send git data to {node_base} over plaintext http.\n\
+         Requests are signed but not encrypted, so the pack contents and the \
+         Signature header are readable by anyone on the path, and a captured \
+         signature can be replayed.\n\
+         Use https://, or set GITLAWB_ALLOW_INSECURE_HTTP=1 to accept the risk \
+         (for a trusted private network only)."
+    )
+}
+
+// ── CLI argument handling ──────────────────────────────────────────────────────
+
+/// How the binary was invoked, derived from its CLI arguments.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    /// `--version` / `-V`: print the version line and exit.
+    Version,
+    /// `--help` / `-h`: print usage and exit.
+    Help,
+    /// Normal git remote-helper invocation: `<remote-name> <url>`.
+    Helper,
+}
+
+/// Classify the process arguments.
+///
+/// Git always calls a remote helper as `git-remote-twigpine <remote-name> <url>`,
+/// so the informational flags are only recognized as the first argument; this
+/// keeps the remote-helper protocol path untouched for git's own invocations.
+fn classify_args(args: &[String]) -> Invocation {
+    match args.get(1).map(String::as_str) {
+        Some("--version") | Some("-V") => Invocation::Version,
+        Some("--help") | Some("-h") => Invocation::Help,
+        _ => Invocation::Helper,
+    }
+}
+
+/// The version line, matching the `<bin> <version>` format that the clap-based
+/// `twigpine` and `twigpine-node` binaries emit, so release smoke tests can treat all
+/// three binaries uniformly.
+fn version_line() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
+/// Usage text for `--help`.
+fn help_text() -> String {
+    format!(
+        "{}\n\
+         \n\
+         Git remote helper for gitlawb:// URLs. Git invokes this automatically\n\
+         when it encounters a gitlawb:// remote; you normally do not run it directly.\n\
+         \n\
+         USAGE:\n\
+         \x20   git clone gitlawb://did:key:z6Mk.../<repo>\n\
+         \n\
+         ENVIRONMENT:\n\
+         \x20   GITLAWB_NODE   Node base URL (default: {DEFAULT_LOCAL_NODE})\n\
+         \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push, absolute\n\
+         \x20                  (default: ~/.gitlawb/identity.pem). Its parent also\n\
+         \x20                  holds the delegations `twigpine ucan import` writes.\n\
+         \x20   GITLAWB_ALLOW_INSECURE_HTTP  Permit plaintext http:// to a non-loopback node (unset by default)\n\
+         \x20   GITLAWB_LOG    Log filter (default: warn)\n\
+         \n\
+         FLAGS:\n\
+         \x20   -V, --version   Print version and exit\n\
+         \x20   -h, --help      Print this help and exit\n",
+        version_line()
+    )
+}
+
+// ── Remote helper protocol loop ───────────────────────────────────────────────
+
+fn run_helper(repo_base: &str, keypair: Option<&Keypair>) -> Result<()> {
+    let stdin = io::stdin();
+    let mut stdin_buf = io::BufReader::new(stdin);
+    let mut stdout = io::stdout();
+
+    loop {
+        let mut line = String::new();
+        let n = stdin_buf
+            .read_line(&mut line)
+            .context("reading command from git")?;
+        if n == 0 {
+            break; // EOF
+        }
+
+        let cmd = line.trim_end_matches('\n').trim_end_matches('\r');
+        tracing::debug!("← git: {:?}", cmd);
+
+        match cmd {
+            "capabilities" => {
+                // Advertise a single capability: connect
+                // This tells git we can proxy any git service bidirectionally
+                write!(stdout, "connect\n\n")?;
+                stdout.flush()?;
+                tracing::debug!("→ advertised: connect");
+            }
+            s if s.starts_with("connect ") => {
+                let service = s["connect ".len()..].trim().to_string();
+                tracing::debug!("→ connecting to service: {service}");
+
+                // Confirm the connection with a blank line
+                writeln!(stdout)?;
+                stdout.flush()?;
+
+                // Proxy the git smart HTTP protocol
+                handle_connect(repo_base, &service, keypair, &mut stdin_buf)?;
+                // After connect completes, exit immediately. Git may not close
+                // our stdin pipe promptly after a push, causing the helper to
+                // hang if we return to the read_line loop.
+                std::process::exit(0);
+            }
+            "" => break, // git signals end of commands with a blank line
+            other => {
+                tracing::warn!("unknown remote helper command: {other:?}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── HTTP proxy for git smart protocol ────────────────────────────────────────
+
+fn handle_connect<R: Read>(
+    repo_base: &str,
+    service: &str,
+    keypair: Option<&Keypair>,
+    stdin: &mut R,
+) -> Result<()> {
+    match service {
+        "git-upload-pack" | "git-receive-pack" => {}
+        other => bail!("unsupported git service: {other}"),
+    }
+
+    // A loopback node must never be proxied; see build_http_client.
+    let client = build_http_client(!is_insecure_remote(repo_base) && is_http(repo_base))?;
+
+    // ── Phase 1: ref advertisement (GET /info/refs?service=<service>) ─────────
+    //
+    // The server advertises its refs. git reads this to decide what to fetch/push.
+
+    // Signing policy for this exchange, carried through to the Phase-2 POST:
+    //  - git-receive-pack (push): sign from the first request; a push is
+    //    signature-gated and can never be anonymous.
+    //  - git-upload-pack (fetch): start anonymous so a public clone never discloses
+    //    the caller's DID, then escalate to a single signed retry only if the node
+    //    denies the anonymous advertisement with 404 (how it withholds a private
+    //    repo from an unauthenticated reader).
+    let mut signing_key = if service == "git-receive-pack" {
+        keypair
+    } else {
+        None
+    };
+
+    let refs_url = format!("{}/info/refs?service={}", repo_base, service);
+    tracing::debug!("GET {refs_url}");
+
+    let mut refs_resp = build_advertisement_request(&client, &refs_url, signing_key)
+        .send()
+        .with_context(|| format!("GET {refs_url}"))?;
+
+    // Fetch escalation: retry the advertisement signed once when the anonymous try
+    // is denied and we hold an identity. A public repo answers 200 on the first
+    // (anonymous) request and never reaches here, so it stays DID-private.
+    if service == "git-upload-pack"
+        && refs_resp.status() == reqwest::StatusCode::NOT_FOUND
+        && keypair.is_some()
+    {
+        tracing::debug!("anonymous info/refs returned 404; retrying signed");
+        signing_key = keypair;
+        refs_resp = build_advertisement_request(&client, &refs_url, signing_key)
+            .send()
+            .with_context(|| format!("GET {refs_url} (signed retry)"))?;
+    }
+
+    if !refs_resp.status().is_success() {
+        let status = refs_resp.status();
+        let body = read_error_body(refs_resp);
+        bail!(
+            "{}",
+            http_error_message(
+                "GET",
+                "/info/refs",
+                status,
+                &body,
+                Some("— is the repo registered on this node?")
+            )
+        );
+    }
+
+    let refs_bytes = refs_resp.bytes().context("reading info/refs body")?;
+    tracing::debug!("ref advertisement: {} bytes (raw)", refs_bytes.len());
+
+    // The HTTP smart protocol wraps the ref advertisement in:
+    //   <pkt-line "# service=git-upload-pack\n"> + "0000" + <actual advertisement>
+    //
+    // But git's `connect` protocol expects raw git-upload-pack output (no HTTP wrapper).
+    // Strip the service-line pkt-line + flush before forwarding.
+    let advertisement = strip_service_announcement(&refs_bytes);
+    tracing::debug!(
+        "ref advertisement: {} bytes (stripped)",
+        advertisement.len()
+    );
+
+    let mut stdout = io::stdout();
+    stdout.write_all(advertisement)?;
+    stdout.flush()?;
+
+    // ── Phase 2: pack exchange (POST /<service>) ──────────────────────────────
+    //
+    // The two services frame Phase 2 differently:
+    //
+    //  git-upload-pack (clone/fetch):
+    //    Git speaks the stateful native protocol over `connect`: it sends its
+    //    wants, a flush, then have-batches each terminated by a flush, and blocks
+    //    for the server's ACK/NAK after every flush before it sends more haves or
+    //    the terminal "done\n". The node serves `git upload-pack --stateless-rpc`,
+    //    which keeps no state between POSTs, so we run a per-round loop: POST a
+    //    self-contained request once per flush-terminated batch and stream each
+    //    response back to git, until the "done" round returns the pack. Collapsing
+    //    this into one POST deadlocks a multi-round fetch (#117).
+    //
+    //  git-receive-pack (push):
+    //    Git sends the ref-update command list (pkt-lines ending in a flush),
+    //    then the complete PACK blob only when a command has a non-zero new-oid.
+    //    A delete-only push sends no pack, and git holds its write pipe open for
+    //    the report-status response, so EOF cannot delimit the request (#369).
+
+    let post_url = format!("{}/{}", repo_base, service);
+
+    if service == "git-upload-pack" {
+        return negotiate_upload_pack(&client, &post_url, service, signing_key, stdin, &mut stdout);
+    }
+
+    let request_body = read_receive_pack_request(stdin)?;
+    tracing::debug!("pack request: {} bytes from git", request_body.len());
+
+    if request_body.is_empty() {
+        // e.g., already up-to-date — nothing to send
+        tracing::debug!("empty request body — skipping POST");
+        return Ok(());
+    }
+
+    post_pack_round(
+        &client,
+        &post_url,
+        service,
+        signing_key,
+        request_body,
+        &mut stdout,
+    )
+}
+
+// ── HTTP client ───────────────────────────────────────────────────────────────
+
+/// Total request timeout. A pack transfer can be large and slow, so this is far
+/// wider than the CLI's.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The one client both phases use, with the redirect policy the signing surfaces
+/// need.
+///
+/// Every request this client sends can carry RFC 9421 `Signature` and
+/// `Signature-Input` headers: a push signs from the first request, and a fetch of a
+/// private repo signs on the retry. reqwest strips only `Authorization`, `Cookie`,
+/// `Proxy-Authorization` and `WWW-Authenticate` across hosts, so under the default
+/// `Policy::limited(10)` those signature headers rode a 302 to whatever origin the
+/// node named, and on a 307/308 the pack body went with them. Scope the follow to the
+/// origin that issued the redirect AND to an identical request-target, which is the
+/// same predicate `twigpine` uses.
+/// `bypass_proxy` must be true whenever the node is on this machine. reqwest's
+/// default client honours `HTTP_PROXY` / `ALL_PROXY` for a loopback URL too, so a
+/// proxy variable pointing off-machine turns an allowed local request into a
+/// cleartext hop carrying the `Signature` header, straight past
+/// `check_transport_security`. Verified: with `HTTP_PROXY` set, reqwest logged
+/// `proxy(...) intercepts 'http://127.0.0.1:7545/'` and dialled the proxy. A
+/// local node is never legitimately reached through a proxy, so this refuses one
+/// rather than trying to reimplement `NO_PROXY` parsing.
+fn build_http_client(bypass_proxy: bool) -> Result<reqwest::blocking::Client> {
+    let builder = reqwest::blocking::Client::builder();
+    let builder = if bypass_proxy {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    Ok(builder
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(same_origin_redirect))
+        .build()?)
+}
+
+/// Refuse any redirect that leaves the issuing origin or rewrites the request-target,
+/// and bound the chain.
+///
+/// Refusal is `stop`, not `error`: the 3xx comes back as an ordinary response and
+/// the caller reports it through the status path it already has.
+///
+/// `Policy::custom` replaces reqwest's built-in limit, so the chain bound is
+/// restated. It is not what makes the request finite (`HTTP_TIMEOUT` covers the whole
+/// chain); it is what keeps a node that redirects to itself from costing a request
+/// per round trip until that timeout. `>` and not `>=` because reqwest pushes the
+/// redirecting URL onto `previous` before consulting the policy, which is how
+/// `Policy::limited` reads the same counter.
+fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
+    let Some(previous) = attempt.previous().last() else {
+        // Unreachable through reqwest, which pushes the redirecting URL first, but
+        // the safe reading of "cannot prove same-origin" is to refuse.
+        return attempt.stop();
+    };
+    if attempt.previous().len() > twigpine_core::redirect::MAX_REDIRECTS {
+        return attempt.stop();
+    }
+    if twigpine_core::redirect::may_follow(previous, attempt.url()) {
+        attempt.follow()
+    } else {
+        attempt.stop()
+    }
+}
+
+// ── Smart-protocol request builders ───────────────────────────────────────────
+
+const USER_AGENT: &str = "git/2.0 git-remote-gitlawb/0.1.0";
+
+/// Build the Phase-1 ref-advertisement GET, signing it when an identity is
+/// present. The node gates the ref advertisement on read visibility for BOTH
+/// services, so a private repo's advertisement is denied (404) to an
+/// unauthenticated caller; without this signature the repo's own owner can
+/// neither fetch (upload-pack) nor push (receive-pack) it. Public repos still
+/// work anonymously (no keypair present, or the gate admits anonymous). Sign over
+/// the path *and* query (?service=...) because the node verifies the signature
+/// over its path_and_query.
+fn build_advertisement_request(
+    client: &reqwest::blocking::Client,
+    refs_url: &str,
+    keypair: Option<&Keypair>,
+) -> reqwest::blocking::RequestBuilder {
+    let mut req = client.get(refs_url).header("User-Agent", USER_AGENT);
+    if let Some(kp) = keypair {
+        let signed = sign_request(kp, "GET", &url_path(refs_url), b"");
+        req = req
+            .header("Content-Digest", signed.content_digest)
+            .header("Signature-Input", signed.signature_input)
+            .header("Signature", signed.signature);
+        tracing::debug!("signed info/refs advertisement (DID: {})", kp.did());
+    }
+    req
+}
+
+/// Build the Phase-2 pack POST, signing it when an identity is present, for BOTH
+/// services. The node read-gates the git-upload-pack POST with visibility_check
+/// at "/", and separately owner-gates the git-receive-pack POST (signature
+/// required, enforced by middleware). The Phase-1 advertisement signature does
+/// not carry to this separate request, so a private repo's owner must
+/// authenticate here too or their fetch/push is denied.
+/// Public-repo fetch still works anonymously when no keypair is present. The body
+/// is signed (content-digest) but NOT attached here, so the caller can move the
+/// (possibly large) pack bytes into `.body()` rather than clone them.
+/// How long to wait for the node's DID before giving up and pushing without a
+/// delegation. Short on purpose: the answer is optional, and the node decides
+/// whether the header was required.
+const NODE_DID_TIMEOUT_SECS: u64 = 5;
+
+/// A path component safe to build a filename from. Mirrors `twigpine`'s
+/// `ucan_cmd::is_safe_component`; change both together.
+///
+/// Here the value comes from the remote URL rather than a token, and the path is
+/// only read — but a `..` owner would still read an arbitrary file and send its
+/// contents to the node as `X-Ucan`, so the same allow-list applies.
+fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+}
+
+/// Where a delegation for `owner_did`/`repo` is stored.
+///
+/// Must agree with `twigpine`'s `ucan_cmd::delegation_path`, which writes these files.
+/// `twigpine` is not a dependency of this crate, so the six lines are duplicated rather
+/// than shared; change both together. Keyed on the bare base58 key because
+/// `did:key:` contains a colon, which Windows rejects in a filename.
+fn delegation_path(dir: &std::path::Path, owner_did: &str, repo: &str) -> std::path::PathBuf {
+    let bare = owner_did.strip_prefix("did:key:").unwrap_or(owner_did);
+    dir.join("delegations").join(format!("{bare}__{repo}.ucan"))
+}
+
+/// Wrap a stored delegation into an invocation addressed to the node.
+///
+/// `iss=agent, aud=node, prf=[delegation]` is exactly the shape the node's
+/// `validate_ucan_chain` expects: it binds `iss` to the request signer and `aud`
+/// to its own DID, then walks `prf` to the root.
+///
+/// The invocation carries the delegation's `git/push` capability narrowed to
+/// this repository (constrained or sibling capabilities are skipped rather than
+/// weakened), so the invocation is never broader than what was delegated and
+/// cannot fail attenuation. `exp` is copied from the delegation's expiry, and
+/// `verify_chain` checks each proof's expiry as it recurses.
+fn build_invocation(
+    agent: &Keypair,
+    node_did: &twigpine_core::did::Did,
+    delegation: &twigpine_core::ucan::Ucan,
+    owner: &str,
+    repo: &str,
+) -> Result<twigpine_core::ucan::Ucan> {
+    use twigpine_core::ucan::{caps, Capability};
+
+    let resource = format!("gitlawb://repos/{owner}/{repo}");
+
+    // The whole chain has to grant push to this repository, by the same rule the
+    // node applies (`chain_grants_push_to`): a stored token whose proof is still a
+    // wildcard would mint an invocation the node is certain to refuse, and the push
+    // would fail remotely with a vaguer message than this one. Checked before the
+    // leaf is selected so the message names the actual reason.
+    if !delegation.chain_grants_push_to(owner, repo) {
+        anyhow::bail!(
+            "stored delegation does not grant git/push for {resource} on every link of \
+             its chain — a proof behind it may be a wildcard or name another repository. \
+             Ask the owner to re-issue it against this repository and re-run \
+             `twigpine ucan import`."
+        );
+    }
+    let source = delegation
+        .payload
+        .att
+        .iter()
+        .find(|c| c.grants_push_to(owner, repo))
+        .ok_or_else(|| {
+            anyhow::anyhow!("stored delegation carries no git/push capability for {resource}")
+        })?;
+
+    // The parent's own resource, verbatim: the node compares `with` by equality via
+    // `is_attenuated_by`, and every capability reaching here already names this repo,
+    // so there is nothing left to narrow.
+    let mut narrowed = Capability::new(source.with.clone(), caps::GIT_PUSH);
+    narrowed.constraints = source.constraints.clone();
+
+    // Carry the delegation's own expiry onto the invocation. The node refuses a
+    // chain with any unbounded link, because without a revocation path an
+    // unbounded write capability can never be withdrawn.
+    let exp = delegation
+        .payload
+        .exp
+        .and_then(|e| chrono::DateTime::from_timestamp(e, 0));
+
+    twigpine_core::ucan::Ucan::delegate(agent, node_did.clone(), vec![narrowed], exp, delegation)
+        .map_err(|e| anyhow::anyhow!("failed to build UCAN invocation: {e}"))
+}
+
+/// Split a pack POST URL into `(node_base, owner, repo)`.
+///
+/// ```text
+/// https://node/zOwner/myrepo/git-receive-pack        -> ("https://node",         "zOwner", "myrepo")
+/// https://node/gitlawb/zOwner/myrepo/git-receive-pack -> ("https://node/gitlawb", "zOwner", "myrepo")
+/// ```
+///
+/// Strips the KNOWN trailing `<owner>/<repo>/<service>` rather than reading the
+/// first two segments, because `GITLAWB_NODE` may carry a path prefix — a
+/// reverse-proxied `https://host/gitlawb` is a supported base, and `repo_base` is
+/// built as `{node_base}/{owner}/{repo}` with the service appended after it.
+/// Reading from the front makes the prefix the owner, which fails the delegation
+/// lookup and probes the wrong URL for the node DID.
+///
+/// This is coupled to how `repo_base` is constructed in `main`; the two must
+/// change together.
+fn split_pack_post_url(post_url: &str) -> Option<(String, String, String)> {
+    let path = url_path(post_url);
+    let origin = post_url.strip_suffix(&path)?;
+
+    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    // owner, repo, service — plus any base-path prefix ahead of them.
+    if segs.len() < 3 {
+        return None;
+    }
+    let repo = segs[segs.len() - 2];
+    let owner = segs[segs.len() - 3];
+    let prefix = &segs[..segs.len() - 3];
+
+    let repo = twigpine_core::ucan::push::canonical_repo_name(repo);
+    if !is_safe_component(owner) || !is_safe_component(repo) {
+        return None;
+    }
+    // Every prefix segment stays part of the base the node DID is fetched from, so
+    // it gets the same allow-list: a `..` here would redirect that probe, and an
+    // encoded separator would smuggle structure past this split.
+    if !prefix.iter().all(|s| is_safe_component(s)) {
+        return None;
+    }
+    let node_base = if prefix.is_empty() {
+        origin.to_string()
+    } else {
+        format!("{origin}/{}", prefix.join("/"))
+    };
+    Some((node_base, owner.to_string(), repo.to_string()))
+}
+
+/// Build the `X-Ucan` value for a delegated push, or `None` when this push does
+/// not need one.
+///
+/// Entirely best-effort. A missing delegation, an unreachable node, or an
+/// unreadable stored token all yield `None` and the push proceeds without the
+/// header — the node decides whether one was required, and a node denial must
+/// reach the user rather than being pre-empted by a local guess.
+fn delegation_header(
+    client: &reqwest::blocking::Client,
+    post_url: &str,
+    keypair: &Keypair,
+) -> Option<String> {
+    let (origin, owner, repo) = split_pack_post_url(post_url)?;
+
+    // The owner pushes on their own authority; no delegation is involved.
+    let bare = |d: &str| d.strip_prefix("did:key:").unwrap_or(d).to_string();
+    if bare(&keypair.did().to_string()) == bare(&owner) {
+        return None;
+    }
+
+    let dir = resolve_identity_dir()?;
+    let path = delegation_path(&dir, &owner, &repo);
+    // The same cap `twigpine ucan import` applies to a token file
+    // (MAX_TOKEN_FILE_BYTES in twigpine-cli/src/ucan_cmd.rs): an oversize store entry is
+    // treated like an unreadable one, not slurped into memory on every push.
+    const MAX_DELEGATION_FILE_BYTES: u64 = 1 << 20;
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > MAX_DELEGATION_FILE_BYTES)
+        .unwrap_or(false)
+    {
+        tracing::warn!("stored delegation at {path:?} is larger than any UCAN token; ignoring it");
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+
+    let delegation = match twigpine_core::ucan::Ucan::decode(raw.trim()) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("stored delegation at {path:?} is unreadable: {e}");
+            return None;
+        }
+    };
+
+    // The same push-readiness refusal import applies before storing a token:
+    // an expired or unbounded delegation the node would refuse at middleware
+    // must not become a header that produces a distinguishable invalid_ucan
+    // 401; omitting it keeps the denial on the unified owner-push 403 path.
+    if delegation.is_expired() || !delegation.chain_lifetime_is_bounded() {
+        tracing::warn!(
+            "stored delegation at {path:?} is expired or has an unbounded link; pushing without X-Ucan"
+        );
+        return None;
+    }
+
+    // The invocation must be addressed to the node that will execute it.
+    // The shared client carries a 300s timeout, which is right for a pack transfer
+    // and wrong for a best-effort metadata probe: a stalled node would delay every
+    // delegated push by five minutes before falling back to sending no header.
+    let node_did: twigpine_core::did::Did = client
+        .get(&origin)
+        .timeout(std::time::Duration::from_secs(NODE_DID_TIMEOUT_SECS))
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|v| v.get("did")?.as_str().map(str::to_owned))
+        .or_else(|| {
+            tracing::warn!("could not read the node DID from {origin}; pushing without X-Ucan");
+            None
+        })?
+        .parse()
+        .ok()?;
+
+    match build_invocation(keypair, &node_did, &delegation, &owner, &repo) {
+        Ok(inv) => inv.encode().ok(),
+        Err(e) => {
+            tracing::warn!("could not build the UCAN invocation: {e}");
+            None
+        }
+    }
+}
+
+fn build_pack_post_request(
+    client: &reqwest::blocking::Client,
+    post_url: &str,
+    service: &str,
+    body: &[u8],
+    keypair: Option<&Keypair>,
+) -> reqwest::blocking::RequestBuilder {
+    let mut req = client
+        .post(post_url)
+        .header("Content-Type", format!("application/x-{}-request", service))
+        .header("User-Agent", USER_AGENT);
+    if let Some(kp) = keypair {
+        let signed = sign_request(kp, "POST", &url_path(post_url), body);
+        req = req
+            .header("Content-Digest", signed.content_digest)
+            .header("Signature-Input", signed.signature_input)
+            .header("Signature", signed.signature);
+        tracing::debug!("signed {service} POST (DID: {})", kp.did());
+
+        // A non-owner pushing under a delegation presents it here. Only on the
+        // push: a fetch is gated by read visibility, not by git/push.
+        if service == "git-receive-pack" {
+            if let Some(token) = delegation_header(client, post_url, kp) {
+                tracing::debug!("attaching a delegated push capability");
+                req = req.header("X-Ucan", token);
+            }
+        }
+    } else if service == "git-receive-pack" {
+        tracing::warn!("no identity keypair found, push will be unsigned (v0.1 local alpha only)");
+    }
+    req
+}
+
+// ── URL helpers ───────────────────────────────────────────────────────────────
+
+/// Parse a `gitlawb://did:key:z6Mk.../repo-name` URL.
+///
+/// Returns `(did_string, short_owner, repo_name)`.
+fn parse_gitlawb_url(url: &str) -> Result<(String, String, String)> {
+    let without_scheme = url
+        .strip_prefix("gitlawb://")
+        .ok_or_else(|| anyhow::anyhow!("not a gitlawb:// URL: {url}"))?;
+
+    // without_scheme = "did:key:z6Mk.../repo-name"
+    let (did_string, repo_name) = without_scheme
+        .rsplit_once('/')
+        .ok_or_else(|| anyhow::anyhow!("gitlawb:// URL must be did:.../repo-name, got: {url}"))?;
+
+    // short_owner = last colon-delimited segment, e.g. "z6Mk..."
+    // The node's DB uses a LIKE '%<short_owner>' query to match the full DID.
+    let short_owner = did_string
+        .split(':')
+        .next_back()
+        .unwrap_or(did_string)
+        .to_string();
+
+    let repo_name = repo_name.trim_end_matches(".git").to_string();
+
+    tracing::debug!("parsed URL → did={did_string}, owner={short_owner}, repo={repo_name}");
+    Ok((did_string.to_string(), short_owner, repo_name))
+}
+
+/// How a single upload-pack negotiation round ended.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RoundEnd {
+    /// A flush pkt (`0000`) ended the round; more negotiation may follow.
+    Flush,
+    /// The terminal `done\n` pkt ended the round; the pack follows.
+    Done,
+    /// The stream ended (git closed its write pipe).
+    Eof,
+}
+
+/// Read ONE round of git's upload-pack request from the pkt-line stream.
+///
+/// Git speaks the stateful native protocol over the `connect` capability: it
+/// sends its `want` lines, a flush, then `have` batches each terminated by a
+/// flush, and blocks for the server's ACK/NAK after every flush before sending
+/// more haves or the terminal `done\n`. Each call returns one such round: the
+/// pkt-lines up to (but not including) the terminating flush or `done`, plus
+/// which terminator ended it. `negotiate_upload_pack` reassembles these into
+/// self-contained stateless-RPC POST bodies. Returning at the flush, instead of
+/// buffering past it waiting for `done`, is what lets a multi-round fetch make
+/// progress rather than deadlock (#117).
+fn read_upload_pack_round<R: Read>(stdin: &mut R) -> Result<(Vec<u8>, RoundEnd)> {
+    let mut content = Vec::new();
+
+    loop {
+        // Read the 4-byte hex pkt-line length prefix.
+        let mut len_bytes = [0u8; 4];
+        match stdin.read_exact(&mut len_bytes) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok((content, RoundEnd::Eof));
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        // A malformed 4-byte length header must NOT be silently collapsed to a
+        // 0000 flush (#192 F5): that masks corrupted/desynchronized protocol input
+        // and can emit accumulated have lines as a synthesized flush round.
+        let Ok(len_hex) = std::str::from_utf8(&len_bytes) else {
+            bail!("malformed pkt-line length prefix: non-UTF-8 bytes {len_bytes:02x?}");
+        };
+        let Ok(pkt_len) = usize::from_str_radix(len_hex, 16) else {
+            bail!("malformed pkt-line length prefix: non-hex {len_hex:?}");
+        };
+
+        if pkt_len == 0 {
+            // Flush pkt "0000": this round is complete.
+            return Ok((content, RoundEnd::Flush));
+        }
+
+        if pkt_len < 4 {
+            bail!("invalid pkt-line length: {pkt_len}");
+        }
+
+        let data_len = pkt_len - 4;
+        let mut data = vec![0u8; data_len];
+        stdin
+            .read_exact(&mut data)
+            .context("reading pkt-line data")?;
+
+        // "done\n" ends the negotiation; the pack follows. The terminator is
+        // reported out-of-band and re-emitted by the caller, so it is not
+        // appended to `content`.
+        if data == b"done\n" {
+            tracing::debug!("upload-pack: got 'done', round complete");
+            return Ok((content, RoundEnd::Done));
+        }
+
+        content.extend_from_slice(&len_bytes);
+        content.extend_from_slice(&data);
+    }
+}
+
+/// Read one git-receive-pack request: optional `shallow` lines, then EITHER a
+/// command list (pkt-lines terminated by a flush) or a push-cert block
+/// (pkt-lines terminated by a "push-cert-end" line), then the negotiated
+/// push-options block, then the pack ONLY when a command carries a non-zero
+/// new-oid.
+///
+/// A delete-only push sends no pack, and git holds its write pipe open waiting
+/// for the report-status response, so a plain read_to_end deadlocks the two
+/// (#369). A signed push is the other trap: when the client sends a push-cert
+/// it sends NO command list at all (the commands live inside the cert), so the
+/// request starts with a "push-cert" line and no flush ever arrives. The
+/// negotiated capability list is on the push-cert line, or on the first
+/// command line after its NUL when there is no cert. EOF at any point also
+/// ends the read, covering git versions that close the pipe early.
+fn read_receive_pack_request<R: Read>(stdin: &mut R) -> Result<Vec<u8>> {
+    /// Read one pkt-line into `body` (length prefix + data), returning its data
+    /// or `None` on flush or EOF. Malformed lengths bail rather than collapse
+    /// into a synthesized flush (#192 F5).
+    fn read_pkt<R: Read>(stdin: &mut R, body: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let mut len_bytes = [0u8; 4];
+        match stdin.read_exact(&mut len_bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let Ok(len_hex) = std::str::from_utf8(&len_bytes) else {
+            bail!("malformed pkt-line length prefix: non-UTF-8 bytes {len_bytes:02x?}");
+        };
+        let Ok(pkt_len) = usize::from_str_radix(len_hex, 16) else {
+            bail!("malformed pkt-line length prefix: non-hex {len_hex:?}");
+        };
+        body.extend_from_slice(&len_bytes);
+        if pkt_len == 0 {
+            return Ok(None);
+        }
+        if pkt_len < 4 {
+            bail!("invalid pkt-line length: {pkt_len}");
+        }
+        let mut data = vec![0u8; pkt_len - 4];
+        stdin
+            .read_exact(&mut data)
+            .context("reading pkt-line data")?;
+        body.extend_from_slice(&data);
+        Ok(Some(data))
+    }
+
+    /// "<40-hex old> <40-hex new> <refname>" — the command shape, whether it
+    /// appears in a command list or inside a push-cert.
+    fn is_command(data: &[u8]) -> bool {
+        data.len() >= 82
+            && data[..40].iter().all(|b| b.is_ascii_hexdigit())
+            && data[40] == b' '
+            && data[41..81].iter().all(|b| b.is_ascii_hexdigit())
+            && data[81] == b' '
+    }
+
+    let mut body = Vec::new();
+    let mut caps = String::new();
+    let mut pack_expected = false;
+    let mut in_cert = false;
+    loop {
+        let Some(data) = read_pkt(stdin, &mut body)? else {
+            // Flush ends a command list; EOF ends anything. A cert has no
+            // legal flush inside it, so the same break covers malformed
+            // input without hanging.
+            break;
+        };
+        if !in_cert && data.starts_with(b"push-cert") {
+            in_cert = true;
+            if let Some(nul) = data.iter().position(|&b| b == 0) {
+                caps = String::from_utf8_lossy(&data[nul + 1..]).into_owned();
+            }
+            continue;
+        }
+        if in_cert && data == b"push-cert-end\n" {
+            break;
+        }
+        if is_command(&data) {
+            if caps.is_empty() {
+                if let Some(nul) = data.iter().position(|&b| b == 0) {
+                    caps = String::from_utf8_lossy(&data[nul + 1..]).into_owned();
+                }
+            }
+            if data[41..81].iter().any(|&b| b != b'0') {
+                pack_expected = true;
+            }
+        }
+    }
+    // When both are negotiated the push-options block follows the cert; when
+    // only options are negotiated it follows the command flush. Either way it
+    // is pkt-lines to a flush.
+    if caps.split(' ').any(|c| c.starts_with("push-options")) {
+        while read_pkt(stdin, &mut body)?.is_some() {}
+    }
+    if pack_expected {
+        stdin
+            .read_to_end(&mut body)
+            .context("reading receive-pack pack")?;
+    }
+    Ok(body)
+}
+
+/// POST one self-contained stateless-RPC request body and stream the response to
+/// `stdout`. Signs the request when `signing_key` is present, so every round of a
+/// private-repo fetch carries the caller's signature (the node visibility-gates
+/// each POST at "/"). A non-2xx status surfaces through the sanitized error path
+/// rather than being rendered as an empty or successful fetch (INV-6/INV-8).
+fn post_pack_round(
+    client: &reqwest::blocking::Client,
+    post_url: &str,
+    service: &str,
+    signing_key: Option<&Keypair>,
+    body: Vec<u8>,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    tracing::debug!("POST {post_url} ({} bytes)", body.len());
+    let req = build_pack_post_request(client, post_url, service, &body, signing_key);
+    // Attach the body after signing so the bytes are moved, not cloned.
+    let resp = req
+        .body(body)
+        .send()
+        .with_context(|| format!("POST {post_url}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_body = read_error_body(resp);
+        let path = format!("/{service}");
+        bail!(
+            "{}",
+            http_error_message("POST", &path, status, &err_body, None)
+        );
+    }
+
+    let bytes = resp.bytes().context("reading pack response")?;
+    tracing::debug!("pack response: {} bytes from node", bytes.len());
+    stdout.write_all(&bytes)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Drive a git-upload-pack fetch as a v0 smart-HTTP stateless-RPC client.
+///
+/// Git (over `connect`) speaks the stateful native protocol; the node serves
+/// `git upload-pack --stateless-rpc`, which keeps no state between POSTs. Bridge
+/// the two: capture the want block once, then for each flush-terminated have
+/// batch POST a self-contained request (the wants plus every have accumulated so
+/// far, then exactly one terminator) and stream the ACK/NAK back to git so it can
+/// continue. The `done` round returns the pack. Every POST re-sends the wants and
+/// all prior haves because the server is stateless; leaving an intermediate flush
+/// in the body would truncate the negotiation, so each body carries exactly one
+/// terminator.
+fn negotiate_upload_pack<R: Read>(
+    client: &reqwest::blocking::Client,
+    post_url: &str,
+    service: &str,
+    signing_key: Option<&Keypair>,
+    stdin: &mut R,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    // Opening round: the want block, a bare `done`, or an empty/flush-only
+    // request from an up-to-date or aborted fetch.
+    let (wants, wend) = read_upload_pack_round(stdin)?;
+    match wend {
+        // Up-to-date with an empty request, truncated, or aborted before a
+        // terminator: nothing safe to POST.
+        RoundEnd::Eof => return Ok(()),
+        // A `done` with no preceding want-section flush: the bare-`done` request
+        // the single-round tests feed. Forward it verbatim as one POST.
+        RoundEnd::Done => {
+            let mut body = wants;
+            body.extend_from_slice(b"0009done\n");
+            return post_pack_round(client, post_url, service, signing_key, body, stdout);
+        }
+        // Normal: the want section ended with its flush; negotiate the haves.
+        // (An empty want block here is a flush-only opener and falls through to
+        // the loop, which POSTs nothing and returns at EOF.)
+        RoundEnd::Flush => {}
+    }
+
+    // The node is stateless between POSTs, so re-send the wants and every have so
+    // far in each round.
+    let mut acc_haves: Vec<u8> = Vec::new();
+    loop {
+        let (batch, bend) = read_upload_pack_round(stdin)?;
+
+        // Only POST when a round carries new haves or a terminator. A round with no
+        // new haves needs no request: an empty EOF ends the fetch, and a bare flush
+        // (git never sends a content-free flush mid-negotiation, but a malformed
+        // stream could) is skipped so a run of empty flushes cannot amplify into one
+        // signed POST each. A `done` round with no haves still POSTs (the fresh-clone
+        // case), handled by the terminator match below.
+        match (batch.is_empty(), bend) {
+            (true, RoundEnd::Eof) => return Ok(()),
+            (true, RoundEnd::Flush) => continue,
+            _ => {}
+        }
+
+        acc_haves.extend_from_slice(&batch);
+
+        // Compose a self-contained stateless-RPC request: wants + one flush + all
+        // accumulated haves + exactly one terminator. No intermediate flush
+        // survives into the body, or the stateless server treats the first flush
+        // after the haves as end-of-request and truncates the negotiation.
+        let mut body = wants.clone();
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(&acc_haves);
+
+        let final_round = match bend {
+            RoundEnd::Flush => {
+                body.extend_from_slice(b"0000");
+                false
+            }
+            // Only a real `done` pkt finalizes the stateless request.
+            RoundEnd::Done => {
+                body.extend_from_slice(b"0009done\n");
+                true
+            }
+            // A nonempty batch terminated by EOF (no flush, no done) means git
+            // ABORTED mid-negotiation (#192, F1). Terminate WITHOUT POSTing:
+            // synthesizing a `done` here would make the node generate and stream a
+            // full pack — signed, for a private fetch — to a client that has gone
+            // away. The accumulated haves are discarded; there is no one to serve.
+            RoundEnd::Eof => return Ok(()),
+        };
+
+        post_pack_round(client, post_url, service, signing_key, body, stdout)?;
+
+        if final_round {
+            return Ok(());
+        }
+    }
+}
+
+/// Strip the HTTP smart-protocol service announcement from a GET /info/refs response.
+///
+/// The HTTP smart protocol prepends:
+///   `<pkt-line("# service=git-{upload,receive}-pack\n")>` + `0000` (flush)
+///
+/// When forwarding through the git remote helper `connect` protocol, git expects
+/// raw git-daemon output (no wrapper), so we discard the first two pkt-lines.
+fn strip_service_announcement(bytes: &[u8]) -> &[u8] {
+    if bytes.len() < 4 {
+        return bytes;
+    }
+
+    // Parse the first pkt-line length (4-byte hex)
+    let Ok(len_hex) = std::str::from_utf8(&bytes[..4]) else {
+        return bytes;
+    };
+    let Ok(line_len) = usize::from_str_radix(len_hex, 16) else {
+        return bytes;
+    };
+
+    // line_len == 0 means flush pkt; an unexpected prefix means pass through as-is
+    if line_len < 4 || line_len > bytes.len() {
+        return bytes;
+    }
+
+    let after_first = &bytes[line_len..];
+
+    // Skip the flush packet "0000" that follows the service announcement
+    if after_first.starts_with(b"0000") {
+        &after_first[4..]
+    } else {
+        after_first
+    }
+}
+
+/// Extract the path component from an absolute URL.
+/// `http://127.0.0.1:7545/z6Mk.../repo/git-receive-pack` → `/z6Mk.../repo/git-receive-pack`
+fn url_path(url: &str) -> String {
+    url.split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map(|(_, path)| format!("/{}", path))
+        .unwrap_or_else(|| "/".to_string())
+}
+
+const MAX_ERROR_BODY_BYTES: u64 = 4096;
+const MAX_ERROR_BODY_CHARS: usize = 2000;
+
+fn read_error_body(mut response: reqwest::blocking::Response) -> String {
+    let mut body = Vec::new();
+    let mut limited = (&mut response).take(MAX_ERROR_BODY_BYTES);
+
+    if limited.read_to_end(&mut body).is_err() {
+        return String::new();
+    }
+
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+fn http_error_message(
+    method: &str,
+    path: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    empty_body_hint: Option<&str>,
+) -> String {
+    let mut message = format!("{method} {path} returned {status}");
+    let body = safe_error_body_excerpt(body);
+
+    if !body.is_empty() {
+        message.push_str(": ");
+        message.push_str(&body);
+    } else if let Some(hint) = empty_body_hint {
+        message.push(' ');
+        message.push_str(hint);
+    }
+
+    message
+}
+
+fn safe_error_body_excerpt(body: &str) -> String {
+    let mut excerpt = String::new();
+    let mut pending_space = false;
+    let mut kept_chars = 0;
+
+    for ch in body.trim().chars() {
+        if kept_chars >= MAX_ERROR_BODY_CHARS {
+            break;
+        }
+
+        if ch.is_control() {
+            if matches!(ch, '\n' | '\r' | '\t') {
+                pending_space = true;
+            }
+            continue;
+        }
+
+        if twigpine_core::sanitize::is_bidi_format(ch) {
+            // Drop Cf bidi/format controls (INV-6, #183) without marking
+            // pending_space: unlike a newline/tab they are not whitespace, so
+            // "a\u{202e}c" collapses to "ac" with no phantom gap.
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+
+        if pending_space && !excerpt.is_empty() {
+            excerpt.push(' ');
+            kept_chars += 1;
+            if kept_chars >= MAX_ERROR_BODY_CHARS {
+                break;
+            }
+        }
+        excerpt.push(ch);
+        kept_chars += 1;
+        pending_space = false;
+    }
+
+    excerpt
+}
+
+// ── Keypair loading ───────────────────────────────────────────────────────────
+
+fn load_keypair() -> Option<Keypair> {
+    let key_path = resolve_key_path()?;
+    if !key_path.exists() {
+        tracing::debug!("no keypair found at {key_path:?}");
+        return None;
+    }
+    match std::fs::read_to_string(&key_path) {
+        Ok(pem) => match Keypair::from_pem(&pem) {
+            Ok(kp) => {
+                tracing::debug!("loaded keypair — DID: {}", kp.did());
+                Some(kp)
+            }
+            Err(e) => {
+                tracing::warn!("failed to parse keypair at {key_path:?}: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!("failed to read {key_path:?}: {e}");
+            None
+        }
+    }
+}
+
+/// The identity PEM, resolved by the same rules `twigpine` uses.
+///
+/// Shared through `twigpine-core` rather than reimplemented here: this helper and
+/// `twigpine ucan import` have to derive the same delegation store from `GITLAWB_KEY`,
+/// and the two had drifted — the local version read `env::var` (so a non-UTF-8
+/// value silently became the default key), expanded only a literal `"~/"`, fell
+/// back to `"."` when `HOME` was unset, and never required an absolute path.
+///
+/// `None` means the value is unusable, not that the key is missing. Git runs this
+/// helper mid-push, so a misconfiguration is logged and the push continues
+/// unsigned rather than aborting the transfer.
+fn resolve_key_path() -> Option<std::path::PathBuf> {
+    twigpine_core::identity_path::identity_key_path(home_dir().as_deref())
+        .inspect_err(|e| tracing::warn!("cannot resolve the identity key path: {e}"))
+        .ok()
+}
+
+/// The directory holding `identity.pem` and `delegations/`.
+fn resolve_identity_dir() -> Option<std::path::PathBuf> {
+    twigpine_core::identity_path::identity_dir(home_dir().as_deref())
+        .inspect_err(|e| tracing::warn!("cannot resolve the identity directory: {e}"))
+        .ok()
+}
+
+/// `dirs`, not `$HOME`: the old code fell back to `"."` when `HOME` was unset,
+/// which on Windows is always, so the default key resolved against whatever
+/// directory git happened to invoke the helper from.
+///
+/// `None` is not fatal — an absolute `GITLAWB_KEY` resolves without it, and only
+/// the default and `~/`-prefixed forms need a home at all.
+fn home_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod insecure_transport_tests {
+    use super::*;
+
+    /// Loopback in every form the transport can legitimately be pointed at.
+    /// Plaintext to this machine is the documented local-alpha default and must
+    /// keep working, so a false positive here breaks every stock install.
+    #[test]
+    fn loopback_http_is_allowed() {
+        for url in [
+            "http://127.0.0.1:7545",
+            "http://localhost:7545",
+            "http://[::1]:7545",
+            "http://127.0.0.2:7545",
+            "http://[::ffff:127.0.0.1]:7545",
+            "http://LocalHost:7545",
+        ] {
+            assert!(
+                !is_insecure_remote(url),
+                "{url} is this machine; plaintext to it must stay allowed"
+            );
+        }
+    }
+
+    /// The case the guard exists for: cleartext git data leaving the machine.
+    #[test]
+    fn remote_http_is_refused() {
+        for url in [
+            "http://node.example.com:7545",
+            "http://10.0.0.36:7777",
+            "http://192.168.1.10",
+            "http://[2001:db8::1]:7545",
+            "http://8.8.8.8",
+        ] {
+            assert!(
+                is_insecure_remote(url),
+                "{url} sends git data off-machine in cleartext and must be refused"
+            );
+        }
+    }
+
+    /// TLS is always fine, loopback or not, so the guard keys on the scheme and
+    /// not merely on the host being remote.
+    #[test]
+    fn https_is_always_allowed() {
+        for url in [
+            "https://node.gitlawb.com",
+            "https://10.0.0.36:7777",
+            "https://127.0.0.1:7545",
+        ] {
+            assert!(!is_insecure_remote(url), "{url} is TLS and must be allowed");
+        }
+    }
+
+    /// Spellings that defeat a naive loopback check. `Url` normalizes the scheme
+    /// and the host at parse time (lowercasing, and the WHATWG numeric forms), so
+    /// these must all still read as this machine.
+    #[test]
+    fn loopback_spellings_are_normalized_not_string_matched() {
+        for url in [
+            "HTTP://127.0.0.1:7545",
+            "Http://LOCALHOST:7545",
+            "http://localhost.:7545",
+            "http://user:pw@127.0.0.1:7545",
+            "http://2130706433:7545",
+            "http://0x7f000001:7545",
+            "http://[::ffff:7f00:1]:7545",
+        ] {
+            assert!(
+                !is_insecure_remote(url),
+                "{url} resolves to this machine; plaintext to it must stay allowed"
+            );
+        }
+    }
+
+    /// The mirror of the above: an uppercase scheme must not become an escape
+    /// from the guard, and a remote host in any spelling is still remote.
+    #[test]
+    fn uppercase_scheme_does_not_escape_the_guard() {
+        for url in [
+            "HTTP://node.example.com:7545",
+            "Http://8.8.8.8",
+            "http://NODE.EXAMPLE.COM",
+            "http://user:pw@node.example.com",
+        ] {
+            assert!(
+                is_insecure_remote(url),
+                "{url} is a remote cleartext hop and must be refused"
+            );
+        }
+    }
+
+    /// The gate itself, both directions, including the opt-in escape hatch.
+    #[test]
+    fn gate_refuses_remote_plaintext_unless_opted_in() {
+        let err = check_transport_security("http://node.example.com:7545", false)
+            .expect_err("remote plaintext must be refused by default");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plaintext http"),
+            "the refusal must say why: {msg}"
+        );
+        assert!(
+            msg.contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+            "the refusal must name the escape hatch: {msg}"
+        );
+
+        check_transport_security("http://node.example.com:7545", true)
+            .expect("the opt-in must permit the same URL");
+        check_transport_security("http://127.0.0.1:7545", false)
+            .expect("the local default must keep working with no opt-in");
+        check_transport_security("https://node.gitlawb.com", false)
+            .expect("TLS must need no opt-in");
+    }
+
+    /// The opt-in is a value, not presence: only `1` / `true` (any case, trimmed)
+    /// opens the gate, and `0`, `false`, empty, a typo, or a non-UTF-8 value
+    /// leave it closed.
+    #[test]
+    fn insecure_http_opt_in_is_truthy_only() {
+        for on in ["1", "true", "TRUE", "True", " 1 ", "\ttrue\n"] {
+            assert!(allow_insecure_http_from_str(Some(on)), "{on:?} must enable");
+        }
+        for off in ["0", "false", "", " ", "yes", "on", "2", "11"] {
+            assert!(
+                !allow_insecure_http_from_str(Some(off)),
+                "{off:?} must not enable"
+            );
+        }
+        assert!(!allow_insecure_http_from_str(None), "unset must not enable");
+        assert!(allow_insecure_http_from_var(Ok("1".into())));
+        assert!(!allow_insecure_http_from_var(Ok("0".into())));
+        assert!(!allow_insecure_http_from_var(Err(
+            std::env::VarError::NotPresent
+        )));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+            assert!(
+                !allow_insecure_http_from_var(Err(std::env::VarError::NotUnicode(bad))),
+                "a non-UTF-8 value must fail closed"
+            );
+        }
+        // And through the gate: an off value must leave a remote node refused.
+        assert!(check_transport_security(
+            "http://node.example.com:7545",
+            allow_insecure_http_from_str(Some("0"))
+        )
+        .is_err());
+    }
+
+    /// The documented knob must appear in --help. A gate the operator cannot
+    /// discover reads as a broken transport rather than a deliberate refusal.
+    #[test]
+    fn help_documents_the_opt_in() {
+        assert!(help_text().contains("GITLAWB_ALLOW_INSECURE_HTTP"));
+    }
+
+    /// An unparseable or non-http value is not classified as insecure here: it
+    /// fails later with its own error, and reporting it as a TLS problem would
+    /// send the reader after the wrong thing.
+    #[test]
+    fn unparseable_or_other_scheme_is_not_this_guards_problem() {
+        for url in [
+            "",
+            "   ",
+            "not a url",
+            "ftp://node.example.com",
+            "file:///tmp/x",
+        ] {
+            assert!(
+                !is_insecure_remote(url),
+                "{url:?} is not a cleartext-http-to-remote case"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::JoinHandle;
+
+    struct TestResponse {
+        request_line: &'static str,
+        status: &'static str,
+        body: &'static str,
+    }
+
+    fn serve_http(responses: Vec<TestResponse>) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(
+                    request.starts_with(response.request_line),
+                    "unexpected request:\n{request}"
+                );
+
+                let response_text = format!(
+                    "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response.status,
+                    response.body.len(),
+                    response.body
+                );
+                stream.write_all(response_text.as_bytes()).unwrap();
+                requests.push(request);
+            }
+
+            requests
+        });
+
+        (base_url, handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        let mut header_len = None;
+
+        loop {
+            let n = stream.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+
+            if header_len.is_none() {
+                header_len = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+            }
+
+            if let Some(header_len) = header_len {
+                let header = String::from_utf8_lossy(&buf[..header_len]);
+                let content_len = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+
+                if buf.len() >= header_len + content_len {
+                    break;
+                }
+            }
+        }
+
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// The signed headers must not survive a redirect off the node's origin, on
+    /// EITHER phase.
+    ///
+    /// This is the binary git runs for `clone`, `fetch` and `push`. It built its
+    /// client with a timeout and nothing else, so it ran reqwest's default
+    /// `Policy::limited(10)`, and reqwest's cross-host header stripping covers
+    /// `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` only.
+    /// `Signature` and `Signature-Input` came straight through. A push signs from the
+    /// first request, so a hostile node answering 302 was handed a working credential,
+    /// and a 307/308 would have taken the pack body along.
+    ///
+    /// Two mockito servers are two ports on one host, which is the boundary this
+    /// policy draws. The second server answers everything and expects nothing, with a
+    /// second mock matching on the `signature` header also at zero, so a followed
+    /// redirect fails whether or not the signature came with it. Phase 1 is driven
+    /// with a 302 and Phase 2 with a 308, the status that would carry the body.
+    ///
+    /// MUTATION (RED): drop the `.redirect(...)` line from `build_http_client`.
+    #[test]
+    fn signed_requests_do_not_follow_a_redirect_off_the_node_origin() {
+        let kp = Keypair::generate();
+        let client = build_http_client(false).unwrap();
+
+        let mut elsewhere = mockito::Server::new();
+        let never = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("bytes from the redirect target")
+            .expect(0)
+            .create();
+        let never_post = elsewhere
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+        let signature_seen_get = elsewhere
+            .mock("GET", mockito::Matcher::Any)
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+        let signature_seen_post = elsewhere
+            .mock("POST", mockito::Matcher::Any)
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+
+        let mut node = mockito::Server::new();
+        let repo_base = format!("{}/zOwner/myrepo", node.url());
+        let bounce_get = node
+            .mock("GET", mockito::Matcher::Regex(r"/info/refs".to_string()))
+            .with_status(302)
+            .with_header("location", &format!("{}/info/refs", elsewhere.url()))
+            .expect(1)
+            .create();
+        let bounce_post = node
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/git-receive-pack$".to_string()),
+            )
+            .with_status(308)
+            .with_header("location", &format!("{}/git-receive-pack", elsewhere.url()))
+            .expect(1)
+            .create();
+
+        let refs_url = format!("{repo_base}/info/refs?service=git-receive-pack");
+        let advertisement = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+
+        let body = b"0009done\n".to_vec();
+        let post_url = format!("{repo_base}/git-receive-pack");
+        let pack_post =
+            build_pack_post_request(&client, &post_url, "git-receive-pack", &body, Some(&kp))
+                .body(body.clone())
+                .send()
+                .unwrap();
+
+        // The other origin first: it is the assertion that names the leak, and it must
+        // be the one that speaks when a followed redirect makes every one of these
+        // fail at once.
+        never.assert();
+        never_post.assert();
+        signature_seen_get.assert();
+        signature_seen_post.assert();
+        bounce_get.assert();
+        bounce_post.assert();
+
+        assert_eq!(
+            advertisement.status(),
+            302,
+            "a refused redirect stops rather than errors, so the caller sees the 3xx"
+        );
+        assert!(
+            !advertisement
+                .text()
+                .unwrap()
+                .contains("bytes from the redirect target"),
+            "the redirect target's bytes must never reach the caller"
+        );
+        assert_eq!(
+            pack_post.status(),
+            308,
+            "the pack POST stops at the redirect too"
+        );
+    }
+
+    /// A same-origin hop that REWRITES the request-target is refused, even though the
+    /// origin never changes.
+    ///
+    /// The signature binds `@path` as the literal path-and-query the helper signed, and
+    /// the node rebuilds it from the URI it received. An `info/refs` to `info/refs/`
+    /// bounce therefore presents a signature over a target the node never saw, so a
+    /// clone or push behind such a proxy 401s. Refusing the hop hands the caller the
+    /// 3xx that names what happened instead.
+    ///
+    /// The target mock expects zero hits and is asserted: mockito only checks
+    /// `.expect(N)` when `.assert()` runs, so an unbound or unasserted mock passes
+    /// vacuously.
+    #[test]
+    fn a_same_origin_path_changing_redirect_is_refused() {
+        let kp = Keypair::generate();
+        let client = build_http_client(false).unwrap();
+
+        let mut node = mockito::Server::new();
+        let bounce = node
+            .mock("GET", "/zOwner/myrepo/info/refs")
+            .with_status(301)
+            .with_header("location", "/zOwner/myrepo/info/refs/")
+            .expect(1)
+            .create();
+        let target = node
+            .mock("GET", "/zOwner/myrepo/info/refs/")
+            .with_status(200)
+            .with_body("bytes from the rewritten target")
+            .expect(0)
+            .create();
+
+        let refs_url = format!("{}/zOwner/myrepo/info/refs", node.url());
+        let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            301,
+            "a refused redirect stops rather than errors, so the caller sees the 3xx"
+        );
+        assert!(
+            !resp
+                .text()
+                .unwrap()
+                .contains("bytes from the rewritten target"),
+            "the rewritten target's bytes must never reach the caller"
+        );
+        bounce.assert();
+        target.assert();
+    }
+
+    /// The other direction, and the only same-origin hop still followed: a redirect
+    /// that re-issues the IDENTICAL request-target.
+    ///
+    /// Without this the policy could be tightened to `Policy::none()` and nothing in
+    /// this crate would notice. It is also the first executed coverage of the chain
+    /// bound in `build_http_client`'s policy closure: the route answers 301 pointing at
+    /// itself, so bounded it is hit once for the original request plus `MAX_REDIRECTS`
+    /// follows and the call returns the 301 (a refused hop stops rather than errors).
+    /// Unbounded it would spin until `HTTP_TIMEOUT`, costing the node a request per
+    /// round trip. Its twin is `a_self_redirect_stops_at_the_chain_bound` in
+    /// `crates/twigpine-cli/src/http.rs`.
+    #[test]
+    fn an_identical_target_redirect_is_still_followed_up_to_the_chain_bound() {
+        let kp = Keypair::generate();
+        let client = build_http_client(false).unwrap();
+
+        let mut node = mockito::Server::new();
+        let loop_route = node
+            .mock("GET", "/zOwner/myrepo/info/refs")
+            .with_status(301)
+            .with_header("location", "/zOwner/myrepo/info/refs")
+            .expect(twigpine_core::redirect::MAX_REDIRECTS + 1)
+            .create();
+
+        let refs_url = format!("{}/zOwner/myrepo/info/refs", node.url());
+        let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .expect("the bound must end the chain, not the timeout");
+
+        assert_eq!(
+            resp.status(),
+            301,
+            "the chain ends by refusing the next hop, so the last 3xx is what comes back"
+        );
+        loop_route.assert();
+    }
+
+    // ── the node's own verification, run over what the helper actually sent ──
+
+    /// What the verifying mock made of a request that reached it.
+    ///
+    /// The empty slot (`None`) is its own state and means the mock was never hit at
+    /// all, which is what the refusal test asserts. It must stay distinguishable from
+    /// [`Verdict::WrongIdentity`], because "nobody verified anything" and "something
+    /// verified against the wrong key" are opposite findings.
+    ///
+    /// The payloads are read through `Debug` in the assertion messages and nowhere
+    /// else, which the dead-code pass does not count; they carry the detail that makes
+    /// a failure legible, so they stay.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    enum Verdict {
+        /// The chain accepted the signature AND the key it resolved is the test's DID.
+        Accepted,
+        /// The chain refused it. Carries the error so a failure reads as the actual
+        /// rejection rather than a bare hit count.
+        Rejected(String),
+        /// The chain accepted a signature made by somebody else. A key resolved from
+        /// the parsed `key_id` is read out of the artifact under verification, so an
+        /// accept on it alone proves consistency, never authenticity.
+        WrongIdentity { expected: String, got: String },
+    }
+
+    /// The node's `require_signature` verification, over a request this crate did not
+    /// necessarily build: parse the headers, recompute the content-digest from the
+    /// body, rebuild the signing string over `@method`/`@path`/`content-digest`,
+    /// Ed25519-verify. Returns the DID the signature resolved to, so a caller can pin
+    /// the identity.
+    ///
+    /// Its twin is the hand-copy in `crates/twigpine-cli/src/http.rs`, which cannot import this
+    /// module (this is a binary crate's test module). Keep the two textually identical
+    /// apart from the mockito seam around them, so an edit to one is visibly an edit to
+    /// both.
+    ///
+    /// The production verifier both copies mirror is `crate::auth::require_signature` in
+    /// `crates/twigpine-node/src/auth/mod.rs`. This is a re-implementation, not a call, so
+    /// an edit to that middleware has to land here too: otherwise the copies drift and
+    /// this test keeps passing against a rule the node has stopped applying.
+    ///
+    /// It asserts internally, which is deliberate but constrains its callers: inside
+    /// `with_body_from_request` those assertions fire on the server thread and reach
+    /// the client as a transport error, not as a recorded verdict. So the identity
+    /// check lives in the caller as a [`Verdict`] variant, never as an assert in here.
+    fn node_verifies(
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+        sig_input: &str,
+        sig_header: &str,
+        content_digest: &str,
+    ) -> anyhow::Result<String> {
+        use std::collections::HashMap;
+        use twigpine_core::http_sig::{
+            build_signing_string, compute_content_digest, HttpSignature,
+        };
+        use twigpine_core::identity::verify;
+
+        let sig = HttpSignature::parse(sig_input, sig_header)?;
+        sig.check_created()?;
+        assert!(
+            sig.missing_components().is_empty(),
+            "signature must cover all required components"
+        );
+        assert_eq!(sig.alg, "ed25519");
+        assert_eq!(
+            content_digest,
+            compute_content_digest(body),
+            "content-digest must match the body"
+        );
+        let vk = sig.key_id.to_verifying_key()?;
+        let mut values = HashMap::new();
+        values.insert("@method".to_string(), method.to_uppercase());
+        values.insert("@path".to_string(), path_and_query.to_string());
+        values.insert("content-digest".to_string(), content_digest.to_string());
+        let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
+        let components: Vec<&str> = sig.components.iter().map(String::as_str).collect();
+        let signing_string = build_signing_string(&components, sig_params_value, &values)?;
+        let sig_array: [u8; 64] = sig.signature_bytes.as_slice().try_into()?;
+        verify(&vk, signing_string.as_bytes(), &sig_array)?;
+        Ok(sig.key_id.to_string())
+    }
+
+    /// Pull a header value off a received mockito request, or explain which one the
+    /// helper failed to send.
+    fn received_header(req: &mockito::Request, name: &str) -> String {
+        req.header(name)
+            .first()
+            .unwrap_or_else(|| panic!("the helper sent no {name} header"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Run [`node_verifies`] over a GET that arrived at the mock and record what the
+    /// node would have made of it, pinned to `expected_did`.
+    fn record_get_verdict(
+        req: &mockito::Request,
+        expected_did: &str,
+        slot: &std::sync::Arc<std::sync::Mutex<Option<Verdict>>>,
+    ) {
+        let verdict = match node_verifies(
+            "GET",
+            req.path_and_query(),
+            b"",
+            &received_header(req, "signature-input"),
+            &received_header(req, "signature"),
+            &received_header(req, "content-digest"),
+        ) {
+            Ok(did) if did == expected_did => Verdict::Accepted,
+            Ok(did) => Verdict::WrongIdentity {
+                expected: expected_did.to_string(),
+                got: did,
+            },
+            Err(e) => Verdict::Rejected(e.to_string()),
+        };
+        *slot.lock().unwrap() = Some(verdict);
+    }
+
+    /// The finding's repro, now a guard: a rewritten same-origin target must never
+    /// receive the advertisement's signature, and the proof is the node's own
+    /// verification, not a hit count.
+    ///
+    /// Post-fix the hop is refused, so the slot stays empty. Pre-fix the hop is
+    /// followed and the slot records the Ed25519 rejection of a signature made over
+    /// `.../info/refs?service=git-upload-pack` and presented at `.../info/refs/...`,
+    /// which is the 401 an operator behind such a proxy actually sees. The verdict is
+    /// asserted first, so a failure speaks about verification rather than about
+    /// reachability.
+    ///
+    /// Its paired positive control is
+    /// `a_direct_signed_advertisement_verifies_under_the_node_verifier`: without it, an
+    /// empty slot would be satisfied just as well by a harness that can never record
+    /// anything.
+    #[test]
+    fn a_rewritten_target_never_receives_the_signature() {
+        let kp = Keypair::generate();
+        let expected_did = kp.did().to_string();
+        let client = build_http_client(false).unwrap();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
+
+        let mut node = mockito::Server::new();
+        let bounce = node
+            .mock("GET", "/zOwner/myrepo/info/refs?service=git-upload-pack")
+            .with_status(301)
+            .with_header(
+                "location",
+                "/zOwner/myrepo/info/refs/?service=git-upload-pack",
+            )
+            .expect(1)
+            .create();
+        let recorder = slot.clone();
+        let did_for_target = expected_did.clone();
+        let target = node
+            .mock("GET", "/zOwner/myrepo/info/refs/?service=git-upload-pack")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                record_get_verdict(req, &did_for_target, &recorder);
+                Vec::new()
+            })
+            .expect(0)
+            .create();
+
+        let refs_url = format!(
+            "{}/zOwner/myrepo/info/refs?service=git-upload-pack",
+            node.url()
+        );
+        let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+
+        let verdict = slot.lock().unwrap().take();
+        assert!(
+            verdict.is_none(),
+            "the node's own verifier must never see this request: the signature covers \
+             /zOwner/myrepo/info/refs?service=git-upload-pack and the rewritten target \
+             adds a trailing slash, so what arrives there is a stale request-target; \
+             recorded verdict: {verdict:?}"
+        );
+        assert_eq!(
+            resp.status(),
+            301,
+            "the caller sees the 3xx, not the rewritten target's answer"
+        );
+        bounce.assert();
+        target.assert();
+    }
+
+    /// The positive control for the test above, and the proof that the helper signs the
+    /// query it sends.
+    ///
+    /// A direct signed advertisement GET, no redirect anywhere, through the same
+    /// verifying mock. The verdict must be `Accepted`, which is what makes the refusal
+    /// test's empty slot attributable to the refusal rather than to a harness that
+    /// cannot record. The advertisement URL carries `?service=`, so a helper that
+    /// signed the bare path would land here as `Rejected`.
+    #[test]
+    fn a_direct_signed_advertisement_verifies_under_the_node_verifier() {
+        let kp = Keypair::generate();
+        let expected_did = kp.did().to_string();
+        let client = build_http_client(false).unwrap();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
+
+        let mut node = mockito::Server::new();
+        let recorder = slot.clone();
+        let did_for_target = expected_did.clone();
+        let route = node
+            .mock("GET", "/zOwner/myrepo/info/refs?service=git-upload-pack")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                record_get_verdict(req, &did_for_target, &recorder);
+                Vec::new()
+            })
+            .expect(1)
+            .create();
+
+        let refs_url = format!(
+            "{}/zOwner/myrepo/info/refs?service=git-upload-pack",
+            node.url()
+        );
+        let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let verdict = slot.lock().unwrap().take();
+        assert!(
+            matches!(verdict, Some(Verdict::Accepted)),
+            "a direct signed advertisement must verify under the node's own chain and \
+             resolve to {expected_did}, or the refusal test's empty slot proves \
+             nothing; recorded verdict: {verdict:?}"
+        );
+        route.assert();
+    }
+
+    /// The regression that round-1 missed: the Phase-2 `git-upload-pack` POST was
+    /// left unsigned, so an owner's fetch of a private repo cleared the (now signed)
+    /// advertisement and then 404'd on the pack POST. Drive BOTH request builders
+    /// against a mock node and assert the RFC-9421 headers actually go out on the
+    /// wire for BOTH services when a keypair is present (the mock only matches when
+    /// the headers exist, so `.assert()` fails if any are dropped).
+    #[test]
+    fn advertisement_and_pack_post_are_signed_for_both_services_with_keypair() {
+        let kp = Keypair::generate();
+        let client = reqwest::blocking::Client::new();
+        let body = b"0009done\n".to_vec();
+        let empty = tempfile::tempdir().expect("tempdir");
+
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let mut server = mockito::Server::new();
+            let repo_base = format!("{}/zOwner/myrepo", server.url());
+
+            let get_mock = server
+                .mock("GET", mockito::Matcher::Regex(r"/info/refs".to_string()))
+                .match_header("signature", mockito::Matcher::Any)
+                .match_header("signature-input", mockito::Matcher::Any)
+                .match_header("content-digest", mockito::Matcher::Any)
+                .with_status(200)
+                .create();
+            let refs_url = format!("{repo_base}/info/refs?service={service}");
+            let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+                .send()
+                .unwrap();
+            assert!(resp.status().is_success());
+            get_mock.assert();
+
+            let post_mock = server
+                .mock("POST", mockito::Matcher::Regex(format!("/{service}$")))
+                .match_header("signature", mockito::Matcher::Any)
+                .match_header("signature-input", mockito::Matcher::Any)
+                .match_header("content-digest", mockito::Matcher::Any)
+                .with_status(200)
+                .create();
+            let post_url = format!("{repo_base}/{service}");
+            // `build_pack_post_request` reaches `delegation_header`, whose store
+            // resolves from process-global `GITLAWB_KEY`. Point it at an empty dir
+            // under the shared lock so the read cannot race a sibling's mutation
+            // and cannot pick up a developer's real store.
+            let req = crate::delegated_push_tests::with_identity_dir(empty.path(), || {
+                build_pack_post_request(&client, &post_url, service, &body, Some(&kp))
+            });
+            let resp = req.body(body.clone()).send().unwrap();
+            assert!(resp.status().is_success());
+            post_mock.assert();
+        }
+    }
+
+    /// Without an identity, the pack POST must go out UNSIGNED so public fetch (and
+    /// alpha unsigned push) still work. `Matcher::Missing` matches only when the
+    /// header is absent, so the mock is hit only if NO signature was attached, for
+    /// BOTH services (the receive-pack iteration also exercises the no-keypair warn
+    /// branch and confirms it does not block the request).
+    #[test]
+    fn pack_post_is_unsigned_without_keypair_for_both_services() {
+        let client = reqwest::blocking::Client::new();
+        let body = b"0009done\n".to_vec();
+
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let mut server = mockito::Server::new();
+            let post_url = format!("{}/zOwner/myrepo/{service}", server.url());
+
+            let post_mock = server
+                .mock("POST", mockito::Matcher::Regex(format!("/{service}$")))
+                .match_header("signature", mockito::Matcher::Missing)
+                .match_header("signature-input", mockito::Matcher::Missing)
+                .match_header("content-digest", mockito::Matcher::Missing)
+                .with_status(200)
+                .create();
+            let resp = build_pack_post_request(&client, &post_url, service, &body, None)
+                .body(body.clone())
+                .send()
+                .unwrap();
+            assert!(resp.status().is_success());
+            post_mock.assert();
+        }
+    }
+
+    /// Symmetric negative case for Phase 1: with no identity the advertisement GET
+    /// carries no signature, so public clones stay anonymous.
+    #[test]
+    fn advertisement_get_is_unsigned_without_keypair() {
+        let client = reqwest::blocking::Client::new();
+        let mut server = mockito::Server::new();
+        let refs_url = format!(
+            "{}/zOwner/myrepo/info/refs?service=git-upload-pack",
+            server.url()
+        );
+
+        let get_mock = server
+            .mock("GET", mockito::Matcher::Regex(r"/info/refs".to_string()))
+            .match_header("signature", mockito::Matcher::Missing)
+            .match_header("signature-input", mockito::Matcher::Missing)
+            .match_header("content-digest", mockito::Matcher::Missing)
+            .with_status(200)
+            .create();
+        let resp = build_advertisement_request(&client, &refs_url, None)
+            .send()
+            .unwrap();
+        assert!(resp.status().is_success());
+        get_mock.assert();
+    }
+
+    // ── Phase-1 retry-on-404 (P2, #119): fetch stays anonymous until the node
+    //    denies it, then escalates to ONE signed retry. Drives handle_connect end to
+    //    end against the recording mock, asserting what actually goes on the wire.
+    //    A request is "signed" iff it carries the `signature-input` header.
+
+    /// Public fetch: the node serves the anonymous advertisement (200), so the
+    /// client never signs — not the advertisement GET, not the upload-pack POST —
+    /// even though an identity is present. This is the privacy fix: a public clone
+    /// must not disclose the caller's DID.
+    #[test]
+    fn fetch_public_stays_anonymous_even_with_keypair() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(b"0009done\n".to_vec());
+        handle_connect(&repo_base, "git-upload-pack", Some(&kp), &mut stdin)
+            .expect("public fetch should succeed");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "public fetch must not retry");
+        assert!(
+            !requests[0].to_lowercase().contains("signature-input"),
+            "the advertisement GET must be anonymous for a public fetch"
+        );
+        assert!(
+            !requests[1].to_lowercase().contains("signature-input"),
+            "the upload-pack POST must be anonymous for a public fetch"
+        );
+    }
+
+    /// Private fetch: the anonymous advertisement is denied (404); with an identity
+    /// present the client retries the GET signed and — because Phase 1 needed
+    /// signing — also signs the Phase-2 upload-pack POST. The FIRST request is still
+    /// anonymous: the DID is not disclosed until the node demands authentication.
+    #[test]
+    fn fetch_private_retries_signed_on_404_and_signs_the_pack_post() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "404 Not Found",
+                body: r#"{"message":"repository is not registered on this node"}"#,
+            },
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(b"0009done\n".to_vec());
+        handle_connect(&repo_base, "git-upload-pack", Some(&kp), &mut stdin)
+            .expect("signed retry should succeed");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "expected anon GET, signed GET retry, signed POST"
+        );
+        assert!(
+            !requests[0].to_lowercase().contains("signature-input"),
+            "the first advertisement GET must be anonymous"
+        );
+        assert!(
+            requests[1].to_lowercase().contains("signature-input"),
+            "the retry advertisement GET must be signed"
+        );
+        assert!(
+            requests[2].to_lowercase().contains("signature-input"),
+            "the upload-pack POST must be signed once the fetch needed auth"
+        );
+    }
+
+    /// Private fetch with no identity: the anonymous advertisement 404s and there is
+    /// no keypair to retry with, so the client surfaces the error after exactly one
+    /// request — no retry, no hang.
+    #[test]
+    fn fetch_without_keypair_does_not_retry_on_404() {
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+            status: "404 Not Found",
+            body: r#"{"message":"not found"}"#,
+        }]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = handle_connect(&repo_base, "git-upload-pack", None, &mut stdin).unwrap_err();
+        assert!(err.to_string().contains("returned 404 Not Found"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1, "no keypair means no signed retry");
+        assert!(!requests[0].to_lowercase().contains("signature-input"));
+    }
+
+    /// Private fetch where the SIGNED retry is also denied (caller is not a reader):
+    /// the client retries exactly once, then surfaces the 404 rather than looping.
+    /// Bounds the escalation to a single signed attempt.
+    #[test]
+    fn fetch_signed_retry_still_denied_surfaces_error_once() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "404 Not Found",
+                body: r#"{"message":"not found"}"#,
+            },
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "404 Not Found",
+                body: r#"{"message":"not found"}"#,
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = handle_connect(&repo_base, "git-upload-pack", Some(&kp), &mut stdin).unwrap_err();
+        assert!(err.to_string().contains("returned 404 Not Found"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "exactly one signed retry, then surface");
+        assert!(!requests[0].to_lowercase().contains("signature-input"));
+        assert!(requests[1].to_lowercase().contains("signature-input"));
+    }
+
+    /// Push (git-receive-pack) is unchanged: it signs from the FIRST request — you
+    /// cannot push anonymously — so there is no anonymous-first probe for push.
+    #[test]
+    fn push_advertisement_is_signed_from_the_first_request() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-receive-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-receive-pack",
+                status: "200 OK",
+                body: "",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(b"0000".to_vec());
+        handle_connect(&repo_base, "git-receive-pack", Some(&kp), &mut stdin)
+            .expect("push should succeed");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].to_lowercase().contains("signature-input"),
+            "push advertisement must be signed from the first request"
+        );
+        assert!(
+            requests[1].to_lowercase().contains("signature-input"),
+            "push POST must be signed"
+        );
+    }
+
+    /// Cross-crate seam: the signature the CLIENT actually emits (via the real
+    /// request builders) verifies under the SAME `twigpine_core::http_sig`
+    /// primitives the node's `require_signature` uses, over the `@path` the client
+    /// genuinely transmits (derived from the built reqwest request, exactly as the
+    /// node derives it from `uri.path_and_query()`). A tampered `@path` must fail:
+    /// this is the byte-match the whole A1 client fix depends on, now executed end
+    /// to end (sign here, verify with the node's verifier), not reasoned.
+    #[test]
+    fn client_signature_verifies_under_node_verification_for_both_services() {
+        let kp = Keypair::generate();
+        let client = reqwest::blocking::Client::new();
+        let body = b"0009done\n".to_vec();
+
+        // The verification chain is [`node_verifies`], the test-module helper the
+        // redirect verdict tests share. Same primitives the node's require_signature
+        // runs, over the request-target this crate transmits.
+        // @path exactly as the node reconstructs it from the request it receives.
+        let path_and_query = |req: &reqwest::blocking::Request| match req.url().query() {
+            Some(q) => format!("{}?{}", req.url().path(), q),
+            None => req.url().path().to_string(),
+        };
+        let header = |req: &reqwest::blocking::Request, name: &str| {
+            req.headers()
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            // Phase-1 advertisement GET (empty body).
+            let refs_url = format!("http://node.example/zOwner/myrepo/info/refs?service={service}");
+            let req = build_advertisement_request(&client, &refs_url, Some(&kp))
+                .build()
+                .unwrap();
+            node_verifies(
+                "GET",
+                &path_and_query(&req),
+                b"",
+                &header(&req, "signature-input"),
+                &header(&req, "signature"),
+                &header(&req, "content-digest"),
+            )
+            .expect("client GET signature must verify under the node's verifier");
+
+            // Phase-2 pack POST (real body).
+            let post_url = format!("http://node.example/zOwner/myrepo/{service}");
+            let req = build_pack_post_request(&client, &post_url, service, &body, Some(&kp))
+                .body(body.clone())
+                .build()
+                .unwrap();
+            let pq = path_and_query(&req);
+            node_verifies(
+                "POST",
+                &pq,
+                &body,
+                &header(&req, "signature-input"),
+                &header(&req, "signature"),
+                &header(&req, "content-digest"),
+            )
+            .expect("client POST signature must verify under the node's verifier");
+
+            // Negative: a tampered @path (the A1 attack surface) must NOT verify.
+            let tampered = pq.replace(service, "git-evil");
+            assert!(
+                node_verifies(
+                    "POST",
+                    &tampered,
+                    &body,
+                    &header(&req, "signature-input"),
+                    &header(&req, "signature"),
+                    &header(&req, "content-digest"),
+                )
+                .is_err(),
+                "a tampered @path must fail verification"
+            );
+        }
+
+        // #117: a multi-round POST body (wants + flush + accumulated haves + done)
+        // signs and verifies over its EXACT bytes. Each per-round POST a private
+        // fetch emits is a different accumulated body, and build_pack_post_request
+        // signs the same bytes it sends, so every round is independently accepted
+        // by the node verifier, not just the single-round `done` body.
+        let mut acc = Vec::new();
+        acc.extend_from_slice(&pkt(&format!(
+            "want {} multi_ack_detailed side-band-64k\n",
+            "a".repeat(40)
+        )));
+        acc.extend_from_slice(b"0000");
+        acc.extend_from_slice(&pkt(&format!("have {}\n", "1".repeat(40))));
+        acc.extend_from_slice(&pkt(&format!("have {}\n", "2".repeat(40))));
+        acc.extend_from_slice(&pkt("done\n"));
+        let post_url = "http://node.example/zOwner/myrepo/git-upload-pack";
+        let req = build_pack_post_request(&client, post_url, "git-upload-pack", &acc, Some(&kp))
+            .body(acc.clone())
+            .build()
+            .unwrap();
+        node_verifies(
+            "POST",
+            &path_and_query(&req),
+            &acc,
+            &header(&req, "signature-input"),
+            &header(&req, "signature"),
+            &header(&req, "content-digest"),
+        )
+        .expect("a multi-round accumulated POST body must verify under the node's verifier");
+    }
+
+    #[test]
+    fn parse_standard_url() {
+        let (did, owner, repo) = parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo").unwrap();
+        assert_eq!(did, "did:key:z6MkFoo123");
+        assert_eq!(owner, "z6MkFoo123");
+        assert_eq!(repo, "my-repo");
+    }
+
+    #[test]
+    fn parse_url_strips_dot_git() {
+        let (_, _, repo) = parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo.git").unwrap();
+        assert_eq!(repo, "my-repo");
+    }
+
+    #[test]
+    fn parse_url_requires_scheme() {
+        assert!(parse_gitlawb_url("http://example.com/repo").is_err());
+    }
+
+    #[test]
+    fn parse_url_requires_repo_segment() {
+        assert!(parse_gitlawb_url("gitlawb://did:key:z6MkFoo123").is_err());
+    }
+
+    #[test]
+    fn strip_service_line() {
+        // Simulate: pkt-line("# service=git-upload-pack\n") + "0000" + b"actual-refs"
+        let service_line = "# service=git-upload-pack\n";
+        let pkt_len = service_line.len() + 4;
+        let header = format!("{:04x}{}", pkt_len, service_line);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(b"0000");
+        bytes.extend_from_slice(b"actual-refs");
+
+        let stripped = strip_service_announcement(&bytes);
+        assert_eq!(stripped, b"actual-refs");
+    }
+
+    #[test]
+    fn extract_url_path() {
+        assert_eq!(
+            url_path("http://127.0.0.1:7545/z6Mk/myrepo/git-receive-pack"),
+            "/z6Mk/myrepo/git-receive-pack"
+        );
+    }
+
+    #[test]
+    fn http_error_message_sanitizes_response_body_controls() {
+        let message = http_error_message(
+            "GET",
+            "/info/refs",
+            reqwest::StatusCode::BAD_GATEWAY,
+            "\u{1b}[2Jrepository\r\nis\tblocked\u{7}",
+            None,
+        );
+
+        assert!(message.contains("repository is blocked"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains('\u{7}'));
+        assert!(!message.contains('\r'));
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn http_error_message_strips_bidi_format_controls() {
+        // Each Cf bidi class must be stripped (INV-6, #183), not just U+202E:
+        // override (RLO), embedding + pop (LRE/PDF), isolate (LRI/PDI), and marks
+        // (LRM/ALM). Asserted per code point so a partial predicate fails loudly.
+        // The visible words must survive and JOIN with no phantom space at the
+        // strip points: a bidi char is dropped like a control byte, but unlike a
+        // newline/tab it is not whitespace, so it must not set pending_space. The
+        // leading bidi char (index 0) also exercises the empty-excerpt path.
+        let body = "\u{202e}err\u{202a}\u{202c}\u{2066}\u{2069}\u{200e}\u{061c}ok";
+        let message = http_error_message(
+            "GET",
+            "/info/refs",
+            reqwest::StatusCode::BAD_GATEWAY,
+            body,
+            None,
+        );
+        for c in [
+            '\u{202e}', '\u{202a}', '\u{202c}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{061c}',
+        ] {
+            assert!(
+                !message.contains(c),
+                "bidi U+{:04X} leaked: {message:?}",
+                c as u32
+            );
+        }
+        assert!(
+            message.contains("errok"),
+            "words should join with no phantom space: {message:?}"
+        );
+    }
+
+    #[test]
+    fn http_error_message_preserves_legitimate_and_rtl_text() {
+        // Must not over-strip: plain text, a genuine RTL SCRIPT letter (Arabic
+        // U+0627, category Lo), and ZWJ (U+200D, a legitimate Cf char) survive.
+        let message = http_error_message(
+            "GET",
+            "/info/refs",
+            reqwest::StatusCode::BAD_GATEWAY,
+            "ok \u{0627}\u{200D}b",
+            None,
+        );
+        assert!(
+            message.ends_with("ok \u{0627}\u{200D}b"),
+            "legitimate text was altered: {message:?}"
+        );
+    }
+
+    #[test]
+    fn http_error_message_truncates_long_response_body() {
+        let body = "x".repeat(MAX_ERROR_BODY_CHARS + 100);
+        let message = http_error_message(
+            "POST",
+            "/git-receive-pack",
+            reqwest::StatusCode::FORBIDDEN,
+            &body,
+            None,
+        );
+        let prefix = "POST /git-receive-pack returned 403 Forbidden: ";
+
+        assert_eq!(message.len(), prefix.len() + MAX_ERROR_BODY_CHARS);
+        assert!(message.starts_with(prefix));
+    }
+
+    #[test]
+    fn connect_get_error_includes_response_body() {
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /z6Mk/myrepo/info/refs?service=git-upload-pack HTTP/1.1",
+            status: "404 Not Found",
+            body: r#"{"message":"repository is not registered on this node"}"#,
+        }]);
+
+        let repo_base = format!("{base_url}/z6Mk/myrepo");
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = handle_connect(&repo_base, "git-upload-pack", None, &mut stdin).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("GET /info/refs returned 404 Not Found"));
+        assert!(message.contains("repository is not registered on this node"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn connect_error_strips_bidi_from_response_body() {
+        // Transport-path proof: a bidi override in the node's real HTTP error body
+        // must not reach the surfaced error text. Drives the full handle_connect
+        // error path, not just the safe_error_body_excerpt unit boundary (INV-6).
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /z6Mk/myrepo/info/refs?service=git-upload-pack HTTP/1.1",
+            status: "404 Not Found",
+            body: "not\u{202e}found",
+        }]);
+
+        let repo_base = format!("{base_url}/z6Mk/myrepo");
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = handle_connect(&repo_base, "git-upload-pack", None, &mut stdin).unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            !message.contains('\u{202e}'),
+            "bidi override reached the terminal: {message:?}"
+        );
+        assert!(
+            message.contains("notfound"),
+            "body should survive with the bidi char stripped: {message:?}"
+        );
+        let _ = server.join();
+    }
+
+    #[test]
+    fn connect_post_error_includes_response_body() {
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /z6Mk/myrepo/info/refs?service=git-receive-pack HTTP/1.1",
+                status: "200 OK",
+                body: "",
+            },
+            TestResponse {
+                request_line: "POST /z6Mk/myrepo/git-receive-pack HTTP/1.1",
+                status: "403 Forbidden",
+                body: r#"{"error":"forbidden","message":"push rejected: only the repo owner may push"}"#,
+            },
+        ]);
+
+        let repo_base = format!("{base_url}/z6Mk/myrepo");
+        let mut stdin = std::io::Cursor::new(b"0000".to_vec());
+        let err = handle_connect(&repo_base, "git-receive-pack", None, &mut stdin).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("POST /git-receive-pack returned 403 Forbidden"));
+        assert!(message.contains("push rejected: only the repo owner may push"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("\r\n\r\n0000"));
+    }
+
+    #[test]
+    fn url_path_preserves_query_for_signed_advertisement() {
+        // The Phase-1 advertisement GET is signed over url_path(refs_url), and the
+        // node verifies the signature over its path_and_query, so the ?service=
+        // query MUST survive verbatim or the signatures will not byte-match.
+        assert_eq!(
+            url_path("http://127.0.0.1:7545/z6Mk/myrepo/info/refs?service=git-upload-pack"),
+            "/z6Mk/myrepo/info/refs?service=git-upload-pack"
+        );
+        assert_eq!(
+            url_path("http://127.0.0.1:7545/z6Mk/myrepo/info/refs?service=git-receive-pack"),
+            "/z6Mk/myrepo/info/refs?service=git-receive-pack"
+        );
+    }
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_version_flags() {
+        assert_eq!(
+            classify_args(&args(&["git-remote-twigpine", "--version"])),
+            Invocation::Version
+        );
+        assert_eq!(
+            classify_args(&args(&["git-remote-twigpine", "-V"])),
+            Invocation::Version
+        );
+    }
+
+    #[test]
+    fn classify_help_flags() {
+        assert_eq!(
+            classify_args(&args(&["git-remote-twigpine", "--help"])),
+            Invocation::Help
+        );
+        assert_eq!(
+            classify_args(&args(&["git-remote-twigpine", "-h"])),
+            Invocation::Help
+        );
+    }
+
+    #[test]
+    fn classify_normal_helper_invocation() {
+        // How git actually calls us: `<remote-name> <url>`.
+        assert_eq!(
+            classify_args(&args(&[
+                "git-remote-twigpine",
+                "origin",
+                "gitlawb://did:key:z6MkFoo123/my-repo",
+            ])),
+            Invocation::Helper
+        );
+    }
+
+    #[test]
+    fn classify_no_args_is_helper() {
+        // No flag → falls through to the helper path, which reports its own
+        // usage error. `--version`/`--help` must not be inferred from emptiness.
+        assert_eq!(
+            classify_args(&args(&["git-remote-twigpine"])),
+            Invocation::Helper
+        );
+    }
+
+    #[test]
+    fn classify_flag_only_in_first_position() {
+        // A remote literally named "--version" must not be treated as the flag.
+        assert_eq!(
+            classify_args(&args(&["git-remote-twigpine", "origin", "--version",])),
+            Invocation::Helper
+        );
+    }
+
+    #[test]
+    fn version_line_matches_package_metadata() {
+        let line = version_line();
+        assert_eq!(
+            line,
+            format!("git-remote-twigpine {}", env!("CARGO_PKG_VERSION"))
+        );
+        // Single line, no trailing newline (println! adds the newline).
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn help_text_includes_version_and_flags() {
+        let help = help_text();
+        assert!(help.starts_with(&version_line()));
+        assert!(help.contains("--version"));
+        assert!(help.contains("--help"));
+        assert!(help.contains("GITLAWB_NODE"));
+        // The advertised default must be the value the helper actually resolves.
+        assert!(help.contains(DEFAULT_LOCAL_NODE));
+        assert!(help.ends_with('\n'));
+    }
+
+    /// The helper's own resolution must stay the shared one; a site walking back to
+    /// a private literal is exactly the drift the shared function exists to stop.
+    #[test]
+    fn node_base_matches_the_shared_resolver() {
+        // No env manipulation: assert the call site delegates, for the default case.
+        let expected = resolve_transport_node(std::env::var("GITLAWB_NODE").ok().as_deref());
+        assert_eq!(node_base_from_env(), expected);
+        assert_eq!(resolve_transport_node(None), DEFAULT_LOCAL_NODE);
+    }
+
+    // ── #369 delete-only push deadlock ───────────────────────────────────────
+
+    /// A delete-only receive-pack request ends at the command flush; git then
+    /// holds the write pipe open for the report and sends no pack. A reader that
+    /// blocks after the command list reproduces the hang that a Cursor (EOF)
+    /// hides. The read must return at the flush, inside the timeout.
+    #[test]
+    fn delete_only_receive_pack_request_returns_at_command_flush() {
+        let old = "a".repeat(40);
+        let zero = "0".repeat(40);
+        let mut seed = Vec::new();
+        seed.extend_from_slice(&pkt(&format!("{old} {zero} refs/heads/gone\n")));
+        seed.extend_from_slice(b"0000"); // command-list flush; git then blocks
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut reader = BlockAfterSeed {
+            seed: io::Cursor::new(seed),
+            gate: rx,
+        };
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let handle = std::thread::spawn(move || {
+            let _ = done_tx.send(read_receive_pack_request(&mut reader).unwrap());
+        });
+
+        let got = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = tx.send(()); // unblock the reader so the thread can exit
+        let _ = handle.join();
+
+        let body = got.expect(
+            "read_receive_pack_request blocked past the command flush waiting for \
+             a pack a delete-only push never sends (#369)",
+        );
+        assert!(
+            body.ends_with(b"0000"),
+            "the request body keeps the command list and its flush terminator"
+        );
+    }
+
+    /// A push carrying objects still reads the pack through to EOF, and the
+    /// command flush sits between the commands and the pack in the body.
+    #[test]
+    fn receive_pack_request_with_pack_reads_through_eof() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt(&format!(
+            "{old} {new} refs/heads/main\0 report-status-v2\n"
+        )));
+        stream.extend_from_slice(b"0000");
+        stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
+
+        let mut stdin = io::Cursor::new(stream);
+        let body = read_receive_pack_request(&mut stdin).unwrap();
+        let pos = body.windows(4).position(|w| w == b"0000").unwrap();
+        assert_eq!(
+            &body[pos + 4..],
+            b"PACK\x00\x00\x00\x02fakepack",
+            "a non-zero new-oid means the pack follows the flush"
+        );
+    }
+
+    /// A signed delete-only push sends NO command list: the request starts
+    /// with the "push-cert" line, the commands live inside the cert, and the
+    /// cert ends with a "push-cert-end" pkt-line (not a flush). The reader
+    /// must return after push-cert-end without waiting on the pipe.
+    #[test]
+    fn signed_delete_only_push_returns_after_push_cert_end() {
+        let old = "a".repeat(40);
+        let zero = "0".repeat(40);
+        let mut seed = Vec::new();
+        seed.extend_from_slice(&pkt("push-cert\0 report-status-v2 push-cert\n"));
+        seed.extend_from_slice(&pkt("certificate version 0.1\n"));
+        seed.extend_from_slice(&pkt("pusher did:key:z6Mk\n"));
+        seed.extend_from_slice(&pkt("\n")); // empty line ends the headers
+        seed.extend_from_slice(&pkt(&format!("{old} {zero} refs/heads/gone\n")));
+        seed.extend_from_slice(&pkt("sig-line\n"));
+        seed.extend_from_slice(&pkt("push-cert-end\n"));
+        // git now blocks for the report; the pipe stays open.
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut reader = BlockAfterSeed {
+            seed: io::Cursor::new(seed),
+            gate: rx,
+        };
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let handle = std::thread::spawn(move || {
+            let _ = done_tx.send(read_receive_pack_request(&mut reader).unwrap());
+        });
+        let got = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = tx.send(());
+        let _ = handle.join();
+
+        let body = got.expect(
+            "read_receive_pack_request blocked past push-cert-end on a signed \
+             delete-only push (#369)",
+        );
+        assert!(
+            body.windows(6).any(|w| w == b"pusher"),
+            "the cert block is part of the request body"
+        );
+    }
+
+    /// A signed pack-bearing push: cert with the commands inside, then the
+    /// pack. Everything must land in the body.
+    #[test]
+    fn signed_pack_push_keeps_cert_and_pack() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt("push-cert\0 report-status-v2 push-cert\n"));
+        stream.extend_from_slice(&pkt("certificate version 0.1\n"));
+        stream.extend_from_slice(&pkt("\n"));
+        stream.extend_from_slice(&pkt(&format!("{old} {new} refs/heads/main\n")));
+        stream.extend_from_slice(&pkt("push-cert-end\n"));
+        stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
+
+        let mut stdin = io::Cursor::new(stream);
+        let body = read_receive_pack_request(&mut stdin).unwrap();
+        assert!(
+            body.windows(5).any(|w| w == b"PACK\x00"),
+            "the pack follows the cert into the body"
+        );
+    }
+
+    /// A negotiated push-options block is pkt-lines ending in its own flush.
+    /// With no cert it follows the command flush; with a cert it follows
+    /// push-cert-end.
+    #[test]
+    fn receive_pack_request_consumes_a_push_options_block() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt(&format!(
+            "{old} {new} refs/heads/main\0 report-status-v2 push-options\n"
+        )));
+        stream.extend_from_slice(b"0000"); // command flush
+        stream.extend_from_slice(&pkt("ci.skip\n"));
+        stream.extend_from_slice(b"0000"); // options flush
+        stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
+
+        let mut stdin = io::Cursor::new(stream);
+        let body = read_receive_pack_request(&mut stdin).unwrap();
+        assert!(body.windows(7).any(|w| w == b"ci.skip"), "options survived");
+        assert!(
+            body.ends_with(b"PACK\x00\x00\x00\x02fakepack"),
+            "the pack lands after the options block"
+        );
+    }
+
+    /// Cert and options together: the cert comes first and the options block
+    /// sits between push-cert-end and the pack.
+    #[test]
+    fn signed_push_with_options_reads_cert_then_options_then_pack() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&pkt(
+            "push-cert\0 report-status-v2 push-cert push-options\n",
+        ));
+        stream.extend_from_slice(&pkt("certificate version 0.1\n"));
+        stream.extend_from_slice(&pkt("\n"));
+        stream.extend_from_slice(&pkt(&format!("{old} {new} refs/heads/main\n")));
+        stream.extend_from_slice(&pkt("push-cert-end\n"));
+        stream.extend_from_slice(&pkt("ci.skip\n"));
+        stream.extend_from_slice(b"0000"); // options flush
+        stream.extend_from_slice(b"PACK\x00\x00\x00\x02fakepack");
+
+        let mut stdin = io::Cursor::new(stream);
+        let body = read_receive_pack_request(&mut stdin).unwrap();
+        assert!(body.windows(7).any(|w| w == b"ci.skip"), "options survived");
+        assert!(
+            body.ends_with(b"PACK\x00\x00\x00\x02fakepack"),
+            "the pack lands after the options block"
+        );
+    }
+
+    // ── #117 multi-round fetch negotiation ───────────────────────────────────
+
+    /// Encode a git pkt-line: 4-byte hex length (incl. the 4 bytes) + data.
+    fn pkt(data: &str) -> Vec<u8> {
+        format!("{:04x}{}", data.len() + 4, data).into_bytes()
+    }
+
+    /// A realistic capability-bearing opening want line (git puts its capability
+    /// list on the first want), so the multi-round tests exercise the want shape
+    /// real git actually sends, not a bare `want <sha>`.
+    fn want_line(sha: &str) -> Vec<u8> {
+        pkt(&format!(
+            "want {sha} multi_ack_detailed side-band-64k ofs-delta agent=git/2.43\n"
+        ))
+    }
+
+    /// A reader that yields `seed`, then BLOCKS until `gate` fires. Models git
+    /// holding the upload-pack pipe open after a have-batch flush, waiting for the
+    /// server's ACK/NAK before it sends more. A real pipe blocks here; an in-memory
+    /// Cursor would EOF and hide the bug, which is why the pre-#117 tests missed it.
+    struct BlockAfterSeed {
+        seed: io::Cursor<Vec<u8>>,
+        gate: std::sync::mpsc::Receiver<()>,
+    }
+    impl Read for BlockAfterSeed {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.seed.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            let _ = self.gate.recv(); // block like a live pipe; unblock -> EOF
+            Ok(0)
+        }
+    }
+
+    /// #117 primitive contract (matrix item 1): `read_upload_pack_round` returns at
+    /// a flush-terminated batch instead of buffering past it waiting for `done`.
+    /// The pre-#117 `read_upload_pack_request` blocked here (the deadlock). A
+    /// blocking reader proves the return under live-pipe semantics: if the reader
+    /// buffered past the flush it would block on the gate and the test would time out.
+    #[test]
+    fn read_upload_pack_round_returns_on_flush_without_done() {
+        let mut seed = Vec::new();
+        seed.extend_from_slice(&want_line(&"a".repeat(40)));
+        seed.extend_from_slice(b"0000"); // end of wants
+        for i in 0..32u32 {
+            seed.extend_from_slice(&pkt(&format!("have {:040x}\n", i)));
+        }
+        seed.extend_from_slice(b"0000"); // have-batch flush; git awaits ACK, sends NO done
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut reader = BlockAfterSeed {
+            seed: io::Cursor::new(seed),
+            gate: rx,
+        };
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(Vec<u8>, RoundEnd)>();
+        let handle = std::thread::spawn(move || {
+            // Opening round (wants) returns at the first flush; the have batch
+            // returns at the second flush. Neither may block for a `done`.
+            let _wants = read_upload_pack_round(&mut reader).unwrap();
+            let haves = read_upload_pack_round(&mut reader).unwrap();
+            let _ = done_tx.send(haves);
+        });
+
+        let got = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = tx.send(()); // unblock the reader so the thread can exit
+        let _ = handle.join();
+
+        let (batch, end) = got.expect(
+            "read_upload_pack_round blocked past a flush-terminated have-batch \
+             waiting for `done` (multi-round fetch deadlock #117)",
+        );
+        assert_eq!(end, RoundEnd::Flush, "a flush terminates the round");
+        assert!(
+            batch.windows(4).any(|w| w == b"have"),
+            "the have batch content is returned to the caller"
+        );
+    }
+
+    /// #117 core (matrix item 2): a multi-round negotiation issues MORE THAN ONE
+    /// POST, and each POST body is a self-contained stateless-RPC request: wants +
+    /// one flush + every have accumulated so far + exactly one terminator. The
+    /// round-2 body is asserted byte-for-byte, which pins both accumulation (round
+    /// 1's have is present) and the one-terminator invariant (no intermediate flush
+    /// survives). Pre-#117 this was a single POST.
+    #[test]
+    fn multi_round_fetch_posts_each_round_with_accumulated_wants_and_haves() {
+        let want_sha = "a".repeat(40);
+        let have1 = "1".repeat(40);
+        let have2 = "2".repeat(40);
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            // Round 1 (flush-terminated): an ACK/NAK continuation, no pack yet.
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\n",
+            },
+            // Round 2 (done): final response plus the (fake) pack.
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\nPACKfake",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+
+        let wants = want_line(&want_sha);
+        let mut stdin_bytes = Vec::new();
+        stdin_bytes.extend_from_slice(&wants);
+        stdin_bytes.extend_from_slice(b"0000"); // end of wants
+        stdin_bytes.extend_from_slice(&pkt(&format!("have {have1}\n")));
+        stdin_bytes.extend_from_slice(b"0000"); // round-1 flush: git awaits ACK
+        stdin_bytes.extend_from_slice(&pkt(&format!("have {have2}\n")));
+        stdin_bytes.extend_from_slice(&pkt("done\n")); // round-2 terminator
+
+        let mut stdin = io::Cursor::new(stdin_bytes);
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("multi-round fetch should complete");
+
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "GET + two POSTs, one per negotiation round"
+        );
+        assert!(
+            request_body(&requests[1])
+                .windows(want_sha.len())
+                .any(|w| w == want_sha.as_bytes()),
+            "round-1 POST must carry the wants"
+        );
+
+        // Round-2 body: wants + one flush + BOTH haves + done, with no flush
+        // between the haves (the accumulation + one-terminator invariant).
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&wants);
+        expected.extend_from_slice(b"0000");
+        expected.extend_from_slice(&pkt(&format!("have {have1}\n")));
+        expected.extend_from_slice(&pkt(&format!("have {have2}\n")));
+        expected.extend_from_slice(&pkt("done\n"));
+        assert_eq!(
+            request_body(&requests[2]),
+            expected,
+            "round-2 POST body must be wants + flush + all accumulated haves + one done terminator"
+        );
+    }
+
+    /// Extract the HTTP request body (bytes after the header/body separator) from a
+    /// captured request string. pkt-lines are ASCII, so the lossy round-trip is exact.
+    fn request_body(request: &str) -> Vec<u8> {
+        match request.split_once("\r\n\r\n") {
+            Some((_, body)) => body.as_bytes().to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    /// U4 / INV-8 / INV-12: a private-repo multi-round fetch escalates on the 404
+    /// exactly once, then EVERY per-round POST carries the signature. Must-not: no
+    /// round goes out unsigned (an unsigned round 2 would 404 the owner's own fetch).
+    #[test]
+    fn private_multi_round_signs_every_post() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "404 Not Found",
+                body: r#"{"message":"not found"}"#,
+            },
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\n",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\nPACKfake",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = io::Cursor::new(two_round_stdin());
+        handle_connect(&repo_base, "git-upload-pack", Some(&kp), &mut stdin)
+            .expect("private multi-round fetch should complete");
+
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "anon GET, signed GET retry, then two signed POSTs"
+        );
+        assert!(
+            !requests[0].to_lowercase().contains("signature-input"),
+            "first GET is anonymous"
+        );
+        assert!(
+            requests[1].to_lowercase().contains("signature-input"),
+            "GET retry is signed"
+        );
+        assert!(
+            requests[2].to_lowercase().contains("signature-input"),
+            "round-1 POST is signed"
+        );
+        assert!(
+            requests[3].to_lowercase().contains("signature-input"),
+            "round-2 POST is signed: no per-round POST may go out unsigned for a private repo"
+        );
+    }
+
+    /// U4: a public multi-round fetch stays anonymous on EVERY round even with a
+    /// keypair present. Must-not: no round signs (no DID disclosure on a public fetch).
+    #[test]
+    fn public_multi_round_stays_anonymous_every_post() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\n",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\nPACKfake",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = io::Cursor::new(two_round_stdin());
+        handle_connect(&repo_base, "git-upload-pack", Some(&kp), &mut stdin)
+            .expect("public multi-round fetch should complete");
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3, "GET + two POSTs, no retry");
+        for (i, r) in requests.iter().enumerate() {
+            assert!(
+                !r.to_lowercase().contains("signature-input"),
+                "request {i} must stay anonymous on a public fetch"
+            );
+        }
+    }
+
+    /// U4 / INV-8 / INV-12: a denial mid-negotiation (round-2 POST 404) surfaces as
+    /// an error, not a silent empty/successful fetch, and does NOT re-trigger the
+    /// Phase-1 signed-retry escalation (that is a GET-only, Phase-1-only behavior).
+    #[test]
+    fn mid_negotiation_post_denial_surfaces_without_reescalation() {
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\n",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "404 Not Found",
+                body: r#"{"message":"repository is no longer readable"}"#,
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = io::Cursor::new(two_round_stdin());
+        let err = handle_connect(&repo_base, "git-upload-pack", None, &mut stdin).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("POST /git-upload-pack returned 404 Not Found"),
+            "the mid-negotiation denial must surface, not read as an empty/successful fetch"
+        );
+        assert!(message.contains("repository is no longer readable"));
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "GET + two POSTs, then bail: a POST denial must not re-run the Phase-1 escalation"
+        );
+    }
+
+    /// Two-round upload-pack request: wants, flush, have1, flush (round 1), have2,
+    /// done (round 2). Shared by the U4 signing/denial tests.
+    fn two_round_stdin() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&want_line(&"a".repeat(40)));
+        v.extend_from_slice(b"0000");
+        v.extend_from_slice(&pkt(&format!("have {}\n", "1".repeat(40))));
+        v.extend_from_slice(b"0000");
+        v.extend_from_slice(&pkt(&format!("have {}\n", "2".repeat(40))));
+        v.extend_from_slice(&pkt("done\n"));
+        v
+    }
+
+    /// U5 (matrix item 5, plumbing only): the node's withheld-blob path
+    /// (`upload_pack_excluding`) ignores negotiation and answers the first POST
+    /// with NAK plus a full self-contained pack. The helper must forward that
+    /// response and terminate without hanging. Whether REAL git accepts a pack
+    /// where it expected an ACK continuation is U7's real-git scenario, not this
+    /// mock (a Cursor never reacts to the response).
+    #[test]
+    fn withheld_shaped_response_is_forwarded_without_hanging() {
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            // Withheld shape: NAK + full pack on the FIRST POST, negotiation ignored.
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\nPACKfullselfcontainedpack",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        // A single flush-terminated round then EOF: the helper POSTs once, forwards
+        // the NAK+pack, and terminates at EOF rather than looping forever.
+        let mut stdin_bytes = Vec::new();
+        stdin_bytes.extend_from_slice(&want_line(&"a".repeat(40)));
+        stdin_bytes.extend_from_slice(b"0000");
+        stdin_bytes.extend_from_slice(&pkt(&format!("have {}\n", "1".repeat(40))));
+        stdin_bytes.extend_from_slice(b"0000");
+        let mut stdin = io::Cursor::new(stdin_bytes);
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("withheld-shaped fetch should forward the pack and terminate");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "GET + one POST; the forwarded pack does not hang the helper"
+        );
+    }
+
+    /// U6 (matrix item 6): a fresh clone (wants, flush, done) issues exactly ONE POST.
+    #[test]
+    fn fresh_clone_issues_single_post() {
+        let want_sha = "a".repeat(40);
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\nPACKfake",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin_bytes = Vec::new();
+        stdin_bytes.extend_from_slice(&want_line(&want_sha));
+        stdin_bytes.extend_from_slice(b"0000");
+        stdin_bytes.extend_from_slice(&pkt("done\n"));
+        let mut stdin = io::Cursor::new(stdin_bytes);
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("clone should complete");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "fresh clone is exactly one POST");
+        assert!(request_body(&requests[1])
+            .windows(want_sha.len())
+            .any(|w| w == want_sha.as_bytes()));
+    }
+
+    /// U6 (matrix item 6): an up-to-date / flush-only opener issues ZERO POSTs and
+    /// completes without entering an ACK wait.
+    #[test]
+    fn flush_only_opener_skips_post() {
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+            status: "200 OK",
+            body: "0000",
+        }]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = io::Cursor::new(b"0000".to_vec()); // flush only, nothing to fetch
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("up-to-date fetch should complete");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1, "flush-only opener issues no POST");
+    }
+
+    /// U6 (matrix item 6): a single-shot fetch git resolved in one round (wants,
+    /// flush, haves, done, no intermediate flush) issues exactly ONE POST. Must-not:
+    /// the fix must not split a single-shot negotiation into multiple POSTs.
+    #[test]
+    fn single_shot_fetch_is_one_post() {
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\nPACKfake",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin_bytes = Vec::new();
+        stdin_bytes.extend_from_slice(&want_line(&"a".repeat(40)));
+        stdin_bytes.extend_from_slice(b"0000");
+        stdin_bytes.extend_from_slice(&pkt(&format!("have {}\n", "1".repeat(40))));
+        stdin_bytes.extend_from_slice(&pkt(&format!("have {}\n", "2".repeat(40))));
+        stdin_bytes.extend_from_slice(&pkt("done\n")); // done with no intermediate flush
+        let mut stdin = io::Cursor::new(stdin_bytes);
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("fetch should complete");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a single-shot negotiation must be exactly one POST, not split"
+        );
+    }
+
+    /// Hardening: content-free flush pkts between the wants and the first haves do
+    /// not each fire a POST. Real git never sends a bare mid-negotiation flush, but
+    /// a malformed stream must not amplify into one signed POST per empty flush; the
+    /// loop skips them and POSTs only the round that carries haves + done.
+    #[test]
+    fn repeated_bare_flushes_do_not_amplify_posts() {
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\nPACKfake",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin_bytes = Vec::new();
+        stdin_bytes.extend_from_slice(&want_line(&"a".repeat(40)));
+        stdin_bytes.extend_from_slice(b"0000");
+        stdin_bytes.extend_from_slice(b"0000"); // bare flush, no haves
+        stdin_bytes.extend_from_slice(b"0000"); // bare flush, no haves
+        stdin_bytes.extend_from_slice(&pkt(&format!("have {}\n", "1".repeat(40))));
+        stdin_bytes.extend_from_slice(&pkt("done\n"));
+        let mut stdin = io::Cursor::new(stdin_bytes);
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("fetch with stray flushes should complete");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "content-free flushes must not each produce a POST"
+        );
+    }
+
+    // ── Branch-coverage closure: exercise the remaining changed arms ─────────
+
+    /// A reader that fails with a non-EOF io error, to exercise the error
+    /// propagation arm of `read_upload_pack_round` (distinct from a clean EOF).
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("simulated read failure"))
+        }
+    }
+
+    /// G4: a non-EOF read error propagates; it is not swallowed as end-of-stream.
+    #[test]
+    fn read_upload_pack_round_propagates_read_error() {
+        let mut r = FailingReader;
+        assert!(read_upload_pack_round(&mut r).is_err());
+    }
+
+    /// G1: an invalid pkt-line length (1..=3) is rejected rather than underflowing
+    /// `pkt_len - 4`.
+    #[test]
+    fn read_upload_pack_round_rejects_invalid_pkt_length() {
+        let mut r = io::Cursor::new(b"0001".to_vec()); // pkt_len 1, < 4
+        let err = read_upload_pack_round(&mut r).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid pkt-line length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// #192 F5: a non-hex length header (e.g. "zzzz") is a malformed frame and must
+    /// be rejected, not silently collapsed to a 0000 flush.
+    #[test]
+    fn read_upload_pack_round_rejects_non_hex_length() {
+        let mut r = io::Cursor::new(b"zzzzdone\n".to_vec());
+        let err = read_upload_pack_round(&mut r).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("pkt-line"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// #192 F5: a non-UTF-8 length header must be rejected, not treated as a flush.
+    #[test]
+    fn read_upload_pack_round_rejects_non_utf8_length() {
+        let mut r = io::Cursor::new(vec![0xffu8, 0xff, 0xff, 0xff]);
+        let err = read_upload_pack_round(&mut r).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("pkt-line"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// G2: an immediately-empty upload-pack request (EOF at the opening round, with
+    /// a 200 advertisement) skips the POST entirely.
+    #[test]
+    fn upload_pack_empty_request_skips_post() {
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+            status: "200 OK",
+            body: "0000",
+        }]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = io::Cursor::new(Vec::<u8>::new()); // immediate EOF
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("empty upload-pack request should skip the POST");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "empty request must issue the GET only, no POST"
+        );
+    }
+
+    /// G3 (#192, F1): a nonempty have-batch terminated by EOF (no flush, no done)
+    /// means git ABORTED mid-negotiation. The helper must terminate WITHOUT POSTing
+    /// — synthesizing a `done` and sending it would make the node generate and
+    /// stream a full pack (signed, for a private fetch) to a client that has gone
+    /// away. Only a real `done` pkt finalizes the stateless request. RED before the
+    /// fix (the folded `Done | Eof` arm POSTs a synthetic done → 2 requests), GREEN
+    /// after (only the info/refs GET, no upload-pack POST).
+    #[test]
+    fn nonempty_eof_batch_aborts_without_posting() {
+        // Only the info/refs GET is served (serve_http accepts exactly N conns). The
+        // fixed helper makes exactly that one request and stops. The pre-fix code
+        // additionally POSTs the synthetic done; that POST hits the now-closed
+        // listener and errors, so handle_connect returns Err and the `.expect` below
+        // fires — the RED. The fixed code returns Ok with one recorded request.
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+            status: "200 OK",
+            body: "0000",
+        }]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin_bytes = Vec::new();
+        stdin_bytes.extend_from_slice(&want_line(&"a".repeat(40)));
+        stdin_bytes.extend_from_slice(b"0000");
+        stdin_bytes.extend_from_slice(&pkt(&format!("have {}\n", "1".repeat(40))));
+        // No trailing flush or done: the stream just ends (EOF) after the have —
+        // git aborted the negotiation.
+        let mut stdin = io::Cursor::new(stdin_bytes);
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("an aborted (EOF) negotiation is a clean no-op, not an error");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "an aborted EOF must NOT trigger an upload-pack POST (only the info/refs GET)"
+        );
+    }
+
+    /// G5: an empty receive-pack (push) body skips the POST, unchanged from before.
+    #[test]
+    fn receive_pack_empty_body_skips_post() {
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /zOwner/myrepo/info/refs?service=git-receive-pack",
+            status: "200 OK",
+            body: "0000",
+        }]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = io::Cursor::new(Vec::<u8>::new()); // empty push
+        handle_connect(&repo_base, "git-receive-pack", None, &mut stdin)
+            .expect("empty receive-pack should skip the POST");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "empty push must issue the GET only, no POST"
+        );
+    }
+}
+
+#[cfg(test)]
+mod delegated_push_tests {
+    use super::*;
+    use twigpine_core::ucan::{caps, Capability, Ucan};
+
+    #[test]
+    fn invocation_wraps_the_delegation_and_targets_the_node() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)],
+            None,
+        )
+        .expect("issue");
+
+        let invocation =
+            build_invocation(&agent, &node.did(), &delegation, "zowner", "r").expect("wrap");
+
+        assert_eq!(invocation.payload.iss, agent.did(), "the agent invokes");
+        assert_eq!(invocation.payload.aud, node.did(), "the node executes");
+        assert_eq!(
+            invocation.payload.prf.len(),
+            1,
+            "exactly one proof: chains are linear"
+        );
+        assert_eq!(
+            invocation.verify_chain().expect("must verify"),
+            owner.did(),
+            "the chain must still root at the owner after wrapping"
+        );
+    }
+
+    /// An expired delegation cannot be laundered into a live one by wrapping it.
+    ///
+    /// Two independent guards now cover this: the invocation inherits the
+    /// delegation's `exp`, so it is expired on its own terms, AND `verify_chain`
+    /// recurses into the proof and rejects it there. Inheriting the expiry is what
+    /// keeps the node's "every link must be bounded" rule satisfiable — a leaf with
+    /// no expiry would be refused outright.
+    #[test]
+    fn an_expired_delegation_cannot_be_laundered_by_wrapping_it() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let expired = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new("gitlawb://repos/zowner/r", caps::GIT_PUSH)],
+            Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        )
+        .expect("issue expired");
+
+        let invocation =
+            build_invocation(&agent, &node.did(), &expired, "zowner", "r").expect("wrap");
+
+        assert_eq!(
+            invocation.payload.exp, expired.payload.exp,
+            "the invocation inherits the delegation's expiry, never a longer one"
+        );
+        assert!(
+            !invocation.chain_lifetime_is_bounded() || invocation.is_expired(),
+            "an inherited expiry in the past leaves the invocation expired"
+        );
+        let err = invocation
+            .verify_chain()
+            .expect_err("an expired proof must fail the chain");
+        assert!(
+            err.to_string().contains("expired"),
+            "the failure must name expiry, got: {err}"
+        );
+    }
+
+    /// The shipping combination: the owner issues with the FULL DID (what
+    /// `RUN-A-NODE.md` instructs), while the push URL yields the BARE key
+    /// (`parse_gitlawb_url` takes the last colon-delimited segment). Comparing the
+    /// whole resource string never matches, so the delegation is not found, no
+    /// `X-Ucan` is sent, and the delegate gets a 403 telling them to obtain the
+    /// delegation they are already holding.
+    #[test]
+    fn build_invocation_matches_a_full_did_delegation_against_a_bare_owner() {
+        use twigpine_core::ucan::{caps, Capability, Ucan};
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let full = owner.did().to_string();
+        let bare = full.strip_prefix("did:key:").unwrap().to_string();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{full}/r"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+        )
+        .expect("issue");
+
+        let invocation = build_invocation(&agent, &node.did(), &delegation, &bare, "r")
+            .expect("a full-DID delegation must match a bare-owner push URL");
+
+        // The narrowed capability must keep the parent's exact `with`: the node's
+        // `is_attenuated_by` compares it by equality, so emitting the bare form under
+        // a full-DID parent would fail attenuation and be refused at the node.
+        assert_eq!(
+            invocation.payload.att[0].with,
+            format!("gitlawb://repos/{full}/r"),
+            "narrowing must not rewrite a resource that already names this repo"
+        );
+        assert!(
+            invocation.payload.att[0].is_attenuated_by(&delegation.payload.att[0]),
+            "the narrowed capability must still attenuate under its parent"
+        );
+    }
+
+    /// A delegation issued against the remote's spelling (`r.git`) still mints
+    /// an invocation for the canonical repo: the URL split strips the suffix
+    /// the same way the matcher does, so the stored token is found and the
+    /// chain check passes.
+    #[test]
+    fn build_invocation_accepts_a_git_suffixed_capability() {
+        use twigpine_core::ucan::{caps, Capability, Ucan};
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_did}/r.git"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+        )
+        .expect("issue");
+
+        let invocation = build_invocation(&agent, &node.did(), &delegation, &owner_did, "r")
+            .expect("a .git capability must grant push to the canonical repo");
+        assert_eq!(
+            invocation.payload.att[0].with,
+            format!("gitlawb://repos/{owner_did}/r.git"),
+            "the parent's resource is kept verbatim so attenuation still holds"
+        );
+    }
+
+    /// A wildcard delegation is refused locally now, rather than narrowed.
+    ///
+    /// Narrowing `*` to the pushed repo is what let one delegation reach every
+    /// repository the owner had or later created: the node saw a concrete leaf and
+    /// the `*` proof behind it satisfied attenuation. The node now requires every
+    /// link to name the repository, so minting from a wildcard could only produce a
+    /// push refused remotely with a vaguer message. Failing here says why.
+    #[test]
+    fn build_invocation_refuses_a_wildcard_delegation() {
+        use twigpine_core::ucan::{caps, Capability, Ucan};
+
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .expect("issue");
+
+        assert!(
+            build_invocation(&agent, &node.did(), &delegation, "z6MkOwner", "r").is_err(),
+            "a bare wildcard cannot be narrowed into a usable invocation any more"
+        );
+    }
+
+    /// A stored two-link delegation whose leaf names this repo but whose proof is
+    /// `*`. The leaf alone would select fine; the node's chain walk refuses it, so
+    /// the helper refuses it first with a message that says why.
+    #[test]
+    fn build_invocation_refuses_a_concrete_leaf_on_a_wildcard_proof() {
+        use twigpine_core::ucan::{caps, Capability, Ucan};
+
+        let owner = Keypair::generate();
+        let intermediary = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let owner_bare = owner
+            .did()
+            .to_string()
+            .strip_prefix("did:key:")
+            .unwrap()
+            .to_string();
+
+        let proof = Ucan::issue(
+            &owner,
+            intermediary.did(),
+            vec![Capability::new("*", caps::GIT_PUSH)],
+            Some(hour),
+        )
+        .expect("issue");
+        let stored = Ucan::delegate(
+            &intermediary,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_bare}/r"),
+                caps::GIT_PUSH,
+            )],
+            Some(hour),
+            &proof,
+        )
+        .expect("re-delegate");
+
+        let err = build_invocation(&agent, &node.did(), &stored, &owner_bare, "r")
+            .expect_err("a wildcard proof must fail closed in the helper");
+        assert!(
+            err.to_string().contains("every link"),
+            "the message must point at the chain, not the leaf: {err}"
+        );
+    }
+
+    /// A delegation holding both a constrained and an unconstrained grant must work
+    /// regardless of their order. The node refuses a constrained leaf outright, so
+    /// picking merely the FIRST push-class capability made a valid delegation
+    /// succeed or fail purely on how the owner happened to order `att`.
+    #[test]
+    fn build_invocation_skips_a_constrained_capability_in_either_order() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let hour = chrono::Utc::now() + chrono::Duration::hours(1);
+        let resource = "gitlawb://repos/z6MkOwner/r";
+
+        let mut constrained = Capability::new(resource, caps::GIT_PUSH);
+        constrained.constraints = Some(serde_json::json!({"max_bytes": 1}));
+        let usable = Capability::new(resource, caps::GIT_PUSH);
+
+        for (label, att) in [
+            (
+                "constrained first",
+                vec![constrained.clone(), usable.clone()],
+            ),
+            ("usable first", vec![usable.clone(), constrained.clone()]),
+        ] {
+            let delegation = Ucan::issue(&owner, agent.did(), att, Some(hour)).expect("issue");
+            let invocation = build_invocation(&agent, &node.did(), &delegation, "z6MkOwner", "r")
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(
+                invocation.payload.att[0].constraints.is_none(),
+                "{label}: the invocation must carry the capability the node can authorize"
+            );
+        }
+
+        // With ONLY a constrained grant there is nothing the node would accept, so
+        // failing here beats minting an invocation guaranteed to be refused.
+        let only_constrained =
+            Ucan::issue(&owner, agent.did(), vec![constrained], Some(hour)).expect("issue");
+        assert!(
+            build_invocation(&agent, &node.did(), &only_constrained, "z6MkOwner", "r").is_err(),
+            "a delegation with no unconstrained grant must not produce an invocation"
+        );
+    }
+
+    #[test]
+    fn split_pack_post_url_separates_origin_owner_and_repo() {
+        assert_eq!(
+            split_pack_post_url("http://127.0.0.1:7545/z6Mk/myrepo.git/git-receive-pack"),
+            Some((
+                "http://127.0.0.1:7545".to_string(),
+                "z6Mk".to_string(),
+                "myrepo".to_string()
+            )),
+            "the origin must come back intact so the node DID can be fetched from it"
+        );
+        // A reverse-proxied GITLAWB_NODE carries a path prefix, which survives into
+        // the pack URL through `repo_base`. Reading the FIRST two segments as
+        // owner/repo makes the prefix the owner: the delegation lookup misses, the
+        // DID probe hits the wrong URL, no X-Ucan is sent, and a valid delegate is
+        // refused with 403 — silently, because every failure here is best-effort.
+        assert_eq!(
+            split_pack_post_url("https://host/gitlawb/z6Mk/myrepo/git-receive-pack"),
+            Some((
+                "https://host/gitlawb".to_string(),
+                "z6Mk".to_string(),
+                "myrepo".to_string()
+            )),
+            "a path-prefixed node base must keep its prefix and still find owner/repo"
+        );
+        assert_eq!(
+            split_pack_post_url("https://host/a/b/c/z6Mk/myrepo/git-receive-pack"),
+            Some((
+                "https://host/a/b/c".to_string(),
+                "z6Mk".to_string(),
+                "myrepo".to_string()
+            )),
+            "prefix depth is not fixed"
+        );
+        // The .git suffix is optional on the wire; the delegation is stored under
+        // the bare repo name either way, so both forms must resolve identically.
+        assert_eq!(
+            split_pack_post_url("https://node.example/z6Mk/myrepo/git-receive-pack")
+                .map(|(_, _, r)| r),
+            Some("myrepo".to_string())
+        );
+        // A repo genuinely named "x.git" keeps its name: only one suffix is stripped.
+        assert_eq!(
+            split_pack_post_url("https://node.example/z6Mk/x.git.git/git-receive-pack")
+                .map(|(_, _, r)| r),
+            Some("x.git".to_string())
+        );
+        for bad in [
+            "not-a-url",
+            "https://node.example",
+            "https://node.example/",
+            "https://node.example/onlyowner",
+            // A traversing owner would read an arbitrary file and send it to the
+            // node as X-Ucan, so it must not resolve to a lookup at all.
+            "https://node.example/../../etc/passwd/git-receive-pack",
+            "https://node.example/../x/git-receive-pack",
+            "https://node.example/a%2Fb/x/git-receive-pack",
+        ] {
+            assert!(
+                split_pack_post_url(bad).is_none(),
+                "{bad} must not parse as a pack POST URL"
+            );
+        }
+    }
+
+    #[test]
+    fn delegation_path_matches_the_gl_layout() {
+        let base = std::path::Path::new("/tmp/id");
+        let expected = base.join("delegations").join("z6MkAbc__myrepo.ucan");
+        assert_eq!(delegation_path(base, "did:key:z6MkAbc", "myrepo"), expected);
+        assert_eq!(delegation_path(base, "z6MkAbc", "myrepo"), expected);
+    }
+
+    // ── delegation_header ─────────────────────────────────────────────────────
+    //
+    // Everything above tests one piece in isolation. `delegation_header` is where
+    // they compose — URL split, owner comparison, store lookup, node-DID probe,
+    // invocation build — and it is the piece with no safety net: every failure
+    // inside it is deliberately silent, so a regression does not fail loudly, it
+    // just stops attaching `X-Ucan` and the delegate starts getting 403s with no
+    // local explanation.
+
+    /// `delegation_header` resolves its store from `GITLAWB_KEY`, which is
+    /// process-global. Every test that sets it, and every test that reaches the
+    /// resolver, takes this lock. `pub(crate)` so `tests::` cases that reach the
+    /// resolver without setting the variable can serialize their read too.
+    pub(crate) static KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point `GITLAWB_KEY` at `dir/identity.pem` for the duration of `f`, so the
+    /// delegation store resolves to `dir/delegations`. The restore runs on drop:
+    /// a panic inside `f` cannot leak the tempdir path into later tests.
+    pub(crate) fn with_identity_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("GITLAWB_KEY", v),
+                    None => std::env::remove_var("GITLAWB_KEY"),
+                }
+            }
+        }
+        let _guard = KEY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = Restore(std::env::var_os("GITLAWB_KEY"));
+        std::env::set_var("GITLAWB_KEY", dir.join("identity.pem"));
+        f()
+    }
+
+    /// Write a token where `twigpine ucan import` would have left it.
+    fn store_delegation(dir: &std::path::Path, owner: &str, repo: &str, raw: &str) {
+        let path = delegation_path(dir, owner, repo);
+        std::fs::create_dir_all(path.parent().expect("delegations dir")).expect("mkdir");
+        std::fs::write(path, raw).expect("write delegation");
+    }
+
+    fn bare(did: &twigpine_core::did::Did) -> String {
+        did.to_string()
+            .strip_prefix("did:key:")
+            .expect("did:key")
+            .to_string()
+    }
+
+    fn push_delegation(owner: &Keypair, agent: &Keypair, resource: &str) -> Ucan {
+        Ucan::issue(
+            owner,
+            agent.did(),
+            vec![Capability::new(resource, caps::GIT_PUSH)],
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .expect("issue")
+    }
+
+    fn did_body(node: &Keypair) -> String {
+        format!(r#"{{"did":"{}"}}"#, node.did())
+    }
+
+    #[test]
+    fn delegation_header_wraps_a_stored_delegation_and_targets_the_node() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let owner_key = bare(&owner.did());
+
+        let delegation = push_delegation(&owner, &agent, &format!("gitlawb://repos/{owner_key}/r"));
+
+        let mut server = mockito::Server::new();
+        let did_probe = server
+            .mock("GET", "/")
+            .with_header("content-type", "application/json")
+            .with_body(did_body(&node))
+            .create();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        store_delegation(
+            dir.path(),
+            &owner_key,
+            "r",
+            &delegation.encode().expect("encode"),
+        );
+
+        let post_url = format!("{}/{owner_key}/r/git-receive-pack", server.url());
+        let client = reqwest::blocking::Client::new();
+        let header =
+            with_identity_dir(dir.path(), || delegation_header(&client, &post_url, &agent))
+                .expect("a stored delegation must produce an X-Ucan");
+
+        did_probe.assert();
+
+        let invocation = Ucan::decode(&header).expect("the header must decode as a UCAN");
+        assert_eq!(invocation.payload.iss, agent.did(), "the agent invokes");
+        assert_eq!(
+            invocation.payload.aud,
+            node.did(),
+            "addressed to the node that will execute it"
+        );
+        assert_eq!(
+            invocation.verify_chain().expect("chain must verify"),
+            owner.did(),
+            "the chain must root at the repo owner"
+        );
+        assert!(
+            invocation.chain_lifetime_is_bounded(),
+            "the node refuses an unbounded push chain, so every link must carry an expiry"
+        );
+    }
+
+    /// An expired stored delegation must not become a header: the node would
+    /// refuse it at middleware with a distinguishable error, so the helper
+    /// applies the same refusal import does and pushes without X-Ucan instead.
+    #[test]
+    fn delegation_header_is_omitted_for_an_expired_stored_delegation() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_key = bare(&owner.did());
+
+        let delegation = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{owner_key}/r"),
+                caps::GIT_PUSH,
+            )],
+            Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        )
+        .expect("issue expired delegation");
+
+        let mut server = mockito::Server::new();
+        let did_probe = server
+            .mock("GET", "/")
+            .with_header("content-type", "application/json")
+            .with_body(did_body(&Keypair::generate()))
+            .expect(0)
+            .create();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        store_delegation(
+            dir.path(),
+            &owner_key,
+            "r",
+            &delegation.encode().expect("encode"),
+        );
+
+        let post_url = format!("{}/{owner_key}/r/git-receive-pack", server.url());
+        let client = reqwest::blocking::Client::new();
+        let header =
+            with_identity_dir(dir.path(), || delegation_header(&client, &post_url, &agent));
+        assert!(
+            header.is_none(),
+            "an expired delegation must produce no X-Ucan"
+        );
+        did_probe.assert();
+    }
+
+    /// A store entry past the token-file cap is ignored like an unreadable
+    /// one instead of being read into memory on every push.
+    #[test]
+    fn delegation_header_is_omitted_for_an_oversized_store_entry() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_key = bare(&owner.did());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oversized = "x".repeat((1 << 20) + 1);
+        store_delegation(dir.path(), &owner_key, "r", &oversized);
+
+        let post_url = format!("http://127.0.0.1:1/{owner_key}/r/git-receive-pack");
+        let client = reqwest::blocking::Client::new();
+        let header =
+            with_identity_dir(dir.path(), || delegation_header(&client, &post_url, &agent));
+        assert!(
+            header.is_none(),
+            "an oversize store entry must produce no X-Ucan"
+        );
+    }
+
+    /// The owner pushes on their own authority. The comparison has to survive the
+    /// form mismatch — the keypair holds `did:key:z…`, the URL carries the bare key
+    /// — or the owner takes the delegate path, finds nothing, and pays a node
+    /// round-trip on every push. `.expect(0)` is the assertion that matters here.
+    #[test]
+    fn delegation_header_is_skipped_when_the_pusher_is_the_owner() {
+        let owner = Keypair::generate();
+        let node = Keypair::generate();
+        let owner_key = bare(&owner.did());
+
+        let mut server = mockito::Server::new();
+        let did_probe = server
+            .mock("GET", "/")
+            .with_body(did_body(&node))
+            .expect(0)
+            .create();
+
+        // A delegation the owner does not need. Present so the assertion is about
+        // the owner check and not about an empty store.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate = Keypair::generate();
+        store_delegation(
+            dir.path(),
+            &owner_key,
+            "r",
+            &push_delegation(&owner, &delegate, &format!("gitlawb://repos/{owner_key}/r"))
+                .encode()
+                .expect("encode"),
+        );
+
+        let post_url = format!("{}/{owner_key}/r/git-receive-pack", server.url());
+        let client = reqwest::blocking::Client::new();
+        let header =
+            with_identity_dir(dir.path(), || delegation_header(&client, &post_url, &owner));
+
+        assert!(header.is_none(), "the owner needs no delegation");
+        did_probe.assert();
+    }
+
+    /// Best-effort means best-effort: nothing here may panic or block the push. The
+    /// node decides whether a delegation was required, and its denial has to reach
+    /// the user instead of being pre-empted by a local guess.
+    #[test]
+    fn delegation_header_is_absent_without_a_usable_stored_delegation() {
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let owner_key = bare(&Keypair::generate().did());
+
+        let mut server = mockito::Server::new();
+        let _did = server.mock("GET", "/").with_body(did_body(&node)).create();
+        let post_url = format!("{}/{owner_key}/r/git-receive-pack", server.url());
+        let client = reqwest::blocking::Client::new();
+
+        // Nothing stored at all.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(
+            with_identity_dir(empty.path(), || delegation_header(
+                &client, &post_url, &agent
+            ))
+            .is_none(),
+            "an empty store must yield no header, not an error"
+        );
+
+        // Stored, but not a UCAN — a truncated write or a hand-edited file.
+        let garbage = tempfile::tempdir().expect("tempdir");
+        store_delegation(garbage.path(), &owner_key, "r", "not a ucan");
+        assert!(
+            with_identity_dir(garbage.path(), || delegation_header(
+                &client, &post_url, &agent
+            ))
+            .is_none(),
+            "an unreadable stored token must yield no header, not a panic"
+        );
+
+        // Stored and valid, but for a capability the push path cannot use. `twigpine ucan
+        // import` refuses these now; a store written by an older `twigpine` still holds them.
+        let owner = Keypair::generate();
+        let wrong_owner_key = bare(&owner.did());
+        let unusable = tempfile::tempdir().expect("tempdir");
+        let fetch_only = Ucan::issue(
+            &owner,
+            agent.did(),
+            vec![Capability::new(
+                format!("gitlawb://repos/{wrong_owner_key}/r"),
+                caps::GIT_FETCH,
+            )],
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        )
+        .expect("issue");
+        store_delegation(
+            unusable.path(),
+            &wrong_owner_key,
+            "r",
+            &fetch_only.encode().expect("encode"),
+        );
+        let fetch_url = format!("{}/{wrong_owner_key}/r/git-receive-pack", server.url());
+        assert!(
+            with_identity_dir(unusable.path(), || delegation_header(
+                &client, &fetch_url, &agent
+            ))
+            .is_none(),
+            "a git/fetch delegation carries no push capability to wrap"
+        );
+    }
+
+    /// The node DID addresses the invocation, so without it there is nothing to
+    /// build. A node that is down, slow, or serving something other than JSON must
+    /// cost the push a header, never an abort.
+    #[test]
+    fn delegation_header_is_absent_when_the_node_did_cannot_be_read() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let owner_key = bare(&owner.did());
+        let encoded = push_delegation(&owner, &agent, &format!("gitlawb://repos/{owner_key}/r"))
+            .encode()
+            .expect("encode");
+        let client = reqwest::blocking::Client::new();
+
+        for (label, status, body) in [
+            ("a 500 from the node", 500, "boom"),
+            ("a JSON body with no did", 200, r#"{"name":"gitlawb"}"#),
+            ("an HTML error page from a proxy", 200, "<html>502</html>"),
+            ("a did that does not parse", 200, r#"{"did":"not-a-did"}"#),
+        ] {
+            let mut server = mockito::Server::new();
+            let _did = server
+                .mock("GET", "/")
+                .with_status(status)
+                .with_body(body)
+                .create();
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            store_delegation(dir.path(), &owner_key, "r", &encoded);
+            let post_url = format!("{}/{owner_key}/r/git-receive-pack", server.url());
+
+            assert!(
+                with_identity_dir(dir.path(), || delegation_header(&client, &post_url, &agent))
+                    .is_none(),
+                "{label} must drop the header, not fail the push"
+            );
+        }
+    }
+
+    /// A reverse-proxied `GITLAWB_NODE` carries a path prefix, and that prefix
+    /// survives into the pack URL. `split_pack_post_url` is unit-tested for it, but
+    /// nothing checked that the probe actually goes to the prefixed base — a
+    /// regression there would GET `/` on the proxy host, read whatever landing page
+    /// it serves, and silently drop the header. `.expect(0)` on `/` is the half that
+    /// catches it.
+    #[test]
+    fn delegation_header_probes_the_prefixed_node_base() {
+        let owner = Keypair::generate();
+        let agent = Keypair::generate();
+        let node = Keypair::generate();
+        let owner_key = bare(&owner.did());
+
+        let mut server = mockito::Server::new();
+        let prefixed = server
+            .mock("GET", "/gitlawb")
+            .with_body(did_body(&node))
+            .create();
+        let root = server.mock("GET", "/").expect(0).create();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        store_delegation(
+            dir.path(),
+            &owner_key,
+            "r",
+            &push_delegation(&owner, &agent, &format!("gitlawb://repos/{owner_key}/r"))
+                .encode()
+                .expect("encode"),
+        );
+
+        let post_url = format!("{}/gitlawb/{owner_key}/r/git-receive-pack", server.url());
+        let client = reqwest::blocking::Client::new();
+        let header =
+            with_identity_dir(dir.path(), || delegation_header(&client, &post_url, &agent))
+                .expect("a path-prefixed node base must still yield an X-Ucan");
+
+        prefixed.assert();
+        root.assert();
+        assert_eq!(
+            Ucan::decode(&header).expect("decode").payload.aud,
+            node.did()
+        );
+    }
+}

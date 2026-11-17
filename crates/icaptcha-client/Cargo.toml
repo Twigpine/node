@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-gitlawb-core = { path = "../gitlawb-core" }
+twigpine-core = { path = "../twigpine-core" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

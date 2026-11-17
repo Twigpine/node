@@ -124,6 +124,24 @@ jobs:
       - name: Test release tag resolver
         run: scripts/test-resolve-release-tag.sh
 
+  installer:
+    name: installer checksum enforcement
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # install.sh under sh (dash), dash and bash, and install.ps1 under pwsh,
+      # against a fake release server: a swapped archive with a matching
+      # .sha256 must be refused unless install-checksums.txt lists it.
+      - name: Test install.sh / install.ps1 and the checksum list tool
+        run: |
+          command -v pwsh >/dev/null || { echo "::error::pwsh is missing; install.ps1 would go untested"; exit 1; }
+          sh scripts/test-install.sh
+
   triage-detector:
     name: triage detector matrix
     runs-on: ubuntu-latest
@@ -203,7 +221,7 @@ jobs:
       - name: cargo test (real-node deny harness)
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/gitlawb_test
-        run: cargo test --locked -p gitlawb-node --features test-harness --lib --test deny_harness
+        run: cargo test --locked -p twigpine-node --features test-harness --lib --test deny_harness
 
   build-release:
     name: build --release
@@ -341,10 +359,10 @@ jobs:
           persist-credentials: false
 
       - name: Build image
-        run: docker build -t gitlawb-node:ci-test .
+        run: docker build -t twigpine-node:ci-test .
 
       - name: Smoke test --version
-        run: docker run --rm gitlawb-node:ci-test --version
+        run: docker run --rm twigpine-node:ci-test --version
 
   test-windows:
     name: test (windows, non-blocking)
@@ -352,8 +370,8 @@ jobs:
     if: needs.changes.outputs.windows == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
-    # Non-blocking, mirroring the informational `beta` lane above. We ship `gl`
-    # and `git-remote-gitlawb` to Windows users (release.yml) with zero Windows
+    # Non-blocking, mirroring the informational `beta` lane above. We ship `twigpine`
+    # and `git-remote-twigpine` to Windows users (release.yml) with zero Windows
     # test coverage, so run their suites here to make Windows-only regressions
     # VISIBLE on the PR without gating merge (#228). These two are the client
     # CLIs and depend on no database, so no Postgres service is needed (service
@@ -379,20 +397,20 @@ jobs:
       - name: cargo test (shipped Windows crates)
         shell: bash
         env:
-          # `-p gl -p git-remote-gitlawb`, or whichever of the two a PR affects.
+          # `-p twigpine-cli -p git-remote-twigpine`, or whichever of the two a PR affects.
           PACKAGES: ${{ needs.changes.outputs.windows_packages }}
         run: |
           # shellcheck disable=SC2086 # PACKAGES is a word list by design
           cargo test --locked $PACKAGES
 
-  # gitlawb-core is embedded by every consumer (gl, git-remote-gitlawb, the node
-  # daemon), so it must stay lean. This gate fails if gitlawb-core's normal
+  # twigpine-core is embedded by every consumer (twigpine, git-remote-twigpine, the node
+  # daemon), so it must stay lean. This gate fails if twigpine-core's normal
   # (non-dev, non-build) dependency tree gains any crate not on the allowlist in
-  # ci/gitlawb-core-allowed-deps.txt. Exhaustive-by-construction: a new heavy
+  # ci/twigpine-core-allowed-deps.txt. Exhaustive-by-construction: a new heavy
   # dependency reds CI whether or not anyone thought to ban it, which a denylist
   # cannot do. Regen instructions live in the allowlist header.
   core-deps-purity:
-    name: gitlawb-core dependency purity
+    name: twigpine-core dependency purity
     needs: changes
     if: needs.changes.outputs.core_deps == 'true'
     runs-on: ubuntu-latest
@@ -413,8 +431,8 @@ jobs:
         with:
           key: core-deps-purity
 
-      - name: Check gitlawb-core dependency allowlist
-        run: bash scripts/check-gitlawb-core-deps.sh
+      - name: Check twigpine-core dependency allowlist
+        run: bash scripts/check-twigpine-core-deps.sh
 
   # release-please only rewrites a crate's version when the line carries the
   # `# x-release-please-version` annotation AND the manifest is listed under

@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "GitlawbNode",
+    name: "TwigpineNode",
     platforms: [.macOS(.v13)],
     targets: [
         .executableTarget(
-            name: "GitlawbNode",
-            path: "Sources/GitlawbNode",
+            name: "TwigpineNode",
+            path: "Sources/TwigpineNode",
             exclude: ["Info.plist"],
             resources: [
                 .copy("Resources/docker-compose.yml"),

@@ -45,7 +45,7 @@ queries retain their activity ordering.
 Every GraphQL document is validated against two budgets before any resolver
 runs. Both apply per document (per request), not per client: `/graphql` has
 no per-caller rate limiting, so a rejected document can always be retried
-smaller. The constants live in `crates/gitlawb-node/src/graphql/mod.rs`.
+smaller. The constants live in `crates/twigpine-node/src/graphql/mod.rs`.
 
 - **Complexity budget: 400 per document** (`GRAPHQL_MAX_COMPLEXITY`). Each
   root field carries a base cost plus the clamped page size plus the selected

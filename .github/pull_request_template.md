@@ -28,7 +28,7 @@ Closes #
 ## What changed
 
 <!-- Bullet the concrete changes. Note the crate(s) touched:
-     gitlawb-core / gitlawb-node / gl / git-remote-gitlawb -->
+     twigpine-core / twigpine-node / twigpine-cli / git-remote-twigpine -->
 
 -
 

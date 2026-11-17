@@ -1,8 +1,8 @@
 # Storage and pinning
 
 How a gitlawb node's **optional post-push pinning tiers** work. This documents
-the behavior implemented in `crates/gitlawb-node/src/ipfs_pin.rs` and
-`crates/gitlawb-node/src/pinata.rs`; it does not change any behavior. Primary
+the behavior implemented in `crates/twigpine-node/src/ipfs_pin.rs` and
+`crates/twigpine-node/src/pinata.rs`; it does not change any behavior. Primary
 git storage for clone/fetch lives in bare repos under `GITLAWB_REPOS_DIR`
 (with optional `GITLAWB_TIGRIS_BUCKET` backing), covered in the README
 Configuration table.
@@ -120,5 +120,5 @@ successful upload, can still cause a repeat upload attempt.
 ## See also
 
 - [RUN-A-NODE.md](RUN-A-NODE.md): provisioning and running a node
-- `crates/gitlawb-node/src/ipfs_pin.rs`: hot-tier implementation
-- `crates/gitlawb-node/src/pinata.rs`: warm-tier implementation
+- `crates/twigpine-node/src/ipfs_pin.rs`: hot-tier implementation
+- `crates/twigpine-node/src/pinata.rs`: warm-tier implementation

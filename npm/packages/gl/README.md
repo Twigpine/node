@@ -24,10 +24,10 @@ Native Windows is not supported via npm — use the PowerShell installer below.
 
 ```bash
 # Homebrew
-brew install gitlawb/tap/gl
+brew install twigpine/tap/gl
 
 # curl (macOS / Linux)
-curl -sSf https://twigpine.com/install.sh | sh
+curl -fsSL https://twigpine.com/install.sh | sh
 
 # PowerShell (Windows)
 irm https://twigpine.com/install.ps1 | iex

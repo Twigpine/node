@@ -14,7 +14,7 @@ ignore = [
     # rsa 0.9.10 (Marvin timing sidechannel). Present in Cargo.lock because sqlx
     # resolves sqlx-mysql unconditionally, and sqlx-mysql depends on rsa. cargo
     # audit scans the lockfile, so it flags rsa even though it is NOT linked into
-    # our binary: sqlx is built postgres-only (crates/gitlawb-node/Cargo.toml),
+    # our binary: sqlx is built postgres-only (crates/twigpine-node/Cargo.toml),
     # so the MySQL RSA auth path is never compiled and there is no RSA oracle to
     # attack. No upstream fix exists regardless. REMOVE this ignore if sqlx is
     # ever built with the `mysql` feature, or any other consumer of rsa enters
@@ -43,10 +43,10 @@ ignore = [
     # crypto-bigint 0.5.5 (secret-dependent branches in operations meant
     # to be constant-time). REACHABLE accepted risk, on two paths:
     # - alloy-signer -> elliptic-curve 0.13 -> crypto-bigint 0.5: the k256
-    #   PrivateKeySigner that signs transactions in `gl name`
-    #   (crates/gl/src/name.rs) and the node operator
-    #   (crates/gitlawb-node/src/operator.rs).
-    # - aws-sigv4 (`sigv4a` feature, crates/gitlawb-node/Cargo.toml) ->
+    #   PrivateKeySigner that signs transactions in `twigpine name`
+    #   (crates/twigpine-cli/src/name.rs) and the node operator
+    #   (crates/twigpine-node/src/operator.rs).
+    # - aws-sigv4 (`sigv4a` feature, crates/twigpine-node/Cargo.toml) ->
     #   crypto-bigint 0.5 (directly and via p256 0.13): SigV4a key
     #   derivation, used only for requests to endpoints that require SigV4a
     #   (e.g. S3 Multi-Region Access Points).
@@ -62,7 +62,7 @@ ignore = [
     # libsqlite3-sys 0.30.1 (bundled SQLite WAL uninitialized-memory disclosure,
     # CVE-2026-119375). Present in Cargo.lock because sqlx resolves sqlx-sqlite
     # unconditionally; sqlx is built postgres-only
-    # (crates/gitlawb-node/Cargo.toml), so sqlx-sqlite and its bundled SQLite C
+    # (crates/twigpine-node/Cargo.toml), so sqlx-sqlite and its bundled SQLite C
     # source are never compiled or linked (`cargo tree -i sqlx-sqlite` prints
     # nothing) and there is no reachable WAL open to attack. The fix requires
     # libsqlite3-sys >= 0.39, but sqlx-sqlite 0.8.6 pins ^0.30.1; a compatible
