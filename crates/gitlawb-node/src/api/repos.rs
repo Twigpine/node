@@ -528,7 +528,10 @@ pub async fn list_commits(
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let head_ref = store::resolve_head(&disk_path, &record.default_branch);
-    let commits = store::log(&disk_path, &head_ref, 30).unwrap_or_default();
+    // A read failure is not an empty history: report it rather than answering
+    // a 200 with no commits (#400).
+    let commits =
+        store::log(&disk_path, &head_ref, 30).map_err(|e| AppError::Git(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "commits": commits })))
 }
@@ -19205,6 +19208,91 @@ exit 0
             "the uploaded fork archive must be deleted after the failed insert — the              attempt-fenced delete removes it because it is this attempt's own work"
         );
         mock.shutdown();
+    }
+
+    /// #400: the commits listing must report a damaged ref or object store as
+    /// an error. `unwrap_or_default()` made it answer `200 {"commits": []}`,
+    /// the same silent-empty class the changelog endpoint was fixed for.
+    #[sqlx::test]
+    async fn list_commits_on_damaged_repo_errors_but_serves_healthy_and_unborn(pool: sqlx::PgPool) {
+        let owner = "did:key:zLISTCOMMITSDAMAGEDAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let now = chrono::Utc::now();
+        let seed = |name: &str| crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap()
+                .success());
+        };
+        let repo_dir = |name: &str| {
+            dir.path()
+                .join(owner.replace([':', '/'], "_"))
+                .join(format!("{name}.git"))
+        };
+        let call = |state: &crate::state::AppState, name: &str| {
+            let state = state.clone();
+            let name = name.to_string();
+            async move {
+                super::list_commits(
+                    axum::extract::State(state),
+                    axum::extract::Path((owner.to_string(), name)),
+                    None,
+                )
+                .await
+            }
+        };
+
+        // Healthy: one commit comes back.
+        state.db.create_repo(&seed("ok")).await.unwrap();
+        let ok = repo_dir("ok");
+        std::fs::create_dir_all(&ok).unwrap();
+        git(&["init", "-q", "-b", "main"], &ok);
+        git(&["config", "user.email", "t@t"], &ok);
+        git(&["config", "user.name", "t"], &ok);
+        git(&["commit", "-q", "--allow-empty", "-m", "c1"], &ok);
+        let axum::Json(v) = call(&state, "ok").await.expect("healthy repo lists");
+        assert_eq!(v["commits"].as_array().unwrap().len(), 1);
+
+        // Unborn: a valid empty listing.
+        state.db.create_repo(&seed("unborn")).await.unwrap();
+        let unborn = repo_dir("unborn");
+        std::fs::create_dir_all(&unborn).unwrap();
+        git(&["init", "-q", "-b", "main"], &unborn);
+        let axum::Json(v) = call(&state, "unborn").await.expect("unborn repo lists");
+        assert!(v["commits"].as_array().unwrap().is_empty());
+
+        // Damaged ref (objects intact): must be an error, not an empty 200.
+        state.db.create_repo(&seed("badref")).await.unwrap();
+        let badref = repo_dir("badref");
+        std::fs::create_dir_all(&badref).unwrap();
+        git(&["init", "-q", "-b", "main"], &badref);
+        git(&["config", "user.email", "t@t"], &badref);
+        git(&["config", "user.name", "t"], &badref);
+        git(&["commit", "-q", "--allow-empty", "-m", "c1"], &badref);
+        std::fs::write(badref.join(".git/refs/heads/main"), b"garbage\n").unwrap();
+        let res = call(&state, "badref").await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::Git(_))),
+            "a damaged ref must surface as a git error, not an empty listing"
+        );
     }
 }
 

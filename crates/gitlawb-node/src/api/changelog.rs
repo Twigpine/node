@@ -251,6 +251,33 @@ mod tests {
         );
     }
 
+    /// A damaged branch ref (objects intact) must be a 500: `rev-parse
+    /// --verify --quiet` exits 1 for it just as for an unborn branch, so the
+    /// endpoint cannot treat that exit as an empty history.
+    #[sqlx::test]
+    async fn changelog_on_damaged_branch_ref_returns_500_not_empty_200(pool: PgPool) {
+        let owner = "did:key:zCHANGELOGBADREFAAAAAAAAAAAAAAAAAAAAAA";
+        let dir = TempDir::new().unwrap();
+        let state = seeded_state(&pool, dir.path(), owner, "bad-ref").await;
+        let repo_path = bare_repo_with_commit(dir.path(), owner, "bad-ref");
+        let out = std::process::Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        let head_ref = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let ref_file = repo_path.join(&head_ref);
+        std::fs::create_dir_all(ref_file.parent().unwrap()).unwrap();
+        std::fs::write(&ref_file, b"garbage\n").unwrap();
+
+        let resp = oneshot_changelog(state, owner, "bad-ref").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a malformed branch ref is a git error, not an empty timeline"
+        );
+    }
+
     /// The DB half of the fold: with the pull_requests table gone, list_prs
     /// fails and the endpoint must surface it (503) rather than answering a
     /// 200 with only the git-derived events.
