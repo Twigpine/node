@@ -45,7 +45,7 @@ nothing=(rust=false rust_packages= windows=false windows_packages= docker=false
   audit=false core_deps=false release_versioning=false release_tag=false
   codeql=false 'codeql_matrix={"include":[]}')
 everything=(rust=true rust_packages=--workspace windows=true
-  'windows_packages=-p gl -p git-remote-gitlawb' docker=true audit=true
+  'windows_packages=-p twigpine-cli -p git-remote-twigpine' docker=true audit=true
   core_deps=true release_versioning=true release_tag=true codeql=true)
 all_languages='codeql_matrix={"include":[{"language":"actions","build-mode":"none","runner":"ubuntu-latest"},{"language":"javascript-typescript","build-mode":"none","runner":"ubuntu-latest"},{"language":"rust","build-mode":"none","runner":"ubuntu-latest"},{"language":"swift","build-mode":"autobuild","runner":"macos-latest"}]}'
 rust_only='codeql_matrix={"include":[{"language":"rust","build-mode":"none","runner":"ubuntu-latest"}]}'
@@ -55,16 +55,16 @@ check "docs only" "$(map README.md docs/x.md infra/x.tf)" "${nothing[@]}"
 check "empty input" "$(map)" "${nothing[@]}"
 
 # A crate change tests that crate and its reverse deps, nothing else.
-check "gl source" "$(map crates/gl/src/main.rs)" \
-  rust=true 'rust_packages=-p gl' windows=true 'windows_packages=-p gl' \
+check "twigpine source" "$(map crates/twigpine-cli/src/main.rs)" \
+  rust=true 'rust_packages=-p twigpine-cli' windows=true 'windows_packages=-p twigpine-cli' \
   docker=false audit=false "$rust_only"
-out="$(map crates/gitlawb-core/src/lib.rs)"
-check "gitlawb-core source" "$out" rust=true windows=true \
-  'windows_packages=-p git-remote-gitlawb -p gl' "$rust_only"
-has_packages "gitlawb-core fan-out" "$out" gitlawb-core icaptcha-client \
-  gitlawb-attest git-remote-gitlawb gl gitlawb-node
+out="$(map crates/twigpine-core/src/lib.rs)"
+check "twigpine-core source" "$out" rust=true windows=true \
+  'windows_packages=-p git-remote-twigpine -p twigpine-cli' "$rust_only"
+has_packages "twigpine-core fan-out" "$out" twigpine-core icaptcha-client \
+  twigpine-attest git-remote-twigpine twigpine-cli twigpine-node
 check "icaptcha-client source" "$(map crates/icaptcha-client/src/lib.rs)" \
-  'rust_packages=-p gl -p icaptcha-client' 'windows_packages=-p gl'
+  'rust_packages=-p icaptcha-client -p twigpine-cli' 'windows_packages=-p twigpine-cli'
 
 # Anything the Rust surface cannot attribute to known crates widens.
 check "unknown crate dir" "$(map crates/no-such-crate/src/lib.rs)" \
@@ -76,14 +76,14 @@ check "toolchain file" "$(map rust-toolchain.toml)" rust=true rust_packages=--wo
 
 # Files compiled into a crate from outside crates/.
 check "bootstrap-peers.json" "$(map bootstrap-peers.json)" \
-  rust=true 'rust_packages=-p gitlawb-node' windows=false docker=true
+  rust=true 'rust_packages=-p twigpine-node' windows=false docker=true
 
 # One must-not-skip trigger per non-Rust row.
 check "Dockerfile" "$(map Dockerfile)" docker=true rust=false
-check "crate manifest" "$(map crates/gl/Cargo.toml)" \
-  docker=true release_versioning=true 'rust_packages=-p gl'
+check "crate manifest" "$(map crates/twigpine-cli/Cargo.toml)" \
+  docker=true release_versioning=true 'rust_packages=-p twigpine-cli'
 check "audit config" "$(map .cargo/audit.toml)" audit=true rust_packages=--workspace
-check "core allowlist" "$(map ci/gitlawb-core-allowed-deps.txt)" core_deps=true rust=false
+check "core allowlist" "$(map ci/twigpine-core-allowed-deps.txt)" core_deps=true rust=false
 check "release-please config" "$(map release-please-config.json)" \
   release_versioning=true rust=false
 check "release tag resolver" "$(map scripts/resolve-release-tag.sh)" release_tag=true rust=false
@@ -102,14 +102,14 @@ check "--all" "$("$mapper" --all </dev/null)" "${everything[@]}" "$all_languages
 
 # Names git C-quotes without -z (non-ASCII, tab, quote, newline) still map.
 for name in $'\xc3\xa9.rs' $'a\tb.rs' 'a"b.rs' $'a\nb.rs'; do
-  check "quoted name $(printf %q "$name")" "$(map "crates/gl/src/$name")" \
-    rust=true 'rust_packages=-p gl'
+  check "quoted name $(printf %q "$name")" "$(map "crates/twigpine-cli/src/$name")" \
+    rust=true 'rust_packages=-p twigpine-cli'
 done
 check "non-ASCII swift" "$(map $'macos-app/Sources/Caf\xc3\xa9.swift')" codeql=true \
   'codeql_matrix={"include":[{"language":"swift","build-mode":"autobuild","runner":"macos-latest"}]}'
 
 # Newline-delimited input (git diff without -z) is rejected, not misread.
-if printf 'crates/gl/src/main.rs\n' | "$mapper" >/dev/null 2>&1; then
+if printf 'crates/twigpine-cli/src/main.rs\n' | "$mapper" >/dev/null 2>&1; then
   echo "FAIL newline-delimited input: mapper accepted it" >&2
   failures=$((failures + 1))
 fi

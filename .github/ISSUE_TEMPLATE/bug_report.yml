@@ -35,10 +35,10 @@ body:
     attributes:
       label: Affected crate
       options:
-        - gitlawb-node
-        - gl
-        - git-remote-gitlawb
-        - gitlawb-core
+        - twigpine-node
+        - twigpine-cli
+        - git-remote-twigpine
+        - twigpine-core
         - not sure / other
     validations:
       required: true

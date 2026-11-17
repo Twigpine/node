@@ -9,7 +9,7 @@
 // stale copy.
 //
 // The matrix encodes the review contract for the detector
-// (Gitlawb/node#277): legal Rust separators between the attribute path and
+// (Twigpine/node#277): legal Rust separators between the attribute path and
 // its ]/( delimiter must be accepted (line comments, nested block comments,
 // splits onto immediately following added lines), while unrelated patch
 // records - delimiter-looking lines before the path, later in the hunk, or in

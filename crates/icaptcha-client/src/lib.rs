@@ -11,7 +11,7 @@
 //! the authenticated signer (the node enforces `sub == authenticated DID`).
 //!
 //! Blocking HTTP (reqwest::blocking) so the git remote helper can use it
-//! directly; `gl` (async) calls it via `tokio::task::spawn_blocking`.
+//! directly; `twigpine` (async) calls it via `tokio::task::spawn_blocking`.
 
 use std::io::Read;
 
@@ -64,7 +64,7 @@ fn sanitize_excerpt(s: &str) -> String {
             }
             continue;
         }
-        if gitlawb_core::sanitize::is_bidi_format(ch) {
+        if twigpine_core::sanitize::is_bidi_format(ch) {
             // Drop Cf bidi/format controls (INV-6, #183) without setting
             // pending_space: they are not whitespace, so stripping leaves no
             // phantom gap.

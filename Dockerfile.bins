@@ -1,4 +1,4 @@
-# Builds gl and git-remote-gitlawb for the target platform.
+# Builds twigpine and git-remote-twigpine for the target platform.
 # ARG TARGET must be set: x86_64-unknown-linux-musl or aarch64-unknown-linux-musl
 # Used by scripts/build-bins.sh — not used for node deployment.
 ARG TARGET=x86_64-unknown-linux-musl
@@ -26,9 +26,9 @@ COPY crates/ crates/
 # Configure cross-linker for aarch64
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
 
-RUN cargo build --release --locked --target "$TARGET" -p gl -p git-remote-gitlawb
+RUN cargo build --release --locked --target "$TARGET" -p twigpine-cli -p git-remote-twigpine
 
 FROM debian:bookworm-slim
 ARG TARGET
-COPY --from=builder /build/target/$TARGET/release/gl /gl
-COPY --from=builder /build/target/$TARGET/release/git-remote-gitlawb /git-remote-gitlawb
+COPY --from=builder /build/target/$TARGET/release/twigpine /twigpine
+COPY --from=builder /build/target/$TARGET/release/git-remote-twigpine /git-remote-twigpine

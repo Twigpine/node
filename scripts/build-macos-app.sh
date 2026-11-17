@@ -30,8 +30,8 @@ done
 echo "==> Building Twigpine Node macOS app..."
 
 # Ensure docker-compose.yml resource is up to date
-mkdir -p "$APP_DIR/Sources/GitlawbNode/Resources"
-cp "$ROOT_DIR/docker-compose.yml" "$APP_DIR/Sources/GitlawbNode/Resources/docker-compose.yml"
+mkdir -p "$APP_DIR/Sources/TwigpineNode/Resources"
+cp "$ROOT_DIR/docker-compose.yml" "$APP_DIR/Sources/TwigpineNode/Resources/docker-compose.yml"
 
 # Build with Swift Package Manager
 cd "$APP_DIR"
@@ -45,24 +45,24 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 # Copy binary
-cp "$BUILD_DIR/GitlawbNode" "$APP_BUNDLE/Contents/MacOS/GitlawbNode"
+cp "$BUILD_DIR/TwigpineNode" "$APP_BUNDLE/Contents/MacOS/TwigpineNode"
 
 # Copy Info.plist
-cp "$APP_DIR/Sources/GitlawbNode/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+cp "$APP_DIR/Sources/TwigpineNode/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 
 # Copy bundled resources
 cp "$ROOT_DIR/docker-compose.yml" "$APP_BUNDLE/Contents/Resources/docker-compose.yml"
 
 # Copy app icon
-cp "$APP_DIR/Sources/GitlawbNode/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+cp "$APP_DIR/Sources/TwigpineNode/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 
 # Copy menu bar icon
-cp "$APP_DIR/Sources/GitlawbNode/Resources/MenuBarIcon.png" "$APP_BUNDLE/Contents/Resources/MenuBarIcon.png"
-cp "$APP_DIR/Sources/GitlawbNode/Resources/MenuBarIcon@2x.png" "$APP_BUNDLE/Contents/Resources/MenuBarIcon@2x.png"
+cp "$APP_DIR/Sources/TwigpineNode/Resources/MenuBarIcon.png" "$APP_BUNDLE/Contents/Resources/MenuBarIcon.png"
+cp "$APP_DIR/Sources/TwigpineNode/Resources/MenuBarIcon@2x.png" "$APP_BUNDLE/Contents/Resources/MenuBarIcon@2x.png"
 
 # Copy SPM-bundled resources if they exist
-if [ -d "$BUILD_DIR/GitlawbNode_GitlawbNode.bundle" ]; then
-    cp -R "$BUILD_DIR/GitlawbNode_GitlawbNode.bundle" "$APP_BUNDLE/Contents/Resources/"
+if [ -d "$BUILD_DIR/TwigpineNode_TwigpineNode.bundle" ]; then
+    cp -R "$BUILD_DIR/TwigpineNode_TwigpineNode.bundle" "$APP_BUNDLE/Contents/Resources/"
 fi
 
 echo "==> App bundle created: $APP_BUNDLE"
@@ -91,7 +91,7 @@ fi
 
 # Create DMG
 echo "==> Creating DMG..."
-DMG_PATH="$OUTPUT_DIR/GitlawbNode-macOS.dmg"
+DMG_PATH="$OUTPUT_DIR/TwigpineNode-macOS.dmg"
 rm -f "$DMG_PATH"
 
 # Create a temporary directory for DMG contents
