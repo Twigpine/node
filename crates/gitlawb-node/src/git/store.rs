@@ -867,8 +867,12 @@ fn ref_is_genuinely_absent(repo_path: &Path, refname: &str) -> Result<bool> {
             String::from_utf8_lossy(&listed.stderr).trim()
         );
     }
-    Ok(listed.stdout.iter().all(u8::is_ascii_whitespace)
-        && listed.stderr.iter().all(u8::is_ascii_whitespace))
+    // for-each-ref matches `target` as a pattern, so it also lists refs below
+    // `target/`. Only a line equal to `target` proves the ref itself exists.
+    let exact = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .any(|l| l.trim() == target);
+    Ok(!exact && listed.stderr.iter().all(u8::is_ascii_whitespace))
 }
 
 /// Get commit log for a ref (up to `limit` entries).
@@ -3753,6 +3757,40 @@ mod tests {
 
         // A name that simply is not there is still an empty history.
         assert!(super::log(work, "refs/heads/nope", 10).unwrap().is_empty());
+    }
+
+    /// `for-each-ref <name>` also lists refs below `<name>/`, so a ref that
+    /// is absent while a descendant exists must still read as absent: an
+    /// empty history, not a "present but unreadable" error.
+    #[test]
+    fn log_absent_ref_with_only_a_descendant_ref_is_empty() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work: &Path = td.path();
+        let g = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap()
+                .success());
+        };
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(work.join("f.txt"), b"x\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+        g(&["update-ref", "refs/heads/topic/one", "HEAD"]);
+
+        assert!(
+            super::log(work, "refs/heads/topic", 10).unwrap().is_empty(),
+            "refs/heads/topic does not exist; only refs/heads/topic/one does"
+        );
+        // The descendant itself still resolves and logs normally.
+        assert_eq!(
+            super::log(work, "refs/heads/topic/one", 10).unwrap().len(),
+            1
+        );
     }
 
     /// The rev-parse recheck inside `log` must distinguish "ref missing"
