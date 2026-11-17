@@ -1004,6 +1004,8 @@ jobs:
       # web-sync publishes install.ps1 + version.json, so the Windows ZIP must exist.
       # Windows is best-effort for npm/Homebrew (continue-on-error), so verify the
       # asset is present before advertising a release the site can't actually serve.
+      # The archive checksums are fetched here too: the sync step lists them in
+      # public/install-checksums.txt, which the installers require.
       - name: Verify website release assets
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
@@ -1022,6 +1024,8 @@ jobs:
               exit 1
             }
           done
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'twigpine-node-*.sha256' --dir "$RUNNER_TEMP/sums" --clobber
 
       - name: Sync and open PR
         if: ${{ steps.guard.outputs.enabled == 'true' }}
@@ -1034,6 +1038,11 @@ jobs:
           # Canonical install scripts (source of truth lives in the node repo).
           cp node/install.sh web/public/install.sh
           cp node/install.ps1 web/public/install.ps1
+          # The installers install only archives listed here, and default to its
+          # "# latest:" version. twigpine.com serves it, not GitHub, so merging
+          # and deploying this PR is what releases ${TAG} to installer users.
+          sh node/scripts/update-install-checksums.sh web/public/install-checksums.txt \
+            "$TAG" "$RUNNER_TEMP"/sums/twigpine-node-*.sha256
           # Single version source the site can read.
           printf '{\n  "version": "%s",\n  "tag": "%s"\n}\n' "$VERSION" "$TAG" > web/public/version.json
           # One-time, idempotent drift fixes: drop orphaned binaries, fix stale link.
@@ -1053,12 +1062,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git commit -m "chore: sync Twigpine ${TAG} (install scripts + version)"
+          git commit -m "chore: sync Twigpine ${TAG} (install scripts, checksums, version)"
           # Credentials are not persisted in .git/config; supply the token only for the push.
           git push --force "https://x-access-token:${GH_TOKEN}@github.com/Twigpine/web.git" "HEAD:$branch"
           gh pr create --repo Twigpine/web --head "$branch" \
             --title "Sync Twigpine ${TAG}" \
-            --body "Automated sync from Twigpine/node ${TAG}: install.sh, install.ps1, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). Review and merge to deploy via Vercel." \
+            --body "Automated sync from Twigpine/node ${TAG}: install.sh, install.ps1, public/install-checksums.txt, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). install.sh and install.ps1 install only archives listed in install-checksums.txt, so check the new lines against the release's .sha256 assets before merging, then deploy twigpine.com (the Vercel project is not git-connected)." \
             || {
               # Only swallow the "PR already exists" case; surface auth/API failures
               # (a failed gh pr list must not be misread as "PR exists").

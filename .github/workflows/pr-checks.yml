@@ -124,6 +124,24 @@ jobs:
       - name: Test release tag resolver
         run: scripts/test-resolve-release-tag.sh
 
+  installer:
+    name: installer checksum enforcement
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # install.sh under sh (dash), dash and bash, and install.ps1 under pwsh,
+      # against a fake release server: a swapped archive with a matching
+      # .sha256 must be refused unless install-checksums.txt lists it.
+      - name: Test install.sh / install.ps1 and the checksum list tool
+        run: |
+          command -v pwsh >/dev/null || { echo "::error::pwsh is missing; install.ps1 would go untested"; exit 1; }
+          sh scripts/test-install.sh
+
   triage-detector:
     name: triage detector matrix
     runs-on: ubuntu-latest
