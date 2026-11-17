@@ -4015,7 +4015,8 @@ mod tests {
     /// This makes the marker write SLOW, so a zero bound cannot smuggle it through.
     /// `mark_pin_sources_incomplete` is `UPDATE pinned_cids`, so `pinned_cids` is held
     /// under `ACCESS EXCLUSIVE` from the moment the source record is seen blocking
-    /// (after `is_pinned` and `provenance_for_oid` have read it) until 3s later.
+    /// (after `is_pinned` and `provenance_for_oid` have read it) until 1s after the
+    /// marker write is seen blocked on it.
     ///
     /// The schedule, with a 1.5s budget and `pin_repo_sources` locked for the whole
     /// run so the source record stalls, and with T the time the source record starts
