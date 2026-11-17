@@ -2478,9 +2478,22 @@ mod tests {
     /// The Hash is a fixed, real CID: the timing tests assert on pin counts,
     /// not on the recorded address.
     async fn delaying_endpoint(delays: Vec<Duration>) -> String {
+        delaying_endpoint_notifying(delays).await.0
+    }
+
+    /// `delaying_endpoint` plus a `Notify` that fires once per request, after the
+    /// full upload has been drained and before the delay starts. A test that must
+    /// act while an add is in flight waits on it instead of on a clock a loaded box
+    /// can outrun. `notify_one` stores a permit, so a request that lands before the
+    /// test starts waiting is not lost.
+    async fn delaying_endpoint_notifying(
+        delays: Vec<Duration>,
+    ) -> (String, std::sync::Arc<tokio::sync::Notify>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let received = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = received.clone();
         tokio::spawn(async move {
             let mut seen = 0usize;
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -2489,6 +2502,7 @@ mod tests {
                     .or_else(|| delays.last())
                     .unwrap_or(&Duration::ZERO);
                 seen += 1;
+                let signal = signal.clone();
                 tokio::spawn(async move {
                     let mut acc = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -2512,6 +2526,7 @@ mod tests {
                             }
                         }
                     }
+                    signal.notify_one();
                     tokio::time::sleep(delay).await;
                     let body = br#"{"Hash":"bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4","Size":"12"}
 "#;
@@ -2525,7 +2540,7 @@ mod tests {
                 });
             }
         });
-        endpoint
+        (endpoint, received)
     }
 
     /// A `tracing` sink a test can read back, so the deadline warn can be
@@ -2956,10 +2971,53 @@ mod tests {
     #[cfg(unix)]
     fn write_script(path: &std::path::Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
+        // std has no stable `ErrorKind` for ETXTBSY. EAGAIN is a transient spawn
+        // failure under process pressure; neither means the script ran.
+        const ETXTBSY: i32 = 26;
+        const EAGAIN: i32 = 11;
+        // Every body starts with a shebang. The line inserted after it lets the
+        // settle exec below exit at once without running the body.
+        let (shebang, rest) = body
+            .split_once('\n')
+            .expect("a fake git body starts with a shebang line");
+        let body = format!("{shebang}\nif [ -n \"$FAKE_GIT_SETTLE\" ]; then exit 0; fi\n{rest}");
         std::fs::write(path, body).expect("write fake git");
         let mut perm = std::fs::metadata(path).unwrap().permissions();
         perm.set_mode(0o755);
         std::fs::set_permissions(path, perm).unwrap();
+        // A script written in this process cannot be exec'd while any process still
+        // holds a write descriptor to it. A concurrent test thread that forks while
+        // the descriptor above is open hands the child a copy until the child execs,
+        // so the first exec fails with "Text file busy". Run the script until that
+        // stops, which also proves later execs succeed: nothing reopens the file for
+        // writing.
+        for _ in 0..100 {
+            match std::process::Command::new(path)
+                .env("FAKE_GIT_SETTLE", "1")
+                .status()
+            {
+                Ok(_) => return,
+                Err(e) if matches!(e.raw_os_error(), Some(ETXTBSY | EAGAIN)) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("settle exec of fake git failed: {}: {e}", path.display()),
+            }
+        }
+        panic!(
+            "fake git still ETXTBSY after 100 attempts: {}",
+            path.display()
+        );
+    }
+
+    /// A settle exec that fails for a reason other than ETXTBSY or EAGAIN is a broken
+    /// fixture, not a script that is ready to run. The interpreter below does not
+    /// exist, so the exec fails with ENOENT, which `write_script` must not swallow.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "settle exec of fake git failed")]
+    fn write_script_panics_when_the_settle_exec_fails_for_another_reason() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_script(&tmp.path().join("git"), "#!/nonexistent/interp\nexit 0\n");
     }
 
     /// A `git_bin` wrapper that records every invocation's arguments and then execs
@@ -3092,12 +3150,14 @@ mod tests {
     /// region, a remainder that is nonzero but too small to cover a bounded read's
     /// teardown, and it takes a fixture built to land in it.
     ///
-    /// The arithmetic, with `r` the time one healthy read costs: a 1500ms budget and a
-    /// 700ms upload leave `800 - r` at the top of the second iteration, which is below the
-    /// 1100ms floor for every `r`, while the first iteration's post-read gate needs only
-    /// `r <= 400ms`. So the batch must stop after exactly one object, and it stops on the
-    /// FLOOR rather than on exhaustion: 800ms is still a perfectly nonzero remainder, and a
-    /// zero-floor gate would happily spend it spawning a child it cannot afford to reap.
+    /// The arithmetic, with `r` the time one healthy read costs: a 2500ms budget and a
+    /// 1500ms upload leave `1000 - r` at the top of the second iteration, which is below
+    /// the 1100ms floor for every `r`, while the first iteration's post-read gate needs
+    /// only `r <= 1000ms` (the upload must fit in what the read leaves). So the batch must
+    /// stop after exactly one object, and it stops on the FLOOR rather than on
+    /// exhaustion: up to 1000ms is still a nonzero remainder, and a zero-floor gate would
+    /// happily spend it spawning a child it cannot afford to reap. The budget is that
+    /// large so a read slowed by a loaded box still lands inside it.
     #[cfg(unix)]
     #[sqlx::test]
     async fn pin_new_objects_stops_when_the_remainder_falls_below_the_read_floor(
@@ -3110,7 +3170,7 @@ mod tests {
         let oids = seed_loose_blobs(&repo_path, 3);
         let log = tmp.path().join("calls.log");
         let git_bin = counting_git(tmp.path(), &log);
-        let endpoint = delaying_endpoint(vec![Duration::from_millis(700)]).await;
+        let endpoint = delaying_endpoint(vec![Duration::from_millis(1500)]).await;
 
         let (logs, _guard) = capture_logs();
         let pinned = tokio::time::timeout(
@@ -3123,12 +3183,12 @@ mod tests {
                 oids,
                 &db,
                 "repo-merge-test",
-                Duration::from_millis(1500),
+                Duration::from_millis(2500),
                 None,
             ),
         )
         .await
-        .expect("wedge guard: a 1.5s budget cannot take 30s");
+        .expect("wedge guard: a 2.5s budget cannot take 30s");
 
         // The named property first, so a regression reddens on it rather than on a
         // downstream count that a zero floor also happens to change.
@@ -3391,6 +3451,31 @@ mod tests {
         .await
         .unwrap();
         conn
+    }
+
+    /// Wait until some statement is blocked waiting for a lock on `table`, so a test
+    /// can sequence a second lock behind a stall it has seen start instead of behind a
+    /// clock a loaded box can outrun.
+    async fn wait_for_lock_waiter(pool: &sqlx::PgPool, table: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                 WHERE c.relname = $1 AND NOT l.granted",
+            )
+            .bind(table)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing ever blocked on {table}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn rollback(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) {
@@ -3764,17 +3849,26 @@ mod tests {
     /// floor the post-add record would then be failed by a spent deadline, leaving
     /// bytes in Kubo with no `pinned_cids` row and nothing able to resolve the CID.
     ///
-    /// Fixture: a 2s budget, a 1.7s add, and `pinned_cids` locked from 500ms (well
-    /// after `is_pinned` has read it, and still well before the add returns) until
-    /// 2.4s. The record therefore starts at ~1.72s with ~280ms of budget left and
-    /// needs ~680ms of lock wait to land, which only the `DB_RECORD_GRACE` floor buys
-    /// it.
+    /// Fixture: a 3s budget, a 1.7s add, and `pinned_cids` locked the moment the
+    /// upload arrives (so `is_pinned` has already read it, and the add has not yet
+    /// returned) and held for 3.4s from that point. Call the upload's arrival `r`, the
+    /// git read plus `is_pinned` before it. The record starts at `r + 1.7s` with
+    /// `1.3s - r` of budget left and blocks past the end of the budget, so it needs
+    /// ~1.7s of lock wait to land, which only the `DB_RECORD_GRACE` floor (a bound of
+    /// `r + 3.72s`) buys it. Unfloored, the bound is the 3s batch deadline and the
+    /// blocked write is cancelled `r + 0.4s` before the lock lifts at `r + 3.4s`.
     ///
-    /// The lock time is a MARGIN, not a boundary: taking it at 100ms left `is_pinned`
-    /// racing it on a loaded box, and losing that race makes the read block, time out,
-    /// and break the batch, which fails on `pinned.confirmed.len() == 1` for a reason that has
-    /// nothing to do with the floor. Any time between the `is_pinned` round trip and
-    /// the add's 1.7s return proves the same thing.
+    /// The locker also waits to see the record write blocked on `pinned_cids` before
+    /// holding to `r + 3.4s`, so a lock that lands after the write fails the test.
+    ///
+    /// The lock is sequenced off the upload being received, not off a clock: a fixed
+    /// delay let a loaded box take the lock while `is_pinned` was still reading, which
+    /// makes the read block, time out, and break the batch, failing
+    /// `pinned.confirmed.len() == 1` for a reason that has nothing to do with the
+    /// floor. The upload only starts after `is_pinned` returns, so waiting for it
+    /// orders the lock after that read on any box. The times that remain are MARGINS
+    /// (the 3s budget against the 1.7s add, the 3.4s hold between the budget and the
+    /// floored bound), sized so a loaded box does not change which path runs.
     #[sqlx::test]
     async fn pin_add_with_spent_budget_still_records_row(pool: sqlx::PgPool) {
         let db = crate::db::Db::for_testing(pool.clone());
@@ -3783,7 +3877,8 @@ mod tests {
         let repo_path = tmp.path().join("spent_budget.git");
         let oids = seed_loose_blobs(&repo_path, 1);
         let sha = oids[0].clone();
-        let endpoint = delaying_endpoint(vec![Duration::from_millis(1700)]).await;
+        let (endpoint, upload_received) =
+            delaying_endpoint_notifying(vec![Duration::from_millis(1700)]).await;
         // Install a log capture even though nothing here asserts on it: `tracing`
         // caches a callsite's interest globally the first time it is hit, and a hit
         // from a thread with no subscriber caches it as never-interested for the whole
@@ -3793,9 +3888,19 @@ mod tests {
 
         let lock_pool = pool.clone();
         let locker = async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::timeout(Duration::from_secs(10), upload_received.notified())
+                .await
+                .expect("the add never reached the endpoint");
+            // The release is timed from the upload's arrival, not from acquiring the
+            // lock: a slow acquisition on a loaded box must not push the release past
+            // the floored bound.
+            let received = tokio::time::Instant::now();
             let mut conn = lock_table(&lock_pool, "pinned_cids").await;
-            tokio::time::sleep(Duration::from_millis(1900)).await;
+            // Require the record write to be seen blocked on the lock, so a lock taken
+            // after the write landed fails here instead of passing without
+            // exercising the floor. The release keeps its upload-relative bound.
+            wait_for_lock_waiter(&lock_pool, "pinned_cids").await;
+            tokio::time::sleep_until(received + Duration::from_millis(3400)).await;
             rollback(&mut conn).await;
         };
 
@@ -3809,7 +3914,7 @@ mod tests {
                 oids.clone(),
                 &db,
                 "repo-spent-budget",
-                Duration::from_millis(2000),
+                Duration::from_millis(3000),
                 None,
             ),
         );
@@ -3909,20 +4014,25 @@ mod tests {
     ///
     /// This makes the marker write SLOW, so a zero bound cannot smuggle it through.
     /// `mark_pin_sources_incomplete` is `UPDATE pinned_cids`, so `pinned_cids` is held
-    /// under `ACCESS EXCLUSIVE` from 300ms (after `is_pinned` and `provenance_for_oid`
-    /// have read it, both round trips inside the first few ms) until 3s.
+    /// under `ACCESS EXCLUSIVE` from the moment the source record is seen blocking
+    /// (after `is_pinned` and `provenance_for_oid` have read it) until 1s after the
+    /// marker write is seen blocked on it.
     ///
     /// The schedule, with a 1.5s budget and `pin_repo_sources` locked for the whole
-    /// run so the source record stalls:
+    /// run so the source record stalls, and with T the time the source record starts
+    /// and blocks (~10ms on an idle box; the controller waits for it rather than
+    /// guessing, so a slow start moves T and the rest follows):
     ///
-    /// - ~10ms: `record_pin_source` starts and blocks on the sources lock. Its own
-    ///   floored bound is `now + 2s`, so it elapses at ~2.01s;
-    /// - ~2.01s: the elapsed arm runs the marker write, which blocks on the
-    ///   `pinned_cids` lock. Floored, its bound is ~4.01s; unfloored it is the spent
+    /// - T: `record_pin_source` blocks on the sources lock. Its own floored bound is
+    ///   `now + 2s`, so it elapses at T + 2s;
+    /// - T + 2s: the elapsed arm runs the marker write, which blocks on the
+    ///   `pinned_cids` lock. Floored, its bound is T + 4s; unfloored it is the spent
     ///   1.5s batch deadline, so the bound is ~0 and the blocked UPDATE is cancelled at
     ///   once, leaving no marker;
-    /// - ~3.0s: the lock lifts, a full second after the write started and a full second
-    ///   before its floored bound expires, so the floored write lands.
+    /// - T + 3s: the lock lifts, a full second after the write started and a full second
+    ///   before its floored bound expires, so the floored write lands. The controller
+    ///   holds the lock for 1s after it sees the marker write blocked, so the release
+    ///   tracks the write and not the time `lock_table` took.
     ///
     /// Both margins are a full second on purpose. The proof only needs the release to
     /// fall strictly between zero and `DB_RECORD_GRACE`, so there is no reason to put
@@ -3948,9 +4058,16 @@ mod tests {
 
         let lock_pool = pool.clone();
         let controller = async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Anchor on the source record blocking, not on a clock: by then
+            // `is_pinned` and `provenance_for_oid` have long since read `pinned_cids`.
+            wait_for_lock_waiter(&lock_pool, "pin_repo_sources").await;
             let mut cids_lock = lock_table(&lock_pool, "pinned_cids").await;
-            tokio::time::sleep(Duration::from_millis(2700)).await;
+            // Time the release from the marker write blocking, not from taking the
+            // lock: a slow `lock_table` must not push the release past the floored
+            // bound. This also fails loudly if the write never blocks, rather than
+            // passing without exercising the floor.
+            wait_for_lock_waiter(&lock_pool, "pinned_cids").await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
             rollback(&mut cids_lock).await;
         };
 
