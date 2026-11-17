@@ -1341,6 +1341,39 @@ mod tests {
 
     use crate::db::RepoRecord;
 
+    /// The real router, not a hand-built one: a refusal carries its code under
+    /// the error header's current name and under the name from before the
+    /// rename. Removing the layer from `build_router` fails this.
+    #[sqlx::test]
+    async fn a_refusal_through_build_router_carries_both_error_header_names(pool: PgPool) {
+        let state = test_state(pool).await;
+        let router = build_router(state);
+        // An unsigned write: refused by the auth layer before any handler runs.
+        let resp = router
+            .oneshot(
+                Request::post("/api/v1/bounties/some-id/claim")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{}", resp.status());
+        let code = resp
+            .headers()
+            .get("x-twigpine-error")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .expect("the refusal names its reason in x-twigpine-error");
+        assert_eq!(
+            resp.headers()
+                .get("x-gitlawb-error")
+                .and_then(|v| v.to_str().ok()),
+            Some(code.as_str()),
+            "the old header name must carry the same code"
+        );
+    }
+
     /// Regression: anonymous callers must not see the pin/anchor index (#121, #134).
     #[sqlx::test]
     async fn unsigned_get_pins_and_anchors_is_401_through_build_router(pool: PgPool) {

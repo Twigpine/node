@@ -115,12 +115,13 @@ pub async fn run() -> Result<()> {
         );
     }
     if !legacy.conflicts.is_empty() {
-        // Info, not a warning: the container image carries its defaults under
-        // the old names, so overriding one with a TWIGPINE_ setting lands here.
-        info!(
+        // A warning: the value in use may not be the one the operator meant,
+        // for example a GITLAWB_ setting in an override file that a TWIGPINE_
+        // default now outranks. (The image's own defaults are not counted.)
+        warn!(
             settings = %legacy.conflicts.join(", "),
             "these settings have a different value under their old GITLAWB_ name; \
-             the TWIGPINE_ value is used"
+             the TWIGPINE_ value is used. Remove or rename the GITLAWB_ one"
         );
     }
 

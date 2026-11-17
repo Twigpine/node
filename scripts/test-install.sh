@@ -178,9 +178,14 @@ suite() {
   # The settings' names from before the rename still work.
   reset_server
   rm -rf "${W:?}/home" && mkdir -p "$W/home"
-  if HOME="$W/home" GITLAWB_INSTALL_DIR="$W/home/bin" GITLAWB_DOWNLOAD_BASE="$BASE/gh" \
-    GITLAWB_CHECKSUMS_URL="$BASE/web/install-checksums.txt" \
-    "$shell" "$INSTALLER" > "$W/out" 2>&1 && installed 9.9.0; then
+  # In a subshell with the new names unset, so a developer shell that exports
+  # them cannot be what makes this pass.
+  if (
+    unset TWIGPINE_INSTALL_DIR TWIGPINE_DOWNLOAD_BASE TWIGPINE_CHECKSUMS_URL TWIGPINE_RELEASE_REPO
+    HOME="$W/home" GITLAWB_INSTALL_DIR="$W/home/bin" GITLAWB_DOWNLOAD_BASE="$BASE/gh" \
+      GITLAWB_CHECKSUMS_URL="$BASE/web/install-checksums.txt" \
+      "$shell" "$INSTALLER" > "$W/out" 2>&1
+  ) && installed 9.9.0; then
     ok "honours the settings under their old GITLAWB_ names"
   else bad "honours the settings under their old GITLAWB_ names"; fi
 
@@ -388,6 +393,18 @@ if [ "$PS1_OK" = yes ] && command -v pwsh >/dev/null 2>&1; then
     ok "upgrades an install from before the rename"
   else bad "upgrades an install from before the rename"; fi
   KEEP_HOME=""
+
+  # The settings' names from before the rename still work.
+  reset_server
+  rm -rf "${W:?}/home" && mkdir -p "$W/home"
+  if (
+    unset TWIGPINE_INSTALL_DIR TWIGPINE_DOWNLOAD_BASE TWIGPINE_CHECKSUMS_URL TWIGPINE_RELEASE_REPO
+    PROCESSOR_ARCHITECTURE=AMD64 GITLAWB_INSTALL_DIR="$W/home/bin" GITLAWB_DOWNLOAD_BASE="$BASE/gh" \
+      GITLAWB_CHECKSUMS_URL="$BASE/web/install-checksums.txt" \
+      pwsh -NoProfile -NonInteractive -File "$ROOT/install.ps1" > "$W/out" 2>&1
+  ) && ps1_installed 9.9.0; then
+    ok "honours the settings under their old GITLAWB_ names"
+  else bad "honours the settings under their old GITLAWB_ names"; fi
 
   # A directory sitting on a name the installer writes: refuse, copy nothing.
   for blocked in twigpine.exe twig.exe git-remote-gitlawb.exe; do

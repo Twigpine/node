@@ -21,6 +21,10 @@ pub const NODE: &str = "x-twigpine-node";
 /// [`NODE`] before the rename.
 pub const LEGACY_NODE: &str = "x-gitlawb-node";
 
+/// The names to try, in order, when reading the error header from a node that
+/// may be older than the rename: current name first.
+pub const ERROR_READ_ORDER: [&str; 2] = [ERROR, LEGACY_ERROR];
+
 /// Response headers the node sends under both names: `(name, old name)`.
 pub const RESPONSE_PAIRS: [(&str, &str); 2] = [(ERROR, LEGACY_ERROR), (NODE, LEGACY_NODE)];
 

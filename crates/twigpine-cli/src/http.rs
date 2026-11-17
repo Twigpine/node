@@ -364,10 +364,9 @@ impl SignatureRejection {
 /// The code the node put in its error header: `x-twigpine-error`, or the
 /// header's name before the rename when the node is older than that.
 fn node_error_code(headers: &reqwest::header::HeaderMap) -> Option<&str> {
-    use twigpine_core::legacy_headers::{ERROR, LEGACY_ERROR};
-    headers
-        .get(ERROR)
-        .or_else(|| headers.get(LEGACY_ERROR))?
+    twigpine_core::legacy_headers::ERROR_READ_ORDER
+        .iter()
+        .find_map(|name| headers.get(*name))?
         .to_str()
         .ok()
 }

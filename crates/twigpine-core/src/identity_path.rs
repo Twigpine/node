@@ -56,6 +56,36 @@ pub fn default_dir(home: &Path) -> PathBuf {
     new
 }
 
+/// The copy of a key file left in the folder from before the rename, when
+/// `path` is that file's place in `<home>/.twigpine` and nothing is there.
+///
+/// This is the one way the folder rule can go wrong: `<home>/.twigpine` came
+/// into existence (another tool, a stray `--dir`, a half-finished move) while
+/// the keys are still in `<home>/.gitlawb`. Reading on would find no key, and
+/// a caller that creates one when none exists would mint a new identity beside
+/// a perfectly good one. Callers use this to stop, or to say where the key is.
+pub fn stranded_legacy_key(path: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let home = home?;
+    if path.parent()? != home.join(DEFAULT_DIR_NAME) || path.symlink_metadata().is_ok() {
+        return None;
+    }
+    let legacy = home.join(LEGACY_DIR_NAME).join(path.file_name()?);
+    legacy.is_file().then_some(legacy)
+}
+
+/// What to tell someone whose key was found by [`stranded_legacy_key`].
+pub fn stranded_legacy_key_message(path: &Path, legacy: &Path) -> String {
+    let new_dir = path.parent().unwrap_or(path).display();
+    let old_dir = legacy.parent().unwrap_or(legacy).display();
+    format!(
+        "{new_dir} exists but holds no {file}, and there is one at {legacy} from before \
+         the rename to Twigpine. Only {new_dir} is read once it exists. Move the contents \
+         of {old_dir} into {new_dir}, or remove {new_dir} to keep using {old_dir}.",
+        file = path.file_name().unwrap_or_default().to_string_lossy(),
+        legacy = legacy.display(),
+    )
+}
+
 /// Absolute path of the identity PEM: `$TWIGPINE_KEY`, else `identity.pem` in
 /// [`default_dir`].
 ///
@@ -369,6 +399,43 @@ mod no_home_tests {
         let home = ScratchHome::new("file");
         std::fs::write(home.0.join(".gitlawb"), b"").unwrap();
         assert_eq!(default_dir(&home.0), home.0.join(".twigpine"));
+    }
+
+    #[test]
+    fn a_key_left_in_the_old_folder_is_found_once_the_new_folder_exists() {
+        let home = ScratchHome::new("stranded");
+        let new_key = home.0.join(".twigpine").join(KEY_FILE_NAME);
+        let old_key = home.0.join(".gitlawb").join(KEY_FILE_NAME);
+        std::fs::create_dir(home.0.join(".gitlawb")).unwrap();
+        std::fs::write(&old_key, b"pem").unwrap();
+
+        // No new folder yet: the old one is simply the default, nothing stranded.
+        assert_eq!(default_dir(&home.0), home.0.join(".gitlawb"));
+
+        std::fs::create_dir(home.0.join(".twigpine")).unwrap();
+        assert_eq!(
+            stranded_legacy_key(&new_key, Some(&home.0)),
+            Some(old_key.clone())
+        );
+        let msg = stranded_legacy_key_message(&new_key, &old_key);
+        assert!(
+            msg.contains(".gitlawb") && msg.contains(".twigpine"),
+            "{msg}"
+        );
+
+        // A different file name, a path outside the default folder, and a key
+        // that is present are all fine.
+        assert_eq!(
+            stranded_legacy_key(&home.0.join(".twigpine/p2p.key"), Some(&home.0)),
+            None
+        );
+        assert_eq!(
+            stranded_legacy_key(&home.0.join("keys").join(KEY_FILE_NAME), Some(&home.0)),
+            None
+        );
+        std::fs::write(&new_key, b"pem").unwrap();
+        assert_eq!(stranded_legacy_key(&new_key, Some(&home.0)), None);
+        assert_eq!(stranded_legacy_key(&new_key, None), None);
     }
 
     #[cfg(unix)]

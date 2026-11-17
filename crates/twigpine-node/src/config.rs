@@ -960,6 +960,38 @@ fn default_key_location(value: &str, default: &str) -> Option<PathBuf> {
 }
 
 impl Config {
+    /// Decide once where key paths left at their default live, and write the
+    /// answer back, so every later read agrees even if a folder appears while
+    /// the node is starting.
+    ///
+    /// Refuses to go on when the default folder is `~/.twigpine`, a key is
+    /// missing from it, and that key exists in `~/.gitlawb`. Starting anyway
+    /// would generate a new node identity or PeerId beside the real one.
+    fn settle_default_key_paths(&mut self) -> Result<(), String> {
+        let home = dirs_next::home_dir();
+        for (value, default) in [
+            (&mut self.key_path, DEFAULT_KEY_PATH),
+            (&mut self.p2p_key_path, DEFAULT_P2P_KEY_PATH),
+        ] {
+            let Some(path) = default_key_location(value, default) else {
+                continue;
+            };
+            if let Some(legacy) =
+                twigpine_core::identity_path::stranded_legacy_key(&path, home.as_deref())
+            {
+                return Err(twigpine_core::identity_path::stranded_legacy_key_message(
+                    &path, &legacy,
+                ));
+            }
+            // A home that is not valid UTF-8 cannot be written back into the
+            // string setting; it keeps resolving through the default each time.
+            if let Some(settled) = path.to_str() {
+                *value = settled.to_string();
+            }
+        }
+        Ok(())
+    }
+
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
@@ -1017,6 +1049,7 @@ impl Config {
     /// `config.web_url` later must see the same string that was actually
     /// validated.
     pub fn validate(&mut self) -> Result<(), String> {
+        self.settle_default_key_paths()?;
         // Concurrent git writes pin the dedicated lock pool for their whole
         // duration (connection-affine advisory lock in acquire_write). The main
         // pool no longer carries that occupancy.

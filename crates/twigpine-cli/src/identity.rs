@@ -126,10 +126,20 @@ fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
 pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
     let path = key_path_for(dir)?;
     let pem = fs::read_to_string(&path).with_context(|| {
-        format!(
-            "no identity found at {}\nRun `twigpine identity new` to create one",
-            path.display()
-        )
+        // The key may be sitting in the folder from before the rename. Saying
+        // "create one" there would walk the user into a second identity.
+        let home = dirs::home_dir();
+        match twigpine_core::identity_path::stranded_legacy_key(&path, home.as_deref()) {
+            Some(legacy) => format!(
+                "no identity found at {}\n{}",
+                path.display(),
+                twigpine_core::identity_path::stranded_legacy_key_message(&path, &legacy)
+            ),
+            None => format!(
+                "no identity found at {}\nRun `twigpine identity new` to create one",
+                path.display()
+            ),
+        }
     })?;
     Keypair::from_pem(&pem).context("failed to load keypair from PEM")
 }

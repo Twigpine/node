@@ -3,6 +3,12 @@
 
 # Settings are TWIGPINE_*. A .env written before the rename, with GITLAWB_*
 # names, still works: each value below falls back to the old name.
+#
+# An override file is different. A GITLAWB_* entry under `environment:` in
+# docker-compose.override.yml no longer replaces the entry below, because the
+# two now have different names, and the node uses the TWIGPINE_* one. Rename
+# such entries to TWIGPINE_*. The node logs a warning naming each setting it
+# was given under both names with different values.
 services:
   postgres:
     image: postgres:16-alpine

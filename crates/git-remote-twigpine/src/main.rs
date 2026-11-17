@@ -58,6 +58,18 @@ fn main() -> Result<()> {
         .with_env_filter(std::env::var("TWIGPINE_LOG").unwrap_or_else(|_| "warn".to_string()))
         .init();
 
+    // A setting given under both its names with different values: the
+    // TWIGPINE_ one is used. Worth a line here, because the value that lost
+    // may be a node someone passed for this one command.
+    let legacy = twigpine_core::legacy_env::report();
+    if !legacy.conflicts.is_empty() {
+        tracing::warn!(
+            "{} set under both the TWIGPINE_ and the old GITLAWB_ name with different values; \
+             using the TWIGPINE_ value",
+            legacy.conflicts.join(", ")
+        );
+    }
+
     if args.len() < 3 {
         eprintln!("usage: git-remote-twigpine <remote-name> <url>");
         eprintln!("try 'git-remote-twigpine --help' for more information");
@@ -1223,7 +1235,16 @@ fn safe_error_body_excerpt(body: &str) -> String {
 fn load_keypair() -> Option<Keypair> {
     let key_path = resolve_key_path()?;
     if !key_path.exists() {
-        tracing::debug!("no keypair found at {key_path:?}");
+        // Unsigned from here on. If the key is sitting in the folder from
+        // before the rename, say so: the push will be refused and nothing
+        // else would explain why.
+        match twigpine_core::identity_path::stranded_legacy_key(&key_path, home_dir().as_deref()) {
+            Some(legacy) => tracing::warn!(
+                "{}",
+                twigpine_core::identity_path::stranded_legacy_key_message(&key_path, &legacy)
+            ),
+            None => tracing::debug!("no keypair found at {key_path:?}"),
+        }
         return None;
     }
     match std::fs::read_to_string(&key_path) {

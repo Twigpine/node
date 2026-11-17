@@ -124,7 +124,11 @@ fn doctor_with(env_node: Option<&str>, node_flag: Option<&str>, extra_env: &[(&s
     }
     // The setting's name from before the rename is read too, so a developer
     // shell that still exports it must not leak into the run.
-    cmd.env_remove("GITLAWB_NODE");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GITLAWB_") {
+            cmd.env_remove(name);
+        }
+    }
     match env_node {
         Some(v) => cmd.env("TWIGPINE_NODE", v),
         None => cmd.env_remove("TWIGPINE_NODE"),

@@ -399,9 +399,9 @@ There is a second precondition on gossip ingest that the flag does not control. 
 
 All configuration is via environment variables. See [`.env.example`](.env.example) for the full reference.
 
-**Names from before the rename still work.** Settings were `GITLAWB_*` and are `TWIGPINE_*` now. The node, `twigpine` and the git helper accept both; when both are set and differ, the `TWIGPINE_*` value is used. The node logs which old names it was given, and `twigpine doctor` lists them. Releases up to 0.7.1 know only the `GITLAWB_*` names.
+**Names from before the rename still work.** Settings were `GITLAWB_*` and are `TWIGPINE_*` now. The node, `twigpine` and the git helper accept both; when both are set and differ, the `TWIGPINE_*` value is used. The node logs which old names it was given, and `twigpine doctor` lists them. One case needs a manual rename: a `GITLAWB_*` entry under `environment:` in a `docker-compose.override.yml` no longer replaces the matching entry in the shipped `docker-compose.yml`, which now uses the `TWIGPINE_*` name. The node warns at startup about every setting it was given under both names with different values. Releases up to 0.7.1 know only the `GITLAWB_*` names.
 
-The default key folder is `~/.twigpine`. An existing `~/.gitlawb` keeps being used as long as there is no `~/.twigpine`; nothing is moved. To switch, stop the node and rename the folder.
+The default key folder is `~/.twigpine`. An existing `~/.gitlawb` keeps being used as long as there is no `~/.twigpine`; nothing is moved. To switch, stop the node and rename the folder. Once `~/.twigpine` exists it is the only one read: if a key is missing there but present in `~/.gitlawb`, the node refuses to start and says so, and it never creates a second identity beside the first.
 
 Response headers and webhook deliveries carry both `X-Twigpine-*` and the older `X-Gitlawb-*` names with the same values.
 

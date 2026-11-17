@@ -29,6 +29,26 @@ pub const PREFIX: &str = "TWIGPINE_";
 /// Prefix the settings had before the rename.
 pub const LEGACY_PREFIX: &str = "GITLAWB_";
 
+/// Defaults the container image sets, under the old names (see the Dockerfile
+/// for why). An old name carrying exactly its image default is not something
+/// the operator typed, so it is adopted without being reported: otherwise
+/// every container start would list six "old names in use", and overriding one
+/// with a `TWIGPINE_` setting would be reported as a conflict.
+pub const IMAGE_DEFAULTS: [(&str, &str); 6] = [
+    ("REPOS_DIR", "/data/repos"),
+    ("KEY", "/data/keys/identity.pem"),
+    ("P2P_KEY", "/data/keys/p2p.key"),
+    ("HOST", "0.0.0.0"),
+    ("PORT", "7545"),
+    ("P2P_PORT", "7546"),
+];
+
+fn is_image_default(rest: &str, value: &OsStr) -> bool {
+    IMAGE_DEFAULTS
+        .iter()
+        .any(|(name, default)| *name == rest && value == OsStr::new(default))
+}
+
 /// What [`adopt`] found. Names only, never values: settings include keys.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -54,10 +74,19 @@ pub fn plan<I>(vars: I) -> (Vec<(String, OsString)>, Report)
 where
     I: IntoIterator<Item = (OsString, OsString)>,
 {
-    // Only names that are valid UTF-8 can carry either prefix.
+    // Only names that are valid UTF-8 can carry either prefix. Windows treats
+    // variable names as case-insensitive, so `gitlawb_node` and `Twigpine_Node`
+    // are these settings there; fold them to the spelling the code reads.
     let vars: Vec<(String, OsString)> = vars
         .into_iter()
         .filter_map(|(k, v)| k.into_string().ok().map(|k| (k, v)))
+        .map(|(k, v)| {
+            if cfg!(windows) {
+                (k.to_ascii_uppercase(), v)
+            } else {
+                (k, v)
+            }
+        })
         .collect();
     let get = |name: &str| -> Option<&OsStr> {
         vars.iter()
@@ -74,11 +103,15 @@ where
             match get(&new_name).filter(|v| !v.is_empty()) {
                 None => {
                     sets.push((new_name.clone(), value.clone()));
-                    report.legacy_only.push(new_name);
+                    if !is_image_default(rest, value) {
+                        report.legacy_only.push(new_name);
+                    }
                 }
                 Some(new_value) if new_value != value.as_os_str() => {
                     sets.push((name.clone(), new_value.to_os_string()));
-                    report.conflicts.push(new_name);
+                    if !is_image_default(rest, value) {
+                        report.conflicts.push(new_name);
+                    }
                 }
                 Some(_) => {}
             }
@@ -212,6 +245,52 @@ mod tests {
         assert_eq!(r.legacy_only, vec!["TWIGPINE_KEY", "TWIGPINE_PORT"]);
         assert_eq!(r.conflicts, vec!["TWIGPINE_HOST"]);
         assert!(!format!("{r:?}").contains("secret"));
+    }
+
+    #[test]
+    fn image_defaults_under_the_old_names_are_adopted_quietly() {
+        // A stock container: the image's six defaults and nothing else.
+        let image: Vec<(String, String)> = IMAGE_DEFAULTS
+            .iter()
+            .map(|(k, v)| (format!("GITLAWB_{k}"), v.to_string()))
+            .collect();
+        let pairs: Vec<(&str, &str)> = image
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (s, r) = plan(env(&pairs));
+        assert_eq!(s.len(), 6, "every default still reaches the new name");
+        assert!(r.is_empty(), "{r:?}");
+
+        // The operator overrides one with the new name: used, not a conflict.
+        let mut with_new = pairs.clone();
+        with_new.push(("TWIGPINE_PORT", "8000"));
+        let (s, r) = plan(env(&with_new));
+        assert!(s.contains(&("GITLAWB_PORT".to_string(), OsString::from("8000"))));
+        assert!(r.is_empty(), "{r:?}");
+
+        // The operator overrides one with the OLD name: that is theirs, so it
+        // is reported like any other old name.
+        let mut with_old: Vec<(&str, &str)> = pairs
+            .iter()
+            .copied()
+            .filter(|(k, _)| *k != "GITLAWB_PORT")
+            .collect();
+        with_old.push(("GITLAWB_PORT", "9000"));
+        let (_, r) = plan(env(&with_old));
+        assert_eq!(r.legacy_only, vec!["TWIGPINE_PORT"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_names_match_whatever_their_case() {
+        let (s, r) = plan(env(&[("gitlawb_node", "https://n.example")]));
+        assert_eq!(s, sets(&[("TWIGPINE_NODE", "https://n.example")]));
+        assert_eq!(r.legacy_only, vec!["TWIGPINE_NODE"]);
+
+        let (s, r) = plan(env(&[("Twigpine_Node", "a"), ("GITLAWB_NODE", "b")]));
+        assert_eq!(s, sets(&[("GITLAWB_NODE", "a")]));
+        assert_eq!(r.conflicts, vec!["TWIGPINE_NODE"]);
     }
 
     #[cfg(unix)]

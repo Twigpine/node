@@ -78,6 +78,12 @@ function install() {
     chmodSync(dest, 0o755);
   }
 
+  // `twigpine` and `twig` run their own copy, so the CLI can tell it was not
+  // started as `gl` (it prints a note about the new name when it was).
+  const renamed = join(binDir, "twigpine");
+  copyFileSync(join(binDir, "gl"), renamed);
+  chmodSync(renamed, 0o755);
+
   console.log(`@gitlawb/gl: Installed Twigpine CLI for ${platformKey}`);
 }
 

@@ -312,14 +312,8 @@ async fn fire_event_async_occurrence(
             // Every header goes out under its current name and the name it had
             // before the rename: receivers verify the signature header by
             // name, and they are not ours to update.
-            for (pair, value) in [
-                (legacy_headers::WEBHOOK_EVENT, Some(event_name.as_str())),
-                (legacy_headers::WEBHOOK_DELIVERY, Some(delivery_id.as_str())),
-                (legacy_headers::WEBHOOK_SIGNATURE, signature.as_deref()),
-            ] {
-                if let Some(value) = value {
-                    req = req.header(pair.0, value).header(pair.1, value);
-                }
+            for (name, value) in delivery_headers(&event_name, &delivery_id, signature.as_deref()) {
+                req = req.header(name, value);
             }
 
             match req.send().await {
@@ -355,9 +349,51 @@ async fn fire_event_async_occurrence(
     }
 }
 
+/// The headers one delivery carries: each under its current name and under
+/// the name it had before the rename, with the same value. The signature pair
+/// is present only when the hook has a secret.
+fn delivery_headers<'a>(
+    event: &'a str,
+    delivery_id: &'a str,
+    signature: Option<&'a str>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut headers = Vec::with_capacity(6);
+    for (pair, value) in [
+        (legacy_headers::WEBHOOK_EVENT, Some(event)),
+        (legacy_headers::WEBHOOK_DELIVERY, Some(delivery_id)),
+        (legacy_headers::WEBHOOK_SIGNATURE, signature),
+    ] {
+        if let Some(value) = value {
+            headers.push((pair.0, value));
+            headers.push((pair.1, value));
+        }
+    }
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delivery_carries_every_header_under_both_names() {
+        let signed = delivery_headers("push", "d-1", Some("sha256=abc"));
+        assert_eq!(
+            signed,
+            vec![
+                ("X-Twigpine-Event", "push"),
+                ("X-Gitlawb-Event", "push"),
+                ("X-Twigpine-Delivery", "d-1"),
+                ("X-Gitlawb-Delivery", "d-1"),
+                ("X-Twigpine-Signature-256", "sha256=abc"),
+                ("X-Gitlawb-Signature-256", "sha256=abc"),
+            ]
+        );
+        // No secret: no signature header under either name.
+        let unsigned = delivery_headers("push", "d-1", None);
+        assert_eq!(unsigned.len(), 4);
+        assert!(unsigned.iter().all(|(name, _)| !name.contains("Signature")));
+    }
     use rand::Rng;
 
     fn key() -> [u8; 32] {
