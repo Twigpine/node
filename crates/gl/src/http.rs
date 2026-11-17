@@ -96,8 +96,8 @@ fn is_loopback_http(url: &str) -> bool {
 
 /// Refuse to sign a request destined for a cleartext hop off this machine
 /// unless the operator has opted in. `GITLAWB_ALLOW_INSECURE_HTTP` exists for a
-/// private LAN where the operator has decided that is acceptable; any value,
-/// including `0`, opts in. A loopback node is never proxied (see
+/// private LAN where the operator has decided that is acceptable; only `1` or
+/// `true` opts in. A loopback node is never proxied (see
 /// [`is_loopback_http`]), so a proxy cannot carry its signed requests
 /// off-machine and the loopback exemption holds under any proxy environment.
 fn ensure_signing_transport(node_base: &str, allow_insecure: bool) -> Result<()> {
@@ -114,10 +114,46 @@ fn ensure_signing_transport(node_base: &str, allow_insecure: bool) -> Result<()>
     )
 }
 
+/// Parse a `GITLAWB_ALLOW_INSECURE_HTTP` value. Only `1` or `true`
+/// (case-insensitive, after trim) opens the gate. Presence alone is not
+/// consent: `=0`, `=false` and an empty value read as "not opting in" to the
+/// operator, and the README and the refusal message document `=1`. A non-empty
+/// value that is not truthy warns, so a misspelling is neither a silent yes nor
+/// a silent no. Same contract as `git-remote-gitlawb` and `icaptcha-client`.
+fn allow_insecure_http_from_str(raw: Option<&str>) -> bool {
+    let Some(v) = raw else {
+        return false;
+    };
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("1") || t.eq_ignore_ascii_case("true") {
+        return true;
+    }
+    if !t.is_empty() {
+        warn_allow_insecure_http_non_truthy();
+    }
+    false
+}
+
+/// Fixed warning for a set but non-truthy value. The raw value is never printed.
+fn warn_allow_insecure_http_non_truthy() {
+    eprintln!(
+        "warning: GITLAWB_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); \
+         plaintext http to a remote node remains refused"
+    );
+}
+
 /// The operator opt-in for a plaintext remote, read at request time so a test
-/// or shell can set it without rebuilding the client.
+/// or shell can set it without rebuilding the client. A non-UTF-8 value fails
+/// closed and warns like any other non-truthy one.
 fn insecure_http_allowed() -> bool {
-    std::env::var_os("GITLAWB_ALLOW_INSECURE_HTTP").is_some()
+    match std::env::var("GITLAWB_ALLOW_INSECURE_HTTP") {
+        Ok(v) => allow_insecure_http_from_str(Some(&v)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn_allow_insecure_http_non_truthy();
+            false
+        }
+        Err(std::env::VarError::NotPresent) => false,
+    }
 }
 
 /// Follow a redirect only when it stays on the origin that issued it AND re-issues the
@@ -2232,17 +2268,26 @@ mod tests {
         );
     }
 
-    /// The opt-in is presence-based: any value, including `0`, enables it.
+    /// The opt-in is read as a value, not as presence, with the same contract as
+    /// `git-remote-gitlawb` and `icaptcha-client`: `1` or `true`, case-insensitive
+    /// after trim. `0`, `false`, empty and anything else leave the gate closed.
     #[test]
-    fn insecure_http_allowed_reads_the_env_var() {
-        {
-            let _env = InsecureHttpEnv::set(Some("1"));
-            assert!(insecure_http_allowed());
+    fn insecure_http_opt_in_is_truthy_only() {
+        for on in ["1", "true", "TRUE", "True", " 1 ", "\ttrue\n"] {
+            assert!(allow_insecure_http_from_str(Some(on)), "{on:?} must opt in");
         }
-        {
-            let _env = InsecureHttpEnv::set(None);
-            assert!(!insecure_http_allowed());
+        for off in ["0", "false", "", " ", "yes", "on", "2", "truee"] {
+            assert!(
+                !allow_insecure_http_from_str(Some(off)),
+                "{off:?} must not opt in"
+            );
         }
+        assert!(!allow_insecure_http_from_str(None));
+        let _env = InsecureHttpEnv::set(Some("0"));
+        assert!(!insecure_http_allowed(), "=0 must not open the gate");
+        drop(_env);
+        let _env = InsecureHttpEnv::set(Some("1"));
+        assert!(insecure_http_allowed());
     }
 
     /// Re-exec this test binary running exactly `child_test` under the given
