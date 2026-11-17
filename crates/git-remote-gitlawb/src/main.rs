@@ -25,6 +25,8 @@
 use anyhow::{bail, Context, Result};
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
+use gitlawb_core::transport_policy::{allow_insecure_http_value, is_http, is_insecure_remote};
+use gitlawb_core::{resolve_transport_node, DEFAULT_LOCAL_NODE};
 use std::io::{self, BufRead, Read, Write};
 
 fn main() -> Result<()> {
@@ -63,9 +65,9 @@ fn main() -> Result<()> {
 
     let (_, short_owner, repo_name) = parse_gitlawb_url(url)?;
 
-    // v0.1: default to localhost. Override with GITLAWB_NODE env var.
-    let node_base =
-        std::env::var("GITLAWB_NODE").unwrap_or_else(|_| "http://127.0.0.1:7545".to_string());
+    // v0.1: default to localhost. Override with GITLAWB_NODE env var. Shared with
+    // `gl doctor` so the diagnostic reports the URL this actually resolves.
+    let node_base = node_base_from_env();
     check_transport_security(&node_base, allow_insecure_http_enabled())?;
     let repo_base = format!("{}/{}/{}", node_base, short_owner, repo_name);
     tracing::debug!("repo_base: {repo_base}");
@@ -79,55 +81,10 @@ fn main() -> Result<()> {
     run_helper(&repo_base, keypair.as_ref())
 }
 
-/// Whether `url` is plaintext http, regardless of where it points.
-fn is_http(url: &str) -> bool {
-    reqwest::Url::parse(url.trim())
-        .map(|u| u.scheme() == "http")
-        .unwrap_or(false)
-}
-
-/// Whether `url` would send git data off this machine in cleartext.
-///
-/// True only for `http://` to a non-loopback host. RFC 9421 signs the request
-/// but does not encrypt it, so on a plaintext hop the pack contents and the
-/// `Signature` header are both readable, and a captured signature is replayable
-/// for its freshness window against any host.
-///
-/// Loopback is decided from the parsed address rather than a string match, so
-/// `127.0.0.2`, `[::1]` and an IPv4-mapped `[::ffff:127.0.0.1]` are all
-/// recognised as this machine. A value that does not parse, or that is not
-/// http(s), is not this guard's business and returns false: it fails later with
-/// its own error, and naming it a TLS problem would misdirect the reader.
-fn is_insecure_remote(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
-        return false;
-    };
-    if parsed.scheme() != "http" {
-        return false;
-    }
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host == "localhost" {
-        return false;
-    }
-    // host_str() keeps the brackets on an IPv6 literal.
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        if ip.is_loopback() {
-            return false;
-        }
-        // An IPv4-mapped IPv6 literal hides a v4 loopback from is_loopback().
-        if let std::net::IpAddr::V6(v6) = ip {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                if v4.is_loopback() {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+/// The node base URL this helper will contact, resolved through the same function
+/// `gl doctor` reports on so the diagnostic cannot describe a different node.
+fn node_base_from_env() -> String {
+    resolve_transport_node(std::env::var("GITLAWB_NODE").ok().as_deref())
 }
 
 /// Fixed warning for a `GITLAWB_ALLOW_INSECURE_HTTP` value that is set but not
@@ -149,11 +106,10 @@ fn allow_insecure_http_from_str(raw: Option<&str>) -> bool {
     let Some(v) = raw else {
         return false;
     };
-    let t = v.trim();
-    if t.eq_ignore_ascii_case("1") || t.eq_ignore_ascii_case("true") {
+    if allow_insecure_http_value(v) {
         true
     } else {
-        if !t.is_empty() {
+        if !v.trim().is_empty() {
             warn_allow_insecure_http_non_truthy();
         }
         false
@@ -242,7 +198,7 @@ fn help_text() -> String {
          \x20   git clone gitlawb://did:key:z6Mk.../<repo>\n\
          \n\
          ENVIRONMENT:\n\
-         \x20   GITLAWB_NODE   Node base URL (default: http://127.0.0.1:7545)\n\
+         \x20   GITLAWB_NODE   Node base URL (default: {DEFAULT_LOCAL_NODE})\n\
          \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push, absolute\n\
          \x20                  (default: ~/.gitlawb/identity.pem). Its parent also\n\
          \x20                  holds the delegations `gl ucan import` writes.\n\
@@ -2689,7 +2645,19 @@ mod tests {
         assert!(help.contains("--version"));
         assert!(help.contains("--help"));
         assert!(help.contains("GITLAWB_NODE"));
+        // The advertised default must be the value the helper actually resolves.
+        assert!(help.contains(DEFAULT_LOCAL_NODE));
         assert!(help.ends_with('\n'));
+    }
+
+    /// The helper's own resolution must stay the shared one; a site walking back to
+    /// a private literal is exactly the drift the shared function exists to stop.
+    #[test]
+    fn node_base_matches_the_shared_resolver() {
+        // No env manipulation: assert the call site delegates, for the default case.
+        let expected = resolve_transport_node(std::env::var("GITLAWB_NODE").ok().as_deref());
+        assert_eq!(node_base_from_env(), expected);
+        assert_eq!(resolve_transport_node(None), DEFAULT_LOCAL_NODE);
     }
 
     // ── #369 delete-only push deadlock ───────────────────────────────────────
