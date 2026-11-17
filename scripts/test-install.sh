@@ -35,7 +35,7 @@ sha() {
 }
 
 # make_release <ver> [marker] [style]: fake archives (+ .sha256) for every
-# target. style "old" builds a release from before the rename to Twigpine:
+# target. style "cli-only" ships no helper; style "old" builds a release from before the rename to Twigpine:
 # gitlawb-node-* archives holding gl, git-remote-gitlawb and gitlawb-node.
 make_release() {
   ver=$1
@@ -44,6 +44,9 @@ make_release() {
   if [ "$style" = old ]; then
     prefix=gitlawb-node
     bins="gl git-remote-gitlawb gitlawb-node"
+  elif [ "$style" = cli-only ]; then
+    prefix=twigpine-node
+    bins="twigpine"
   else
     prefix=twigpine-node
     bins="twigpine git-remote-twigpine twigpine-node"
@@ -196,15 +199,37 @@ suite() {
   else bad "goes back to a release from before the rename"; fi
   KEEP_HOME=""
 
-  # A command name that already exists as a directory must not swallow the link.
+  # A directory sitting on a name the installer writes: refuse, change nothing.
+  for blocked in twigpine twig git-remote-gitlawb; do
+    reset_server
+    rm -rf "${W:?}/home" && mkdir -p "$W/home/bin/$blocked"
+    KEEP_HOME=yes
+    if run_installer "$shell"; then
+      bad "refuses to install over a directory named $blocked"
+    elif grep -q "is a directory" "$W/out" && [ -z "$(ls -A "$W/home/bin/$blocked")" ] \
+      && [ "$(ls -A "$W/home/bin")" = "$blocked" ]; then
+      ok "refuses to install over a directory named $blocked"
+    else bad "refuses to install over a directory named $blocked"; fi
+    KEEP_HOME=""
+  done
+  # A link to a directory is replaced, not installed into.
   reset_server
-  rm -rf "${W:?}/home" && mkdir -p "$W/home/bin/twig"
+  rm -rf "${W:?}/home" && mkdir -p "$W/home/bin" "$W/home/elsewhere"
+  ln -s ../elsewhere "$W/home/bin/twigpine"
   KEEP_HOME=yes
-  run_installer "$shell" || true
+  if run_installer "$shell" && installed 9.9.0 && [ -z "$(ls -A "$W/home/elsewhere")" ]; then
+    ok "replaces a link to a directory instead of installing into it"
+  else bad "replaces a link to a directory instead of installing into it"; fi
   KEEP_HOME=""
-  if [ ! -e "$W/home/bin/twig/twigpine" ] && [ ! -L "$W/home/bin/twig/twigpine" ]; then
-    ok "does not link inside a directory named like a command"
-  else bad "does not link inside a directory named like a command"; fi
+
+  # An archive without the helper would leave a mixed-version install.
+  reset_server
+  make_release 9.6.0 genuine cli-only
+  sh "$UPDATE" "$W/srv/web/install-checksums.txt" v9.6.0 "$W/srv/gh/v9.6.0"/*.sha256 > /dev/null
+  if ! run_installer "$shell" --version v9.6.0 && nothing_installed \
+    && grep -q "missing a required program" "$W/out"; then
+    ok "refuses an archive without the helper"
+  else bad "refuses an archive without the helper"; fi
 
   # Hijack: the GitHub side swaps every archive AND its .sha256.
   reset_server
@@ -382,6 +407,8 @@ expect_reject "rejects a latest release missing a platform" \
   "$L" v9.9.0 "$W/srv/gh/v9.9.0/twigpine-node-9.9.0-aarch64-apple-darwin.tar.gz.sha256"
 [ ! -e "$L" ] && ok "leaves no file behind on error" || bad "leaves no file behind on error"
 expect_reject "rejects a pre-release tag" "$L" v9.9.0-rc.1 "$W/srv/gh/v9.9.0/"*.sha256
+expect_reject "rejects a tag with an extra part" "$L" v9.9.0.1 "$W/srv/gh/v9.9.0/"*.sha256
+expect_reject "rejects a tag with an empty part" "$L" v9..0 "$W/srv/gh/v9.9.0/"*.sha256
 expect_reject "rejects checksums of another version" "$L" v9.8.0 "$W/srv/gh/v9.9.0/"*.sha256
 printf 'deadbeef  twigpine-node-9.9.0-x86_64-apple-darwin.tar.gz\n' > "$W/short.sha256"
 expect_reject "rejects a malformed checksum line" "$L" v9.9.0 "$W/short.sha256"
@@ -398,6 +425,12 @@ printf '%s  %s\n' "$(printf '0%.0s' $(seq 1 64))" "other-node-9.9.0-x86_64-apple
 expect_reject "rejects an archive that is not a node release" "$L" v9.9.0 "$W/other.sha256"
 # A list that still ends at a release from before the rename (as the live one
 # does) takes a renamed release and moves latest to it.
+printf '%s  %s\n' "$(printf '0%.0s' $(seq 1 64))" "twigpine-node-9.9.0-evil.tar.gz" > "$W/evil.sha256"
+expect_reject "rejects an archive for a platform no installer serves" "$L" v9.9.0 "$W/srv/gh/v9.9.0/"*.sha256 "$W/evil.sha256"
+sed 's/twigpine-node-/gitlawb-node-/' "$W/srv/gh/v9.9.0/twigpine-node-9.9.0-x86_64-apple-darwin.tar.gz.sha256" > "$W/mixed.sha256"
+expect_reject "rejects one version under both archive names" "$L" v9.9.0 "$W/srv/gh/v9.9.0/"*.sha256 "$W/mixed.sha256"
+grep -v '^# latest:' "$L" > "$W/nolatest"
+expect_reject "rejects a list with no latest line" "$W/nolatest" v9.8.0 "$W/srv/gh/v9.8.0/"*.sha256
 rm -f "$L"
 sh "$UPDATE" "$L" v9.7.0 "$W/srv/gh/v9.7.0/"*.sha256 > /dev/null
 sh "$UPDATE" "$L" v9.9.0 "$W/srv/gh/v9.9.0/"*.sha256 > /dev/null

@@ -215,25 +215,47 @@ if [ ! -d "$PACKAGE_DIR" ]; then
   exit 1
 fi
 
+# The CLI and the helper always ship together. An archive with only one of
+# them would leave a mixed-version install behind.
+for PAIR in "twigpine gl" "git-remote-twigpine git-remote-gitlawb"; do
+  FOUND=""
+  for NAME in $PAIR; do
+    if [ -f "$PACKAGE_DIR/$NAME" ]; then FOUND="$NAME"; fi
+  done
+  if [ -z "$FOUND" ]; then
+    echo "error: $ARCHIVE is missing a required program: ${PAIR%% *}. Nothing was installed." >&2
+    exit 1
+  fi
+done
+
 mkdir -p "$INSTALL_DIR"
+
+# Check every name this run will write before changing anything. A directory in
+# the way cannot be replaced by a file: mv and ln would put the program inside
+# it and report success.
+for NAME in twigpine twig gl git-remote-twigpine git-remote-gitlawb twigpine-node gitlawb-node; do
+  if [ -d "$INSTALL_DIR/$NAME" ] && [ ! -L "$INSTALL_DIR/$NAME" ]; then
+    echo "error: ${INSTALL_DIR}/${NAME} is a directory, and the installer needs that name for a program." >&2
+    echo "       Move it away or set GITLAWB_INSTALL_DIR. Nothing was installed." >&2
+    exit 1
+  fi
+done
 
 INSTALLED=""
 
 # install_file <name>: copy one binary from the archive into place.
 install_file() {
   install -m 755 "$PACKAGE_DIR/$1" "$INSTALL_DIR/$1.new"
+  # A link left by an earlier install (or one pointing at a directory) is
+  # removed first: mv would follow a link to a directory and move into it.
+  if [ -L "$INSTALL_DIR/$1" ]; then rm -f "$INSTALL_DIR/$1"; fi
   mv -f "$INSTALL_DIR/$1.new" "$INSTALL_DIR/$1"
   INSTALLED="$INSTALLED $1"
 }
 
 # link_name <target> <name>: make <name> run <target>. -n replaces a link to a
-# directory instead of linking inside it; a real directory in the way is left
-# alone and reported.
+# directory instead of linking inside it.
 link_name() {
-  if [ -d "$INSTALL_DIR/$2" ] && [ ! -L "$INSTALL_DIR/$2" ]; then
-    echo "warning: ${INSTALL_DIR}/$2 is a directory; not installing the $2 command" >&2
-    return 0
-  fi
   ln -sfn "$1" "$INSTALL_DIR/$2"
   INSTALLED="$INSTALLED $2"
 }

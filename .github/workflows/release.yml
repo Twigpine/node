@@ -1004,7 +1004,7 @@ jobs:
       # web-sync publishes install.ps1 + version.json, so the Windows ZIP must exist.
       # Windows is best-effort for npm/Homebrew (continue-on-error), so verify the
       # asset is present before advertising a release the site can't actually serve.
-      # The archive checksums are fetched here too: the sync step lists them in
+      # The archives are hashed here too: the sync step lists the hashes in
       # public/install-checksums.txt, which the installers require.
       - name: Verify website release assets
         if: ${{ steps.guard.outputs.enabled == 'true' }}
@@ -1012,6 +1012,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.rel.outputs.version }}
           TAG: ${{ steps.rel.outputs.tag }}
+          ASSETS: ${{ steps.rel.outputs.assets }}
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
@@ -1024,8 +1025,27 @@ jobs:
               exit 1
             }
           done
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'twigpine-node-*.sha256' --dir "$RUNNER_TEMP/sums" --clobber
+          # Hash the archives themselves, fetched by the asset id the resolver
+          # captured and uploader-checked (as the Homebrew job does). The
+          # *.sha256 sidecars are mutable release assets too; copying them into
+          # the list would trust the same surface the list exists to check.
+          mkdir -p "$RUNNER_TEMP/sums"
+          for archive in \
+            "twigpine-node-${VERSION}-aarch64-apple-darwin.tar.gz" \
+            "twigpine-node-${VERSION}-x86_64-apple-darwin.tar.gz" \
+            "twigpine-node-${VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+            "twigpine-node-${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            "twigpine-node-${VERSION}-x86_64-pc-windows-msvc.zip"; do
+            want="$(printf '%s' "$archive" | base64 -w0)"
+            asset_id="$(printf '%s\n' "$ASSETS" | awk -v n="$want" '$1 == n {print $2; exit}')"
+            if [ -z "$asset_id" ]; then
+              echo "::error::release $TAG has no asset $archive captured at resolve time"
+              exit 1
+            fi
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              -H 'Accept: application/octet-stream' > "$RUNNER_TEMP/sums/$archive"
+            (cd "$RUNNER_TEMP/sums" && sha256sum "$archive" > "$archive.sha256" && rm -f "$archive")
+          done
 
       - name: Sync and open PR
         if: ${{ steps.guard.outputs.enabled == 'true' }}
@@ -1067,7 +1087,7 @@ jobs:
           git push --force "https://x-access-token:${GH_TOKEN}@github.com/Twigpine/web.git" "HEAD:$branch"
           gh pr create --repo Twigpine/web --head "$branch" \
             --title "Sync Twigpine ${TAG}" \
-            --body "Automated sync from Twigpine/node ${TAG}: install.sh, install.ps1, public/install-checksums.txt, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). install.sh and install.ps1 install only archives listed in install-checksums.txt, so check the new lines against the release's .sha256 assets before merging, then deploy twigpine.com (the Vercel project is not git-connected)." \
+            --body "Automated sync from Twigpine/node ${TAG}: install.sh, install.ps1, public/install-checksums.txt, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). install.sh and install.ps1 install only archives listed in install-checksums.txt, and each new line is the hash of the archive as the release workflow fetched it by asset id. Before merging, check the new lines against the Homebrew formula bump for ${TAG} and the release's .sha256 assets (all three must agree), then deploy twigpine.com (the Vercel project is not git-connected)." \
             || {
               # Only swallow the "PR already exists" case; surface auth/API failures
               # (a failed gh pr list must not be misread as "PR exists").

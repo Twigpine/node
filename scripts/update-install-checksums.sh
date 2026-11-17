@@ -22,14 +22,10 @@ LIST="$1"
 TAG="$2"
 shift 2
 
-case "$TAG" in
-  v[0-9]*.[0-9]*.[0-9]*) ;;
-  *) die "tag must look like vX.Y.Z: $TAG" ;;
-esac
+# Exactly vX.Y.Z, three numeric parts: no pre-release, no extra or empty part.
+printf '%s\n' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' ||
+  die "only plain vX.Y.Z releases can be listed: $TAG"
 VERSION="${TAG#v}"
-case "$VERSION" in
-  *[!0-9.]*) die "only plain vX.Y.Z releases can be listed: $TAG" ;;
-esac
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -39,6 +35,15 @@ trap 'rm -rf "$TMP"' EXIT
 for SUM in "$@"; do
   [ -f "$SUM" ] || die "no such file: $SUM"
   tr -d '\r' < "$SUM" | awk -v ver="$VERSION" -v src="$SUM" '
+    # Only the archives the installers can ask for are listable.
+    function known_target(n, v,    rest) {
+      rest = n
+      sub(/^(twigpine|gitlawb)-node-/, "", rest)
+      rest = substr(rest, length(v) + 2)
+      return rest == "aarch64-apple-darwin.tar.gz" || rest == "x86_64-apple-darwin.tar.gz" ||
+        rest == "aarch64-unknown-linux-musl.tar.gz" || rest == "x86_64-unknown-linux-musl.tar.gz" ||
+        rest == "x86_64-pc-windows-msvc.zip"
+    }
     NF == 0 { next }
     {
       name = $2
@@ -47,7 +52,7 @@ for SUM in "$@"; do
       # gitlawb-node-*, and a backfill of one of those must still be listable.
       if (NF != 2 || length($1) != 64 || $1 !~ /^[0-9A-Fa-f]+$/ ||
           (index(name, "twigpine-node-" ver "-") != 1 && index(name, "gitlawb-node-" ver "-") != 1) ||
-          name !~ /\.(tar\.gz|zip)$/ || name ~ /[\/ ]/) {
+          name ~ /[^A-Za-z0-9._-]/ || !known_target(name, ver)) {
         printf "error: %s: not a sha256 line for a %s archive: %s\n", src, ver, $0 > "/dev/stderr"
         bad = 1
         exit 1
@@ -58,6 +63,10 @@ for SUM in "$@"; do
   ' >> "$TMP/new" || die "rejected $SUM"
 done
 [ -s "$TMP/new" ] || die "no checksums given for $TAG"
+# One release has one archive name; both at once would list two builds as one version.
+if grep -q '  twigpine-node-' "$TMP/new" && grep -q '  gitlawb-node-' "$TMP/new"; then
+  die "$TAG has archives under both names (twigpine-node-* and gitlawb-node-*)"
+fi
 
 HEADER_DEFAULT='# SHA-256 checksums of Twigpine release archives (github.com/Twigpine/node).
 #
@@ -77,7 +86,9 @@ LATEST=""
 if [ -f "$LIST" ]; then
   tr -d '\r' < "$LIST" > "$TMP/old"
   grep '^#' "$TMP/old" | grep -v '^# latest:' > "$TMP/header" || true
-  LATEST=$(sed -n 's/^# latest: *v\([0-9][0-9.]*\) *$/\1/p' "$TMP/old" | head -n 1)
+  LATEST=$(sed -n 's/^# latest: *v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\) *$/\1/p' "$TMP/old" | head -n 1)
+  # Without a readable latest line this run could move latest backwards.
+  [ -n "$LATEST" ] || die "$LIST has no '# latest: vX.Y.Z' line; fix the list by hand first"
   # Keep every other version's entries.
   awk -v ver="$VERSION" '
     /^#/ || NF == 0 { next }
@@ -111,7 +122,7 @@ fi
     sub(/^(twigpine|gitlawb)-node-/, "", v)
     split(v, p, /[.-]/)
     printf "%d %d %d %s %s\n", p[1], p[2], p[3], $2, $1
-  }' | sort -k1,1nr -k2,2nr -k3,3nr -k4,4 | uniq | awk '{ printf "%s  %s\n", $5, $4 }'
+  }' | LC_ALL=C sort -k1,1nr -k2,2nr -k3,3nr -k4,4 | uniq | awk '{ printf "%s  %s\n", $5, $4 }'
 } > "$TMP/list"
 
 DUP=$(grep -v '^#' "$TMP/list" | awk '{ print $2 }' | sort | uniq -d | head -n 1)

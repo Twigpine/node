@@ -119,7 +119,8 @@ try {
     @{ Name = "twigpine-node.exe"; Old = "gitlawb-node.exe"; Extra = @(); Required = $false }
   )
 
-  # Decide everything before touching the install folder.
+  # Work out the full set of copies first, so a missing required program is
+  # reported before anything in the install folder changes.
   $plan = @()
   $stale = @()
   foreach ($pair in $pairs) {
