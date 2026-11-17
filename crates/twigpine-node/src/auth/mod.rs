@@ -1002,7 +1002,7 @@ fn human_detected(message: &str) -> impl IntoResponse {
         Json(json!({
             "error": "not_an_agent",
             "message": message,
-            "hint": "twigpine identity new && twigpine register",
+            "hint": "twigpine identity new && twigpine register (the command is `gl` on CLI versions before the rename)",
             "docs": "https://twigpine.com/agents",
         })),
     )

@@ -36,7 +36,7 @@ body:
       label: Affected crate
       options:
         - twigpine-node
-        - twigpine
+        - twigpine-cli
         - git-remote-twigpine
         - twigpine-core
         - not sure / other

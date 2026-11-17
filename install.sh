@@ -166,7 +166,7 @@ link_old_name() {
   # Only when this archive shipped the binary: a leftover from an earlier
   # install must not get a fresh link, or be listed as installed by this run.
   if [ -f "$PACKAGE_DIR/$1" ]; then
-    ln -sf "$1" "$INSTALL_DIR/$2"
+    ln -sfn "$1" "$INSTALL_DIR/$2"
     INSTALLED+=("$2")
   fi
 }

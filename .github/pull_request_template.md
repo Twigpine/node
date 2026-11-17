@@ -28,7 +28,7 @@ Closes #
 ## What changed
 
 <!-- Bullet the concrete changes. Note the crate(s) touched:
-     twigpine-core / twigpine-node / twigpine / git-remote-twigpine -->
+     twigpine-core / twigpine-node / twigpine-cli / git-remote-twigpine -->
 
 -
 

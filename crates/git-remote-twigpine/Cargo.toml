@@ -5,6 +5,7 @@ version = "0.7.1" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+default-run = "git-remote-twigpine"
 
 [[bin]]
 name = "git-remote-twigpine"
@@ -13,10 +14,12 @@ path = "src/main.rs"
 # The same program under the name git looks for today. Git picks a remote
 # helper by URL scheme, so a `gitlawb://` remote runs `git-remote-gitlawb`.
 # Building it here means a source build, `cargo install` and the tests all get
-# a working helper without a separate link step.
+# a working helper without a separate link step. The unit tests already run
+# once for the bin above.
 [[bin]]
 name = "git-remote-gitlawb"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 twigpine-core = { path = "../twigpine-core", features = ["redirect"] }

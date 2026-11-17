@@ -67,7 +67,7 @@ These are documented limitations of the current live release. They should be pri
 ### git-receive-pack authentication
 - The `git-receive-pack` endpoint enforces HTTP Signature auth. Plain Git smart-HTTP clients do not generate those headers, so the `git-remote-twigpine` helper is required for pushes.
 - **Impact:** Direct HTTP pushes without RFC 9421 headers are rejected; users need `gitlawb://` remotes or equivalent signed clients.
-- **Mitigation:** Use `gitlawb://` remote URLs and keep the helper on the user's `PATH` as `git-remote-gitlawb`, the name git runs for that scheme (every install method provides it beside `git-remote-twigpine`).
+- **Mitigation:** Use `gitlawb://` remote URLs and keep the helper on the user's `PATH` as `git-remote-gitlawb`, the name git runs for that scheme (every install method provides it).
 - **Fix target:** v0.2
 
 ### Private repository reads

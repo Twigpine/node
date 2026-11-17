@@ -24,7 +24,7 @@ This is a Rust workspace with six crates:
 | Crate | Purpose |
 |---|---|
 | `twigpine-node` | The node daemon: Axum HTTP server, git smart-HTTP, Postgres metadata, libp2p gossip, optional S3/Tigris/IPFS/Arweave/Base PoS hooks. |
-| `twigpine` | The Twigpine CLI for identity, repos, issues, PRs, bounties, tasks, peers, node status, MCP, and setup flows. |
+| `twigpine-cli` | The `twigpine` command: the Twigpine CLI for identity, repos, issues, PRs, bounties, tasks, peers, node status, MCP, and setup flows. |
 | `git-remote-twigpine` | Git remote helper for `gitlawb://` URLs, so normal `git clone`, `git fetch`, and `git push` can talk to Twigpine nodes. |
 | `twigpine-core` | Shared primitives: Ed25519 identities, `did:key`, CIDs, RFC 9421 HTTP signatures, certificates, and UCAN tokens. |
 | `twigpine-attest` | Pluggable external provenance attestations for ref-update certificates. |
@@ -125,6 +125,8 @@ docker compose down
 
 ## Install the CLI
 
+The command is `twigpine`. Every install method also provides `twig` as a short form and `gl`, the name used before the rename.
+
 ```bash
 # npm (macOS / Linux)
 npm install -g @gitlawb/gl
@@ -211,12 +213,12 @@ Public nodes (e.g. `node.twigpine.com`) require two things on writes:
    with the `x-icaptcha-proof` header. No manual steps, no env vars.
 
 ```bash
-twigpine identity new                                   # create did:key identity
-twigpine register      --node https://node.twigpine.com  # signed + auto-solves iCaptcha
-twigpine repo create memlawb --node https://node.twigpine.com   # signed + auto-solves iCaptcha
-git push  origin2 main                            # origin2 = gitlawb://<your-did>/memlawb (signed)
-git clone gitlawb://<your-did>/memlawb            # public read, no proof needed
-twigpine doctor                                         # preflight: identity, node, version, iCaptcha
+twigpine identity new                                          # create did:key identity
+twigpine register      --node https://node.twigpine.com        # signed + auto-solves iCaptcha
+twigpine repo create memlawb --node https://node.twigpine.com  # signed + auto-solves iCaptcha
+git push  origin2 main                                         # origin2 = gitlawb://<your-did>/memlawb (signed)
+git clone gitlawb://<your-did>/memlawb                         # public read, no proof needed
+twigpine doctor                                                # preflight: identity, node, version, iCaptcha
 ```
 
 Notes:

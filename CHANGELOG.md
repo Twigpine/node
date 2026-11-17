@@ -55,7 +55,7 @@
 ### Bug Fixes
 
 * **core:** honor wildcard capabilities in Ucan::can, matching is_attenuated_by ([#200](https://github.com/Twigpine/node/issues/200)) ([b6877a6](https://github.com/Twigpine/node/commit/b6877a65981dbf41c4a7838971eb5c826c7fcaf2))
-* **gl:** point doctor's version check at Twigpine/node, not the frozen Gitlawb/releases repo ([#198](https://github.com/Twigpine/node/issues/198)) ([98d728c](https://github.com/Twigpine/node/commit/98d728c325f68f0ee4a62e473dc484b7dd627504))
+* **gl:** point doctor's version check at Gitlawb/node, not the frozen Gitlawb/releases repo ([#198](https://github.com/Twigpine/node/issues/198)) ([98d728c](https://github.com/Twigpine/node/commit/98d728c325f68f0ee4a62e473dc484b7dd627504))
 * **node:** carry full owner DID on ref-update wire event ([#144](https://github.com/Twigpine/node/issues/144)) ([#145](https://github.com/Twigpine/node/issues/145)) ([69a62e5](https://github.com/Twigpine/node/commit/69a62e51c2d2f090f9cae88f4d8ce3b9017b7149))
 * **node:** gate /hooks and sibling read surfaces leaking private repo metadata ([#94](https://github.com/Twigpine/node/issues/94)) ([#113](https://github.com/Twigpine/node/issues/113)) ([ee8d7c0](https://github.com/Twigpine/node/commit/ee8d7c03b26a0b678cc90b8801aa340fe81da700))
 * strip Cf bidi/format controls in terminal-bound error sanitizers ([#183](https://github.com/Twigpine/node/issues/183)) ([#188](https://github.com/Twigpine/node/issues/188)) ([b07d41e](https://github.com/Twigpine/node/commit/b07d41ea97569d79d3f545ae5d43c373cd6f0f33))

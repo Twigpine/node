@@ -5,7 +5,7 @@
 //!   2. Registration    — ~/.gitlawb/ucan.json exists (registered with a node)
 //!   3. GITLAWB_NODE    — env var points at a public node (unset is advisory)
 //!   4. Node            — GITLAWB_NODE is reachable (default: https://node.twigpine.com)
-//!   5. git helper      — git-remote-twigpine is in PATH
+//!   5. git helper      — git-remote-gitlawb (the name git runs) is in PATH
 //!   6. git             — git is installed
 //!   7. version         — twigpine is up to date with latest GitHub release
 
@@ -777,7 +777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_version_queries_gitlawb_node_releases() {
+    async fn test_check_version_queries_node_releases() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("GET", "/repos/Twigpine/node/releases/latest")

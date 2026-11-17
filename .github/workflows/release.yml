@@ -7,7 +7,8 @@ on:
   # Manual backfill: republish an already-cut release to a channel that
   # missed it. Fill in only the channel(s) you want — an empty input leaves
   # that channel's jobs skipped. npm reuses the existing release's binary
-  # assets; docker rebuilds the image from the tag and re-tags the manifest.
+  # assets, so it only works for releases cut after the Twigpine rename (their
+  # archives are named twigpine-node-*); docker rebuilds the image from the tag and re-tags the manifest.
   workflow_dispatch:
     inputs:
       npm_backfill_tag:
