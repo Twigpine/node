@@ -50,6 +50,17 @@ pub struct Config {
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// True when `--key-path` / `TWIGPINE_KEY` was given, even with the same
+    /// text as the default. A path someone wrote is taken as written; only an
+    /// omitted one goes through the default-folder rule. Set by
+    /// [`Config::parse_with_sources`].
+    #[arg(skip)]
+    pub key_path_given: bool,
+
+    /// The same, for `--p2p-key-path` / `TWIGPINE_P2P_KEY`.
+    #[arg(skip)]
+    pub p2p_key_path_given: bool,
+
     /// Directory where bare git repositories are stored. `global` so it can
     /// follow a subcommand (e.g. `twigpine-node purge-spam --repos-dir …`).
     #[arg(
@@ -960,6 +971,25 @@ fn default_key_location(value: &str, default: &str) -> Option<PathBuf> {
 }
 
 impl Config {
+    /// `Config::parse()`, plus a record of which key paths were actually
+    /// given. Clap fills an omitted option with its default text, so the
+    /// parsed value alone cannot tell "left at the default" from "set to the
+    /// same text"; the value's source can.
+    pub fn parse_with_sources() -> Self {
+        use clap::parser::ValueSource;
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = Self::command().get_matches();
+        let mut config = Self::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+        let given = |id: &str| {
+            matches
+                .value_source(id)
+                .is_some_and(|source| source != ValueSource::DefaultValue)
+        };
+        config.key_path_given = given("key_path");
+        config.p2p_key_path_given = given("p2p_key_path");
+        config
+    }
+
     /// Decide once where key paths left at their default live, and write the
     /// answer back, so every later read agrees even if a folder appears while
     /// the node is starting.
@@ -969,10 +999,20 @@ impl Config {
     /// would generate a new node identity or PeerId beside the real one.
     fn settle_default_key_paths(&mut self) -> Result<(), String> {
         let home = dirs_next::home_dir();
-        for (value, default) in [
-            (&mut self.key_path, DEFAULT_KEY_PATH),
-            (&mut self.p2p_key_path, DEFAULT_P2P_KEY_PATH),
+        // With p2p off (port 0) its key is never read, so a missing one must
+        // not stop the node.
+        let p2p_on = self.p2p_port > 0;
+        for (value, default, in_use) in [
+            (&mut self.key_path, DEFAULT_KEY_PATH, !self.key_path_given),
+            (
+                &mut self.p2p_key_path,
+                DEFAULT_P2P_KEY_PATH,
+                !self.p2p_key_path_given && p2p_on,
+            ),
         ] {
+            if !in_use {
+                continue;
+            }
             let Some(path) = default_key_location(value, default) else {
                 continue;
             };
@@ -998,8 +1038,10 @@ impl Config {
 
     /// Resolve ~ in key_path
     pub fn resolved_key_path(&self) -> PathBuf {
-        if let Some(path) = default_key_location(&self.key_path, DEFAULT_KEY_PATH) {
-            return path;
+        if !self.key_path_given {
+            if let Some(path) = default_key_location(&self.key_path, DEFAULT_KEY_PATH) {
+                return path;
+            }
         }
         if self.key_path.starts_with("~/") {
             let suffix = &self.key_path[2..];
@@ -1014,8 +1056,10 @@ impl Config {
 
     /// Resolve ~ in p2p_key_path
     pub fn resolved_p2p_key_path(&self) -> PathBuf {
-        if let Some(path) = default_key_location(&self.p2p_key_path, DEFAULT_P2P_KEY_PATH) {
-            return path;
+        if !self.p2p_key_path_given {
+            if let Some(path) = default_key_location(&self.p2p_key_path, DEFAULT_P2P_KEY_PATH) {
+                return path;
+            }
         }
         if self.p2p_key_path.starts_with("~/") {
             let suffix = &self.p2p_key_path[2..];
@@ -2647,6 +2691,27 @@ mod tests {
     /// path beneath the selected home, and suffixes that would escape are
     /// left unexpanded (and then rejected by `validate`, as the matrix above
     /// asserts) rather than joined and repaired after.
+    #[test]
+    fn a_key_path_that_was_given_is_taken_as_written_even_when_it_equals_the_default() {
+        let Some(home) = dirs_next::home_dir() else {
+            return;
+        };
+        // Left at the default: the folder rule decides (this machine may have
+        // a `~/.gitlawb` from before the rename).
+        let omitted = config_with_p2p_key(DEFAULT_P2P_KEY_PATH);
+        assert_eq!(
+            omitted.resolved_p2p_key_path(),
+            twigpine_core::identity_path::default_dir(&home).join("p2p.key")
+        );
+        // The same text, but the operator wrote it: no redirect.
+        let mut given = config_with_p2p_key(DEFAULT_P2P_KEY_PATH);
+        given.p2p_key_path_given = true;
+        assert_eq!(
+            given.resolved_p2p_key_path(),
+            home.join(".twigpine").join("p2p.key")
+        );
+    }
+
     #[test]
     fn p2p_tilde_expansion_stays_beneath_home() {
         let Some(home) = dirs_next::home_dir() else {

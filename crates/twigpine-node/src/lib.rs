@@ -44,7 +44,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use clap::Parser;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -101,7 +100,7 @@ pub async fn run() -> Result<()> {
         )
         .init();
 
-    let mut config = Config::parse();
+    let mut config = Config::parse_with_sources();
 
     // Settings given under their names from before the rename still work
     // (`main` copied them over before anything read a setting). Say which, by
