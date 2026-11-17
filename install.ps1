@@ -138,6 +138,15 @@ try {
     }
   }
 
+  # A directory on a name this run writes cannot be replaced by a file:
+  # Copy-Item would put the program inside it and report success.
+  foreach ($item in $plan) {
+    $dst = Join-Path $InstallDir $item.Name
+    if (Test-Path -LiteralPath $dst -PathType Container) {
+      throw "$dst is a directory, and the installer needs that name for a program. Move it away or set GITLAWB_INSTALL_DIR. Nothing was installed."
+    }
+  }
+
   $installed = @()
   foreach ($item in $plan) {
     Copy-Item -Path $item.Src -Destination (Join-Path $InstallDir $item.Name) -Force

@@ -380,6 +380,20 @@ if [ "$PS1_OK" = yes ] && command -v pwsh >/dev/null 2>&1; then
   else bad "upgrades an install from before the rename"; fi
   KEEP_HOME=""
 
+  # A directory sitting on a name the installer writes: refuse, copy nothing.
+  for blocked in twigpine.exe twig.exe git-remote-gitlawb.exe; do
+    reset_server
+    rm -rf "${W:?}/home" && mkdir -p "$W/home/bin/$blocked"
+    KEEP_HOME=yes
+    if run_ps1; then
+      bad "refuses to install over a directory named $blocked"
+    elif grep -q "is a directory" "$W/out" && [ -z "$(ls -A "$W/home/bin/$blocked")" ] \
+      && [ "$(ls -A "$W/home/bin")" = "$blocked" ]; then
+      ok "refuses to install over a directory named $blocked"
+    else bad "refuses to install over a directory named $blocked"; fi
+    KEEP_HOME=""
+  done
+
   reset_server
   make_release 9.9.0 hijacked
   if ! run_ps1 && ps1_nothing && grep -q "checksum mismatch" "$W/out"; then
