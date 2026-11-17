@@ -79,7 +79,7 @@ pub struct CloneArgs {
     #[arg(
         long,
         default_value = "https://node.twigpine.com",
-        env = "GITLAWB_NODE"
+        env = "TWIGPINE_NODE"
     )]
     pub node: String,
 
@@ -88,7 +88,7 @@ pub struct CloneArgs {
     #[arg(
         long,
         default_value = "https://arweave.net",
-        env = "GITLAWB_ARWEAVE_GATEWAY"
+        env = "TWIGPINE_ARWEAVE_GATEWAY"
     )]
     pub arweave_gateway: String,
 
@@ -96,7 +96,7 @@ pub struct CloneArgs {
     #[arg(
         long,
         default_value = "https://dweb.link",
-        env = "GITLAWB_IPFS_GATEWAY"
+        env = "TWIGPINE_IPFS_GATEWAY"
     )]
     pub ipfs_gateway: String,
 }

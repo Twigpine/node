@@ -2,7 +2,7 @@
 //!
 //! `twigpine`'s `--node` defaults to the public node while `git-remote-twigpine` falls
 //! back to a local one, and an explicit `--node` outranks the environment. So the
-//! two disagree whenever GITLAWB_NODE is unset, blank, or overridden, and doctor's
+//! two disagree whenever TWIGPINE_NODE is unset, blank, or overridden, and doctor's
 //! own `node` row describes a URL `git clone` and `git push` never contact.
 
 use std::io::{Read, Write};
@@ -114,27 +114,30 @@ fn doctor_with(env_node: Option<&str>, node_flag: Option<&str>, extra_env: &[(&s
     }
     cmd.arg("--dir")
         .arg(dir.path().join("gitlawb"))
-        .env("GITLAWB_ICAPTCHA_URL", "http://127.0.0.1:1")
+        .env("TWIGPINE_ICAPTCHA_URL", "http://127.0.0.1:1")
         .env(
-            "GITLAWB_GITHUB_API_URL",
+            "TWIGPINE_GITHUB_API_URL",
             format!("http://127.0.0.1:{release_port}"),
         );
     for v in PROXY_VARS {
         cmd.env_remove(v);
     }
+    // The setting's name from before the rename is read too, so a developer
+    // shell that still exports it must not leak into the run.
+    cmd.env_remove("GITLAWB_NODE");
+    match env_node {
+        Some(v) => cmd.env("TWIGPINE_NODE", v),
+        None => cmd.env_remove("TWIGPINE_NODE"),
+    };
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    match env_node {
-        Some(v) => cmd.env("GITLAWB_NODE", v),
-        None => cmd.env_remove("GITLAWB_NODE"),
-    };
     let out = cmd.output().unwrap();
     // Under a configured proxy the lookup goes to the proxy fixture, not this one,
     // so the fixture-boundary check only applies to the unproxied runs.
     let proxied = extra_env
         .iter()
-        .any(|(k, _)| *k == "HTTP_PROXY" || *k == "GITLAWB_GITHUB_API_URL");
+        .any(|(k, _)| *k == "HTTP_PROXY" || *k == "TWIGPINE_GITHUB_API_URL");
     assert!(
         proxied || release_hits.load(Ordering::SeqCst) >= 1,
         "the release lookup never reached the fixture, so it went to the public API"
@@ -144,7 +147,7 @@ fn doctor_with(env_node: Option<&str>, node_flag: Option<&str>, extra_env: &[(&s
     }
 }
 
-/// GITLAWB_NODE unset: the helper falls back to the local node, twigpine targets the
+/// TWIGPINE_NODE unset: the helper falls back to the local node, twigpine targets the
 /// public one, so the row must name the local node as the transport target.
 #[test]
 fn unset_env_reports_the_transport_node() {
@@ -200,7 +203,7 @@ fn agreeing_env_and_flag_produce_no_divergence_row() {
 }
 
 /// `--node` equal to the transport default says nothing about whether the user
-/// set `GITLAWB_NODE`. With the variable unset the row must stay the advisory
+/// set `TWIGPINE_NODE`. With the variable unset the row must stay the advisory
 /// "not set" Warn, not a Pass describing a configured loopback node.
 #[test]
 fn unset_env_with_flag_equal_to_transport_default_still_warns_not_set() {
@@ -208,8 +211,8 @@ fn unset_env_with_flag_equal_to_transport_default_still_warns_not_set() {
     let row = r
         .stdout
         .lines()
-        .find(|l| l.contains("GITLAWB_NODE"))
-        .unwrap_or_else(|| panic!("no GITLAWB_NODE row in:\n{}", r.stdout));
+        .find(|l| l.contains("TWIGPINE_NODE"))
+        .unwrap_or_else(|| panic!("no TWIGPINE_NODE row in:\n{}", r.stdout));
     assert!(
         row.contains("not set"),
         "unset env must report 'not set', got row {row:?} in:\n{}",
@@ -274,7 +277,7 @@ fn control_characters_in_the_node_url_are_stripped() {
     let owned: String = r
         .stdout
         .lines()
-        .filter(|l| l.contains(DIVERGENCE) || l.trim_start().starts_with("GITLAWB_NODE:"))
+        .filter(|l| l.contains(DIVERGENCE) || l.trim_start().starts_with("TWIGPINE_NODE:"))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -320,7 +323,7 @@ fn an_unset_env_adds_no_failing_row() {
         .filter(|l| l.trim_start().starts_with('\u{2717}'))
         .collect();
     assert!(
-        failing.iter().all(|l| !l.contains("GITLAWB_NODE")),
+        failing.iter().all(|l| !l.contains("TWIGPINE_NODE")),
         "an unset variable must stay advisory, got failing rows: {failing:?}"
     );
     assert!(r.divergence_line().is_some(), "got:\n{}", r.stdout);
@@ -330,7 +333,7 @@ fn an_unset_env_adds_no_failing_row() {
 fn fix_line(r: &Run) -> &str {
     r.stdout
         .lines()
-        .find(|l| l.trim_start().starts_with("GITLAWB_NODE:"))
+        .find(|l| l.trim_start().starts_with("TWIGPINE_NODE:"))
         .unwrap_or("")
 }
 
@@ -417,7 +420,7 @@ fn a_node_reachable_only_through_the_configured_proxy_is_reachable() {
         Some("http://127.0.0.1:1"),
         &[
             ("HTTP_PROXY", &format!("http://127.0.0.1:{proxy}")),
-            ("GITLAWB_ALLOW_INSECURE_HTTP", "1"),
+            ("TWIGPINE_ALLOW_INSECURE_HTTP", "1"),
         ],
     );
     let line = r
@@ -476,7 +479,7 @@ fn a_loopback_node_is_never_sent_through_a_live_proxy() {
 }
 
 /// The helper refuses a non-loopback `http://` node before sending anything unless
-/// `GITLAWB_ALLOW_INSECURE_HTTP` is truthy. Doctor must report that refusal, as a
+/// `TWIGPINE_ALLOW_INSECURE_HTTP` is truthy. Doctor must report that refusal, as a
 /// failure because the user set the variable, and must not contact the node.
 #[test]
 fn a_plaintext_remote_node_is_refused_like_the_helper_and_never_probed() {
@@ -521,7 +524,7 @@ fn the_plaintext_refusal_follows_the_helpers_opt_in_parsing() {
             Some("http://127.0.0.1:1"),
             &[
                 ("HTTP_PROXY", &proxy_env),
-                ("GITLAWB_ALLOW_INSECURE_HTTP", val),
+                ("TWIGPINE_ALLOW_INSECURE_HTTP", val),
             ],
         );
         let line = r
@@ -605,7 +608,7 @@ fn an_oversized_probe_body_is_rejected_not_parsed() {
     assert!(!line.contains("(reachable)"), "got: {line}");
 }
 
-/// Blank GITLAWB_NODE with no `--node`: clap hands doctor the raw blank value, and
+/// Blank TWIGPINE_NODE with no `--node`: clap hands doctor the raw blank value, and
 /// the remedy must not reproduce it. It names the public node instead.
 #[test]
 fn a_blank_env_remedy_does_not_reproduce_the_blank_value() {
@@ -613,7 +616,7 @@ fn a_blank_env_remedy_does_not_reproduce_the_blank_value() {
         let r = doctor_with(Some(blank), None, &[]);
         let fix = fix_line(&r);
         assert!(
-            fix.contains("export GITLAWB_NODE='https://node.twigpine.com'"),
+            fix.contains("export TWIGPINE_NODE='https://node.twigpine.com'"),
             "blank {blank:?} must be replaced by a valid target, got: {fix:?}\n{}",
             r.stdout
         );
@@ -631,7 +634,7 @@ fn an_apostrophe_in_the_node_value_cannot_break_out_of_the_remedy() {
     );
 }
 
-/// `GITLAWB_NODE` may carry a path prefix (a reverse-proxied `https://host/mount`),
+/// `TWIGPINE_NODE` may carry a path prefix (a reverse-proxied `https://host/mount`),
 /// with identity served at exactly that prefix and nothing at `/mount/`. The probe
 /// must request the configured base verbatim, as the helper does.
 #[test]
@@ -668,7 +671,10 @@ fn a_hostile_release_tag_cannot_reach_the_terminal_raw() {
     let r = doctor_with(
         None,
         Some("http://127.0.0.1:1"),
-        &[("GITLAWB_GITHUB_API_URL", &format!("http://127.0.0.1:{api}"))],
+        &[(
+            "TWIGPINE_GITHUB_API_URL",
+            &format!("http://127.0.0.1:{api}"),
+        )],
     );
     assert!(hits.load(Ordering::SeqCst) >= 1, "fixture never hit");
     assert!(
@@ -726,7 +732,7 @@ fn invalid_utf8_in_the_identity_body_is_not_a_reachable_node() {
     }
 }
 
-/// A padded `GITLAWB_NODE` with no `--node` resolves to the trimmed URL for the
+/// A padded `TWIGPINE_NODE` with no `--node` resolves to the trimmed URL for the
 /// transport, so the connectivity row must dial the trimmed URL too instead of
 /// failing to parse ` http://host:port /`.
 #[test]
@@ -744,7 +750,7 @@ fn a_padded_env_node_is_dialed_trimmed_by_the_connectivity_row() {
     );
 }
 
-/// clap binds `--node` from `GITLAWB_NODE` verbatim, while the transport resolver
+/// clap binds `--node` from `TWIGPINE_NODE` verbatim, while the transport resolver
 /// trims it. A padded value therefore resolves to the same node on both sides, and
 /// doctor must not read the whitespace difference as a divergence: no divergence
 /// clause, and the env row classified as the configured loopback node (Pass),
@@ -762,8 +768,8 @@ fn a_padded_env_node_is_not_a_divergence() {
         let row = r
             .stdout
             .lines()
-            .find(|l| l.contains("GITLAWB_NODE") && !l.trim_start().starts_with("GITLAWB_NODE:"))
-            .unwrap_or_else(|| panic!("no GITLAWB_NODE row, got:\n{}", r.stdout));
+            .find(|l| l.contains("TWIGPINE_NODE") && !l.trim_start().starts_with("TWIGPINE_NODE:"))
+            .unwrap_or_else(|| panic!("no TWIGPINE_NODE row, got:\n{}", r.stdout));
         assert!(
             !row.trim_start().starts_with('\u{2717}'),
             "padding alone must not fail the env row (node up: {up}): {row}"
@@ -773,4 +779,49 @@ fn a_padded_env_node_is_not_a_divergence() {
             "a padded loopback env must classify as the configured loopback node (node up: {up}): {row}"
         );
     }
+}
+
+/// The `settings` row doctor prints when a setting was given under its name
+/// from before the rename.
+fn settings_row(r: &Run) -> Option<&str> {
+    // The row itself, not the fix hint printed under it.
+    r.stdout
+        .lines()
+        .find(|l| l.contains("under the old GITLAWB_ name") || l.contains("TWIGPINE_ wins"))
+}
+
+#[test]
+fn a_setting_under_its_old_name_still_selects_the_node() {
+    let (port, hits) = serve(|_, _| did_ok());
+    let url = format!("http://127.0.0.1:{port}");
+    // No --node and no TWIGPINE_NODE: the old name is the only source.
+    let r = doctor_with(None, None, &[("GITLAWB_NODE", &url)]);
+    assert!(
+        hits.load(Ordering::SeqCst) > 0,
+        "the node named by GITLAWB_NODE was never contacted:\n{}",
+        r.stdout
+    );
+    let row = settings_row(&r).unwrap_or_else(|| panic!("no settings row:\n{}", r.stdout));
+    assert!(row.contains("TWIGPINE_NODE"), "{row}");
+}
+
+#[test]
+fn the_new_name_wins_over_the_old_one_and_doctor_says_so() {
+    let (new_port, new_hits) = serve(|_, _| did_ok());
+    let (old_port, old_hits) = serve(|_, _| did_ok());
+    let new_url = format!("http://127.0.0.1:{new_port}");
+    let old_url = format!("http://127.0.0.1:{old_port}");
+    let r = doctor_with(Some(&new_url), None, &[("GITLAWB_NODE", &old_url)]);
+    assert!(new_hits.load(Ordering::SeqCst) > 0, "{}", r.stdout);
+    assert_eq!(old_hits.load(Ordering::SeqCst), 0, "{}", r.stdout);
+    let row = settings_row(&r).unwrap_or_else(|| panic!("no settings row:\n{}", r.stdout));
+    assert!(row.contains("TWIGPINE_ wins"), "{row}");
+}
+
+#[test]
+fn no_settings_row_without_an_old_name() {
+    let (port, _) = serve(|_, _| did_ok());
+    let url = format!("http://127.0.0.1:{port}");
+    let r = doctor_with(Some(&url), None, &[]);
+    assert!(settings_row(&r).is_none(), "{}", r.stdout);
 }

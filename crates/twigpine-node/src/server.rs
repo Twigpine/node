@@ -405,7 +405,7 @@ pub fn build_router(state: AppState) -> Router {
             auth::optional_signature,
         ));
 
-    // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
+    // Body limit is raised to TWIGPINE_MAX_PACK_BYTES (default 2 GB) for git
     // routes only — all other API routes keep axum's default 2 MB cap.
     // HTTP Signature is enforced on receive-pack (push) — the git-remote-twigpine
     // helper signs requests with RFC 9421 signatures using the agent's keypair.
@@ -804,7 +804,34 @@ pub fn build_router(state: AppState) -> Router {
                 .on_response(DefaultOnResponse::new().level(Level::DEBUG))
                 .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
         )
+        // Outermost, so it sees every response, including the ones the layers
+        // above build themselves (auth, rate limits, body limits).
+        .layer(middleware::from_fn(send_legacy_header_names))
         .with_state(state)
+}
+
+/// Send each renamed response header under its old name too.
+///
+/// Handlers set only the current name. A client written before the rename
+/// reads the old one, and for the error header that read is what turns a
+/// refusal into an error instead of something that looks like success.
+pub(crate) async fn send_legacy_header_names(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    for (name, legacy) in twigpine_core::legacy_headers::RESPONSE_PAIRS {
+        let values: Vec<_> = response.headers().get_all(name).iter().cloned().collect();
+        if values.is_empty() {
+            continue;
+        }
+        let legacy = axum::http::HeaderName::from_static(legacy);
+        response.headers_mut().remove(&legacy);
+        for value in values {
+            response.headers_mut().append(legacy.clone(), value);
+        }
+    }
+    response
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -834,7 +861,7 @@ async fn ready(State(state): State<AppState>) -> axum::response::Response {
 async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {
     let p2p_peer_id = state.p2p.as_ref().map(|h| h.local_peer_id.to_string());
     let mut body = json!({
-        "name": "gitlawb-node",
+        "name": "twigpine-node",
         "version": env!("CARGO_PKG_VERSION"),
         "did": state.node_did.to_string(),
         "network": "alpha",
@@ -1271,6 +1298,45 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+
+    /// Every response carries the renamed headers under their old names too,
+    /// with the same values, and an old-name header a handler might still set
+    /// cannot disagree with the current one.
+    #[tokio::test]
+    async fn renamed_response_headers_also_go_out_under_their_old_names() {
+        let app = Router::new()
+            .route(
+                "/refused",
+                get(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        [
+                            ("X-Twigpine-Error", "signature_replayed"),
+                            ("X-Gitlawb-Error", "stale"),
+                        ],
+                    )
+                }),
+            )
+            .route("/plain", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(send_legacy_header_names));
+
+        let refused = app
+            .clone()
+            .oneshot(Request::get("/refused").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let h = refused.headers();
+        assert_eq!(h.get("x-twigpine-error").unwrap(), "signature_replayed");
+        let old: Vec<_> = h.get_all("x-gitlawb-error").iter().collect();
+        assert_eq!(old, ["signature_replayed"]);
+
+        let plain = app
+            .oneshot(Request::get("/plain").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(plain.headers().get("x-gitlawb-error").is_none());
+        assert!(plain.headers().get("x-twigpine-error").is_none());
+    }
     use tower::ServiceExt;
 
     use crate::db::RepoRecord;

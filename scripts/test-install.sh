@@ -134,9 +134,9 @@ run_installer() {
   shift
   if [ "${KEEP_HOME:-}" != yes ]; then rm -rf "${W:?}/home" && mkdir -p "$W/home"; fi
   HOME="${W:?}/home" \
-    GITLAWB_INSTALL_DIR="$W/home/bin" \
-    GITLAWB_DOWNLOAD_BASE="$BASE/gh" \
-    GITLAWB_CHECKSUMS_URL="${LIST_URL:-$BASE/web/install-checksums.txt}" \
+    TWIGPINE_INSTALL_DIR="$W/home/bin" \
+    TWIGPINE_DOWNLOAD_BASE="$BASE/gh" \
+    TWIGPINE_CHECKSUMS_URL="${LIST_URL:-$BASE/web/install-checksums.txt}" \
     PATH="${RUN_PATH:-$PATH}" \
     "$shell" "$INSTALLER" "$@" > "$W/out" 2>&1
 }
@@ -174,6 +174,15 @@ suite() {
   if run_installer "$shell" && installed 9.9.0 && grep -q "checksum OK" "$W/out"; then
     ok "installs the latest listed version"
   else bad "installs the latest listed version"; fi
+
+  # The settings' names from before the rename still work.
+  reset_server
+  rm -rf "${W:?}/home" && mkdir -p "$W/home"
+  if HOME="$W/home" GITLAWB_INSTALL_DIR="$W/home/bin" GITLAWB_DOWNLOAD_BASE="$BASE/gh" \
+    GITLAWB_CHECKSUMS_URL="$BASE/web/install-checksums.txt" \
+    "$shell" "$INSTALLER" > "$W/out" 2>&1 && installed 9.9.0; then
+    ok "honours the settings under their old GITLAWB_ names"
+  else bad "honours the settings under their old GITLAWB_ names"; fi
 
   reset_server
   if run_installer "$shell" --version v9.8.0 && installed 9.8.0; then
@@ -332,9 +341,9 @@ done
 run_ps1() {
   if [ "${KEEP_HOME:-}" != yes ]; then rm -rf "${W:?}/home" && mkdir -p "$W/home"; fi
   PROCESSOR_ARCHITECTURE=AMD64 \
-    GITLAWB_INSTALL_DIR="$W/home/bin" \
-    GITLAWB_DOWNLOAD_BASE="$BASE/gh" \
-    GITLAWB_CHECKSUMS_URL="${LIST_URL:-$BASE/web/install-checksums.txt}" \
+    TWIGPINE_INSTALL_DIR="$W/home/bin" \
+    TWIGPINE_DOWNLOAD_BASE="$BASE/gh" \
+    TWIGPINE_CHECKSUMS_URL="${LIST_URL:-$BASE/web/install-checksums.txt}" \
     pwsh -NoProfile -NonInteractive -File "$ROOT/install.ps1" "$@" > "$W/out" 2>&1
 }
 # has <name> <content>: the installed <name>.exe is the build that says <content>.

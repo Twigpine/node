@@ -19,7 +19,7 @@ Owner focus: maintainers.
 - Keep CI green on `main`: format, clippy, workspace tests, release build.
 - Add PR Docker smoke testing so quickstart regressions are caught before merge.
 - Add installer smoke tests for release archive names and extraction layout.
-- Publish a short operator notice for `GITLAWB_REQUIRE_SIGNED_PEER_WRITES`: leave it `false` until all known peers upgrade, then flip it.
+- Publish a short operator notice for `TWIGPINE_REQUIRE_SIGNED_PEER_WRITES`: leave it `false` until all known peers upgrade, then flip it.
 - Add a live-node checklist: health endpoint, database backup, data volume backup, public URL, reverse proxy/TLS, peer reachability.
 - Track known public nodes and their version so coordinated upgrades are possible.
 
@@ -30,7 +30,7 @@ Owner focus: node reliability.
 - Add versioned database migrations instead of implicit startup schema changes.
 - Add graceful shutdown and startup logging that clearly distinguishes database, repos, P2P, and operator-loop failures.
 - Add bounded request/concurrency settings for git pack operations.
-- Add operator docs for lowering `GITLAWB_MAX_PACK_BYTES` on small nodes.
+- Add operator docs for lowering `TWIGPINE_MAX_PACK_BYTES` on small nodes.
 - Add recovery docs for a broken repo cache, missing data volume, or failed Tigris/S3 sync.
 - Add basic metrics for pushes, fetches, pack sizes, peer sync queue, failed auth, and webhook failures.
 

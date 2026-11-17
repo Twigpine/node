@@ -357,11 +357,12 @@ fn fetch_with_helper_env(
         // test, e.g. `expected ACK/NAK`) are the untranslated English strings on a
         // machine/CI with git-l10n installed and LANG set to a translated locale.
         .env("LC_ALL", "C")
-        .env("GITLAWB_NODE", node_url)
-        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-fetch")
+        .env("TWIGPINE_NODE", node_url)
+        .env("TWIGPINE_KEY", "/nonexistent-key-for-anon-fetch")
         // The helper inherits this process's environment, so an operator or CI
         // that exports the insecure-HTTP override would decide the transport
         // policy for every test below. Clear it and let each test opt in.
+        .env_remove("TWIGPINE_ALLOW_INSECURE_HTTP")
         .env_remove("GITLAWB_ALLOW_INSECURE_HTTP");
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -393,8 +394,9 @@ fn push_with_helper(local: &Path, node_url: &str, args: &[&str]) -> (bool, std::
         .args(args)
         .env("PATH", path_env)
         .env("LC_ALL", "C")
-        .env("GITLAWB_NODE", node_url)
-        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-push")
+        .env("TWIGPINE_NODE", node_url)
+        .env("TWIGPINE_KEY", "/nonexistent-key-for-anon-push")
+        .env_remove("TWIGPINE_ALLOW_INSECURE_HTTP")
         .env_remove("GITLAWB_ALLOW_INSECURE_HTTP");
     run_bounded(cmd, Duration::from_secs(30))
 }
@@ -1399,12 +1401,12 @@ fn real_git_fetch_refuses_a_remote_plaintext_node() {
         "the helper must refuse the cleartext hop and say so; stderr was: {stderr}"
     );
     assert!(
-        stderr.contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+        stderr.contains("TWIGPINE_ALLOW_INSECURE_HTTP"),
         "the refusal must name the escape hatch; stderr was: {stderr}"
     );
 }
 
-/// The opt-in is read as a value, not as presence. `GITLAWB_ALLOW_INSECURE_HTTP`
+/// The opt-in is read as a value, not as presence. `TWIGPINE_ALLOW_INSECURE_HTTP`
 /// set to `0`, `false`, empty or a misspelling must leave the gate closed: the
 /// README and the refusal message both tell the operator to set it to `1`, so
 /// anything else reads as "not opting in". Drives the built binary because the
@@ -1416,18 +1418,18 @@ fn real_git_fetch_still_refuses_a_remote_plaintext_node_when_override_is_not_tru
         let (ok, out) = fetch_with_helper_env(
             &repos.clone,
             "http://192.0.2.1:7545",
-            &[("GITLAWB_ALLOW_INSECURE_HTTP", value)],
+            &[("TWIGPINE_ALLOW_INSECURE_HTTP", value)],
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             !ok || !out.status.success(),
-            "GITLAWB_ALLOW_INSECURE_HTTP={value:?} must not permit a remote plaintext node: {stderr}"
+            "TWIGPINE_ALLOW_INSECURE_HTTP={value:?} must not permit a remote plaintext node: {stderr}"
         );
         // The not-truthy warning also says "plaintext http", so match the text
         // only the refusal itself emits.
         assert!(
             stderr.contains("refusing to send git data"),
-            "GITLAWB_ALLOW_INSECURE_HTTP={value:?} must leave the gate refusing; stderr was: {stderr}"
+            "TWIGPINE_ALLOW_INSECURE_HTTP={value:?} must leave the gate refusing; stderr was: {stderr}"
         );
     }
 }

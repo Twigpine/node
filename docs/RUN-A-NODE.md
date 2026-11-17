@@ -38,10 +38,10 @@ This is your **node DID** — it's distinct from your Ethereum wallet.
 This stakes $GITLAWB and links your node DID to your operator wallet:
 
 ```bash
-export GITLAWB_OPERATOR_PRIVATE_KEY=0xYOUR_KEY
-export GITLAWB_TOKEN=0x5F980Dcfc4c0fa3911554cf5ab288ed0eb13DBa3
-export GITLAWB_CONTRACT_NODE_STAKING=0xNODE_STAKING_ADDR
-export GITLAWB_CHAIN_RPC_URL=https://mainnet.base.org
+export TWIGPINE_OPERATOR_PRIVATE_KEY=0xYOUR_KEY
+export TWIGPINE_TOKEN=0x5F980Dcfc4c0fa3911554cf5ab288ed0eb13DBa3
+export TWIGPINE_CONTRACT_NODE_STAKING=0xNODE_STAKING_ADDR
+export TWIGPINE_CHAIN_RPC_URL=https://mainnet.base.org
 
 twigpine node register \
   --stake 10000 \
@@ -65,11 +65,11 @@ docker run -d \
   -p 7546:7546/udp \
   -v gitlawb-data:/data \
   -e DATABASE_URL=postgresql://user:pass@host/gitlawb \
-  -e GITLAWB_PUBLIC_URL=https://my-node.example.com \
-  -e GITLAWB_OPERATOR_PRIVATE_KEY=$GITLAWB_OPERATOR_PRIVATE_KEY \
-  -e GITLAWB_CONTRACT_NODE_STAKING=$GITLAWB_CONTRACT_NODE_STAKING \
-  -e GITLAWB_CHAIN_RPC_URL=$GITLAWB_CHAIN_RPC_URL \
-  -e GITLAWB_OPERATOR_STRICT_MODE=true \
+  -e TWIGPINE_PUBLIC_URL=https://my-node.example.com \
+  -e TWIGPINE_OPERATOR_PRIVATE_KEY=$TWIGPINE_OPERATOR_PRIVATE_KEY \
+  -e TWIGPINE_CONTRACT_NODE_STAKING=$TWIGPINE_CONTRACT_NODE_STAKING \
+  -e TWIGPINE_CHAIN_RPC_URL=$TWIGPINE_CHAIN_RPC_URL \
+  -e TWIGPINE_OPERATOR_STRICT_MODE=true \
   ghcr.io/twigpine/node:latest
 ```
 
@@ -84,14 +84,14 @@ cargo run -p twigpine-node --release
 ```
 
 Required env for on-chain PoS mode:
-- `GITLAWB_CONTRACT_NODE_STAKING` — contract address
-- `GITLAWB_OPERATOR_PRIVATE_KEY` — key that posts heartbeats
-- `GITLAWB_CHAIN_RPC_URL` — Base RPC URL (default Sepolia)
+- `TWIGPINE_CONTRACT_NODE_STAKING` — contract address
+- `TWIGPINE_OPERATOR_PRIVATE_KEY` — key that posts heartbeats
+- `TWIGPINE_CHAIN_RPC_URL` — Base RPC URL (default Sepolia)
 
 Optional:
-- `GITLAWB_OPERATOR_STRICT_MODE=true` — refuse to start if not registered or not currently active
-- `GITLAWB_HEARTBEAT_INTERVAL_HOURS=20` — how often to post heartbeats (must be < 24)
-- `GITLAWB_RECONCILIATION_SWEEP=true` — enable the hourly durability sweep that re-pins/backstops missing objects (default `true`; disabled when no IPFS/Pinata backend is configured). Public pin repair runs against any configured backend. Encrypted recovery repair requires local IPFS (`GITLAWB_IPFS_API`); Pinata-only nodes reconcile public pins only. Set `=false` to disable.
+- `TWIGPINE_OPERATOR_STRICT_MODE=true` — refuse to start if not registered or not currently active
+- `TWIGPINE_HEARTBEAT_INTERVAL_HOURS=20` — how often to post heartbeats (must be < 24)
+- `TWIGPINE_RECONCILIATION_SWEEP=true` — enable the hourly durability sweep that re-pins/backstops missing objects (default `true`; disabled when no IPFS/Pinata backend is configured). Public pin repair runs against any configured backend. Encrypted recovery repair requires local IPFS (`TWIGPINE_IPFS_API`); Pinata-only nodes reconcile public pins only. Set `=false` to disable.
 
 ## 5. Verify
 
@@ -181,7 +181,7 @@ repository, the delegate must also be a reader — see *Private repositories and
 ### Turning it off
 
 ```bash
-GITLAWB_ENFORCE_OWNER_PUSH=false
+TWIGPINE_ENFORCE_OWNER_PUSH=false
 ```
 
 Both the environment variable and `--enforce-owner-push false` disable it; the
@@ -204,7 +204,7 @@ from anyone who can generate a keypair.
 The owner issues a capability, the agent stores it, and the git helper presents it
 automatically on every push:
 
-Before anything below, set `GITLAWB_KEY` to an **absolute** path to the
+Before anything below, set `TWIGPINE_KEY` to an **absolute** path to the
 identity PEM (`twigpine identity new` prints it). `twigpine ucan import` and
 `git-remote-twigpine` both resolve the delegation store from that key's parent
 directory, so do not pass `import --dir` pointing anywhere else: an import that
@@ -299,9 +299,9 @@ short lifetimes reissued often are safer than one long-lived grant.
 
 **"insufficient $GITLAWB balance"** — fund the operator wallet with at least 10,000 $GITLAWB.
 
-**Node refuses to start with "strict-mode operator check failed"** — either `twigpine node register` first, or unset `GITLAWB_OPERATOR_STRICT_MODE`.
+**Node refuses to start with "strict-mode operator check failed"** — either `twigpine node register` first, or unset `TWIGPINE_OPERATOR_STRICT_MODE`.
 
-**Node refuses to start with "GITLAWB_DB_MAX_CONNECTIONS (20) must be at least max_concurrent_git_pushes (32) + 8 headroom"**: raise `GITLAWB_DB_MAX_CONNECTIONS` to at least the push cap plus 8 (40 with the default cap of 32; 48 is the shipped default and the recommended value), or lower `GITLAWB_MAX_CONCURRENT_GIT_PUSHES`. This bites a node upgraded in place that still sets the old pool size of 20. The check is deliberate: each concurrent push pins one pooled connection for its whole receive-pack, so a pool that does not clear the push cap lets a burst of slow pushes starve every other database path.
+**Node refuses to start with "TWIGPINE_DB_MAX_CONNECTIONS (20) must be at least max_concurrent_git_pushes (32) + 8 headroom"**: raise `TWIGPINE_DB_MAX_CONNECTIONS` to at least the push cap plus 8 (40 with the default cap of 32; 48 is the shipped default and the recommended value), or lower `TWIGPINE_MAX_CONCURRENT_GIT_PUSHES`. This bites a node upgraded in place that still sets the old pool size of 20. The check is deliberate: each concurrent push pins one pooled connection for its whole receive-pack, so a pool that does not clear the push cap lets a burst of slow pushes starve every other database path.
 
 **Rewards are 0 after a week** — run `twigpine node onchain-status`. If `currentlyActive: false`, check your heartbeat loop (node logs for `operator heartbeat sent`).
 

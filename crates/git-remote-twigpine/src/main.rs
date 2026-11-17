@@ -9,7 +9,7 @@
 //!
 //! # v0.1 resolution
 //!   DID → http://127.0.0.1:7545  (hardcoded; v0.2 will use DHT)
-//!   Override with: GITLAWB_NODE=http://my-node:7545
+//!   Override with: TWIGPINE_NODE=http://my-node:7545
 //!
 //! # Protocol flow (connect capability)
 //!   capabilities → "connect\n\n"
@@ -30,6 +30,10 @@ use twigpine_core::transport_policy::{allow_insecure_http_value, is_http, is_ins
 use twigpine_core::{resolve_transport_node, DEFAULT_LOCAL_NODE};
 
 fn main() -> Result<()> {
+    // Before anything reads a setting: accept the names settings had before
+    // the rename.
+    twigpine_core::legacy_env::adopt();
+
     let args: Vec<String> = std::env::args().collect();
 
     // Handle informational flags before anything else. Git always invokes a
@@ -51,7 +55,7 @@ fn main() -> Result<()> {
     // All logging goes to stderr so it doesn't corrupt the git protocol on stdout
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(std::env::var("GITLAWB_LOG").unwrap_or_else(|_| "warn".to_string()))
+        .with_env_filter(std::env::var("TWIGPINE_LOG").unwrap_or_else(|_| "warn".to_string()))
         .init();
 
     if args.len() < 3 {
@@ -65,7 +69,7 @@ fn main() -> Result<()> {
 
     let (_, short_owner, repo_name) = parse_gitlawb_url(url)?;
 
-    // v0.1: default to localhost. Override with GITLAWB_NODE env var. Shared with
+    // v0.1: default to localhost. Override with TWIGPINE_NODE env var. Shared with
     // `twigpine doctor` so the diagnostic reports the URL this actually resolves.
     let node_base = node_base_from_env();
     check_transport_security(&node_base, allow_insecure_http_enabled())?;
@@ -84,18 +88,18 @@ fn main() -> Result<()> {
 /// The node base URL this helper will contact, resolved through the same function
 /// `twigpine doctor` reports on so the diagnostic cannot describe a different node.
 fn node_base_from_env() -> String {
-    resolve_transport_node(std::env::var("GITLAWB_NODE").ok().as_deref())
+    resolve_transport_node(std::env::var("TWIGPINE_NODE").ok().as_deref())
 }
 
-/// Fixed warning for a `GITLAWB_ALLOW_INSECURE_HTTP` value that is set but not
+/// Fixed warning for a `TWIGPINE_ALLOW_INSECURE_HTTP` value that is set but not
 /// truthy. The raw value is never logged.
 fn warn_allow_insecure_http_non_truthy() {
     tracing::warn!(
-        "GITLAWB_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); plaintext http to a remote node remains refused"
+        "TWIGPINE_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); plaintext http to a remote node remains refused"
     );
 }
 
-/// Parse a possibly-present `GITLAWB_ALLOW_INSECURE_HTTP` value.
+/// Parse a possibly-present `TWIGPINE_ALLOW_INSECURE_HTTP` value.
 ///
 /// Only `1` or `true` (case-insensitive, after trim) opens the gate. Presence
 /// alone is not consent: `=0`, `=false` and an empty value read as "not opting
@@ -116,7 +120,7 @@ fn allow_insecure_http_from_str(raw: Option<&str>) -> bool {
     }
 }
 
-/// Interpret the result of `std::env::var("GITLAWB_ALLOW_INSECURE_HTTP")`
+/// Interpret the result of `std::env::var("TWIGPINE_ALLOW_INSECURE_HTTP")`
 /// without reading the environment again. A non-UTF-8 value fails closed and
 /// warns, like a present non-truthy one.
 fn allow_insecure_http_from_var(result: Result<String, std::env::VarError>) -> bool {
@@ -131,13 +135,13 @@ fn allow_insecure_http_from_var(result: Result<String, std::env::VarError>) -> b
 }
 
 fn allow_insecure_http_enabled() -> bool {
-    allow_insecure_http_from_var(std::env::var("GITLAWB_ALLOW_INSECURE_HTTP"))
+    allow_insecure_http_from_var(std::env::var("TWIGPINE_ALLOW_INSECURE_HTTP"))
 }
 
 /// Refuse a cleartext hop off this machine unless the operator has opted in.
 ///
 /// Fail closed: the alternative is signing a request and then handing it, and
-/// the pack it carries, to anyone on the path. `GITLAWB_ALLOW_INSECURE_HTTP`
+/// the pack it carries, to anyone on the path. `TWIGPINE_ALLOW_INSECURE_HTTP`
 /// exists for a private LAN where the operator has decided that is acceptable.
 fn check_transport_security(node_base: &str, allow_insecure: bool) -> Result<()> {
     if allow_insecure || !is_insecure_remote(node_base) {
@@ -148,7 +152,7 @@ fn check_transport_security(node_base: &str, allow_insecure: bool) -> Result<()>
          Requests are signed but not encrypted, so the pack contents and the \
          Signature header are readable by anyone on the path, and a captured \
          signature can be replayed.\n\
-         Use https://, or set GITLAWB_ALLOW_INSECURE_HTTP=1 to accept the risk \
+         Use https://, or set TWIGPINE_ALLOW_INSECURE_HTTP=1 to accept the risk \
          (for a trusted private network only)."
     )
 }
@@ -198,12 +202,12 @@ fn help_text() -> String {
          \x20   git clone gitlawb://did:key:z6Mk.../<repo>\n\
          \n\
          ENVIRONMENT:\n\
-         \x20   GITLAWB_NODE   Node base URL (default: {DEFAULT_LOCAL_NODE})\n\
-         \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push, absolute\n\
-         \x20                  (default: ~/.gitlawb/identity.pem). Its parent also\n\
+         \x20   TWIGPINE_NODE   Node base URL (default: {DEFAULT_LOCAL_NODE})\n\
+         \x20   TWIGPINE_KEY    Identity PEM path for signed fetch/push, absolute\n\
+         \x20                  (default: ~/.twigpine/identity.pem). Its parent also\n\
          \x20                  holds the delegations `twigpine ucan import` writes.\n\
-         \x20   GITLAWB_ALLOW_INSECURE_HTTP  Permit plaintext http:// to a non-loopback node (unset by default)\n\
-         \x20   GITLAWB_LOG    Log filter (default: warn)\n\
+         \x20   TWIGPINE_ALLOW_INSECURE_HTTP  Permit plaintext http:// to a non-loopback node (unset by default)\n\
+         \x20   TWIGPINE_LOG    Log filter (default: warn)\n\
          \n\
          FLAGS:\n\
          \x20   -V, --version   Print version and exit\n\
@@ -601,7 +605,7 @@ fn build_invocation(
 /// ```
 ///
 /// Strips the KNOWN trailing `<owner>/<repo>/<service>` rather than reading the
-/// first two segments, because `GITLAWB_NODE` may carry a path prefix — a
+/// first two segments, because `TWIGPINE_NODE` may carry a path prefix — a
 /// reverse-proxied `https://host/gitlawb` is a supported base, and `repo_base` is
 /// built as `{node_base}/{owner}/{repo}` with the service appended after it.
 /// Reading from the front makes the prefix the owner, which fails the delegation
@@ -1243,7 +1247,7 @@ fn load_keypair() -> Option<Keypair> {
 /// The identity PEM, resolved by the same rules `twigpine` uses.
 ///
 /// Shared through `twigpine-core` rather than reimplemented here: this helper and
-/// `twigpine ucan import` have to derive the same delegation store from `GITLAWB_KEY`,
+/// `twigpine ucan import` have to derive the same delegation store from `TWIGPINE_KEY`,
 /// and the two had drifted — the local version read `env::var` (so a non-UTF-8
 /// value silently became the default key), expanded only a literal `"~/"`, fell
 /// back to `"."` when `HOME` was unset, and never required an absolute path.
@@ -1268,7 +1272,7 @@ fn resolve_identity_dir() -> Option<std::path::PathBuf> {
 /// which on Windows is always, so the default key resolved against whatever
 /// directory git happened to invoke the helper from.
 ///
-/// `None` is not fatal — an absolute `GITLAWB_KEY` resolves without it, and only
+/// `None` is not fatal — an absolute `TWIGPINE_KEY` resolves without it, and only
 /// the default and `~/`-prefixed forms need a home at all.
 fn home_dir() -> Option<std::path::PathBuf> {
     dirs::home_dir()
@@ -1379,7 +1383,7 @@ mod insecure_transport_tests {
             "the refusal must say why: {msg}"
         );
         assert!(
-            msg.contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+            msg.contains("TWIGPINE_ALLOW_INSECURE_HTTP"),
             "the refusal must name the escape hatch: {msg}"
         );
 
@@ -1432,7 +1436,7 @@ mod insecure_transport_tests {
     /// discover reads as a broken transport rather than a deliberate refusal.
     #[test]
     fn help_documents_the_opt_in() {
-        assert!(help_text().contains("GITLAWB_ALLOW_INSECURE_HTTP"));
+        assert!(help_text().contains("TWIGPINE_ALLOW_INSECURE_HTTP"));
     }
 
     /// An unparseable or non-http value is not classified as insecure here: it
@@ -2008,7 +2012,7 @@ mod tests {
                 .create();
             let post_url = format!("{repo_base}/{service}");
             // `build_pack_post_request` reaches `delegation_header`, whose store
-            // resolves from process-global `GITLAWB_KEY`. Point it at an empty dir
+            // resolves from process-global `TWIGPINE_KEY`. Point it at an empty dir
             // under the shared lock so the read cannot race a sibling's mutation
             // and cannot pick up a developer's real store.
             let req = crate::delegated_push_tests::with_identity_dir(empty.path(), || {
@@ -2646,7 +2650,7 @@ mod tests {
         assert!(help.starts_with(&version_line()));
         assert!(help.contains("--version"));
         assert!(help.contains("--help"));
-        assert!(help.contains("GITLAWB_NODE"));
+        assert!(help.contains("TWIGPINE_NODE"));
         // The advertised default must be the value the helper actually resolves.
         assert!(help.contains(DEFAULT_LOCAL_NODE));
         assert!(help.ends_with('\n'));
@@ -2657,7 +2661,7 @@ mod tests {
     #[test]
     fn node_base_matches_the_shared_resolver() {
         // No env manipulation: assert the call site delegates, for the default case.
-        let expected = resolve_transport_node(std::env::var("GITLAWB_NODE").ok().as_deref());
+        let expected = resolve_transport_node(std::env::var("TWIGPINE_NODE").ok().as_deref());
         assert_eq!(node_base_from_env(), expected);
         assert_eq!(resolve_transport_node(None), DEFAULT_LOCAL_NODE);
     }
@@ -3723,7 +3727,7 @@ mod delegated_push_tests {
             )),
             "the origin must come back intact so the node DID can be fetched from it"
         );
-        // A reverse-proxied GITLAWB_NODE carries a path prefix, which survives into
+        // A reverse-proxied TWIGPINE_NODE carries a path prefix, which survives into
         // the pack URL through `repo_base`. Reading the FIRST two segments as
         // owner/repo makes the prefix the owner: the delegation lookup misses, the
         // DID probe hits the wrong URL, no X-Ucan is sent, and a valid delegate is
@@ -3794,13 +3798,13 @@ mod delegated_push_tests {
     // just stops attaching `X-Ucan` and the delegate starts getting 403s with no
     // local explanation.
 
-    /// `delegation_header` resolves its store from `GITLAWB_KEY`, which is
+    /// `delegation_header` resolves its store from `TWIGPINE_KEY`, which is
     /// process-global. Every test that sets it, and every test that reaches the
     /// resolver, takes this lock. `pub(crate)` so `tests::` cases that reach the
     /// resolver without setting the variable can serialize their read too.
     pub(crate) static KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Point `GITLAWB_KEY` at `dir/identity.pem` for the duration of `f`, so the
+    /// Point `TWIGPINE_KEY` at `dir/identity.pem` for the duration of `f`, so the
     /// delegation store resolves to `dir/delegations`. The restore runs on drop:
     /// a panic inside `f` cannot leak the tempdir path into later tests.
     pub(crate) fn with_identity_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
@@ -3808,14 +3812,14 @@ mod delegated_push_tests {
         impl Drop for Restore {
             fn drop(&mut self) {
                 match self.0.take() {
-                    Some(v) => std::env::set_var("GITLAWB_KEY", v),
-                    None => std::env::remove_var("GITLAWB_KEY"),
+                    Some(v) => std::env::set_var("TWIGPINE_KEY", v),
+                    None => std::env::remove_var("TWIGPINE_KEY"),
                 }
             }
         }
         let _guard = KEY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _restore = Restore(std::env::var_os("GITLAWB_KEY"));
-        std::env::set_var("GITLAWB_KEY", dir.join("identity.pem"));
+        let _restore = Restore(std::env::var_os("TWIGPINE_KEY"));
+        std::env::set_var("TWIGPINE_KEY", dir.join("identity.pem"));
         f()
     }
 
@@ -4109,7 +4113,7 @@ mod delegated_push_tests {
         }
     }
 
-    /// A reverse-proxied `GITLAWB_NODE` carries a path prefix, and that prefix
+    /// A reverse-proxied `TWIGPINE_NODE` carries a path prefix, and that prefix
     /// survives into the pack URL. `split_pack_post_url` is unit-tested for it, but
     /// nothing checked that the probe actually goes to the prefixed base — a
     /// regression there would GET `/` on the proxy host, read whatever landing page

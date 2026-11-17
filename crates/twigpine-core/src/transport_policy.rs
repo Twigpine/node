@@ -52,7 +52,7 @@ pub fn is_insecure_remote(url: &str) -> bool {
     true
 }
 
-/// Whether a non-empty `GITLAWB_ALLOW_INSECURE_HTTP` value opts in: only `1` or
+/// Whether a non-empty `TWIGPINE_ALLOW_INSECURE_HTTP` value opts in: only `1` or
 /// `true` (case-insensitive, after trim). Presence alone is not consent.
 pub fn allow_insecure_http_value(raw: &str) -> bool {
     let t = raw.trim();

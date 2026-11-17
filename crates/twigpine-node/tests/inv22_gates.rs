@@ -306,7 +306,7 @@ fn f6_ipfs_metadata_queries_are_deadline_wrapped() {
                 "F6 gate missing: occurrence {n} of `{call}` (of {occurrences}) is not \
                  wrapped in tokio::time::timeout(...) clamped to the remaining request \
                  budget. An unwrapped await pins the held walk permit for the whole DB \
-                 stall, past GITLAWB_IPFS_REQUEST_BUDGET_SECS."
+                 stall, past TWIGPINE_IPFS_REQUEST_BUDGET_SECS."
             );
         }
     }

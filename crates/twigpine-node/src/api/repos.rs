@@ -1945,7 +1945,7 @@ pub async fn git_upload_pack(
         // — the safe direction, same tradeoff as `fail_closed_full_scan_objects` and
         // `build_filtered_pack`. The cost is honest: a genuinely slow walk on a large
         // repo 504s this clone instead of silently holding the pool for ~2x, so size
-        // `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` so both phases normally fit.
+        // `TWIGPINE_GIT_SERVICE_TIMEOUT_SECS` so both phases normally fit.
         let deadline = std::time::Instant::now() + git_timeout;
         let (withheld, _permit, _caller_permit) = {
             let path = disk_path.clone();
@@ -2156,7 +2156,7 @@ fn owner_push_rejection(
         _ => Some(AppError::Forbidden(
             "push rejected — you must be the repo owner, or hold a valid \
              owner-issued git/push delegation for this repository \
-             (GITLAWB_ENFORCE_OWNER_PUSH is enabled)"
+             (TWIGPINE_ENFORCE_OWNER_PUSH is enabled)"
                 .into(),
         )),
     }
@@ -2254,7 +2254,7 @@ enum NotifyDisposition {
 
 /// Classify a peer's `/sync/notify` response.
 ///
-/// The gate is the peer's `X-Gitlawb-Error` code, not the status. Only two
+/// The gate is the peer's `X-Twigpine-Error` code, not the status. Only two
 /// codes mean "the write did not happen and another attempt can clear it":
 /// `signature_ledger_full` (the per-identity spent-signature cap, which drains
 /// as entries expire) and `signature_ledger_unavailable`. Everything else is
@@ -2608,7 +2608,7 @@ pub async fn git_receive_pack(
         ref_count = ref_updates.len(),
         "parsed ref updates from pack"
     );
-    // ── Owner-only push enforcement (on by default; GITLAWB_ENFORCE_OWNER_PUSH) ──
+    // ── Owner-only push enforcement (on by default; TWIGPINE_ENFORCE_OWNER_PUSH) ──
     // Runs before branch protection on purpose: when enabled, a non-owner is
     // rejected here regardless of whether the target branch is protected, so a
     // single rejection never yields two different error bodies. The identity is
@@ -2857,12 +2857,12 @@ pub async fn git_receive_pack(
     // it. `body: Bytes` means axum has already buffered the whole pack before this handler
     // runs, and the park runs to steal_after (1260s at defaults), so an unbounded waiter
     // set would let same-repo pushes stack buffered bodies. `acquire` therefore counts its
-    // LIVE WAITERS against GITLAWB_REPO_LEASE_MAX_WAITERS and returns None past the cap,
+    // LIVE WAITERS against TWIGPINE_REPO_LEASE_MAX_WAITERS and returns None past the cap,
     // which sheds here as a 503 + Retry-After like the other admission paths. The cap is
     // per repo and counts only handlers actually parked, so it denies same-repo
     // concurrency on the contended repo alone: a push to any other repo, from any source,
     // is untouched. Taking a per-source or global admission permit above the park instead
-    // is what the F1 review rejected, since GITLAWB_TRUSTED_PROXY defaults to unset and
+    // is what the F1 review rejected, since TWIGPINE_TRUSTED_PROXY defaults to unset and
     // every pusher behind a proxy/NAT then resolves to ONE key, turning one contended repo
     // into a node-wide denial.
     // The stable disk identity, never record.id: the row id rotates on a
@@ -2905,7 +2905,7 @@ pub async fn git_receive_pack(
     // pushes, hold every global slot on zero-byte lease-waiters, and shed 503 on every push
     // to every OTHER repo node-wide. The per-source sub-cap belongs below the park for the
     // same reason: its key is the resolved source IP, which collapses to one key for every
-    // pusher when GITLAWB_TRUSTED_PROXY is unset (the default), so above the park it sheds
+    // pusher when TWIGPINE_TRUSTED_PROXY is unset (the default), so above the park it sheds
     // cross-tenant too. Still before acquire_write, so the git op stays admission-gated
     // (INV-10) and a saturated pool sheds 503 before spawning git.
     //
@@ -8838,14 +8838,14 @@ mod tests {
         let mock_a = server_a
             .mock("POST", SYNC_NOTIFY_PATH)
             .with_status(429)
-            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .with_header("x-twigpine-error", "signature_ledger_full")
             .expect(6)
             .create_async()
             .await;
         let mock_b = server_b
             .mock("POST", SYNC_NOTIFY_PATH)
             .with_status(429)
-            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .with_header("x-twigpine-error", "signature_ledger_full")
             .expect(1)
             .create_async()
             .await;
@@ -8904,7 +8904,7 @@ mod tests {
         let rejected = server
             .mock("POST", SYNC_NOTIFY_PATH)
             .with_status(429)
-            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .with_header("x-twigpine-error", "signature_ledger_full")
             .expect(2)
             .create_async()
             .await;
@@ -8952,7 +8952,7 @@ mod tests {
         let mock = server
             .mock("POST", SYNC_NOTIFY_PATH)
             .with_status(429)
-            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .with_header("x-twigpine-error", "signature_ledger_full")
             .expect(FAST_BACKOFF.len() + 1)
             .create_async()
             .await;
@@ -9007,7 +9007,7 @@ mod tests {
         let mock = server
             .mock("POST", SYNC_NOTIFY_PATH)
             .with_status(429)
-            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .with_header("x-twigpine-error", "signature_ledger_full")
             .expect(budgeted * (FAST_BACKOFF.len() + 1) + 1)
             .create_async()
             .await;
@@ -9039,8 +9039,8 @@ mod tests {
     #[tokio::test]
     async fn notify_peer_does_not_retry_a_429_with_an_unrelated_code() {
         for headers in [
-            vec![("x-gitlawb-error", "rate_limited")],
-            vec![("x-gitlawb-error", "some_code_from_a_newer_node")],
+            vec![("x-twigpine-error", "rate_limited")],
+            vec![("x-twigpine-error", "some_code_from_a_newer_node")],
             vec![],
         ] {
             let mut server = mockito::Server::new_async().await;
@@ -9119,7 +9119,7 @@ mod tests {
         let mock = server
             .mock("POST", SYNC_NOTIFY_PATH)
             .with_status(409)
-            .with_header("x-gitlawb-error", "signature_replayed")
+            .with_header("x-twigpine-error", "signature_replayed")
             .expect(1)
             .create_async()
             .await;
@@ -10081,7 +10081,7 @@ mod tests {
 
     /// The parser REFUSES at the cap instead of scanning and allocating the whole
     /// request and being refused afterwards. Git routes raise the body
-    /// limit to GITLAWB_MAX_PACK_BYTES — 2 GB by default — so the count check
+    /// limit to TWIGPINE_MAX_PACK_BYTES — 2 GB by default — so the count check
     /// lives inside `parse_ref_updates`'s command loop, which returns the 400
     /// the first command past the cap rather than at the end of whatever the
     /// client sent.
@@ -15723,7 +15723,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(60), handle_b).await;
     }
 
-    /// #174 U1 scenario 3, THE CROSS-TENANT GUARD. `GITLAWB_TRUSTED_PROXY` is unset by
+    /// #174 U1 scenario 3, THE CROSS-TENANT GUARD. `TWIGPINE_TRUSTED_PROXY` is unset by
     /// default (`TrustedProxy::None`), so behind an edge proxy, a NAT, or a CI pool every
     /// pusher resolves to the SAME source key. A push parked on one repo's lease must not
     /// shed a DIFFERENT pusher's push to a DIFFERENT repo. This is the shape that made
@@ -18391,7 +18391,7 @@ exit 0
         );
     }
 
-    // GITLAWB_WRITE_RATE_LIMIT=0 disables the brake end-to-end: no write is 429'd
+    // TWIGPINE_WRITE_RATE_LIMIT=0 disables the brake end-to-end: no write is 429'd
     // however many arrive from one IP.
     #[sqlx::test]
     async fn write_rate_limit_zero_disables_the_brake(pool: sqlx::PgPool) {
@@ -18996,7 +18996,7 @@ exit 0
     // create_repo must NOT take its serialization lock from the APP pool. Doing so
     // pins an app-pool connection in the lock guard while the create's own work
     // (get_repo / proof.consume / db.create_repo, all on state.db = the app pool)
-    // still needs an app connection. At GITLAWB_DB_MAX_CONNECTIONS=1 (a supported
+    // still needs an app connection. At TWIGPINE_DB_MAX_CONNECTIONS=1 (a supported
     // config) the guard holds the only app connection and get_repo self-deadlocks
     // (PoolTimedOut -> 500). Locking on the separate write lock_pool instead keeps
     // the lock and the work on different pools, so a size-1 app pool never wedges.
@@ -19018,7 +19018,7 @@ exit 0
         let mut state = crate::test_support::test_state(migrate_pool).await;
 
         // Now point state.db at an APP pool of MAX size 1 on the SAME database, the
-        // minimal supported config (GITLAWB_DB_MAX_CONNECTIONS=1). The schema is
+        // minimal supported config (TWIGPINE_DB_MAX_CONNECTIONS=1). The schema is
         // already applied, so this pool only serves create's work (get_repo -> insert).
         // A short acquire timeout makes the RED case (the lock guard pinning this one
         // connection while get_repo waits for another) fail fast instead of hanging.

@@ -6,6 +6,8 @@ pub mod error;
 pub mod http_sig;
 pub mod identity;
 pub mod identity_path;
+pub mod legacy_env;
+pub mod legacy_headers;
 pub mod node_denial;
 // `url` is the one dependency here that drags a tail (idna, then the icu
 // crates), and twigpine-core is allowlisted to stay embeddable. Every client that
@@ -21,13 +23,13 @@ pub mod scan_token;
 pub mod transport_policy;
 pub mod ucan;
 
-/// Node URL the git transport falls back to when `GITLAWB_NODE` is unset.
+/// Node URL the git transport falls back to when `TWIGPINE_NODE` is unset.
 ///
 /// `twigpine` defaults to the public node instead, so the two disagree on an install
 /// that never sets the variable.
 pub const DEFAULT_LOCAL_NODE: &str = "http://127.0.0.1:7545";
 
-/// The node `git clone` and `git push` will contact, given the raw `GITLAWB_NODE`
+/// The node `git clone` and `git push` will contact, given the raw `TWIGPINE_NODE`
 /// value (`None` when the variable is absent).
 ///
 /// `git-remote-twigpine` calls this to pick its base URL and `twigpine doctor` calls it

@@ -54,7 +54,7 @@ pub struct Config {
     /// follow a subcommand (e.g. `twigpine-node purge-spam --repos-dir …`).
     #[arg(
         long,
-        env = "GITLAWB_REPOS_DIR",
+        env = "TWIGPINE_REPOS_DIR",
         default_value = "./data/repos",
         global = true
     )]
@@ -71,36 +71,36 @@ pub struct Config {
     pub database_url: String,
 
     /// Host to bind to
-    #[arg(long, env = "GITLAWB_HOST", default_value = "127.0.0.1")]
+    #[arg(long, env = "TWIGPINE_HOST", default_value = "127.0.0.1")]
     pub host: String,
 
     /// Port to listen on
-    #[arg(long, env = "GITLAWB_PORT", default_value_t = 7545)]
+    #[arg(long, env = "TWIGPINE_PORT", default_value_t = 7545)]
     pub port: u16,
 
     /// Path to the node's Ed25519 identity PEM key
-    #[arg(long, env = "GITLAWB_KEY", default_value = "~/.gitlawb/identity.pem")]
+    #[arg(long, env = "TWIGPINE_KEY", default_value = DEFAULT_KEY_PATH)]
     pub key_path: String,
 
     /// Reserved and currently inert: read access is enforced per repository
     /// through `is_public` and path-scoped visibility rules, not this flag.
     /// Setting it to false changes nothing; make a repo private through its
     /// own visibility instead.
-    #[arg(long, env = "GITLAWB_PUBLIC_READ", default_value_t = true)]
+    #[arg(long, env = "TWIGPINE_PUBLIC_READ", default_value_t = true)]
     pub public_read: bool,
 
     /// Public URL of this node (for peer announcements)
-    #[arg(long, env = "GITLAWB_PUBLIC_URL")]
+    #[arg(long, env = "TWIGPINE_PUBLIC_URL")]
     pub public_url: Option<String>,
 
     /// Base URL for the web view of repos on this node (e.g. https://gitlawb.com).
     /// When set, `GET /` advertises it as `web_url` so the CLI can print a
     /// working `View:` link.  Omit for nodes that have no web front-end.
-    #[arg(long, env = "GITLAWB_WEB_URL")]
+    #[arg(long, env = "TWIGPINE_WEB_URL")]
     pub web_url: Option<String>,
 
     /// Comma-separated list of bootstrap peer URLs to announce to on startup
-    #[arg(long, env = "GITLAWB_BOOTSTRAP_PEERS", value_delimiter = ',')]
+    #[arg(long, env = "TWIGPINE_BOOTSTRAP_PEERS", value_delimiter = ',')]
     pub bootstrap_peers: Vec<String>,
 
     /// Require a peer write to prove its DID on any transport: RFC 9421
@@ -109,7 +109,7 @@ pub struct Config {
     /// Keep false during rolling upgrades so existing live nodes can still gossip.
     #[arg(
         long,
-        env = "GITLAWB_REQUIRE_SIGNED_PEER_WRITES",
+        env = "TWIGPINE_REQUIRE_SIGNED_PEER_WRITES",
         default_value_t = false
     )]
     pub require_signed_peer_writes: bool,
@@ -119,7 +119,11 @@ pub struct Config {
     /// keying the replay ledger on the signing-string hash without it, which
     /// rejects a byte-identical mutation repeated inside the same second.
     /// Enforced on write routes only, so signed reads are never affected.
-    #[arg(long, env = "GITLAWB_REQUIRE_SIGNATURE_NONCE", default_value_t = false)]
+    #[arg(
+        long,
+        env = "TWIGPINE_REQUIRE_SIGNATURE_NONCE",
+        default_value_t = false
+    )]
     pub require_signature_nonce: bool,
 
     /// Require the authenticated pusher to be the repo owner on `git-receive-pack`.
@@ -128,7 +132,7 @@ pub struct Config {
     /// caller may push to every repository, private ones included. On by default.
     ///
     /// Turn it off only for a rolling upgrade whose pushers are not yet the repo
-    /// owner. Both `GITLAWB_ENFORCE_OWNER_PUSH=false` and `--enforce-owner-push
+    /// owner. Both `TWIGPINE_ENFORCE_OWNER_PUSH=false` and `--enforce-owner-push
     /// false` disable it, and the bare `--enforce-owner-push` form still means
     /// `true`.
     ///
@@ -138,7 +142,7 @@ pub struct Config {
     /// hatch this buys, not the environment one.
     #[arg(
         long,
-        env = "GITLAWB_ENFORCE_OWNER_PUSH",
+        env = "TWIGPINE_ENFORCE_OWNER_PUSH",
         action = clap::ArgAction::Set,
         num_args = 0..=1,
         default_value_t = true,
@@ -147,23 +151,23 @@ pub struct Config {
     pub enforce_owner_push: bool,
 
     /// URL of local IPFS/Kubo node HTTP API (e.g. http://127.0.0.1:5001)
-    #[arg(long, env = "GITLAWB_IPFS_API", default_value = "")]
+    #[arg(long, env = "TWIGPINE_IPFS_API", default_value = "")]
     pub ipfs_api: String,
 
     /// Pinata JWT for IPFS warm storage. Leave empty to disable (default).
-    #[arg(long, env = "GITLAWB_PINATA_JWT", default_value = "")]
+    #[arg(long, env = "TWIGPINE_PINATA_JWT", default_value = "")]
     pub pinata_jwt: String,
 
     /// Pinata v3 upload URL
     #[arg(
         long,
-        env = "GITLAWB_PINATA_UPLOAD_URL",
+        env = "TWIGPINE_PINATA_UPLOAD_URL",
         default_value = "https://uploads.pinata.cloud/v3/files"
     )]
     pub pinata_upload_url: String,
 
     /// libp2p QUIC/UDP port (0 = disabled)
-    #[arg(long, env = "GITLAWB_P2P_PORT", default_value_t = 7546)]
+    #[arg(long, env = "TWIGPINE_P2P_PORT", default_value_t = 7546)]
     pub p2p_port: u16,
 
     /// Path to the persistent libp2p identity key. A value that cannot name a
@@ -175,23 +179,27 @@ pub struct Config {
     /// and write permissions) before using it. A 0755 key directory is tightened
     /// on start; rotate the key only if the directory was group/world-writable
     /// or the key was group/world-readable.
-    #[arg(long, env = "GITLAWB_P2P_KEY", default_value = "~/.gitlawb/p2p.key")]
+    #[arg(long, env = "TWIGPINE_P2P_KEY", default_value = DEFAULT_P2P_KEY_PATH)]
     pub p2p_key_path: String,
 
     /// libp2p bootstrap multiaddrs (comma-separated)
     /// Example: /ip4/1.2.3.4/udp/7546/quic-v1/p2p/12D3KooW...
-    #[arg(long, env = "GITLAWB_P2P_BOOTSTRAP", value_delimiter = ',')]
+    #[arg(long, env = "TWIGPINE_P2P_BOOTSTRAP", value_delimiter = ',')]
     pub p2p_bootstrap: Vec<String>,
 
     /// Automatically mirror repos from peers when ref-update events arrive via Gossipsub.
-    #[arg(long, env = "GITLAWB_AUTO_SYNC", default_value_t = false)]
+    #[arg(long, env = "TWIGPINE_AUTO_SYNC", default_value_t = false)]
     pub auto_sync: bool,
 
     /// Periodically fetch configured INBOUND repositories from their external
     /// HTTPS upstream. Disabled by default: enabling this also requires
-    /// `GITLAWB_ENFORCE_OWNER_PUSH=true`, so an upstream-authoritative mirror
+    /// `TWIGPINE_ENFORCE_OWNER_PUSH=true`, so an upstream-authoritative mirror
     /// cannot accept writes from arbitrary signed identities between fetches.
-    #[arg(long, env = "GITLAWB_UPSTREAM_MIRROR_ENABLED", default_value_t = false)]
+    #[arg(
+        long,
+        env = "TWIGPINE_UPSTREAM_MIRROR_ENABLED",
+        default_value_t = false
+    )]
     pub upstream_mirror_enabled: bool,
 
     /// Pause between complete upstream-mirror scans. A scan is sequential and
@@ -199,7 +207,7 @@ pub struct Config {
     /// slow forge cannot create overlapping worker cycles.
     #[arg(
         long,
-        env = "GITLAWB_UPSTREAM_MIRROR_INTERVAL_SECS",
+        env = "TWIGPINE_UPSTREAM_MIRROR_INTERVAL_SECS",
         default_value_t = 300,
         value_parser = clap::value_parser!(u64).range(5..=86_400)
     )]
@@ -211,7 +219,7 @@ pub struct Config {
     /// do not consume this budget.
     #[arg(
         long,
-        env = "GITLAWB_UPSTREAM_MIRROR_FETCH_TIMEOUT_SECS",
+        env = "TWIGPINE_UPSTREAM_MIRROR_FETCH_TIMEOUT_SECS",
         default_value_t = 600,
         value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
     )]
@@ -222,7 +230,7 @@ pub struct Config {
     /// permanently starving repositories beyond the first page.
     #[arg(
         long,
-        env = "GITLAWB_UPSTREAM_MIRROR_PAGE_SIZE",
+        env = "TWIGPINE_UPSTREAM_MIRROR_PAGE_SIZE",
         default_value_t = 100,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000)
     )]
@@ -232,7 +240,7 @@ pub struct Config {
     /// the sweep even when a pin backend (IPFS/Pinata) is configured.
     #[arg(
         long,
-        env = "GITLAWB_RECONCILIATION_SWEEP",
+        env = "TWIGPINE_RECONCILIATION_SWEEP",
         default_value_t = true,
         action = clap::ArgAction::Set
     )]
@@ -240,21 +248,21 @@ pub struct Config {
 
     /// Irys URL for Arweave permanent anchoring.
     /// Leave empty to disable. Use https://devnet.irys.xyz for free devnet.
-    #[arg(long, env = "GITLAWB_IRYS_URL", default_value = "")]
+    #[arg(long, env = "TWIGPINE_IRYS_URL", default_value = "")]
     pub irys_url: String,
 
     /// Base L2 DID registry contract address (0x...)
-    #[arg(long, env = "GITLAWB_CONTRACT_DID_REGISTRY", default_value = "")]
+    #[arg(long, env = "TWIGPINE_CONTRACT_DID_REGISTRY", default_value = "")]
     pub contract_did_registry: String,
 
     /// Base L2 name registry contract address (0x...)
-    #[arg(long, env = "GITLAWB_CONTRACT_NAME_REGISTRY", default_value = "")]
+    #[arg(long, env = "TWIGPINE_CONTRACT_NAME_REGISTRY", default_value = "")]
     pub contract_name_registry: String,
 
     /// Base L2 RPC URL
     #[arg(
         long,
-        env = "GITLAWB_CHAIN_RPC_URL",
+        env = "TWIGPINE_CHAIN_RPC_URL",
         default_value = "https://sepolia.base.org"
     )]
     pub chain_rpc_url: String,
@@ -262,40 +270,45 @@ pub struct Config {
     /// Base L2 node staking contract address (GitlawbNodeStaking). When set
     /// along with `operator_private_key`, the node verifies its stake on
     /// startup and posts a heartbeat on a fixed cadence.
-    #[arg(long, env = "GITLAWB_CONTRACT_NODE_STAKING", default_value = "")]
+    #[arg(long, env = "TWIGPINE_CONTRACT_NODE_STAKING", default_value = "")]
     pub contract_node_staking: String,
 
     /// Hex-encoded (0x-prefixed) private key for the operator wallet that
     /// posts heartbeats. Not required unless on-chain PoS is enabled.
-    #[arg(long, env = "GITLAWB_OPERATOR_PRIVATE_KEY", default_value = "")]
+    #[arg(long, env = "TWIGPINE_OPERATOR_PRIVATE_KEY", default_value = "")]
     pub operator_private_key: String,
 
     /// If true, the node refuses to start when it is not registered on-chain
     /// or is currently inactive (missed heartbeats). Use once your network is
     /// live and every operator is expected to have stake.
-    #[arg(long, env = "GITLAWB_OPERATOR_STRICT_MODE", default_value_t = false)]
+    #[arg(long, env = "TWIGPINE_OPERATOR_STRICT_MODE", default_value_t = false)]
     pub operator_strict_mode: bool,
 
     /// How often to post the operator heartbeat, in hours. Must be less than
     /// the contract's HEARTBEAT_WINDOW (24h) with headroom. Default: 20h.
-    #[arg(long, env = "GITLAWB_HEARTBEAT_INTERVAL_HOURS", default_value_t = 20)]
+    #[arg(long, env = "TWIGPINE_HEARTBEAT_INTERVAL_HOURS", default_value_t = 20)]
     pub heartbeat_interval_hours: u64,
 
     /// Tigris (S3-compatible) bucket for repo storage.
     /// Leave empty to disable Tigris and use local-only storage.
-    #[arg(long, env = "GITLAWB_TIGRIS_BUCKET", default_value = "", global = true)]
+    #[arg(
+        long,
+        env = "TWIGPINE_TIGRIS_BUCKET",
+        default_value = "",
+        global = true
+    )]
     pub tigris_bucket: String,
 
     /// Maximum pack body size for git-receive-pack and git-upload-pack, in bytes.
     /// Applies only to git smart-HTTP routes — all other API routes keep the 2 MB default.
     /// Default: 2 GB.  Set lower on resource-constrained nodes.
-    #[arg(long, env = "GITLAWB_MAX_PACK_BYTES", default_value_t = 2_147_483_648)]
+    #[arg(long, env = "TWIGPINE_MAX_PACK_BYTES", default_value_t = 2_147_483_648)]
     pub max_pack_bytes: usize,
 
     /// Per-client-IP rate limit for `POST /api/v1/sync/trigger`, in requests per
     /// hour. `/sync/trigger` requires a signature and drives an O(peers) outbound
     /// fan-out per call, so it gets a tight bucket. `0` disables. Default: 60.
-    #[arg(long, env = "GITLAWB_SYNC_TRIGGER_RATE_LIMIT", default_value_t = 60)]
+    #[arg(long, env = "TWIGPINE_SYNC_TRIGGER_RATE_LIMIT", default_value_t = 60)]
     pub sync_trigger_rate_limit: usize,
 
     /// Per-client-IP rate limit for the peer-write routes (`/peers/announce`,
@@ -303,20 +316,20 @@ pub struct Config {
     /// known peers and run at higher frequency, so the bucket is generous. Keeping
     /// it separate from the trigger bucket stops an unsigned notify flood from
     /// draining the signed trigger caller's quota. `0` disables. Default: 600.
-    #[arg(long, env = "GITLAWB_PEER_WRITE_RATE_LIMIT", default_value_t = 600)]
+    #[arg(long, env = "TWIGPINE_PEER_WRITE_RATE_LIMIT", default_value_t = 600)]
     pub peer_write_rate_limit: usize,
 
     /// Optional address to bind a Prometheus `/metrics` exposition endpoint on.
     /// Example: `127.0.0.1:9091`. Leave empty (default) to disable.
     /// Bind to localhost or a private interface — the metrics endpoint is
     /// unauthenticated.
-    #[arg(long, env = "GITLAWB_METRICS_ADDR", default_value = "")]
+    #[arg(long, env = "TWIGPINE_METRICS_ADDR", default_value = "")]
     pub metrics_addr: String,
 
     /// Shutdown grace setting, in seconds. Currently not enforced: the value
     /// is logged at startup and axum drains in-flight requests on the shutdown
     /// signal with no upper bound. Default: 30s.
-    #[arg(long, env = "GITLAWB_SHUTDOWN_GRACE_SECS", default_value_t = 30)]
+    #[arg(long, env = "TWIGPINE_SHUTDOWN_GRACE_SECS", default_value_t = 30)]
     pub shutdown_grace_secs: u64,
 
     /// Maximum number of creation requests (repo create, issue create, PR
@@ -326,7 +339,7 @@ pub struct Config {
     /// creation request.
     #[arg(
         long,
-        env = "GITLAWB_RATE_LIMIT_MAX",
+        env = "TWIGPINE_RATE_LIMIT_MAX",
         default_value_t = 10,
         value_parser = clap::value_parser!(u32).range(1..)
     )]
@@ -337,7 +350,7 @@ pub struct Config {
     /// timestamp would prune immediately, silently disabling the limiter.
     #[arg(
         long,
-        env = "GITLAWB_RATE_LIMIT_WINDOW_SECS",
+        env = "TWIGPINE_RATE_LIMIT_WINDOW_SECS",
         default_value_t = 3600,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -355,7 +368,7 @@ pub struct Config {
     /// teardown (#174).
     #[arg(
         long,
-        env = "GITLAWB_GIT_SERVICE_TIMEOUT_SECS",
+        env = "TWIGPINE_GIT_SERVICE_TIMEOUT_SECS",
         default_value_t = 600,
         value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
     )]
@@ -376,7 +389,7 @@ pub struct Config {
     /// positive; set it very large to effectively disable the bound. Default: 30s.
     #[arg(
         long,
-        env = "GITLAWB_GIT_ACQUIRE_TIMEOUT_SECS",
+        env = "TWIGPINE_GIT_ACQUIRE_TIMEOUT_SECS",
         default_value_t = 30,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -389,7 +402,7 @@ pub struct Config {
     /// for ordinary request handlers and metadata paths (`DB_POOL_APP_HEADROOM`).
     #[arg(
         long,
-        env = "GITLAWB_DB_MAX_CONNECTIONS",
+        env = "TWIGPINE_DB_MAX_CONNECTIONS",
         default_value_t = 48,
         value_parser = clap::value_parser!(u32).range(1..)
     )]
@@ -402,13 +415,13 @@ pub struct Config {
     /// writers, NOT small. Every in-flight repo write pins one connection here for
     /// its whole duration (the write, its metadata tail, and the bounded archive
     /// upload), so this value is a hard ceiling on simultaneous writes node-wide.
-    /// Keeping it separate from GITLAWB_DB_MAX_CONNECTIONS is what stops a push
+    /// Keeping it separate from TWIGPINE_DB_MAX_CONNECTIONS is what stops a push
     /// burst from starving ordinary request handlers; the cost is that
     /// (main pool + lock pool) must fit inside the database server's
     /// max_connections, times the number of nodes, plus admin tooling.
     #[arg(
         long,
-        env = "GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS",
+        env = "TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS",
         default_value_t = 40,
         value_parser = clap::value_parser!(u32).range(1..)
     )]
@@ -429,7 +442,7 @@ pub struct Config {
     /// This is the bound that keeps a stall from becoming an outage.
     #[arg(
         long,
-        env = "GITLAWB_LOCK_HELD_TRANSFER_TIMEOUT_SECS",
+        env = "TWIGPINE_LOCK_HELD_TRANSFER_TIMEOUT_SECS",
         default_value_t = 300,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -439,7 +452,7 @@ pub struct Config {
     /// 503, in seconds. Bounds queueing when the database is slow or down.
     #[arg(
         long,
-        env = "GITLAWB_DB_ACQUIRE_TIMEOUT_SECS",
+        env = "TWIGPINE_DB_ACQUIRE_TIMEOUT_SECS",
         default_value_t = 5,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -451,7 +464,7 @@ pub struct Config {
     /// attempt is retried (migrations are idempotent).
     #[arg(
         long,
-        env = "GITLAWB_DB_CONNECT_TIMEOUT_SECS",
+        env = "TWIGPINE_DB_CONNECT_TIMEOUT_SECS",
         default_value_t = 60,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -461,7 +474,7 @@ pub struct Config {
     /// seconds. Doubles each attempt up to --db-retry-max-secs.
     #[arg(
         long,
-        env = "GITLAWB_DB_RETRY_INITIAL_SECS",
+        env = "TWIGPINE_DB_RETRY_INITIAL_SECS",
         default_value_t = 5,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -470,7 +483,7 @@ pub struct Config {
     /// Ceiling on the startup retry delay, in seconds.
     #[arg(
         long,
-        env = "GITLAWB_DB_RETRY_MAX_SECS",
+        env = "TWIGPINE_DB_RETRY_MAX_SECS",
         default_value_t = 60,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -509,7 +522,7 @@ pub struct Config {
     /// clean CLI error rather than a boot-time panic.
     #[arg(
         long,
-        env = "GITLAWB_MAX_CONCURRENT_GIT_OPS",
+        env = "TWIGPINE_MAX_CONCURRENT_GIT_OPS",
         default_value_t = 128,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -529,17 +542,17 @@ pub struct Config {
     /// error rather than a boot-time panic).
     ///
     /// CONNECTION BUDGET. A push holds a Postgres connection from the node's separate
-    /// advisory-lock pool (`GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS`, default 40) for
+    /// advisory-lock pool (`TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS`, default 40) for
     /// the whole receive-pack. That pool must be at least this value plus
     /// `DB_LOCK_POOL_NON_PUSH_HEADROOM` so admitted pushes and non-push mutations
     /// can each pin a lock-pool connection for their whole duration. Size BOTH
     /// pools against the database server's `max_connections`: the main pool
-    /// (`GITLAWB_DB_MAX_CONNECTIONS`, default 48) serves ordinary handlers, and the
+    /// (`TWIGPINE_DB_MAX_CONNECTIONS`, default 48) serves ordinary handlers, and the
     /// lock pool serves writes. Raising this knob does not raise the lock pool;
-    /// set `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` explicitly.
+    /// set `TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS` explicitly.
     #[arg(
         long,
-        env = "GITLAWB_MAX_CONCURRENT_GIT_PUSHES",
+        env = "TWIGPINE_MAX_CONCURRENT_GIT_PUSHES",
         default_value_t = 32,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -563,7 +576,7 @@ pub struct Config {
     /// push pool does not raise this; set it explicitly. Must be between 1 and 1_048_576.
     #[arg(
         long,
-        env = "GITLAWB_REPO_LEASE_MAX_WAITERS",
+        env = "TWIGPINE_REPO_LEASE_MAX_WAITERS",
         default_value_t = 8,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -585,7 +598,7 @@ pub struct Config {
     /// Default: 8. Must be between 1 and 1_048_576.
     #[arg(
         long,
-        env = "GITLAWB_MAX_CONCURRENT_PIN_TASKS",
+        env = "TWIGPINE_MAX_CONCURRENT_PIN_TASKS",
         default_value_t = 8,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -596,17 +609,17 @@ pub struct Config {
     /// cannot monopolize the `max_concurrent_git_ops` read pool (#174). Callers are
     /// keyed on the RESOLVED SOURCE IP, never the DID — a signature does not move a
     /// caller off this cap, so an authenticated client cannot mint DIDs to escape it.
-    /// IMPORTANT: the source-IP key is only as granular as `GITLAWB_TRUSTED_PROXY`.
+    /// IMPORTANT: the source-IP key is only as granular as `TWIGPINE_TRUSTED_PROXY`.
     /// Left unset (the default), a node behind an edge/NAT keys all callers on the
     /// edge IP, so this cap collapses to a single global cap rather than per-client.
-    /// Set `GITLAWB_TRUSTED_PROXY` to key on the real client; a high-fanout caller (a
+    /// Set `TWIGPINE_TRUSTED_PROXY` to key on the real client; a high-fanout caller (a
     /// CI fleet behind one NAT) then needs the operator to raise this. Over-cap for a
     /// caller sheds a clean 503 + Retry-After.
     ///
     /// Default: 16. Must be between 1 and 1_048_576.
     #[arg(
         long,
-        env = "GITLAWB_MAX_CONCURRENT_READS_PER_CALLER",
+        env = "TWIGPINE_MAX_CONCURRENT_READS_PER_CALLER",
         default_value_t = 16,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -626,7 +639,7 @@ pub struct Config {
     /// is a clean CLI error rather than a boot-time panic. Default: 32.
     #[arg(
         long,
-        env = "GITLAWB_MAX_CONCURRENT_IPFS_WALKS",
+        env = "TWIGPINE_MAX_CONCURRENT_IPFS_WALKS",
         default_value_t = 32,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -634,7 +647,7 @@ pub struct Config {
 
     /// Maximum concurrent `/ipfs/{cid}` walk requests a single source may hold at
     /// once, so one source cannot monopolize `max_concurrent_ipfs_walks` (#174).
-    /// Callers are keyed on the RESOLVED SOURCE IP (`client_key`/`GITLAWB_TRUSTED_PROXY`),
+    /// Callers are keyed on the RESOLVED SOURCE IP (`client_key`/`TWIGPINE_TRUSTED_PROXY`),
     /// never the DID — `/ipfs` accepts any `did:key` via `optional_signature` with no
     /// admission step, so keying on the DID would let one host mint disposable DIDs to
     /// multiply its budget. A request with no resolvable key (no trusted header, no
@@ -642,7 +655,7 @@ pub struct Config {
     /// clean 503 + Retry-After. Must be between 1 and 1_048_576. Default: 4.
     #[arg(
         long,
-        env = "GITLAWB_IPFS_WALK_PER_SOURCE",
+        env = "TWIGPINE_IPFS_WALK_PER_SOURCE",
         default_value_t = 4,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -659,7 +672,7 @@ pub struct Config {
     /// Must be between 1 and 1_048_576. Default: 256.
     #[arg(
         long,
-        env = "GITLAWB_IPFS_MAX_LEGACY_PROBES",
+        env = "TWIGPINE_IPFS_MAX_LEGACY_PROBES",
         default_value_t = crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST as usize,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -690,7 +703,7 @@ pub struct Config {
     /// Must be between 1 and 1_048_576. Default: 2048.
     #[arg(
         long,
-        env = "GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS",
+        env = "TWIGPINE_IPFS_MAX_LEGACY_SCAN_ROWS",
         default_value_t = crate::api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -725,7 +738,7 @@ pub struct Config {
     /// remainder).
     #[arg(
         long,
-        env = "GITLAWB_IPFS_MAX_REPOS_WALKED",
+        env = "TWIGPINE_IPFS_MAX_REPOS_WALKED",
         default_value_t = 64,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -743,7 +756,7 @@ pub struct Config {
     /// Default: 1024.
     #[arg(
         long,
-        env = "GITLAWB_IPFS_MAX_REPO_VISITS",
+        env = "TWIGPINE_IPFS_MAX_REPO_VISITS",
         default_value_t = 1024,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
@@ -785,7 +798,7 @@ pub struct Config {
     /// walk still fits.
     #[arg(
         long,
-        env = "GITLAWB_IPFS_REQUEST_BUDGET_SECS",
+        env = "TWIGPINE_IPFS_REQUEST_BUDGET_SECS",
         default_value_t = 600,
         value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
     )]
@@ -819,7 +832,7 @@ pub struct Config {
     /// panics on overflow in release builds too. Default: 10s.
     #[arg(
         long,
-        env = "GITLAWB_IPFS_RESOLVE_BUDGET_SECS",
+        env = "TWIGPINE_IPFS_RESOLVE_BUDGET_SECS",
         default_value_t = 10,
         value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
     )]
@@ -830,13 +843,13 @@ pub struct Config {
     /// a full-history git walk, so it carries a per-IP flood brake in addition to the
     /// concurrency cap above (a rate limit bounds request *rate*, the semaphore
     /// bounds concurrent slow holds — different axes). Keyed on the resolved client
-    /// IP via `GITLAWB_TRUSTED_PROXY`. `0` disables. Default: 600.
+    /// IP via `TWIGPINE_TRUSTED_PROXY`. `0` disables. Default: 600.
     ///
     /// This is the pure once-per-request ROUTE brake. The resolver's internal
     /// per-probe/per-walk WORK budget is a SEPARATE bucket whose capacity is DERIVED
     /// from this value (`AppState::ipfs_work_budget`), not a knob of its own; `0` here
     /// disables that derived bucket too.
-    #[arg(long, env = "GITLAWB_IPFS_RATE_LIMIT", default_value_t = 600)]
+    #[arg(long, env = "TWIGPINE_IPFS_RATE_LIMIT", default_value_t = 600)]
     pub ipfs_rate_limit: usize,
 
     /// Rows the legacy provider-CID repair sweep reads per batch (U4, #173).
@@ -850,7 +863,7 @@ pub struct Config {
     /// work rather than one expensive burst. Must be between 1 and 100_000.
     #[arg(
         long,
-        env = "GITLAWB_PIN_REPAIR_SWEEP_BATCH",
+        env = "TWIGPINE_PIN_REPAIR_SWEEP_BATCH",
         default_value_t = 64,
         value_parser = clap::builder::RangedU64ValueParser::<i64>::new().range(1..=100_000)
     )]
@@ -866,7 +879,7 @@ pub struct Config {
     /// Must be between 0 and 86_400.
     #[arg(
         long,
-        env = "GITLAWB_PIN_REPAIR_SWEEP_DELAY_SECS",
+        env = "TWIGPINE_PIN_REPAIR_SWEEP_DELAY_SECS",
         default_value_t = 60,
         value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(0..=86_400)
     )]
@@ -880,7 +893,7 @@ pub struct Config {
     /// cheap regardless of the value.
     #[arg(
         long,
-        env = "GITLAWB_QUEUE_RETENTION_DAYS",
+        env = "TWIGPINE_QUEUE_RETENTION_DAYS",
         default_value_t = 7,
         value_parser = clap::builder::RangedU64ValueParser::<i64>::new().range(1..=365)
     )]
@@ -893,7 +906,7 @@ pub struct Config {
     /// `main.rs` for the wiring.
     #[arg(
         long,
-        env = "GITLAWB_QUEUE_PURGE_BATCH",
+        env = "TWIGPINE_QUEUE_PURGE_BATCH",
         default_value_t = 1000,
         value_parser = clap::builder::RangedU64ValueParser::<i64>::new().range(1..=100_000)
     )]
@@ -906,7 +919,7 @@ pub struct Config {
     /// lower in tests.
     #[arg(
         long,
-        env = "GITLAWB_EFFECTS_MAX_ATTEMPTS",
+        env = "TWIGPINE_EFFECTS_MAX_ATTEMPTS",
         default_value_t = 8,
         value_parser = clap::builder::RangedU64ValueParser::<i32>::new().range(1..=1000)
     )]
@@ -919,12 +932,31 @@ pub struct Config {
     /// when the task is hidden or missing. These reads can require task,
     /// repository, and visibility-rule queries even when no task is returned,
     /// so the brake bounds the cost of anonymous probes. Keyed on the resolved
-    /// client IP via `GITLAWB_TRUSTED_PROXY`. `0` disables. Default: 1200 (a list page
+    /// client IP via `TWIGPINE_TRUSTED_PROXY`. `0` disables. Default: 1200 (a list page
     /// followed by per-task reads is a normal client pattern, so this sits above
     /// the `/ipfs` budget). GraphQL `tasks` / `task` queries, including WebSocket
     /// operations, share this per-IP budget with REST task reads.
-    #[arg(long, env = "GITLAWB_TASK_READ_RATE_LIMIT", default_value_t = 1200)]
+    #[arg(long, env = "TWIGPINE_TASK_READ_RATE_LIMIT", default_value_t = 1200)]
     pub task_read_rate_limit: usize,
+}
+
+/// Default for `--key-path`. Resolved through [`default_key_location`].
+pub const DEFAULT_KEY_PATH: &str = "~/.twigpine/identity.pem";
+
+/// Default for `--p2p-key-path`. Resolved through [`default_key_location`].
+pub const DEFAULT_P2P_KEY_PATH: &str = "~/.twigpine/p2p.key";
+
+/// Where a key path left at its default lives: in `~/.twigpine`, or in an
+/// existing `~/.gitlawb` from before the rename when there is no `~/.twigpine`
+/// (see `twigpine_core::identity_path::default_dir`). `None` for any other
+/// value, including an explicit `~/.gitlawb/...`, which is taken as written.
+fn default_key_location(value: &str, default: &str) -> Option<PathBuf> {
+    if value != default {
+        return None;
+    }
+    let file = Path::new(default).file_name()?;
+    let home = dirs_next::home_dir()?;
+    Some(twigpine_core::identity_path::default_dir(&home).join(file))
 }
 
 impl Config {
@@ -934,6 +966,9 @@ impl Config {
 
     /// Resolve ~ in key_path
     pub fn resolved_key_path(&self) -> PathBuf {
+        if let Some(path) = default_key_location(&self.key_path, DEFAULT_KEY_PATH) {
+            return path;
+        }
         if self.key_path.starts_with("~/") {
             let suffix = &self.key_path[2..];
             if !crate::p2p::tilde_suffix_escapes_home(suffix) {
@@ -947,6 +982,9 @@ impl Config {
 
     /// Resolve ~ in p2p_key_path
     pub fn resolved_p2p_key_path(&self) -> PathBuf {
+        if let Some(path) = default_key_location(&self.p2p_key_path, DEFAULT_P2P_KEY_PATH) {
+            return path;
+        }
         if self.p2p_key_path.starts_with("~/") {
             let suffix = &self.p2p_key_path[2..];
             if !crate::p2p::tilde_suffix_escapes_home(suffix) {
@@ -987,7 +1025,7 @@ impl Config {
             .saturating_add(Self::DB_LOCK_POOL_NON_PUSH_HEADROOM as usize);
         if (self.db_lock_pool_max_connections as usize) < lock_floor {
             return Err(format!(
-                "GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS ({}) must be at least \
+                "TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS ({}) must be at least \
                  max_concurrent_git_pushes ({}) plus {} for non-push mutations \
                  that share the lock pool",
                 self.db_lock_pool_max_connections,
@@ -997,7 +1035,7 @@ impl Config {
         }
         if self.upstream_mirror_enabled && !self.enforce_owner_push {
             return Err(
-                "GITLAWB_UPSTREAM_MIRROR_ENABLED requires GITLAWB_ENFORCE_OWNER_PUSH=true: \
+                "TWIGPINE_UPSTREAM_MIRROR_ENABLED requires TWIGPINE_ENFORCE_OWNER_PUSH=true: \
                  an upstream-authoritative mirror must not accept writes from arbitrary signed identities"
                     .to_string(),
             );
@@ -1005,7 +1043,7 @@ impl Config {
         let main_floor = Self::DB_POOL_APP_HEADROOM as u64;
         if (self.db_max_connections as u64) < main_floor {
             return Err(format!(
-                "GITLAWB_DB_MAX_CONNECTIONS ({}) must be at least {} for non-git \
+                "TWIGPINE_DB_MAX_CONNECTIONS ({}) must be at least {} for non-git \
                  database paths",
                 self.db_max_connections, main_floor
             ));
@@ -1018,7 +1056,7 @@ impl Config {
             let suffix = &self.key_path[2..];
             if crate::p2p::tilde_suffix_escapes_home(suffix) {
                 return Err(format!(
-                    "GITLAWB_KEY ({}) must stay inside the home directory after `~/` \
+                    "TWIGPINE_KEY ({}) must stay inside the home directory after `~/` \
                      expansion; rooted suffixes such as `~//etc/identity.pem`, drive-prefixed \
                      suffixes, and `..` traversal are refused",
                     self.key_path
@@ -1028,7 +1066,7 @@ impl Config {
         let identity_key_path = self.resolved_key_path();
         if self.key_path.starts_with("~/") && identity_key_path == Path::new(&self.key_path) {
             return Err(format!(
-                "GITLAWB_KEY ({}) starts with `~/` but no home directory could be resolved, \
+                "TWIGPINE_KEY ({}) starts with `~/` but no home directory could be resolved, \
                  so it would name a literal `~` directory relative to the working directory. \
                  Set an absolute path such as /data/keys/identity.pem.",
                 self.key_path
@@ -1040,14 +1078,14 @@ impl Config {
                 .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return Err(format!(
-                "GITLAWB_KEY ({}) must name a key file, not a directory; a trailing separator, \
+                "TWIGPINE_KEY ({}) must name a key file, not a directory; a trailing separator, \
                  a final `.` or `..` component, and `..` traversal are refused so the path \
                  cannot retarget a parent",
                 self.key_path
             ));
         }
 
-        // P2P is optional: an HTTP-only node with GITLAWB_P2P_PORT=0 never loads
+        // P2P is optional: an HTTP-only node with TWIGPINE_P2P_PORT=0 never loads
         // or creates this key, so refusing startup on an unused path would be a
         // silent outage with no security benefit.
         if self.p2p_port > 0 {
@@ -1062,7 +1100,7 @@ impl Config {
             // green /health.
             //
             // Decided lexically on the resolved path: `canonicalize` would fail on a
-            // parent that does not exist yet (the shipped `~/.gitlawb` default, and
+            // parent that does not exist yet (the shipped `~/.twigpine` default, and
             // every container's first boot), and comparing against the process
             // working directory would reject `/data/p2p.key` under the image's
             // WORKDIR, an absolute directory the operator did name.
@@ -1077,7 +1115,7 @@ impl Config {
                 let suffix = &self.p2p_key_path[2..];
                 if crate::p2p::tilde_suffix_escapes_home(suffix) {
                     return Err(format!(
-                        "GITLAWB_P2P_KEY ({}) must stay inside the home directory after `~/` \
+                        "TWIGPINE_P2P_KEY ({}) must stay inside the home directory after `~/` \
                          expansion; rooted suffixes such as `~//etc/p2p.key`, drive-prefixed \
                          suffixes, and `..` traversal are refused",
                         self.p2p_key_path
@@ -1088,7 +1126,7 @@ impl Config {
             if self.p2p_key_path.starts_with("~/") && p2p_key_path == Path::new(&self.p2p_key_path)
             {
                 return Err(format!(
-                    "GITLAWB_P2P_KEY ({}) starts with `~/` but no home directory could be resolved, \
+                    "TWIGPINE_P2P_KEY ({}) starts with `~/` but no home directory could be resolved, \
                      so it would name a literal `~` directory relative to the working directory. \
                      Set an absolute path such as /data/keys/p2p.key.",
                     self.p2p_key_path
@@ -1102,7 +1140,7 @@ impl Config {
                 .map_err(|e| e.to_string())?;
         }
 
-        // GITLAWB_WEB_URL is advertised in GET / so the CLI can print a working
+        // TWIGPINE_WEB_URL is advertised in GET / so the CLI can print a working
         // View: link. Clap maps "" to Some("") which would produce a broken URL;
         // reject early instead of serving a malformed link. Non-blank values must
         // additionally parse as an absolute http(s) URL — the CLI appends
@@ -1113,7 +1151,7 @@ impl Config {
                 Ok(()) => {}
                 Err(reason) => {
                     return Err(format!(
-                        "GITLAWB_WEB_URL {reason} — \
+                        "TWIGPINE_WEB_URL {reason} — \
                          set it to an absolute URL like https://gitlawb.com or leave it unset."
                     ));
                 }
@@ -1230,7 +1268,7 @@ mod tests {
             "false",
         ]);
         let error = unsafe_config.validate().unwrap_err();
-        assert!(error.contains("GITLAWB_ENFORCE_OWNER_PUSH=true"));
+        assert!(error.contains("TWIGPINE_ENFORCE_OWNER_PUSH=true"));
 
         Config::parse_from([
             "twigpine-node",
@@ -1295,7 +1333,7 @@ mod tests {
     }
 
     /// Child half of [`nonce_flag_env_values_never_silently_enforce`]. It runs in
-    /// a subprocess with `GITLAWB_REQUIRE_SIGNATURE_NONCE` set, because setting
+    /// a subprocess with `TWIGPINE_REQUIRE_SIGNATURE_NONCE` set, because setting
     /// that variable in-process would race every other test that parses a
     /// `Config` and would take the whole binary down if the value were invalid.
     #[test]
@@ -1308,7 +1346,7 @@ mod tests {
     }
 
     /// The flag is read as a boolean, not as "is the variable present". An
-    /// operator writing `GITLAWB_REQUIRE_SIGNATURE_NONCE=0` (or leaving it
+    /// operator writing `TWIGPINE_REQUIRE_SIGNATURE_NONCE=0` (or leaving it
     /// empty) must never end up enforcing.
     #[test]
     fn nonce_flag_env_values_never_silently_enforce() {
@@ -1322,7 +1360,7 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("GITLAWB_REQUIRE_SIGNATURE_NONCE", value)
+            .env("TWIGPINE_REQUIRE_SIGNATURE_NONCE", value)
             .output()
             .expect("run the env probe");
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1341,7 +1379,7 @@ mod tests {
             let observed = probe(value);
             assert_ne!(
                 observed, "PROBE:ok:true",
-                "GITLAWB_REQUIRE_SIGNATURE_NONCE={value:?} must not enforce, got {observed}"
+                "TWIGPINE_REQUIRE_SIGNATURE_NONCE={value:?} must not enforce, got {observed}"
             );
         }
         assert_eq!(
@@ -1624,7 +1662,7 @@ mod tests {
         assert!(Config::try_parse_from(["twigpine-node", "--ipfs-max-repos-walked", "0"]).is_err());
     }
 
-    /// The `GITLAWB_IPFS_MAX_LEGACY_PROBES` knob must actually reach the legacy-probe
+    /// The `TWIGPINE_IPFS_MAX_LEGACY_PROBES` knob must actually reach the legacy-probe
     /// budget it advertises: production seeds `ipfs_max_legacy_probes` from this helper,
     /// so the knob is a no-op unless the helper reflects it. RED while the helper returns
     /// the hardcoded `MAX_LEGACY_PROBES_PER_REQUEST` (256 regardless of the knob), GREEN
@@ -2157,7 +2195,7 @@ mod tests {
     /// must match the canonical form actually validated, so every consumer
     /// (the regular and degraded `GET /` handlers, anyone who reads
     /// `config.web_url` directly) sees the same string. Without this, an
-    /// operator that sets `GITLAWB_WEB_URL="  https://git.example  "` boots
+    /// operator that sets `TWIGPINE_WEB_URL="  https://git.example  "` boots
     /// a node that advertises `"  https://git.example  "` on public
     /// metadata — different from what was validated, different from what
     /// any other consumer would parse.
@@ -2189,7 +2227,7 @@ mod tests {
     /// The DECLARED default, read off the parser rather than out of a parse.
     ///
     /// `Config::parse_from` consults the process environment, so on a host that
-    /// exports `GITLAWB_ENFORCE_OWNER_PUSH=false` a parse-based assertion says
+    /// exports `TWIGPINE_ENFORCE_OWNER_PUSH=false` a parse-based assertion says
     /// nothing about what this crate declares — it reports the operator's setting.
     /// Asserting the declaration is the env-independent form, and it is the one that
     /// actually fails if someone flips `default_value_t` back.
@@ -2209,7 +2247,7 @@ mod tests {
         );
     }
 
-    /// #338: GITLAWB_PUBLIC_READ is inert, so its help must not claim read
+    /// #338: TWIGPINE_PUBLIC_READ is inert, so its help must not claim read
     /// enforcement is missing; it must tell the operator the flag changes
     /// nothing and where the real control lives.
     #[test]
@@ -2352,7 +2390,7 @@ mod tests {
             },
             Row {
                 port: 7546,
-                path: "~/.gitlawb/p2p.key",
+                path: "~/.twigpine/p2p.key",
                 expect: Expect::Accepted,
                 needs_home: true,
             },
@@ -2399,7 +2437,7 @@ mod tests {
             },
             Row {
                 port: 7546,
-                path: "~/.gitlawb/.",
+                path: "~/.twigpine/.",
                 expect: Expect::Rejected("must name a key file"),
                 needs_home: true,
             },
@@ -2582,14 +2620,27 @@ mod tests {
             return;
         };
 
-        let resolved = config_with_p2p_key("~/.gitlawb/p2p.key").resolved_p2p_key_path();
+        let resolved = config_with_p2p_key("~/.twigpine/p2p.key").resolved_p2p_key_path();
         assert!(
             resolved.starts_with(&home),
             "the resolved default must stay beneath home"
         );
-        assert!(
-            resolved.ends_with(".gitlawb/p2p.key"),
-            "the resolved default must keep the configured suffix"
+        // The default folder is `~/.twigpine`, or an existing `~/.gitlawb` from
+        // before the rename, whichever this machine has.
+        assert_eq!(
+            resolved,
+            twigpine_core::identity_path::default_dir(&home).join("p2p.key"),
+            "the resolved default must be the key file in the default folder"
+        );
+        // A path that is not the default keeps its own suffix.
+        assert_eq!(
+            config_with_p2p_key("~/keys/p2p.key").resolved_p2p_key_path(),
+            home.join("keys/p2p.key")
+        );
+        assert_eq!(
+            config_with_p2p_key("~/.gitlawb/p2p.key").resolved_p2p_key_path(),
+            home.join(".gitlawb/p2p.key"),
+            "an explicit old folder is taken as written"
         );
 
         for path in ["~//etc/p2p.key", "~/../etc/p2p.key"] {
@@ -2645,7 +2696,7 @@ mod tests {
             "./keys/p2p.key",
             "/data/keys/p2p.key",
             "/data/p2p.key",
-            "~/.gitlawb/p2p.key",
+            "~/.twigpine/p2p.key",
         ] {
             assert!(
                 config_with_p2p_key(path).validate().is_ok(),
@@ -2709,7 +2760,7 @@ mod tests {
                 .validate()
                 .expect_err("a terminal `.` must be rejected as a directory");
             assert!(
-                err.contains("GITLAWB_KEY") && err.contains("must name a key file"),
+                err.contains("TWIGPINE_KEY") && err.contains("must name a key file"),
                 "{path:?} must be refused before Path can retarget it, got: {err}"
             );
         }

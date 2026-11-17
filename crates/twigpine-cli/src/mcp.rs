@@ -58,7 +58,7 @@ pub enum McpCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         /// Identity directory
@@ -2058,7 +2058,7 @@ mod tests {
     #[tokio::test]
     async fn test_task_list_via_mcp_follows_cursors() {
         // The env-mutating suites serialize on test_env's lock; a resolver
-        // reader that skips it can observe a half-set GITLAWB_KEY mid-race.
+        // reader that skips it can observe a half-set TWIGPINE_KEY mid-race.
         // Taking it here (with the key absent) keeps this read deterministic.
         let _key_guard = crate::identity::test_env::set_key(None::<&str>);
         let mut server = mockito::Server::new_async().await;
@@ -3093,7 +3093,7 @@ mod tests {
             .await;
 
         // Point at an EMPTY dir rather than passing `None`: `None` falls back to
-        // the ambient ~/.gitlawb/identity.pem, which exists on a dev box and not
+        // the ambient ~/.twigpine/identity.pem, which exists on a dev box and not
         // on CI, so the request would be signed here and unsigned there.
         let empty = tempfile::TempDir::new().unwrap();
         let err = call_tool(
@@ -3385,7 +3385,7 @@ mod tests {
             .mock("POST", "/api/v1/repos")
             .with_status(409)
             .with_header("content-type", "application/json")
-            .with_header("x-gitlawb-error", "signature_replayed")
+            .with_header("x-twigpine-error", "signature_replayed")
             .with_body(r#"{"error":"signature_replayed","message":"signature already spent"}"#)
             .expect(1)
             .create_async()
@@ -3412,7 +3412,7 @@ mod tests {
             .mock("POST", "/api/v1/repos/alice/myrepo/issues")
             .with_status(409)
             .with_header("content-type", "application/json")
-            .with_header("x-gitlawb-error", "signature_replayed")
+            .with_header("x-twigpine-error", "signature_replayed")
             .with_body(r#"{"error":"signature_replayed","message":"signature already spent"}"#)
             .expect(1)
             .create_async()
@@ -3458,7 +3458,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_repo_create_repo_exists_409_is_distinguishable_from_a_replay() {
-        // The pre-existing 409 carries no x-gitlawb-error header. It must still
+        // The pre-existing 409 carries no x-twigpine-error header. It must still
         // fail the tool call (a denial is not a success), but its message must
         // not name a signature rejection.
         let mut server = mockito::Server::new_async().await;

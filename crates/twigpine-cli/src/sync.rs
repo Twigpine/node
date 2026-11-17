@@ -13,7 +13,7 @@ pub struct SyncArgs {
     /// Node URL
     #[arg(
         long,
-        env = "GITLAWB_NODE",
+        env = "TWIGPINE_NODE",
         default_value = "https://node.twigpine.com"
     )]
     pub node: String,

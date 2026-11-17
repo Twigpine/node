@@ -22,11 +22,11 @@ pub struct InitArgs {
     #[arg(
         long,
         default_value = "https://node.twigpine.com",
-        env = "GITLAWB_NODE"
+        env = "TWIGPINE_NODE"
     )]
     pub node: String,
 
-    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+    /// Identity directory (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 
@@ -392,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn init_fails_on_replay_409_without_the_error_header() {
         // The node refused the create (the signature was already spent) and a
-        // proxy stripped `x-gitlawb-error`, so the client layer cannot see the
+        // proxy stripped `x-twigpine-error`, so the client layer cannot see the
         // denial and hands the 409 straight back. `twigpine init` used to read
         // "already" out of the prose, print "Repository already exists —
         // continuing", add the remote, print "Ready! Push with", and exit 0 for

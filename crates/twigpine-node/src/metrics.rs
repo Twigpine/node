@@ -35,7 +35,7 @@
 //! are no-ops until [`init`] has been called, so unit tests and benchmarks
 //! that don't go through `main()` don't need to do anything special.
 //!
-//! The endpoint is opt-in via `GITLAWB_METRICS_ADDR`; if unset, no listener
+//! The endpoint is opt-in via `TWIGPINE_METRICS_ADDR`; if unset, no listener
 //! is bound and no exposition happens. Increments are atomic and effectively
 //! free.
 //!

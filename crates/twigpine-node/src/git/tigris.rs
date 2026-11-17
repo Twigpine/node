@@ -792,7 +792,7 @@ mod tests {
     /// to real AWS S3, and a probe that passed there would say nothing about
     /// Tigris.
     fn probe_env() -> Option<String> {
-        if std::env::var("GITLAWB_TIGRIS_PROBE").ok().as_deref() != Some("1") {
+        if std::env::var("TWIGPINE_TIGRIS_PROBE").ok().as_deref() != Some("1") {
             return None;
         }
         for name in [
@@ -805,11 +805,11 @@ mod tests {
                 return None;
             }
         }
-        match std::env::var("GITLAWB_TIGRIS_BUCKET") {
+        match std::env::var("TWIGPINE_TIGRIS_BUCKET") {
             Ok(b) if !b.is_empty() => Some(b),
             _ => {
                 eprintln!(
-                    "tigris conditional-write probe: GITLAWB_TIGRIS_BUCKET is unset, skipping"
+                    "tigris conditional-write probe: TWIGPINE_TIGRIS_BUCKET is unset, skipping"
                 );
                 None
             }
@@ -943,20 +943,20 @@ mod tests {
     /// operations as supported on Single-region and Multi-region buckets only.
     /// Global and Dual-region buckets are eventually consistent, and a
     /// conditional PUT evaluated against a stale replica would make the fence a
-    /// silent no-op rather than an error. So point `GITLAWB_TIGRIS_BUCKET` at a
+    /// silent no-op rather than an error. So point `TWIGPINE_TIGRIS_BUCKET` at a
     /// throwaway bucket of the SAME type production uses.
     ///
-    /// Ignored by default and additionally gated on `GITLAWB_TIGRIS_PROBE=1`,
+    /// Ignored by default and additionally gated on `TWIGPINE_TIGRIS_PROBE=1`,
     /// because it writes to a real bucket and costs real requests. Run with:
-    /// `GITLAWB_TIGRIS_PROBE=1 cargo test -p twigpine-node --lib
+    /// `TWIGPINE_TIGRIS_PROBE=1 cargo test -p twigpine-node --lib
     /// tigris_honors_conditional_writes -- --ignored --nocapture`
     #[tokio::test]
-    #[ignore = "writes to a real Tigris bucket; needs GITLAWB_TIGRIS_PROBE=1 plus credentials"]
+    #[ignore = "writes to a real Tigris bucket; needs TWIGPINE_TIGRIS_PROBE=1 plus credentials"]
     async fn tigris_honors_conditional_writes() {
         let Some(bucket) = probe_env() else {
             eprintln!(
-                "tigris conditional-write probe: skipped. Set GITLAWB_TIGRIS_PROBE=1, \
-                 GITLAWB_TIGRIS_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and \
+                "tigris conditional-write probe: skipped. Set TWIGPINE_TIGRIS_PROBE=1, \
+                 TWIGPINE_TIGRIS_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and \
                  AWS_ENDPOINT_URL_S3 to run it."
             );
             return;

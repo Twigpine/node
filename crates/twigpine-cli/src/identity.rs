@@ -10,7 +10,7 @@ pub enum IdentityCmd {
     /// Generate a new Ed25519 keypair and DID
     New {
         /// Output directory for key files
-        /// (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+        /// (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Overwrite existing keys if present
@@ -69,11 +69,11 @@ pub async fn run(cmd: IdentityCmd) -> Result<()> {
 /// place the identity itself lives.
 ///
 /// Without an override this is [`twigpine_core::identity_path::identity_dir`] — the
-/// parent of `GITLAWB_KEY`, else `~/.gitlawb`. The rules live in `twigpine-core`
+/// parent of `TWIGPINE_KEY`, else `~/.twigpine`. The rules live in `twigpine-core`
 /// because `git-remote-twigpine` needs the identical answer: an operator who moved
-/// their key (`GITLAWB_KEY=/data/keys/identity.pem`, the shape `.env.example`
+/// their key (`TWIGPINE_KEY=/data/keys/identity.pem`, the shape `.env.example`
 /// documents) would otherwise have `twigpine ucan import` write the delegation to
-/// `~/.gitlawb/delegations` while the helper reads `/data/keys/delegations` and
+/// `~/.twigpine/delegations` while the helper reads `/data/keys/delegations` and
 /// finds it empty. The push then goes out with no `X-Ucan` and the delegate is
 /// refused, with nothing on either side to indicate why.
 pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -81,7 +81,7 @@ pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
         return Ok(d);
     }
     // `home_dir()` is passed as an Option rather than demanded here: an absolute
-    // GITLAWB_KEY resolves without a home directory, and a host that has none is a
+    // TWIGPINE_KEY resolves without a home directory, and a host that has none is a
     // normal container shape, not a reason to refuse a correctly-configured key.
     let home = dirs::home_dir();
     twigpine_core::identity_path::identity_dir(home.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))
@@ -91,12 +91,12 @@ pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
 ///
 /// With an explicit `--dir` this is `<dir>/identity.pem`, the conventional layout.
 /// Without one it is [`twigpine_core::identity_path::identity_key_path`] — the whole
-/// of `GITLAWB_KEY`, basename included.
+/// of `TWIGPINE_KEY`, basename included.
 ///
 /// Taking only the parent and re-appending `identity.pem` was a real divergence,
-/// not a tidy-up: `GITLAWB_KEY` is documented as a path to a PEM, and
+/// not a tidy-up: `TWIGPINE_KEY` is documented as a path to a PEM, and
 /// `git-remote-twigpine` opens exactly that path. With
-/// `GITLAWB_KEY=/data/keys/ci-agent.pem`, `twigpine identity new` wrote
+/// `TWIGPINE_KEY=/data/keys/ci-agent.pem`, `twigpine identity new` wrote
 /// `/data/keys/identity.pem` while every push loaded `/data/keys/ci-agent.pem`, so
 /// the two either disagreed on identity or the helper found no key at all — and
 /// owner enforcement and the delegation proof both key off that identity.
@@ -118,8 +118,8 @@ fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
 /// Load keypair from an optional directory override.
 /// Used by other modules (register, repo, mcp).
 ///
-/// Routed through [`gitlawb_dir`] rather than reaching for `~/.gitlawb` directly:
-/// `twigpine identity new` writes the key wherever `GITLAWB_KEY` points, so a second
+/// Routed through [`gitlawb_dir`] rather than reaching for `~/.twigpine` directly:
+/// `twigpine identity new` writes the key wherever `TWIGPINE_KEY` points, so a second
 /// resolver here would have every other command read a different file than the one
 /// just created — `twigpine ucan delegate` would either fail to find an identity or sign
 /// with a stale DID that is not the repo owner.
@@ -141,15 +141,15 @@ pub fn load_optional_keypair(dir: Option<&std::path::Path>) -> Result<Option<Key
         return load_keypair_from_dir(Some(d)).map(Some);
     }
     // Route the default lookup through key_path_for(None), not a hand-built
-    // ~/.gitlawb/identity.pem: that path pinned the conventional basename and
-    // ignored GITLAWB_KEY, so callers on this helper (task list/view, the MCP
+    // ~/.twigpine/identity.pem: that path pinned the conventional basename and
+    // ignored TWIGPINE_KEY, so callers on this helper (task list/view, the MCP
     // identity fallback) signed as a stale DID or went anonymous while every
     // sibling command read the configured key. A host with no home and no
-    // GITLAWB_KEY still resolves to anonymous rather than refusing.
-    // An empty GITLAWB_KEY counts as unconfigured, matching identity_key_path:
+    // TWIGPINE_KEY still resolves to anonymous rather than refusing.
+    // An empty TWIGPINE_KEY counts as unconfigured, matching identity_key_path:
     // set-but-empty should not force an anonymous resolution through a path
     // that cannot resolve.
-    let key_configured = std::env::var_os("GITLAWB_KEY").is_some_and(|v| !v.is_empty());
+    let key_configured = std::env::var_os("TWIGPINE_KEY").is_some_and(|v| !v.is_empty());
     if !key_configured && dirs::home_dir().is_none() {
         return Ok(None);
     }
@@ -341,7 +341,7 @@ mod tests {
             assert_eq!(
                 loaded.map(|k| k.did().to_string()),
                 Some(kp.did().to_string()),
-                "the configured basename must be read, not ~/.gitlawb/identity.pem"
+                "the configured basename must be read, not ~/.twigpine/identity.pem"
             );
         });
     }
@@ -582,7 +582,7 @@ mod tests {
     }
 }
 
-/// Scoped `GITLAWB_KEY` for tests, shared crate-wide.
+/// Scoped `TWIGPINE_KEY` for tests, shared crate-wide.
 ///
 /// The process environment is global and more than one suite in this crate
 /// depends on it — the resolver's own cases here, and `twigpine register`'s check that
@@ -604,25 +604,25 @@ pub(crate) mod test_env {
     impl Drop for KeyEnv {
         fn drop(&mut self) {
             match self.restore.take() {
-                Some(v) => std::env::set_var("GITLAWB_KEY", v),
-                None => std::env::remove_var("GITLAWB_KEY"),
+                Some(v) => std::env::set_var("TWIGPINE_KEY", v),
+                None => std::env::remove_var("TWIGPINE_KEY"),
             }
         }
     }
 
-    /// Run `f` with `GITLAWB_KEY` set, restoring it afterwards.
+    /// Run `f` with `TWIGPINE_KEY` set, restoring it afterwards.
     pub(crate) fn with_key<T, V: AsRef<OsStr>>(value: Option<V>, f: impl FnOnce() -> T) -> T {
         let _guard = set_key(value);
         f()
     }
 
-    /// Set `GITLAWB_KEY` (or remove it, for `None`) until the guard drops.
+    /// Set `TWIGPINE_KEY` (or remove it, for `None`) until the guard drops.
     pub(crate) fn set_key<V: AsRef<OsStr>>(value: Option<V>) -> KeyEnv {
         let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let restore = std::env::var_os("GITLAWB_KEY");
+        let restore = std::env::var_os("TWIGPINE_KEY");
         match value {
-            Some(v) => std::env::set_var("GITLAWB_KEY", v),
-            None => std::env::remove_var("GITLAWB_KEY"),
+            Some(v) => std::env::set_var("TWIGPINE_KEY", v),
+            None => std::env::remove_var("TWIGPINE_KEY"),
         }
         KeyEnv {
             _guard: guard,
@@ -637,21 +637,21 @@ mod gitlawb_dir_tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    /// Run `f` with `GITLAWB_KEY` set to `value` (or removed for `None`), restoring
+    /// Run `f` with `TWIGPINE_KEY` set to `value` (or removed for `None`), restoring
     /// whatever was there before.
     fn with_key_env<T>(value: Option<OsString>, f: impl FnOnce() -> T) -> T {
         let _env = crate::identity::test_env::set_key(value);
         f()
     }
 
-    /// An explicit --dir always wins and is never validated against GITLAWB_KEY.
+    /// An explicit --dir always wins and is never validated against TWIGPINE_KEY.
     #[test]
     fn explicit_override_wins() {
         let d = PathBuf::from("/tmp/explicit");
         assert_eq!(gitlawb_dir(Some(d.clone())).unwrap(), d);
     }
 
-    /// A relative GITLAWB_KEY must fail loudly. `twigpine` and `git-remote-twigpine` run
+    /// A relative TWIGPINE_KEY must fail loudly. `twigpine` and `git-remote-twigpine` run
     /// from different working directories, so resolving one relatively sends the
     /// import and the lookup to different stores; a one-component value yields an
     /// empty parent and puts the store in `./delegations`.
@@ -674,14 +674,15 @@ mod gitlawb_dir_tests {
         let result = with_key_env(Some(OsString::new()), || gitlawb_dir(None));
         assert_eq!(
             result.unwrap(),
-            home.join(".gitlawb"),
+            // `~/.twigpine`, or an existing `~/.gitlawb` from before the rename.
+            twigpine_core::identity_path::default_dir(&home),
             "an empty value selects the default directory"
         );
     }
 
     /// The reason `gitlawb_dir` reads through `var_os`: `env::var` folds a non-UTF-8
     /// value into the same `Err` as unset, so a bad path would silently resolve to
-    /// `~/.gitlawb` instead of being reported. Byte 0xFF is not valid UTF-8 in any
+    /// `~/.twigpine` instead of being reported. Byte 0xFF is not valid UTF-8 in any
     /// position, so this value is unreachable through `env::var`.
     #[cfg(unix)]
     #[test]
@@ -704,13 +705,13 @@ mod gitlawb_dir_tests {
         assert_eq!(
             resolved,
             PathBuf::from(&absolute).parent().unwrap(),
-            "an absolute non-UTF-8 path resolves to its own parent, not to ~/.gitlawb"
+            "an absolute non-UTF-8 path resolves to its own parent, not to ~/.twigpine"
         );
     }
 
-    /// `twigpine identity new` writes the key wherever `GITLAWB_KEY` points, so every
+    /// `twigpine identity new` writes the key wherever `TWIGPINE_KEY` points, so every
     /// other command has to read it back from there. `load_keypair_from_dir(None)`
-    /// used to hardcode `~/.gitlawb`, which made `twigpine ucan delegate` sign with a
+    /// used to hardcode `~/.twigpine`, which made `twigpine ucan delegate` sign with a
     /// stale DID — or fail outright — for exactly the operators who moved the key.
     #[test]
     fn load_keypair_from_dir_honours_the_key_env() {
@@ -720,7 +721,7 @@ mod gitlawb_dir_tests {
         std::fs::write(&key, expected.to_pem().unwrap()).unwrap();
 
         let loaded = with_key_env(Some(key.into_os_string()), || load_keypair_from_dir(None))
-            .expect("the identity beside GITLAWB_KEY must be found");
+            .expect("the identity beside TWIGPINE_KEY must be found");
 
         assert_eq!(loaded.did(), expected.did());
     }
@@ -730,9 +731,9 @@ mod gitlawb_dir_tests {
 mod key_basename_tests {
     use super::*;
 
-    /// `GITLAWB_KEY` names a FILE. `twigpine` used to keep only its parent and re-append
+    /// `TWIGPINE_KEY` names a FILE. `twigpine` used to keep only its parent and re-append
     /// `identity.pem`, while `git-remote-twigpine` opened the configured path — so
-    /// with `GITLAWB_KEY=/data/keys/ci-agent.pem` the CLI and the push path loaded
+    /// with `TWIGPINE_KEY=/data/keys/ci-agent.pem` the CLI and the push path loaded
     /// different files, and owner enforcement and the delegation proof both key off
     /// whichever identity that was.
     #[test]
@@ -748,7 +749,7 @@ mod key_basename_tests {
 
         assert_eq!(resolved, key, "the configured basename must survive");
         assert_eq!(
-            loaded.expect("the key at GITLAWB_KEY must load").did(),
+            loaded.expect("the key at TWIGPINE_KEY must load").did(),
             expected.did(),
             "twigpine must load the same file the helper opens"
         );

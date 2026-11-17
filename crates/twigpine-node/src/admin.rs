@@ -923,7 +923,7 @@ mod db_tests {
     }
 
     /// A Postgres pool of a fixed size with a short acquire timeout and no ambient
-    /// reaping, so a purge exercised at GITLAWB_DB_MAX_CONNECTIONS=1 fails fast
+    /// reaping, so a purge exercised at TWIGPINE_DB_MAX_CONNECTIONS=1 fails fast
     /// (rather than stalling the whole test) if the single connection is pinned.
     /// min/idle/lifetime pinned so a held connection is never reclaimed
     /// mid-assertion.
@@ -1100,7 +1100,7 @@ mod db_tests {
         assert!(!path.exists(), "on-disk bare repo dir must be removed too");
     }
 
-    // U3 (R3/KTD3): a purge at GITLAWB_DB_MAX_CONNECTIONS=1 (app pool size 1) must
+    // U3 (R3/KTD3): a purge at TWIGPINE_DB_MAX_CONNECTIONS=1 (app pool size 1) must
     // still delete. U2 split the pools: the advisory-lock guard pins a connection
     // from the dedicated lock_pool while delete_repo_by_id runs on the app pool, so
     // the single app connection is free for the delete's begin() even while the guard

@@ -20,10 +20,10 @@ const PUBLIC_NODE: &str = "https://node.twigpine.com";
 #[derive(Args)]
 pub struct QuickstartArgs {
     /// Node URL to register with
-    #[arg(long, default_value = PUBLIC_NODE, env = "GITLAWB_NODE")]
+    #[arg(long, default_value = PUBLIC_NODE, env = "TWIGPINE_NODE")]
     pub node: String,
 
-    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+    /// Identity directory (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 
@@ -40,8 +40,8 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     println!();
 
     // The wizard generates the identity AND stores the bootstrap UCAN, so it has to
-    // land where every later command reads from — the parent of `GITLAWB_KEY`, not
-    // an unconditional `~/.gitlawb`.
+    // land where every later command reads from — the parent of `TWIGPINE_KEY`, not
+    // an unconditional `~/.twigpine`.
     let dir = crate::identity::gitlawb_dir(args.dir.clone())?;
 
     // ── Step 1: Identity ──────────────────────────────────────────────────
@@ -52,7 +52,7 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     let keypair = if pem_path.exists() {
         // `args.dir.as_deref()`, not `Some(&dir)`. Passing the DIRECTORY made the
         // loader re-derive the basename as `identity.pem`, so with
-        // `GITLAWB_KEY=/data/keys/ci-agent.pem` the check above found `ci-agent.pem`
+        // `TWIGPINE_KEY=/data/keys/ci-agent.pem` the check above found `ci-agent.pem`
         // while the load looked for a sibling that need not exist. The load must
         // target the file that was actually selected, and a file that exists but
         // fails to load is refused below, never regenerated over: `pem_path` can

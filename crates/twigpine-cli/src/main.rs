@@ -142,8 +142,31 @@ enum Commands {
     Whoami(whoami::WhoamiArgs),
 }
 
+/// The command was `gl` before the rename and still answers to it. Say so
+/// once per run, on stderr, and only to a person: scripts and the MCP server
+/// (which owns stdout and is never a terminal on stderr's side of a pipe) see
+/// nothing.
+fn old_command_name_notice() {
+    use std::io::IsTerminal;
+    let invoked_as_gl = std::env::args_os()
+        .next()
+        .map(std::path::PathBuf::from)
+        .and_then(|p| p.file_stem().map(|s| s.to_os_string()))
+        .is_some_and(|stem| stem == "gl");
+    if invoked_as_gl && std::io::stderr().is_terminal() {
+        eprintln!("note: `gl` is now `twigpine` (short: `twig`). `gl` still works for now.");
+    }
+}
+
+fn main() -> Result<()> {
+    // Before the runtime starts its threads, and before anything reads a
+    // setting: accept the names settings had before the rename.
+    twigpine_core::legacy_env::adopt();
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -151,6 +174,8 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr) // keep stdout clean for MCP framing
         .init();
+
+    old_command_name_notice();
 
     let cli = Cli::parse();
     match cli.command {

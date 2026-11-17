@@ -1,6 +1,6 @@
-//! The denial codes the node puts in `X-Gitlawb-Error`, in one place.
+//! The denial codes the node puts in `X-Twigpine-Error`, in one place.
 //!
-//! When the node refuses a write it answers with an `X-Gitlawb-Error` header
+//! When the node refuses a write it answers with an `X-Twigpine-Error` header
 //! and a matching `error` field in the JSON body. The `twigpine` client keys off that
 //! header to turn a denial into a hard error instead of handing the caller a
 //! response that pretty-prints like a success.
@@ -48,10 +48,10 @@
 //! [`from_code`]: NodeDenial::from_code
 //! [`RateLimited`]: NodeDenial::RateLimited
 
-/// A refusal the node names in `X-Gitlawb-Error`.
+/// A refusal the node names in `X-Twigpine-Error`.
 ///
 /// The `as_str` value is the wire contract: it appears verbatim in the
-/// `X-Gitlawb-Error` response header and in the body's `error` field, and
+/// `X-Twigpine-Error` response header and in the body's `error` field, and
 /// scripts match on it. Never change one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeDenial {
@@ -96,7 +96,7 @@ impl NodeDenial {
         Self::RateLimited,
     ];
 
-    /// The wire code, as it appears in `X-Gitlawb-Error` and in the body.
+    /// The wire code, as it appears in `X-Twigpine-Error` and in the body.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NonceRequired => "signature_nonce_required",

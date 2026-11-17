@@ -9,9 +9,9 @@
 //!
 //! Payload headers:
 //!   Content-Type: application/json
-//!   X-Gitlawb-Event: <event>
-//!   X-Gitlawb-Delivery: <uuid>
-//!   X-Gitlawb-Signature-256: sha256=<hmac-sha256-hex>  (only if secret set)
+//!   X-Twigpine-Event: <event>
+//!   X-Twigpine-Delivery: <uuid>
+//!   X-Twigpine-Signature-256: sha256=<hmac-sha256-hex>  (only if secret set)
 
 use std::sync::Arc;
 
@@ -19,6 +19,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::db::Db;
+use twigpine_core::legacy_headers;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -307,12 +308,18 @@ async fn fire_event_async_occurrence(
             let mut req = client
                 .post(&hook.url)
                 .header("Content-Type", "application/json")
-                .header("X-Gitlawb-Event", &event_name)
-                .header("X-Gitlawb-Delivery", &delivery_id)
                 .body(bytes);
-
-            if let Some(sig) = signature {
-                req = req.header("X-Gitlawb-Signature-256", sig);
+            // Every header goes out under its current name and the name it had
+            // before the rename: receivers verify the signature header by
+            // name, and they are not ours to update.
+            for (pair, value) in [
+                (legacy_headers::WEBHOOK_EVENT, Some(event_name.as_str())),
+                (legacy_headers::WEBHOOK_DELIVERY, Some(delivery_id.as_str())),
+                (legacy_headers::WEBHOOK_SIGNATURE, signature.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    req = req.header(pair.0, value).header(pair.1, value);
+                }
             }
 
             match req.send().await {

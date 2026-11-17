@@ -120,7 +120,7 @@ pub(crate) const LEGACY_SCAN_PAGE_ROWS: usize = 128;
 /// count (private and quarantined rows included) to within one ceiling. At the 2048
 /// default that is tolled and coarse; it sharpens as the ceiling is lowered.
 ///
-/// Tunable via `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS` / `AppState`.
+/// Tunable via `TWIGPINE_IPFS_MAX_LEGACY_SCAN_ROWS` / `AppState`.
 pub(crate) const MAX_LEGACY_SCAN_ROWS_PER_REQUEST: usize = 2048;
 
 /// Hard per-request ceiling on the BYTES of visibility rules the legacy scan's pager may
@@ -282,7 +282,7 @@ impl LegacyScanPager {
                 tracing::warn!(
                     budget_secs,
                     "/ipfs list_repos_page_for_scan exceeded the request budget \
-                     (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                     (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
                 );
                 return Err(budget_shed());
             }
@@ -326,7 +326,7 @@ impl LegacyScanPager {
                 tracing::warn!(
                     budget_secs,
                     "/ipfs list_visibility_rules_for_repos exceeded the request budget \
-                     (GITLAWB_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
+                     (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
                 );
                 return Err(budget_shed());
             }
@@ -638,7 +638,7 @@ pub async fn get_by_cid(
                 tracing::warn!(
                     resolve_budget_secs = state.config.ipfs_resolve_budget_secs,
                     "/ipfs oids_for_cid exceeded the pre-walk resolve budget \
-                     (GITLAWB_IPFS_RESOLVE_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                     (TWIGPINE_IPFS_RESOLVE_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
                 );
                 return Err(AppError::Overloaded(format!(
                     "ipfs resolve incomplete (resolve budget) for CID {cid_str}; retry shortly"
@@ -647,7 +647,7 @@ pub async fn get_by_cid(
             tracing::warn!(
                 budget_secs = state.config.ipfs_request_budget_secs,
                 "/ipfs oids_for_cid exceeded the request budget \
-                 (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                 (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
             );
             return Err(budget_shed());
         }
@@ -789,7 +789,7 @@ pub async fn get_by_cid(
                 tracing::warn!(
                     budget_secs = state.config.ipfs_request_budget_secs,
                     "/ipfs pin_sources_for_oid exceeded the request budget \
-                     (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                     (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
                 );
                 return Err(budget_shed());
             }
@@ -819,7 +819,7 @@ pub async fn get_by_cid(
                     tracing::warn!(
                         budget_secs = state.config.ipfs_request_budget_secs,
                         "/ipfs get_repo_by_id exceeded the request budget \
-                         (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                         (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
                     );
                     return Err(budget_shed());
                 }
@@ -836,7 +836,7 @@ pub async fn get_by_cid(
                     tracing::warn!(
                         budget_secs = state.config.ipfs_request_budget_secs,
                         "/ipfs is_repo_quarantined exceeded the request budget \
-                         (GITLAWB_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
+                         (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
                     );
                     return Err(budget_shed());
                 }
@@ -855,7 +855,7 @@ pub async fn get_by_cid(
                     tracing::warn!(
                         budget_secs = state.config.ipfs_request_budget_secs,
                         "/ipfs per-source list_visibility_rules_for_repos exceeded the request budget \
-                         (GITLAWB_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
+                         (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
                     );
                     return Err(budget_shed());
                 }
@@ -976,7 +976,7 @@ pub async fn get_by_cid(
                         tracing::warn!(
                         budget_secs = state.config.ipfs_request_budget_secs,
                         "/ipfs pin_sources_at_cap exceeded the request budget \
-                         (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                         (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
                     );
                         return Err(budget_shed());
                     }
@@ -995,7 +995,7 @@ pub async fn get_by_cid(
                             tracing::warn!(
                             budget_secs = state.config.ipfs_request_budget_secs,
                             "/ipfs pin_sources_incomplete exceeded the request budget \
-                             (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+                             (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
                         );
                             return Err(budget_shed());
                         }
@@ -1598,7 +1598,7 @@ impl WalkState {
                 stage,
                 budget_secs,
                 "/ipfs request budget exhausted before the stage \
-                 (GITLAWB_IPFS_REQUEST_BUDGET_SECS); stopping without a verdict"
+                 (TWIGPINE_IPFS_REQUEST_BUDGET_SECS); stopping without a verdict"
             );
             self.taint("budget");
             return None;
@@ -1684,7 +1684,7 @@ async fn gate_and_serve(
             ceiling = state.config.ipfs_max_repo_visits,
             repo = %repo.name,
             "/ipfs request hit the per-request repo-visit ceiling \
-             (GITLAWB_IPFS_MAX_REPO_VISITS); skipping repo without a verdict"
+             (TWIGPINE_IPFS_MAX_REPO_VISITS); skipping repo without a verdict"
         );
         return GateOutcome::CeilingStop("visit-ceiling");
     }
@@ -1834,7 +1834,7 @@ async fn gate_and_serve(
             // candidates never consume budget.
             // Both parents bound this loop, under different knobs: #173's
             // `ipfs_max_history_walks` (an AppState field, seeded from config) and
-            // #174's `GITLAWB_IPFS_MAX_REPOS_WALKED`. Honor the tighter of the two, so
+            // #174's `TWIGPINE_IPFS_MAX_REPOS_WALKED`. Honor the tighter of the two, so
             // neither knob silently stops working after the merge.
             //
             // The cap is charged PER PHASE (#173 round 13, F3): the provenance path and
@@ -3908,7 +3908,7 @@ mod tests {
     /// `AppState::ipfs_work_budget` floors the per-IP work bucket at
     /// `ipfs_max_legacy_probes + pages`, but the SAME bucket is debited once per
     /// provenance visibility walk, before the fallback the markers arm has run at all.
-    /// So with `GITLAWB_IPFS_RATE_LIMIT` below the floor (the only configuration where
+    /// So with `TWIGPINE_IPFS_RATE_LIMIT` below the floor (the only configuration where
     /// the floor is what sizes the bucket), the provenance phase eats into the budget
     /// the floor exists to reserve for the search, and the "one complete legacy search
     /// per window" guarantee stops holding: the search 429s short of its configured
@@ -8437,7 +8437,7 @@ mod tests {
         assert!(
             body.contains("budget"),
             "the truncation body must name the budget taint so the operator can \
-             map the shed to GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+             map the shed to TWIGPINE_IPFS_REQUEST_BUDGET_SECS; got: {body}"
         );
     }
 
@@ -9290,7 +9290,7 @@ mod tests {
     /// a deny VERDICT) and the second is cut by the cap (no verdict), so the fake git's
     /// `rev-list` runs exactly once and the request sheds a retryable 503 + Retry-After
     /// — never the old false 404 (the blob genuinely sits in the second repo).
-    /// This drives the GITLAWB_IPFS_MAX_REPOS_WALKED knob specifically. The merge left
+    /// This drives the TWIGPINE_IPFS_MAX_REPOS_WALKED knob specifically. The merge left
     /// two walk caps in play, this one and the branch's own history-walk ceiling, and
     /// the gate takes the tighter of the two; setting this knob to 1 is what makes it
     /// the binding one here. A sibling case covers the ceiling.
@@ -9576,7 +9576,7 @@ mod tests {
         assert!(
             body.contains("budget"),
             "the shed must name the budget taint so it maps to \
-             GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+             TWIGPINE_IPFS_REQUEST_BUDGET_SECS; got: {body}"
         );
         // The scarce walk permit was RAII-dropped on the early return, not pinned for
         // the stall: the slot is free again the instant the request returns.
@@ -9606,7 +9606,7 @@ mod tests {
     /// region, and pre-fix it was a bare await with no deadline. A query blocked in
     /// Postgres there pinned both walk permits for the whole stall, past the request
     /// budget, so later /ipfs requests took capacity 503s long after
-    /// GITLAWB_IPFS_REQUEST_BUDGET_SECS elapsed, reachable by any unauthenticated
+    /// TWIGPINE_IPFS_REQUEST_BUDGET_SECS elapsed, reachable by any unauthenticated
     /// caller. Here `pinned_cids` (the only table `oids_for_cid` reads) is held
     /// ACCESS EXCLUSIVE so the query blocks at lock acquisition.
     ///
@@ -9669,7 +9669,7 @@ mod tests {
         assert!(
             body.contains("budget"),
             "the shed must name the budget taint so it maps to \
-             GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+             TWIGPINE_IPFS_REQUEST_BUDGET_SECS; got: {body}"
         );
         assert_eq!(
             sem.available_permits(),
@@ -9770,7 +9770,7 @@ mod tests {
         assert!(
             body.contains("resolve budget"),
             "the shed must name the RESOLVE budget so it maps to \
-             GITLAWB_IPFS_RESOLVE_BUDGET_SECS; got: {body}"
+             TWIGPINE_IPFS_RESOLVE_BUDGET_SECS; got: {body}"
         );
         assert!(
             !body.contains("request budget"),
@@ -9959,7 +9959,7 @@ mod tests {
         assert!(
             body.contains("budget"),
             "the shed must name the budget taint so it maps to \
-             GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+             TWIGPINE_IPFS_REQUEST_BUDGET_SECS; got: {body}"
         );
         assert_eq!(
             sem.available_permits(),
@@ -10166,7 +10166,7 @@ mod tests {
         assert!(
             body.contains("budget"),
             "{label}: the shed must name the budget taint so it maps to \
-             GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+             TWIGPINE_IPFS_REQUEST_BUDGET_SECS; got: {body}"
         );
         // The scarce walk permit was RAII-dropped on the early return, not pinned for
         // the stall: the slot is free again the instant the request returns.

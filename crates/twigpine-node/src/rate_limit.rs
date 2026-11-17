@@ -383,7 +383,7 @@ pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
 /// a proxy the operator controls may be believed; a raw client can put any
 /// value in `Fly-Client-IP` / `X-Forwarded-For`, so trusting them unconditionally
 /// lets a flooder rotate the header and never fill a bucket. Configured via
-/// `GITLAWB_TRUSTED_PROXY`.
+/// `TWIGPINE_TRUSTED_PROXY`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrustedProxy {
     /// No trusted proxy: ignore forwarded headers, key on the socket peer IP.
@@ -398,7 +398,7 @@ pub enum TrustedProxy {
 }
 
 impl TrustedProxy {
-    /// Parse `GITLAWB_TRUSTED_PROXY`. Unknown/empty → `None` (trust nothing).
+    /// Parse `TWIGPINE_TRUSTED_PROXY`. Unknown/empty → `None` (trust nothing).
     pub fn from_env_value(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "fly" | "fly-client-ip" => TrustedProxy::Fly,
@@ -487,7 +487,7 @@ pub const RATE_LIMIT_MESSAGE: &str = "rate limit exceeded — try again later";
 /// alike). Route-agnostic: the message stays generic (the offending path, when
 /// logged, is recorded at the call site).
 ///
-/// Carries `X-Gitlawb-Error: rate_limited` and the same JSON shape the ledger's
+/// Carries `X-Twigpine-Error: rate_limited` and the same JSON shape the ledger's
 /// `ledger_rejection` uses, because the brake shares 429 with the ledger's
 /// `signature_ledger_full` on every route group the write brake covers. Without a
 /// code the only discriminator between two unrelated conditions is the
@@ -500,7 +500,7 @@ pub fn too_many_requests(retry_after: Duration) -> Response {
         StatusCode::TOO_MANY_REQUESTS,
         [
             ("retry-after", retry_after.as_secs().to_string()),
-            ("X-Gitlawb-Error", code.to_string()),
+            ("X-Twigpine-Error", code.to_string()),
         ],
         Json(json!({ "error": code, "message": RATE_LIMIT_MESSAGE })),
     )
@@ -585,7 +585,7 @@ mod tests {
     /// The brake shares 429 with the spent-signature ledger's
     /// `signature_ledger_full`, so it has to be told apart by something other
     /// than the status. It carries the same shape the ledger uses: an
-    /// `X-Gitlawb-Error` header and a JSON body whose `error` matches it.
+    /// `X-Twigpine-Error` header and a JSON body whose `error` matches it.
     #[tokio::test]
     async fn brake_429_carries_a_machine_readable_code_and_json_body() {
         let resp = too_many_requests(Duration::from_secs(60));
@@ -598,7 +598,7 @@ mod tests {
         );
         assert_eq!(
             resp.headers()
-                .get("x-gitlawb-error")
+                .get("x-twigpine-error")
                 .and_then(|v| v.to_str().ok()),
             Some("rate_limited"),
             "a brake 429 must be distinguishable from a ledger 429 by its code",

@@ -3,7 +3,7 @@
 //! `twigpine` and `git-remote-twigpine` have to agree on this. `twigpine ucan import` writes a
 //! delegation to `<dir>/delegations/`, and the helper reads it back from the same
 //! place when it builds the `X-Ucan` header on push. If the two resolve
-//! `GITLAWB_KEY` differently the push goes out with no header and the node refuses
+//! `TWIGPINE_KEY` differently the push goes out with no header and the node refuses
 //! the delegate, with nothing on either side to say why — so the rules live here
 //! once, in the crate both binaries already depend on, rather than being written
 //! twice and drifting.
@@ -20,18 +20,46 @@ use std::path::{Component, Path, PathBuf};
 use crate::{Error, Result};
 
 /// Environment variable naming the identity PEM.
-pub const KEY_ENV: &str = "GITLAWB_KEY";
+pub const KEY_ENV: &str = "TWIGPINE_KEY";
 
 /// Name of the PEM file inside the identity directory.
 pub const KEY_FILE_NAME: &str = "identity.pem";
 
-/// Directory under the home directory used when `GITLAWB_KEY` is unset.
-pub const DEFAULT_DIR_NAME: &str = ".gitlawb";
+/// Directory under the home directory used when `TWIGPINE_KEY` is unset.
+pub const DEFAULT_DIR_NAME: &str = ".twigpine";
 
-/// Absolute path of the identity PEM: `$GITLAWB_KEY`, else
-/// `<home>/.gitlawb/identity.pem`.
+/// The directory's name before the rename to Twigpine. See [`default_dir`].
+pub const LEGACY_DIR_NAME: &str = ".gitlawb";
+
+/// The directory used when `TWIGPINE_KEY` is unset: `<home>/.twigpine`, or an
+/// existing `<home>/.gitlawb` when there is no `<home>/.twigpine`.
 ///
-/// An empty `GITLAWB_KEY` counts as unset. That is what a shell leaves behind for
+/// Nothing is moved. An identity created before the rename stays where it is
+/// and keeps working; a move that failed halfway could strand the key. Once
+/// `<home>/.twigpine` exists (a new install, or the operator renamed the old
+/// directory) it is the only one read.
+///
+/// The check is on the directory, not on a file in it, so the key, the
+/// delegation store and everything else that lives beside the key always
+/// resolve to the same place.
+pub fn default_dir(home: &Path) -> PathBuf {
+    let new = home.join(DEFAULT_DIR_NAME);
+    // `symlink_metadata`: a link named `.twigpine` counts as present even when
+    // its target is missing, so a broken link is reported where it is instead
+    // of silently falling back to the old directory.
+    if new.symlink_metadata().is_err() {
+        let legacy = home.join(LEGACY_DIR_NAME);
+        if legacy.is_dir() {
+            return legacy;
+        }
+    }
+    new
+}
+
+/// Absolute path of the identity PEM: `$TWIGPINE_KEY`, else `identity.pem` in
+/// [`default_dir`].
+///
+/// An empty `TWIGPINE_KEY` counts as unset. That is what a shell leaves behind for
 /// `FOO=` and for an unset variable expanded into a wrapper script, and reading it
 /// as a path would resolve against the process working directory instead.
 pub fn identity_key_path(home: Option<&Path>) -> Result<PathBuf> {
@@ -41,9 +69,7 @@ pub fn identity_key_path(home: Option<&Path>) -> Result<PathBuf> {
     // problem.
     match std::env::var_os(KEY_ENV) {
         Some(raw) if !raw.is_empty() => resolve_key_value(Path::new(&raw), home),
-        _ => Ok(require_home(home)?
-            .join(DEFAULT_DIR_NAME)
-            .join(KEY_FILE_NAME)),
+        _ => Ok(default_dir(require_home(home)?).join(KEY_FILE_NAME)),
     }
 }
 
@@ -61,7 +87,7 @@ pub fn identity_dir(home: Option<&Path>) -> Result<PathBuf> {
 
 /// The home directory, demanded only where the value being resolved needs it.
 ///
-/// An absolute `GITLAWB_KEY` never needs home, so requiring it up front would
+/// An absolute `TWIGPINE_KEY` never needs home, so requiring it up front would
 /// discard a perfectly good key on a host where `dirs::home_dir()` returns `None`
 /// — no `HOME` and no passwd entry, which is an ordinary container shape. The
 /// helper would then push unsigned, blaming the home directory for a setting the
@@ -75,7 +101,7 @@ fn require_home(home: Option<&Path>) -> Result<&Path> {
     })
 }
 
-/// Apply the `GITLAWB_KEY` rules to a raw value.
+/// Apply the `TWIGPINE_KEY` rules to a raw value.
 ///
 /// Split out from [`identity_key_path`] so the rules can be tested without setting
 /// a process-global environment variable, which would make the tests race.
@@ -164,7 +190,7 @@ mod tests {
     #[test]
     fn the_tilde_spelling_of_the_default_resolves_to_the_default() {
         let resolved =
-            resolve_key_value(Path::new("~/.gitlawb/identity.pem"), Some(&home())).unwrap();
+            resolve_key_value(Path::new("~/.twigpine/identity.pem"), Some(&home())).unwrap();
         assert_eq!(resolved, home().join(DEFAULT_DIR_NAME).join(KEY_FILE_NAME));
     }
 
@@ -269,7 +295,7 @@ mod no_home_tests {
     use super::*;
 
     /// An absolute key needs no home directory. Demanding one up front discarded a
-    /// correctly-configured `GITLAWB_KEY` on any host where `dirs::home_dir()`
+    /// correctly-configured `TWIGPINE_KEY` on any host where `dirs::home_dir()`
     /// returns `None` — no `HOME` and no passwd entry, an ordinary container shape —
     /// and the helper then pushed unsigned while blaming the home directory.
     #[test]
@@ -295,5 +321,62 @@ mod no_home_tests {
             err.to_string().contains("home directory"),
             "the error must name the missing home directory, got: {err}"
         );
+    }
+
+    /// A scratch home under the system temp directory, removed on drop.
+    struct ScratchHome(PathBuf);
+    impl ScratchHome {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "twigpine-core-home-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn default_dir_is_the_new_name_on_a_fresh_home() {
+        let home = ScratchHome::new("fresh");
+        assert_eq!(default_dir(&home.0), home.0.join(".twigpine"));
+    }
+
+    #[test]
+    fn default_dir_keeps_an_existing_old_directory() {
+        let home = ScratchHome::new("old");
+        std::fs::create_dir(home.0.join(".gitlawb")).unwrap();
+        assert_eq!(default_dir(&home.0), home.0.join(".gitlawb"));
+    }
+
+    #[test]
+    fn default_dir_prefers_the_new_directory_once_it_exists() {
+        let home = ScratchHome::new("both");
+        std::fs::create_dir(home.0.join(".gitlawb")).unwrap();
+        std::fs::create_dir(home.0.join(".twigpine")).unwrap();
+        assert_eq!(default_dir(&home.0), home.0.join(".twigpine"));
+    }
+
+    #[test]
+    fn default_dir_ignores_an_old_name_that_is_not_a_directory() {
+        let home = ScratchHome::new("file");
+        std::fs::write(home.0.join(".gitlawb"), b"").unwrap();
+        assert_eq!(default_dir(&home.0), home.0.join(".twigpine"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_dir_does_not_fall_back_past_a_broken_new_link() {
+        let home = ScratchHome::new("link");
+        std::fs::create_dir(home.0.join(".gitlawb")).unwrap();
+        std::os::unix::fs::symlink(home.0.join("missing"), home.0.join(".twigpine")).unwrap();
+        assert_eq!(default_dir(&home.0), home.0.join(".twigpine"));
     }
 }

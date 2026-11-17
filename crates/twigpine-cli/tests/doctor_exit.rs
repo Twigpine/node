@@ -1,7 +1,7 @@
 //! #357: pin the `twigpine doctor` exit-code wiring, not just the predicate.
 //!
 //! The unit tests for `has_failures` never touch `std::process::exit(1)` or
-//! the `GITLAWB_NODE` Warn tier. Deleting the exit gate outright kept
+//! the `TWIGPINE_NODE` Warn tier. Deleting the exit gate outright kept
 //! `cargo test -p twigpine-cli doctor::` green, so this binary probe is the only thing
 //! that breaks when the wiring is gutted.
 
@@ -22,12 +22,13 @@ fn doctor_exits_nonzero_when_fail_rows_present() {
             "--node",
             "http://127.0.0.1:1",
         ])
-        // Inherit PATH but neutralize GITLAWB_NODE so the test is deterministic
+        // Inherit PATH but neutralize TWIGPINE_NODE so the test is deterministic
         // across machines that have it set (otherwise it would be Pass).
+        .env_remove("TWIGPINE_NODE")
         .env_remove("GITLAWB_NODE")
         // iCaptcha probes a real URL by default; keep it unreachable too so
         // it stays Warn and does not affect the Fail gating.
-        .env("GITLAWB_ICAPTCHA_URL", "http://127.0.0.1:1")
+        .env("TWIGPINE_ICAPTCHA_URL", "http://127.0.0.1:1")
         .output()
         .expect("run twigpine doctor");
 
