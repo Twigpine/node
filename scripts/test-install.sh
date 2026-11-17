@@ -156,9 +156,8 @@ installed_old() {
     && runs git-remote-twigpine "git-remote-gitlawb $1 genuine" \
     && runs gitlawb-node "gitlawb-node $1 genuine" && runs twigpine-node "gitlawb-node $1 genuine"
 }
-nothing_installed() {
-  [ ! -e "$W/home/bin/twigpine" ] && [ ! -e "$W/home/bin/gl" ] && [ ! -e "$W/home/bin/git-remote-gitlawb" ]
-}
+# Nothing at all: no program, no stray file, no dangling link.
+nothing_installed() { [ ! -d "$W/home/bin" ] || [ -z "$(ls -A "$W/home/bin")" ]; }
 
 # A PATH with every tool install.sh needs except the SHA-256 ones.
 mkdir -p "$W/nohash"
@@ -317,9 +316,15 @@ suite() {
   else bad "accepts a local checksum list (file://)"; fi
 }
 
+# Shells named on the command line must exist; the default set is whatever
+# of sh, dash and bash this machine has.
 SHELLS=${*:-"sh dash bash"}
 for s in $SHELLS; do
-  if command -v "$s" >/dev/null 2>&1; then suite "$s"; fi
+  if command -v "$s" >/dev/null 2>&1; then suite "$s"
+  elif [ "$#" -gt 0 ]; then
+    FAIL=$((FAIL + 1))
+    echo "  FAIL  shell not found: $s"
+  fi
 done
 
 # install.ps1: same server, same cases. PROCESSOR_ARCHITECTURE stands in for
@@ -346,7 +351,7 @@ ps1_installed_old() {
     && has git-remote-twigpine "git-remote-gitlawb $1 genuine" \
     && has gitlawb-node "gitlawb-node $1 genuine" && has twigpine-node "gitlawb-node $1 genuine"
 }
-ps1_nothing() { [ ! -e "$W/home/bin/twigpine.exe" ] && [ ! -e "$W/home/bin/gl.exe" ]; }
+ps1_nothing() { nothing_installed; }
 
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*) PS1_OK=no ;; # would edit the real user PATH
