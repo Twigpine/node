@@ -64,7 +64,7 @@ check "twigpine-core source" "$out" rust=true windows=true \
 has_packages "twigpine-core fan-out" "$out" twigpine-core icaptcha-client \
   twigpine-attest git-remote-twigpine twigpine-cli twigpine-node
 check "icaptcha-client source" "$(map crates/icaptcha-client/src/lib.rs)" \
-  'rust_packages=-p twigpine-cli -p icaptcha-client' 'windows_packages=-p twigpine-cli'
+  'rust_packages=-p icaptcha-client -p twigpine-cli' 'windows_packages=-p twigpine-cli'
 
 # Anything the Rust surface cannot attribute to known crates widens.
 check "unknown crate dir" "$(map crates/no-such-crate/src/lib.rs)" \

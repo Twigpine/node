@@ -99,12 +99,17 @@ try {
     "twig.exe" = "twigpine.exe"
     "gl.exe" = "twigpine.exe"
     "git-remote-gitlawb.exe" = "git-remote-twigpine.exe"
+    "gitlawb-node.exe" = "twigpine-node.exe"
   }
   foreach ($alias in $oldNames.Keys) {
-    $src = Join-Path $InstallDir $oldNames[$alias]
-    if (Test-Path $src) {
-      Copy-Item -Path $src -Destination (Join-Path $InstallDir $alias) -Force
+    $dst = Join-Path $InstallDir $alias
+    if ($installed -contains $oldNames[$alias]) {
+      Copy-Item -Path (Join-Path $InstallDir $oldNames[$alias]) -Destination $dst -Force
       $installed += $alias
+    } elseif (Test-Path $dst) {
+      # This release did not ship the binary this name stood for; a leftover
+      # copy would keep running an older version.
+      Remove-Item -Path $dst -Force
     }
   }
 

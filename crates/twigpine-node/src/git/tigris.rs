@@ -948,7 +948,7 @@ mod tests {
     ///
     /// Ignored by default and additionally gated on `GITLAWB_TIGRIS_PROBE=1`,
     /// because it writes to a real bucket and costs real requests. Run with:
-    /// `GITLAWB_TIGRIS_PROBE=1 cargo test -p twigpine-node --bin twigpine-node
+    /// `GITLAWB_TIGRIS_PROBE=1 cargo test -p twigpine-node --lib
     /// tigris_honors_conditional_writes -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "writes to a real Tigris bucket; needs GITLAWB_TIGRIS_PROBE=1 plus credentials"]

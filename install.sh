@@ -163,7 +163,9 @@ done
 # scheme, so existing remotes still run the old helper name, and scripts or
 # service units may still call the old command and daemon names.
 link_old_name() {
-  if [ -f "$INSTALL_DIR/$1" ]; then
+  # Only when this archive shipped the binary: a leftover from an earlier
+  # install must not get a fresh link, or be listed as installed by this run.
+  if [ -f "$PACKAGE_DIR/$1" ]; then
     ln -sf "$1" "$INSTALL_DIR/$2"
     INSTALLED+=("$2")
   fi
