@@ -189,7 +189,12 @@ export GITLAWB_NODE=http://localhost:7545
 git clone gitlawb://did:key:z6Mk.../my-repo
 ```
 
-For public-network use, make sure `GITLAWB_NODE` points to the node you want. The helper defaults to localhost for local development.
+For public-network use, make sure `GITLAWB_NODE` points to the node you want, over
+`https://`. The helper defaults to localhost for local development, and plaintext
+`http://` is allowed only to this machine: requests are signed but not encrypted, so
+a cleartext hop to a remote node exposes the pack contents and the `Signature`
+header. A remote `http://` node is refused, and `GITLAWB_ALLOW_INSECURE_HTTP=1`
+overrides that for a trusted private network.
 
 ### Full lifecycle against an iCaptcha-enforcing node
 

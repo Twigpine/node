@@ -66,6 +66,7 @@ fn main() -> Result<()> {
     // v0.1: default to localhost. Override with GITLAWB_NODE env var.
     let node_base =
         std::env::var("GITLAWB_NODE").unwrap_or_else(|_| "http://127.0.0.1:7545".to_string());
+    check_transport_security(&node_base, allow_insecure_http_enabled())?;
     let repo_base = format!("{}/{}/{}", node_base, short_owner, repo_name);
     tracing::debug!("repo_base: {repo_base}");
 
@@ -76,6 +77,124 @@ fn main() -> Result<()> {
     let keypair = load_keypair();
 
     run_helper(&repo_base, keypair.as_ref())
+}
+
+/// Whether `url` is plaintext http, regardless of where it points.
+fn is_http(url: &str) -> bool {
+    reqwest::Url::parse(url.trim())
+        .map(|u| u.scheme() == "http")
+        .unwrap_or(false)
+}
+
+/// Whether `url` would send git data off this machine in cleartext.
+///
+/// True only for `http://` to a non-loopback host. RFC 9421 signs the request
+/// but does not encrypt it, so on a plaintext hop the pack contents and the
+/// `Signature` header are both readable, and a captured signature is replayable
+/// for its freshness window against any host.
+///
+/// Loopback is decided from the parsed address rather than a string match, so
+/// `127.0.0.2`, `[::1]` and an IPv4-mapped `[::ffff:127.0.0.1]` are all
+/// recognised as this machine. A value that does not parse, or that is not
+/// http(s), is not this guard's business and returns false: it fails later with
+/// its own error, and naming it a TLS problem would misdirect the reader.
+fn is_insecure_remote(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" {
+        return false;
+    }
+    // host_str() keeps the brackets on an IPv6 literal.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            return false;
+        }
+        // An IPv4-mapped IPv6 literal hides a v4 loopback from is_loopback().
+        if let std::net::IpAddr::V6(v6) = ip {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if v4.is_loopback() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Fixed warning for a `GITLAWB_ALLOW_INSECURE_HTTP` value that is set but not
+/// truthy. The raw value is never logged.
+fn warn_allow_insecure_http_non_truthy() {
+    tracing::warn!(
+        "GITLAWB_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); plaintext http to a remote node remains refused"
+    );
+}
+
+/// Parse a possibly-present `GITLAWB_ALLOW_INSECURE_HTTP` value.
+///
+/// Only `1` or `true` (case-insensitive, after trim) opens the gate. Presence
+/// alone is not consent: `=0`, `=false` and an empty value read as "not opting
+/// in" to the operator, and the README and refusal message document `=1`. Any
+/// other non-empty value warns so a misspelling is not a silent yes or a silent
+/// no. Same contract as `icaptcha_insecure_from_str` in `icaptcha-client`.
+fn allow_insecure_http_from_str(raw: Option<&str>) -> bool {
+    let Some(v) = raw else {
+        return false;
+    };
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("1") || t.eq_ignore_ascii_case("true") {
+        true
+    } else {
+        if !t.is_empty() {
+            warn_allow_insecure_http_non_truthy();
+        }
+        false
+    }
+}
+
+/// Interpret the result of `std::env::var("GITLAWB_ALLOW_INSECURE_HTTP")`
+/// without reading the environment again. A non-UTF-8 value fails closed and
+/// warns, like a present non-truthy one.
+fn allow_insecure_http_from_var(result: Result<String, std::env::VarError>) -> bool {
+    match result {
+        Ok(v) => allow_insecure_http_from_str(Some(&v)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn_allow_insecure_http_non_truthy();
+            false
+        }
+        Err(std::env::VarError::NotPresent) => false,
+    }
+}
+
+fn allow_insecure_http_enabled() -> bool {
+    allow_insecure_http_from_var(std::env::var("GITLAWB_ALLOW_INSECURE_HTTP"))
+}
+
+/// Refuse a cleartext hop off this machine unless the operator has opted in.
+///
+/// Fail closed: the alternative is signing a request and then handing it, and
+/// the pack it carries, to anyone on the path. `GITLAWB_ALLOW_INSECURE_HTTP`
+/// exists for a private LAN where the operator has decided that is acceptable.
+fn check_transport_security(node_base: &str, allow_insecure: bool) -> Result<()> {
+    if allow_insecure || !is_insecure_remote(node_base) {
+        return Ok(());
+    }
+    bail!(
+        "refusing to send git data to {node_base} over plaintext http.\n\
+         Requests are signed but not encrypted, so the pack contents and the \
+         Signature header are readable by anyone on the path, and a captured \
+         signature can be replayed.\n\
+         Use https://, or set GITLAWB_ALLOW_INSECURE_HTTP=1 to accept the risk \
+         (for a trusted private network only)."
+    )
 }
 
 // ── CLI argument handling ──────────────────────────────────────────────────────
@@ -127,6 +246,7 @@ fn help_text() -> String {
          \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push, absolute\n\
          \x20                  (default: ~/.gitlawb/identity.pem). Its parent also\n\
          \x20                  holds the delegations `gl ucan import` writes.\n\
+         \x20   GITLAWB_ALLOW_INSECURE_HTTP  Permit plaintext http:// to a non-loopback node (unset by default)\n\
          \x20   GITLAWB_LOG    Log filter (default: warn)\n\
          \n\
          FLAGS:\n\
@@ -201,7 +321,8 @@ fn handle_connect<R: Read>(
         other => bail!("unsupported git service: {other}"),
     }
 
-    let client = build_http_client()?;
+    // A loopback node must never be proxied; see build_http_client.
+    let client = build_http_client(!is_insecure_remote(repo_base) && is_http(repo_base))?;
 
     // ── Phase 1: ref advertisement (GET /info/refs?service=<service>) ─────────
     //
@@ -336,8 +457,22 @@ const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// node named, and on a 307/308 the pack body went with them. Scope the follow to the
 /// origin that issued the redirect AND to an identical request-target, which is the
 /// same predicate `gl` uses.
-fn build_http_client() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
+/// `bypass_proxy` must be true whenever the node is on this machine. reqwest's
+/// default client honours `HTTP_PROXY` / `ALL_PROXY` for a loopback URL too, so a
+/// proxy variable pointing off-machine turns an allowed local request into a
+/// cleartext hop carrying the `Signature` header, straight past
+/// `check_transport_security`. Verified: with `HTTP_PROXY` set, reqwest logged
+/// `proxy(...) intercepts 'http://127.0.0.1:7545/'` and dialled the proxy. A
+/// local node is never legitimately reached through a proxy, so this refuses one
+/// rather than trying to reimplement `NO_PROXY` parsing.
+fn build_http_client(bypass_proxy: bool) -> Result<reqwest::blocking::Client> {
+    let builder = reqwest::blocking::Client::builder();
+    let builder = if bypass_proxy {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    Ok(builder
         .timeout(HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(same_origin_redirect))
         .build()?)
@@ -1186,6 +1321,185 @@ fn home_dir() -> Option<std::path::PathBuf> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod insecure_transport_tests {
+    use super::*;
+
+    /// Loopback in every form the transport can legitimately be pointed at.
+    /// Plaintext to this machine is the documented local-alpha default and must
+    /// keep working, so a false positive here breaks every stock install.
+    #[test]
+    fn loopback_http_is_allowed() {
+        for url in [
+            "http://127.0.0.1:7545",
+            "http://localhost:7545",
+            "http://[::1]:7545",
+            "http://127.0.0.2:7545",
+            "http://[::ffff:127.0.0.1]:7545",
+            "http://LocalHost:7545",
+        ] {
+            assert!(
+                !is_insecure_remote(url),
+                "{url} is this machine; plaintext to it must stay allowed"
+            );
+        }
+    }
+
+    /// The case the guard exists for: cleartext git data leaving the machine.
+    #[test]
+    fn remote_http_is_refused() {
+        for url in [
+            "http://node.example.com:7545",
+            "http://10.0.0.36:7777",
+            "http://192.168.1.10",
+            "http://[2001:db8::1]:7545",
+            "http://8.8.8.8",
+        ] {
+            assert!(
+                is_insecure_remote(url),
+                "{url} sends git data off-machine in cleartext and must be refused"
+            );
+        }
+    }
+
+    /// TLS is always fine, loopback or not, so the guard keys on the scheme and
+    /// not merely on the host being remote.
+    #[test]
+    fn https_is_always_allowed() {
+        for url in [
+            "https://node.gitlawb.com",
+            "https://10.0.0.36:7777",
+            "https://127.0.0.1:7545",
+        ] {
+            assert!(!is_insecure_remote(url), "{url} is TLS and must be allowed");
+        }
+    }
+
+    /// Spellings that defeat a naive loopback check. `Url` normalizes the scheme
+    /// and the host at parse time (lowercasing, and the WHATWG numeric forms), so
+    /// these must all still read as this machine.
+    #[test]
+    fn loopback_spellings_are_normalized_not_string_matched() {
+        for url in [
+            "HTTP://127.0.0.1:7545",
+            "Http://LOCALHOST:7545",
+            "http://localhost.:7545",
+            "http://user:pw@127.0.0.1:7545",
+            "http://2130706433:7545",
+            "http://0x7f000001:7545",
+            "http://[::ffff:7f00:1]:7545",
+        ] {
+            assert!(
+                !is_insecure_remote(url),
+                "{url} resolves to this machine; plaintext to it must stay allowed"
+            );
+        }
+    }
+
+    /// The mirror of the above: an uppercase scheme must not become an escape
+    /// from the guard, and a remote host in any spelling is still remote.
+    #[test]
+    fn uppercase_scheme_does_not_escape_the_guard() {
+        for url in [
+            "HTTP://node.example.com:7545",
+            "Http://8.8.8.8",
+            "http://NODE.EXAMPLE.COM",
+            "http://user:pw@node.example.com",
+        ] {
+            assert!(
+                is_insecure_remote(url),
+                "{url} is a remote cleartext hop and must be refused"
+            );
+        }
+    }
+
+    /// The gate itself, both directions, including the opt-in escape hatch.
+    #[test]
+    fn gate_refuses_remote_plaintext_unless_opted_in() {
+        let err = check_transport_security("http://node.example.com:7545", false)
+            .expect_err("remote plaintext must be refused by default");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plaintext http"),
+            "the refusal must say why: {msg}"
+        );
+        assert!(
+            msg.contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+            "the refusal must name the escape hatch: {msg}"
+        );
+
+        check_transport_security("http://node.example.com:7545", true)
+            .expect("the opt-in must permit the same URL");
+        check_transport_security("http://127.0.0.1:7545", false)
+            .expect("the local default must keep working with no opt-in");
+        check_transport_security("https://node.gitlawb.com", false)
+            .expect("TLS must need no opt-in");
+    }
+
+    /// The opt-in is a value, not presence: only `1` / `true` (any case, trimmed)
+    /// opens the gate, and `0`, `false`, empty, a typo, or a non-UTF-8 value
+    /// leave it closed.
+    #[test]
+    fn insecure_http_opt_in_is_truthy_only() {
+        for on in ["1", "true", "TRUE", "True", " 1 ", "\ttrue\n"] {
+            assert!(allow_insecure_http_from_str(Some(on)), "{on:?} must enable");
+        }
+        for off in ["0", "false", "", " ", "yes", "on", "2", "11"] {
+            assert!(
+                !allow_insecure_http_from_str(Some(off)),
+                "{off:?} must not enable"
+            );
+        }
+        assert!(!allow_insecure_http_from_str(None), "unset must not enable");
+        assert!(allow_insecure_http_from_var(Ok("1".into())));
+        assert!(!allow_insecure_http_from_var(Ok("0".into())));
+        assert!(!allow_insecure_http_from_var(Err(
+            std::env::VarError::NotPresent
+        )));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+            assert!(
+                !allow_insecure_http_from_var(Err(std::env::VarError::NotUnicode(bad))),
+                "a non-UTF-8 value must fail closed"
+            );
+        }
+        // And through the gate: an off value must leave a remote node refused.
+        assert!(check_transport_security(
+            "http://node.example.com:7545",
+            allow_insecure_http_from_str(Some("0"))
+        )
+        .is_err());
+    }
+
+    /// The documented knob must appear in --help. A gate the operator cannot
+    /// discover reads as a broken transport rather than a deliberate refusal.
+    #[test]
+    fn help_documents_the_opt_in() {
+        assert!(help_text().contains("GITLAWB_ALLOW_INSECURE_HTTP"));
+    }
+
+    /// An unparseable or non-http value is not classified as insecure here: it
+    /// fails later with its own error, and reporting it as a TLS problem would
+    /// send the reader after the wrong thing.
+    #[test]
+    fn unparseable_or_other_scheme_is_not_this_guards_problem() {
+        for url in [
+            "",
+            "   ",
+            "not a url",
+            "ftp://node.example.com",
+            "file:///tmp/x",
+        ] {
+            assert!(
+                !is_insecure_remote(url),
+                "{url:?} is not a cleartext-http-to-remote case"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
@@ -1285,7 +1599,7 @@ mod tests {
     #[test]
     fn signed_requests_do_not_follow_a_redirect_off_the_node_origin() {
         let kp = Keypair::generate();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
 
         let mut elsewhere = mockito::Server::new();
         let never = elsewhere
@@ -1387,7 +1701,7 @@ mod tests {
     #[test]
     fn a_same_origin_path_changing_redirect_is_refused() {
         let kp = Keypair::generate();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
 
         let mut node = mockito::Server::new();
         let bounce = node
@@ -1438,7 +1752,7 @@ mod tests {
     #[test]
     fn an_identical_target_redirect_is_still_followed_up_to_the_chain_bound() {
         let kp = Keypair::generate();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
 
         let mut node = mockito::Server::new();
         let loop_route = node
@@ -1599,7 +1913,7 @@ mod tests {
     fn a_rewritten_target_never_receives_the_signature() {
         let kp = Keypair::generate();
         let expected_did = kp.did().to_string();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
 
         let mut node = mockito::Server::new();
@@ -1661,7 +1975,7 @@ mod tests {
     fn a_direct_signed_advertisement_verifies_under_the_node_verifier() {
         let kp = Keypair::generate();
         let expected_did = kp.did().to_string();
-        let client = build_http_client().unwrap();
+        let client = build_http_client(false).unwrap();
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Verdict>));
 
         let mut node = mockito::Server::new();
