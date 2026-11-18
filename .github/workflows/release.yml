@@ -478,8 +478,11 @@ jobs:
           # macos-15-intel is GitHub's supported Intel label.
           - target: x86_64-apple-darwin
             os: macos-15-intel
+          # macos-14 is retired: GitHub refuses the job before it starts
+          # ("macos-14-arm64-us-default is not supported"), which cancelled the
+          # 0.8.0 build. macos-15 is the supported Apple Silicon label.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
