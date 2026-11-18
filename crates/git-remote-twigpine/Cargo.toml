@@ -1,7 +1,7 @@
 [package]
 name = "git-remote-twigpine"
 description = "Git remote helper — enables 'git clone twigpine://did:key:...'"
-version = "0.8.0" # x-release-please-version
+version = "0.8.1" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

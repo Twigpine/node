@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/Twigpine/node/compare/v0.8.0...v0.8.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* **ci:** build the Apple Silicon release binary on macos-15 ([#610](https://github.com/Twigpine/node/issues/610)) ([22808ea](https://github.com/Twigpine/node/commit/22808eaea247e0268935a374b3dbd87057cf2415))
+
 ## [0.8.0](https://github.com/Twigpine/node/compare/v0.7.1...v0.8.0) (2026-11-18)
 
 
