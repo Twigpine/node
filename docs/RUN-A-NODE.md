@@ -301,7 +301,9 @@ short lifetimes reissued often are safer than one long-lived grant.
 
 **Node refuses to start with "strict-mode operator check failed"** — either `twigpine node register` first, or set `TWIGPINE_OPERATOR_STRICT_MODE=false`. Unsetting it is not enough if the setting is also present under its old name, `GITLAWB_OPERATOR_STRICT_MODE`.
 
-**Node refuses to start with "TWIGPINE_DB_MAX_CONNECTIONS (20) must be at least max_concurrent_git_pushes (32) + 8 headroom"**: raise `TWIGPINE_DB_MAX_CONNECTIONS` to at least the push cap plus 8 (40 with the default cap of 32; 48 is the shipped default and the recommended value), or lower `TWIGPINE_MAX_CONCURRENT_GIT_PUSHES`. This bites a node upgraded in place that still sets the old pool size of 20. The check is deliberate: each concurrent push pins one pooled connection for its whole receive-pack, so a pool that does not clear the push cap lets a burst of slow pushes starve every other database path.
+**Node refuses to start with "TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS (20) must be at least max_concurrent_git_pushes (32) plus 8 for non-push mutations that share the lock pool"**: raise `TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS` to at least the push cap plus 8 (40 with the default cap of 32, which is also the shipped default), or lower `TWIGPINE_MAX_CONCURRENT_GIT_PUSHES`. The check is deliberate: each concurrent push pins one connection from the lock pool for its whole receive-pack, so a lock pool that does not clear the push cap lets a burst of slow pushes starve every other mutation that needs a lock.
+
+**Node refuses to start with "TWIGPINE_DB_MAX_CONNECTIONS (4) must be at least 8 for non-git database paths"**: raise `TWIGPINE_DB_MAX_CONNECTIONS` to 8 or more (48 is the shipped default). This is the main pool, which serves everything other than held write locks; pushes no longer count against it.
 
 **Rewards are 0 after a week** — run `twigpine node onchain-status`. If `currentlyActive: false`, check your heartbeat loop (node logs for `operator heartbeat sent`).
 
