@@ -55,7 +55,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
             println!("  repo      {short_did}/{repo}");
         }
         None => {
-            println!("  repo      (not in a Twigpine repo — no gitlawb:// remote)");
+            println!("  repo      (not in a Twigpine repo — no twigpine:// remote)");
         }
     }
 
@@ -240,12 +240,14 @@ fn detect_gitlawb_remote() -> Option<(String, String)> {
     None
 }
 
-/// Parse a gitlawb:// URL string into (did, repo).
+/// Parse a twigpine:// (or gitlawb://) remote URL into (did, repo).
 fn parse_gitlawb_url(url: &str) -> Option<(String, String)> {
     let rest = twigpine_core::url_scheme::strip_scheme(url.trim())?;
     let slash = rest.rfind('/')?;
     let did = rest[..slash].to_string();
-    let repo = rest[slash + 1..].to_string();
+    // The API names repositories without the `.git` a remote URL may carry:
+    // at most one is dropped, the node's own rule.
+    let repo = twigpine_core::ucan::push::canonical_repo_name(&rest[slash + 1..]).to_string();
     if did.is_empty() || repo.is_empty() {
         return None;
     }
@@ -255,6 +257,21 @@ fn parse_gitlawb_url(url: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_drops_one_git_suffix_like_the_node() {
+        for (url, repo) in [
+            ("twigpine://did:key:z6Mk1234/myrepo.git", "myrepo"),
+            ("twigpine://did:key:z6Mk1234/foo.git.git", "foo.git"),
+        ] {
+            assert_eq!(
+                parse_gitlawb_url(url),
+                Some(("did:key:z6Mk1234".to_string(), repo.to_string())),
+                "{url}"
+            );
+        }
+        assert_eq!(parse_gitlawb_url("twigpine://did:key:z6Mk1234/.git"), None);
+    }
 
     #[test]
     fn parse_url_under_the_new_scheme() {

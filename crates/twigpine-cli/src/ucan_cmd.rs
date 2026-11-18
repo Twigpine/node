@@ -140,7 +140,18 @@ fn repo_from_resource(with: &str) -> Option<(String, String)> {
 /// before.
 pub(crate) fn canonical_resource(with: &str) -> String {
     match repo_from_resource(with) {
-        Some((owner, repo)) => format!("gitlawb://repos/{owner}/{repo}"),
+        Some((owner, repo)) => {
+            // Read back, the resource loses at most one `.git`
+            // (`Capability::grants_push_to`). A repository whose name itself
+            // ends in `.git` is therefore written with one more, or the token
+            // would name the repository without it.
+            let written = if repo.ends_with(".git") {
+                format!("{repo}.git")
+            } else {
+                repo
+            };
+            format!("gitlawb://repos/{owner}/{written}")
+        }
         None => with.to_string(),
     }
 }
@@ -1005,6 +1016,27 @@ mod tests {
             super::canonical_resource("gitlawb://repos/did:key:z6MkA/r"),
             "gitlawb://repos/did:key:z6MkA/r"
         );
+    }
+
+    /// The resource a token is minted with names the same repository when the
+    /// node reads it back: `r.git` is `r`, and `foo.git.git` is the repository
+    /// literally named `foo.git`.
+    #[test]
+    fn a_minted_resource_reads_back_as_the_repository_it_was_given() {
+        use twigpine_core::ucan::{caps, Capability};
+        for (typed, repository, not) in [
+            ("twigpine://repos/did:key:z6MkA/r.git", "r", "r.git"),
+            (
+                "twigpine://repos/did:key:z6MkA/foo.git.git",
+                "foo.git",
+                "foo",
+            ),
+            ("gitlawb://repos/did:key:z6MkA/plain", "plain", "plain.git"),
+        ] {
+            let cap = Capability::new(super::canonical_resource(typed), caps::GIT_PUSH);
+            assert!(cap.grants_push_to("did:key:z6MkA", repository), "{typed}");
+            assert!(!cap.grants_push_to("did:key:z6MkA", not), "{typed}");
+        }
     }
 
     use super::*;

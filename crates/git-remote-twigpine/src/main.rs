@@ -798,7 +798,12 @@ fn parse_gitlawb_url(url: &str) -> Result<(String, String, String)> {
         .unwrap_or(did_string)
         .to_string();
 
-    let repo_name = repo_name.trim_end_matches(".git").to_string();
+    // The path segment goes to the node as written. The node strips at most one
+    // `.git` (`smart_http_repo_name`), the same rule as the delegation lookup
+    // below (`canonical_repo_name`), so `my-repo.git` reaches `my-repo` and a
+    // repository literally named `foo.git` is reached as `foo.git.git`.
+    // Stripping here as well would send `foo.git.git` to `foo`.
+    let repo_name = repo_name.to_string();
 
     tracing::debug!("parsed URL → did={did_string}, owner={short_owner}, repo={repo_name}");
     Ok((did_string.to_string(), short_owner, repo_name))
@@ -2392,16 +2397,40 @@ mod tests {
     #[test]
     fn parse_url_under_the_new_scheme() {
         let (did, owner, repo) =
-            parse_gitlawb_url("twigpine://did:key:z6MkFoo123/my-repo.git").unwrap();
+            parse_gitlawb_url("twigpine://did:key:z6MkFoo123/my-repo").unwrap();
         assert_eq!(did, "did:key:z6MkFoo123");
         assert_eq!(owner, "z6MkFoo123");
         assert_eq!(repo, "my-repo");
     }
 
+    /// The path segment reaches the node as written, and the node's
+    /// at-most-one `.git` rule names the repository: `my-repo.git` is
+    /// `my-repo`, and `foo.git.git` is the repository literally named
+    /// `foo.git`, not `foo`.
     #[test]
-    fn parse_url_strips_dot_git() {
-        let (_, _, repo) = parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo.git").unwrap();
-        assert_eq!(repo, "my-repo");
+    fn parse_url_leaves_the_git_suffix_to_the_node() {
+        use twigpine_core::ucan::push::canonical_repo_name;
+        for (url, segment, repository) in [
+            (
+                "gitlawb://did:key:z6MkFoo123/my-repo.git",
+                "my-repo.git",
+                "my-repo",
+            ),
+            (
+                "twigpine://did:key:z6MkFoo123/my-repo",
+                "my-repo",
+                "my-repo",
+            ),
+            (
+                "twigpine://did:key:z6MkFoo123/foo.git.git",
+                "foo.git.git",
+                "foo.git",
+            ),
+        ] {
+            let (_, _, repo) = parse_gitlawb_url(url).unwrap();
+            assert_eq!(repo, segment, "{url}");
+            assert_eq!(canonical_repo_name(&repo), repository, "{url}");
+        }
     }
 
     #[test]
