@@ -28,7 +28,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -39,7 +39,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -51,7 +51,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -63,7 +63,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -82,7 +82,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -98,7 +98,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -111,7 +111,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -124,7 +124,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -136,7 +136,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -149,7 +149,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -169,7 +169,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -182,7 +182,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -195,7 +195,7 @@ pub enum RepoCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -489,6 +489,8 @@ async fn cmd_clone(name: String, node: String, dir: Option<PathBuf>) -> Result<(
         .arg("clone")
         .arg(&url)
         // Point the remote helper at the same node the user selected.
+        .env("TWIGPINE_NODE", &node)
+        // The helper on PATH may be a build from before the rename.
         .env("GITLAWB_NODE", &node)
         .status()
         .context("failed to run git clone — is git installed?")?;
@@ -999,7 +1001,7 @@ mod tests {
     async fn fork_surfaces_a_rate_limit_brake_not_invalid_json() {
         let err = fork_against(
             429,
-            &[("x-gitlawb-error", "rate_limited")],
+            &[("x-twigpine-error", "rate_limited")],
             r#"{"error":"rate_limited","message":"rate limit exceeded — try again later"}"#,
         )
         .await;

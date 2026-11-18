@@ -78,6 +78,18 @@ function install() {
     chmodSync(dest, 0o755);
   }
 
+  // `twigpine` and `twig` run their own copy, so the CLI can tell it was not
+  // started as `gl` (it prints a note about the new name when it was).
+  const renamed = join(binDir, "twigpine");
+  copyFileSync(join(binDir, "gl"), renamed);
+  chmodSync(renamed, 0o755);
+
+  // Git picks its remote helper by URL scheme: `git-remote-twigpine` runs
+  // twigpine:// remotes, `git-remote-gitlawb` runs gitlawb:// ones.
+  const helper = join(binDir, "git-remote-twigpine");
+  copyFileSync(join(binDir, "git-remote-gitlawb"), helper);
+  chmodSync(helper, 0o755);
+
   console.log(`@gitlawb/gl: Installed Twigpine CLI for ${platformKey}`);
 }
 

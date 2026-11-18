@@ -54,6 +54,13 @@ fn emit_warning(line: &str) {
     let _ = writeln!(warn_sink(), "{line}");
 }
 
+/// Warn-and-degrade for the recovery arms in `run`: a failed recovery source
+/// is reported and yields no paths, never silently empty (#400).
+fn warn_recovery_failed(what: &str, e: &anyhow::Error) -> Vec<String> {
+    emit_warning(&format!("warning: {what} failed: {e}"));
+    Vec::new()
+}
+
 #[cfg(not(test))]
 fn warn_sink() -> impl std::io::Write {
     std::io::stderr()
@@ -79,7 +86,7 @@ pub struct CloneArgs {
     #[arg(
         long,
         default_value = "https://node.twigpine.com",
-        env = "GITLAWB_NODE"
+        env = "TWIGPINE_NODE"
     )]
     pub node: String,
 
@@ -88,7 +95,7 @@ pub struct CloneArgs {
     #[arg(
         long,
         default_value = "https://arweave.net",
-        env = "GITLAWB_ARWEAVE_GATEWAY"
+        env = "TWIGPINE_ARWEAVE_GATEWAY"
     )]
     pub arweave_gateway: String,
 
@@ -96,7 +103,7 @@ pub struct CloneArgs {
     #[arg(
         long,
         default_value = "https://dweb.link",
-        env = "GITLAWB_IPFS_GATEWAY"
+        env = "TWIGPINE_IPFS_GATEWAY"
     )]
     pub ipfs_gateway: String,
 }
@@ -230,16 +237,17 @@ pub fn setup_partial_clone(
 }
 
 /// Parse `repo` into (gitlawb_url, owner, name). Accepts a full
-/// `gitlawb://<owner>/<name>` URL or a bare `<owner>/<name>`. The owner DID may
+/// `twigpine://<owner>/<name>` URL (or the `gitlawb://` spelling) or a bare
+/// `<owner>/<name>`. The owner DID may
 /// itself contain colons but no slash, so split on the first slash.
 fn parse_repo(repo: &str) -> Result<(String, String, String)> {
-    let stripped = repo.strip_prefix("gitlawb://").unwrap_or(repo);
+    let stripped = twigpine_core::url_scheme::strip_scheme(repo).unwrap_or(repo);
     let (owner, name) = stripped
         .trim_end_matches('/')
         .split_once('/')
-        .context("repo must be <owner>/<name> or gitlawb://<owner>/<name>")?;
+        .context("repo must be <owner>/<name> or twigpine://<owner>/<name>")?;
     if owner.is_empty() || name.is_empty() || name.contains('/') {
-        bail!("repo must be <owner>/<name> or gitlawb://<owner>/<name>");
+        bail!("repo must be <owner>/<name> or twigpine://<owner>/<name>");
     }
     Ok((
         format!("gitlawb://{owner}/{name}"),
@@ -482,7 +490,7 @@ const ARWEAVE_PAGE_SIZE: usize = 100;
 
 /// Paginated discovery query: manifests tagged for this repo, newest first, with
 /// `pageInfo` for cursor pagination and `block{height}` for the recency tie-break.
-const ARWEAVE_DISCOVERY_QUERY: &str = r#"query($repo:String!,$cursor:String){transactions(tags:[{name:"App-Name",values:["gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100,after:$cursor){pageInfo{hasNextPage endCursor}edges{cursor node{id block{height}}}}}"#;
+const ARWEAVE_DISCOVERY_QUERY: &str = r#"query($repo:String!,$cursor:String){transactions(tags:[{name:"App-Name",values:["twigpine","gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100,after:$cursor){pageInfo{hasNextPage endCursor}edges{cursor node{id block{height}}}}}"#;
 
 /// A parsed page of an Arweave GraphQL `transactions` response: the edge refs
 /// plus pagination state. `has_next` is `None` when the response omitted
@@ -874,8 +882,7 @@ pub async fn run(args: CloneArgs) -> Result<()> {
                 // fallback still runs), but the strict /encrypted-blobs parse now
                 // fails closed on schema drift, so surface it rather than letting
                 // `.unwrap_or_default()` silently swallow it into "no paths".
-                eprintln!("warning: encrypted-blobs recovery failed: {e}");
-                Vec::new()
+                warn_recovery_failed("encrypted-blobs recovery", &e)
             });
         let from_arweave = recover_from_arweave(
             &args.arweave_gateway,
@@ -886,7 +893,10 @@ pub async fn run(args: CloneArgs) -> Result<()> {
             &keypair,
         )
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            // Same rule as the node-recovery arm above: warn, never abort.
+            warn_recovery_failed("arweave/ipfs gateway recovery", &e)
+        });
         paths.extend(from_arweave);
 
         if !paths.is_empty() {
@@ -965,6 +975,21 @@ mod tests {
 
     fn warnings() -> String {
         WARNINGS.with(|w| w.borrow().clone())
+    }
+
+    // #400: the recovery-arm degrade must warn, not silently become "no
+    // paths". `warn_recovery_failed` is the write both arms go through.
+    #[test]
+    fn warn_recovery_failed_warns_and_returns_empty() {
+        reset_warnings();
+        let out =
+            super::warn_recovery_failed("arweave/ipfs gateway recovery", &anyhow::anyhow!("boom"));
+        assert!(out.is_empty());
+        assert!(
+            warnings().contains("arweave/ipfs gateway recovery failed: boom"),
+            "a recovery failure must warn, got: {:?}",
+            warnings()
+        );
     }
 
     fn g(args: &[&str], dir: &Path) {
@@ -2201,6 +2226,12 @@ mod tests {
         let (url2, o2, n2) = parse_repo("did:key:zAbc/myrepo").unwrap();
         assert_eq!(url2, "gitlawb://did:key:zAbc/myrepo");
         assert_eq!((o2.as_str(), n2.as_str()), ("did:key:zAbc", "myrepo"));
+
+        // The new scheme is read; the remote is still written under the old
+        // one until writers switch (docs/LEGACY-NAMES.md).
+        let (url3, o3, n3) = parse_repo("twigpine://did:key:zAbc/myrepo").unwrap();
+        assert_eq!(url3, "gitlawb://did:key:zAbc/myrepo");
+        assert_eq!((o3.as_str(), n3.as_str()), ("did:key:zAbc", "myrepo"));
     }
 
     #[test]

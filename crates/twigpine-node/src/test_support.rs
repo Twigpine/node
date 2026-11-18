@@ -35,7 +35,7 @@ mod git_shim;
 /// Runs the schema migrations first, because the per-test database starts empty.
 ///
 /// **The config here is parsed from the process environment.** `Config` sources 47
-/// fields from `GITLAWB_*` variables, so a developer or CI environment that sets one
+/// fields from `TWIGPINE_*` variables, so a developer or CI environment that sets one
 /// silently changes what this state does. Never assert a behaviour that a config
 /// field controls on top of this state — use [`test_state_with`] and set the field,
 /// so the test states the configuration it is about instead of inheriting it.
@@ -6145,7 +6145,7 @@ mod tests {
     /// The gate's own unit tests pass `enforce` as a literal and never exercise the
     /// handler, so this is what proves the flag is actually consulted on the request
     /// path. It sets the field EXPLICITLY rather than leaning on the default: on a
-    /// host exporting `GITLAWB_ENFORCE_OWNER_PUSH=false` — which is exactly what the
+    /// host exporting `TWIGPINE_ENFORCE_OWNER_PUSH=false` — which is exactly what the
     /// rolling-upgrade guidance tells operators to set — an ambient config would
     /// build a disabled state, let the push through to git, and fail this test for a
     /// reason that has nothing to do with the code under test.
@@ -16064,7 +16064,7 @@ mod tests {
         );
     }
 
-    /// T2b (R5, KTD5): the `GITLAWB_IPFS_MAX_REPOS_WALKED` knob drives the legacy-probe
+    /// T2b (R5, KTD5): the `TWIGPINE_IPFS_MAX_REPOS_WALKED` knob drives the legacy-probe
     /// budget end to end. With the knob at 1 (fed through the same production helper the
     /// state seeding uses) and two candidate repos that miss, the first repo spends the
     /// single probe and the second is skipped at the cap → truncated → 503. If the knob
@@ -22392,7 +22392,7 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::CONFLICT);
             assert_eq!(
                 resp.headers()
-                    .get("x-gitlawb-error")
+                    .get("x-twigpine-error")
                     .and_then(|v| v.to_str().ok()),
                 Some("signature_replayed"),
                 "the 409 must be told apart by header, not only by body"
@@ -22477,7 +22477,7 @@ mod tests {
             );
             assert_eq!(
                 resp.headers()
-                    .get("x-gitlawb-error")
+                    .get("x-twigpine-error")
                     .and_then(|v| v.to_str().ok()),
                 Some("signature_ledger_full")
             );
@@ -22599,7 +22599,7 @@ mod tests {
             assert_eq!(
                 retry
                     .headers()
-                    .get("x-gitlawb-error")
+                    .get("x-twigpine-error")
                     .and_then(|v| v.to_str().ok()),
                 None,
                 "the retry must not be rejected by the ledger"
@@ -22701,7 +22701,7 @@ mod tests {
             );
             assert_eq!(
                 resp.headers()
-                    .get("x-gitlawb-error")
+                    .get("x-twigpine-error")
                     .and_then(|v| v.to_str().ok()),
                 Some("signature_nonce_required"),
                 "the denial must be distinguishable by header from every other ledger rejection"
@@ -22824,7 +22824,7 @@ mod tests {
                 );
                 assert_eq!(
                     resp.headers()
-                        .get("x-gitlawb-error")
+                        .get("x-twigpine-error")
                         .and_then(|v| v.to_str().ok()),
                     Some("signature_nonce_too_short"),
                     "nonce={nonce:?} must be told apart from a nonce-less signer by header"
@@ -24472,7 +24472,7 @@ mod tests {
 
     /// Scenario 1, the regression test for the probe that found this: an UNSIGNED
     /// POST to `/{owner}/{repo}/git-receive-pack` with a body far larger than the
-    /// configured `GITLAWB_MAX_PACK_BYTES`. Before the fix this drained all 4 MiB
+    /// configured `TWIGPINE_MAX_PACK_BYTES`. Before the fix this drained all 4 MiB
     /// into memory and then returned 401 (no DID, no signature, no repo needed).
     #[tokio::test]
     async fn unsigned_oversize_push_is_not_drained_into_memory() {

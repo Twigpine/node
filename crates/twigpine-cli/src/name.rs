@@ -67,10 +67,10 @@ pub enum NameCmd {
         #[arg(long, env = "ETH_PRIVATE_KEY")]
         private_key: String,
         /// RPC URL (default: Base Sepolia)
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
         /// Name registry contract address
-        #[arg(long, env = "GITLAWB_CONTRACT_NAME_REGISTRY", default_value = DEFAULT_NAME_REGISTRY)]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NAME_REGISTRY", default_value = DEFAULT_NAME_REGISTRY)]
         contract: String,
         /// Twigpine identity directory (reads your DID)
         #[arg(long)]
@@ -80,27 +80,27 @@ pub enum NameCmd {
     /// Resolve name → owner address + DID
     Resolve {
         name: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
-        #[arg(long, env = "GITLAWB_CONTRACT_NAME_REGISTRY", default_value = DEFAULT_NAME_REGISTRY)]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NAME_REGISTRY", default_value = DEFAULT_NAME_REGISTRY)]
         contract: String,
     },
 
     /// Reverse lookup: DID → registered name
     Lookup {
         did: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
-        #[arg(long, env = "GITLAWB_CONTRACT_NAME_REGISTRY", default_value = DEFAULT_NAME_REGISTRY)]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NAME_REGISTRY", default_value = DEFAULT_NAME_REGISTRY)]
         contract: String,
     },
 
     /// Check whether a name is available to register
     Available {
         name: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
-        #[arg(long, env = "GITLAWB_CONTRACT_NAME_REGISTRY", default_value = DEFAULT_NAME_REGISTRY)]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NAME_REGISTRY", default_value = DEFAULT_NAME_REGISTRY)]
         contract: String,
     },
 
@@ -108,9 +108,9 @@ pub enum NameCmd {
     RegisterDid {
         #[arg(long, env = "ETH_PRIVATE_KEY")]
         private_key: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
-        #[arg(long, env = "GITLAWB_CONTRACT_DID_REGISTRY", default_value = DEFAULT_DID_REGISTRY)]
+        #[arg(long, env = "TWIGPINE_CONTRACT_DID_REGISTRY", default_value = DEFAULT_DID_REGISTRY)]
         contract: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -119,9 +119,9 @@ pub enum NameCmd {
     /// Resolve a DID from the on-chain DID registry
     ResolveDid {
         did: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
-        #[arg(long, env = "GITLAWB_CONTRACT_DID_REGISTRY", default_value = DEFAULT_DID_REGISTRY)]
+        #[arg(long, env = "TWIGPINE_CONTRACT_DID_REGISTRY", default_value = DEFAULT_DID_REGISTRY)]
         contract: String,
     },
 }

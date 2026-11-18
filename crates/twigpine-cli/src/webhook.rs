@@ -28,13 +28,13 @@ pub enum WebhookCmd {
         ///        pull_request.closed, push, *
         #[arg(long, default_value = "*")]
         events: String,
-        /// Optional HMAC secret for payload signing (sets X-Gitlawb-Signature-256)
+        /// Optional HMAC secret for payload signing (sets X-Twigpine-Signature-256)
         #[arg(long)]
         secret: Option<String>,
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -47,7 +47,7 @@ pub enum WebhookCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -62,7 +62,7 @@ pub enum WebhookCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]

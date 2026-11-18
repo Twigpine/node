@@ -10,11 +10,11 @@ use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct WhoamiArgs {
-    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+    /// Identity directory (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
     #[arg(long)]
     dir: Option<PathBuf>,
     /// Node URL to query for registration info
-    #[arg(long, env = "GITLAWB_NODE")]
+    #[arg(long, env = "TWIGPINE_NODE")]
     node: Option<String>,
     /// Output structured JSON for scripting
     #[arg(long)]

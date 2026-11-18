@@ -88,7 +88,7 @@ fn sanitize_excerpt(s: &str) -> String {
     out
 }
 
-/// Fixed warning when `GITLAWB_ICAPTCHA_INSECURE` is present but not an
+/// Fixed warning when `TWIGPINE_ICAPTCHA_INSECURE` is present but not an
 /// explicit truthy value. Does not include the raw env value (arbitrary
 /// deployment input — secrets / terminal controls).
 fn warn_icaptcha_insecure_non_truthy() {
@@ -97,11 +97,11 @@ fn warn_icaptcha_insecure_non_truthy() {
     // single-line form makes that property visible without knowing the escape
     // semantics, which is what the review asked for.
     tracing::warn!(
-        "GITLAWB_ICAPTCHA_INSECURE is set but not truthy (expected 1 or true); loopback HTTP trust relaxation remains disabled"
+        "TWIGPINE_ICAPTCHA_INSECURE is set but not truthy (expected 1 or true); loopback HTTP trust relaxation remains disabled"
     );
 }
 
-/// Parse a possibly-present `GITLAWB_ICAPTCHA_INSECURE` string.
+/// Parse a possibly-present `TWIGPINE_ICAPTCHA_INSECURE` string.
 ///
 /// Only an explicit truthy value (`1` / `true`, case-insensitive, after trim)
 /// enables the loopback-HTTP trust relaxation. Presence alone is not enough:
@@ -122,7 +122,7 @@ fn icaptcha_insecure_from_str(raw: Option<&str>) -> bool {
     }
 }
 
-/// Interpret `std::env::var("GITLAWB_ICAPTCHA_INSECURE")` without reading the
+/// Interpret `std::env::var("TWIGPINE_ICAPTCHA_INSECURE")` without reading the
 /// environment again — used by production and by unit tests.
 ///
 /// `NotPresent` → disabled. `NotUnicode` → disabled + the same fixed warning
@@ -138,7 +138,7 @@ fn icaptcha_insecure_from_var(result: Result<String, std::env::VarError>) -> boo
     }
 }
 
-/// Whether `GITLAWB_ICAPTCHA_INSECURE` explicitly enables the loopback-HTTP
+/// Whether `TWIGPINE_ICAPTCHA_INSECURE` explicitly enables the loopback-HTTP
 /// trust relaxation used by integration tests.
 ///
 /// Only an explicit truthy value (`1` / `true`, case-insensitive, after trim)
@@ -147,7 +147,7 @@ fn icaptcha_insecure_from_var(result: Result<String, std::env::VarError>) -> boo
 /// present non-Unicode value) emits a `tracing::warn!` (visible when the
 /// `icaptcha_client` target is at WARN+, e.g. `RUST_LOG=icaptcha_client=warn`).
 fn icaptcha_insecure_enabled() -> bool {
-    icaptcha_insecure_from_var(std::env::var("GITLAWB_ICAPTCHA_INSECURE"))
+    icaptcha_insecure_from_var(std::env::var("TWIGPINE_ICAPTCHA_INSECURE"))
 }
 
 /// Whether `u` parses as a trusted URL, given a pre-parsed insecure flag.
@@ -194,7 +194,7 @@ fn origin_key(u: &str) -> Option<String> {
 /// it at an attacker origin (client-side SSRF) or capture a bearer token on the
 /// first hop. So an advertised URL is honored only when it is `https` AND its
 /// host is allowlisted — the public default host, or the operator's own
-/// `GITLAWB_ICAPTCHA_URL`. Otherwise we fall back to the operator/default origin.
+/// `TWIGPINE_ICAPTCHA_URL`. Otherwise we fall back to the operator/default origin.
 ///
 /// The API key is attached only when the resolved origin is the operator's
 /// explicitly-configured host (never a node-discovered one), so a key is never
@@ -268,16 +268,16 @@ impl IcaptchaCfg {
     ///
     /// The advertised URL is validated and allowlisted (see [`resolve_solver_url`])
     /// so a hostile node cannot redirect the solve to an attacker origin. The
-    /// `GITLAWB_ICAPTCHA_API_KEY` bearer token is attached only when the resolved
-    /// origin is the operator's own `GITLAWB_ICAPTCHA_URL`, never a
+    /// `TWIGPINE_ICAPTCHA_API_KEY` bearer token is attached only when the resolved
+    /// origin is the operator's own `TWIGPINE_ICAPTCHA_URL`, never a
     /// node-discovered one.
     pub fn new(did: impl Into<String>, url: Option<String>, level: Option<u32>) -> Self {
-        let operator = std::env::var("GITLAWB_ICAPTCHA_URL")
+        let operator = std::env::var("TWIGPINE_ICAPTCHA_URL")
             .ok()
             .filter(|s| !s.is_empty());
         let (resolved_url, key_trusted) = resolve_solver_url(url.as_deref(), operator.as_deref());
         let api_key = if key_trusted {
-            std::env::var("GITLAWB_ICAPTCHA_API_KEY")
+            std::env::var("TWIGPINE_ICAPTCHA_API_KEY")
                 .ok()
                 .filter(|s| !s.is_empty())
         } else {
@@ -337,7 +337,7 @@ pub fn obtain_proof(cfg: &IcaptchaCfg, solver: Option<&Solver>) -> Result<String
             .ok_or_else(|| {
                 anyhow!(
                     "cannot solve iCaptcha challenge type '{}' automatically; \
-                     set GITLAWB_ICAPTCHA_API_KEY/solver or solve interactively",
+                     set TWIGPINE_ICAPTCHA_API_KEY/solver or solve interactively",
                     challenge.kind
                 )
             })?;
@@ -474,15 +474,15 @@ mod tests {
 
         fn with_value(val: &str) -> Self {
             let lock = Self::lock();
-            let prev = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
-            std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", val);
+            let prev = std::env::var_os("TWIGPINE_ICAPTCHA_INSECURE");
+            std::env::set_var("TWIGPINE_ICAPTCHA_INSECURE", val);
             EnvGuard { _lock: lock, prev }
         }
 
         fn unset() -> Self {
             let lock = Self::lock();
-            let prev = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
-            std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE");
+            let prev = std::env::var_os("TWIGPINE_ICAPTCHA_INSECURE");
+            std::env::remove_var("TWIGPINE_ICAPTCHA_INSECURE");
             EnvGuard { _lock: lock, prev }
         }
     }
@@ -490,8 +490,8 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match self.prev.take() {
-                Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", v),
-                None => std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE"),
+                Some(v) => std::env::set_var("TWIGPINE_ICAPTCHA_INSECURE", v),
+                None => std::env::remove_var("TWIGPINE_ICAPTCHA_INSECURE"),
             }
         }
     }
@@ -749,13 +749,13 @@ mod tests {
     #[test]
     fn new_withholds_key_from_untrusted_origin_but_attaches_for_operator() {
         let guard = ICAPTCHA_ENV_LOCK.lock().unwrap();
-        let prev_key = std::env::var_os("GITLAWB_ICAPTCHA_API_KEY");
-        let prev_op = std::env::var_os("GITLAWB_ICAPTCHA_URL");
-        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "secret-bearer");
+        let prev_key = std::env::var_os("TWIGPINE_ICAPTCHA_API_KEY");
+        let prev_op = std::env::var_os("TWIGPINE_ICAPTCHA_URL");
+        std::env::set_var("TWIGPINE_ICAPTCHA_API_KEY", "secret-bearer");
 
         // Arm 1: No operator configured, node advertises an attacker origin.
         // The key has no trusted destination; the advert is rejected.
-        std::env::remove_var("GITLAWB_ICAPTCHA_URL");
+        std::env::remove_var("TWIGPINE_ICAPTCHA_URL");
         let untrusted =
             IcaptchaCfg::new("did:key:zTEST", Some("https://evil.example".into()), None);
 
@@ -765,7 +765,7 @@ mod tests {
         let no_operator_no_advert = IcaptchaCfg::new("did:key:zTEST", None, None);
 
         // Arm 2: Operator origin configured and advertised — key attached.
-        std::env::set_var("GITLAWB_ICAPTCHA_URL", "https://icap.mynode.example");
+        std::env::set_var("TWIGPINE_ICAPTCHA_URL", "https://icap.mynode.example");
         let operator_match = IcaptchaCfg::new(
             "did:key:zTEST",
             Some("https://icap.mynode.example/v1".into()),
@@ -811,12 +811,12 @@ mod tests {
         // Restore env and release the lock BEFORE asserting, so a failing
         // assertion can't poison the shared lock or cascade into a sibling.
         match prev_key {
-            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", v),
-            None => std::env::remove_var("GITLAWB_ICAPTCHA_API_KEY"),
+            Some(v) => std::env::set_var("TWIGPINE_ICAPTCHA_API_KEY", v),
+            None => std::env::remove_var("TWIGPINE_ICAPTCHA_API_KEY"),
         }
         match prev_op {
-            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_URL", v),
-            None => std::env::remove_var("GITLAWB_ICAPTCHA_URL"),
+            Some(v) => std::env::set_var("TWIGPINE_ICAPTCHA_URL", v),
+            None => std::env::remove_var("TWIGPINE_ICAPTCHA_URL"),
         }
         drop(guard);
 
@@ -919,40 +919,40 @@ mod tests {
     #[test]
     fn new_normalizes_empty_api_key_to_none_on_trusted_origin() {
         let guard = ICAPTCHA_ENV_LOCK.lock().unwrap();
-        let prev_key = std::env::var_os("GITLAWB_ICAPTCHA_API_KEY");
-        let prev_op = std::env::var_os("GITLAWB_ICAPTCHA_URL");
+        let prev_key = std::env::var_os("TWIGPINE_ICAPTCHA_API_KEY");
+        let prev_op = std::env::var_os("TWIGPINE_ICAPTCHA_URL");
 
         // Operator origin configured and resolved as trusted (no advert), so
         // api_key reaches the env read and the emptiness filter is the only
         // thing standing between a blank var and an empty bearer token.
-        std::env::set_var("GITLAWB_ICAPTCHA_URL", "https://icap.mynode.example");
+        std::env::set_var("TWIGPINE_ICAPTCHA_URL", "https://icap.mynode.example");
 
         // "Operator set the var but left it blank" must stay keyless: a
         // Some("") would attach `Authorization: Bearer ` (empty token) to the
         // challenge and answer requests instead of omitting the header.
-        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "");
+        std::env::set_var("TWIGPINE_ICAPTCHA_API_KEY", "");
         let empty = IcaptchaCfg::new("did:key:zTEST", None, None);
 
         // Contrast arm: a real key on the same trusted path must survive the
         // filter, so the filter can't regress to dropping every key.
-        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "secret-bearer");
+        std::env::set_var("TWIGPINE_ICAPTCHA_API_KEY", "secret-bearer");
         let non_empty = IcaptchaCfg::new("did:key:zTEST", None, None);
 
         // Restore env and release the lock BEFORE asserting, so a failing
         // assertion can't poison the shared lock or cascade into a sibling.
         match prev_key {
-            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", v),
-            None => std::env::remove_var("GITLAWB_ICAPTCHA_API_KEY"),
+            Some(v) => std::env::set_var("TWIGPINE_ICAPTCHA_API_KEY", v),
+            None => std::env::remove_var("TWIGPINE_ICAPTCHA_API_KEY"),
         }
         match prev_op {
-            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_URL", v),
-            None => std::env::remove_var("GITLAWB_ICAPTCHA_URL"),
+            Some(v) => std::env::set_var("TWIGPINE_ICAPTCHA_URL", v),
+            None => std::env::remove_var("TWIGPINE_ICAPTCHA_URL"),
         }
         drop(guard);
 
         assert_eq!(
             empty.api_key, None,
-            "empty GITLAWB_ICAPTCHA_API_KEY must normalize to None"
+            "empty TWIGPINE_ICAPTCHA_API_KEY must normalize to None"
         );
         assert_eq!(non_empty.api_key.as_deref(), Some("secret-bearer"));
     }

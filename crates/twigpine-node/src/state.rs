@@ -11,6 +11,7 @@ use crate::rate_limit::RateLimiter;
 /// HKDF salt for [`AppState::derive_scan_token_key`]. A constant, not a secret: HKDF's
 /// salt is a domain qualifier, and the confidentiality of the derived key rests entirely
 /// on the node's private seed being the input keying material.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
 
 /// HKDF `info` for [`AppState::derive_scan_token_key`]: the domain separation AND the
@@ -19,11 +20,13 @@ const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
 /// trailing version rotates every node's token key on its next boot, which invalidates
 /// outstanding continuations (they simply fail to open and the caller restarts at the
 /// front) and needs no migration, no config, and no change to this function.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const SCAN_TOKEN_KEY_INFO: &[u8] = b"gitlawb/ipfs-scan-token/v1";
 
 /// HKDF salt for [`AppState::derive_webhook_secret_key`]. A constant, not a
 /// secret: the confidentiality of the derived key rests on the node's private
 /// seed being the input keying material, exactly as for the scan-token key.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const WEBHOOK_SECRET_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/webhook-secret";
 
 /// HKDF `info` for [`AppState::derive_webhook_secret_key`]: the domain
@@ -32,6 +35,7 @@ const WEBHOOK_SECRET_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/webhook-secret";
 /// rotation: sealed secrets persist, `open` has no old-key fallback, and a new
 /// version renders every stored ciphertext permanently unopenable until a
 /// re-seal path exists.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const WEBHOOK_SECRET_KEY_INFO: &[u8] = b"gitlawb/webhook-secret/v1";
 
 #[derive(Clone, Debug)]
@@ -105,7 +109,7 @@ pub struct AppState {
     /// (its own budget, per the `sync_trigger`/`peer_write` precedent) so a
     /// write flood cannot drain the creation budget and vice versa. Per-DID is
     /// deliberately NOT paired here: a DID farm never trips it, and busy
-    /// legitimate agents would false-positive. `GITLAWB_WRITE_RATE_LIMIT`
+    /// legitimate agents would false-positive. `TWIGPINE_WRITE_RATE_LIMIT`
     /// overrides the default, 0 disables. Keyed by `push_limiter_trust`.
     pub write_rate_limiter: RateLimiter,
     /// Per-client-IP rate limiter for git-receive-pack. Per-DID limits cannot
@@ -118,7 +122,7 @@ pub struct AppState {
     pub close_issue_rate_limiter: RateLimiter,
     /// Per-client-IP ROUTE brake for `GET /ipfs/{cid}`: charged ONCE per request by the
     /// `rate_limit_by_ip` middleware (server.rs), never inside the handler. It bounds
-    /// request RATE (the "requests per hour" contract of `GITLAWB_IPFS_RATE_LIMIT`) on
+    /// request RATE (the "requests per hour" contract of `TWIGPINE_IPFS_RATE_LIMIT`) on
     /// the non-farmable source IP, so an anonymous flood of the public route is capped.
     /// The per-probe/per-walk WORK accounting the resolver does WITHIN a request draws
     /// from the SEPARATE `ipfs_work_rate_limiter` below — the two cannot share one bucket
@@ -158,7 +162,7 @@ pub struct AppState {
     pub ipfs_legacy_scan_page_rows: usize,
     /// Per-request ceiling on how many repo ROWS the CID resolver's legacy scan may
     /// fetch (default `api::ipfs::MAX_LEGACY_SCAN_ROWS_PER_REQUEST`, operator-tunable via
-    /// `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS`). `ipfs_max_legacy_probes` bounds the PROBE
+    /// `TWIGPINE_IPFS_MAX_LEGACY_SCAN_ROWS`). `ipfs_max_legacy_probes` bounds the PROBE
     /// fan-out but only starts counting once a probe runs, and quarantine plus a
     /// root-scope visibility deny both return before a probe or a visit is spent, so an
     /// all-denying inventory paged the whole repo table at zero probes (#173 round 13, F2).
@@ -214,7 +218,7 @@ pub struct AppState {
     /// A field for the same test-seam reason as the sibling caps.
     pub ipfs_max_served_object_bytes: u64,
     /// Which forwarded header (if any) the edge is trusted to set, for
-    /// resolving the push limiter's client-IP key. See `GITLAWB_TRUSTED_PROXY`.
+    /// resolving the push limiter's client-IP key. See `TWIGPINE_TRUSTED_PROXY`.
     /// Node-wide; also keys the two peer-sync limiters below.
     pub push_limiter_trust: crate::rate_limit::TrustedProxy,
     /// Per-client-IP limiter for `POST /api/v1/sync/trigger` (tight). The route
@@ -429,7 +433,7 @@ impl AppState {
         self.federated_rate_limiter.cleanup().await;
     }
 
-    /// Legacy-probe budget wired from the `GITLAWB_IPFS_MAX_LEGACY_PROBES` operator
+    /// Legacy-probe budget wired from the `TWIGPINE_IPFS_MAX_LEGACY_PROBES` operator
     /// knob. The knob seeds `ipfs_max_legacy_probes` at construction so it controls the
     /// per-request legacy (NULL-provenance) probe fan-out it advertises. It deliberately
     /// does NOT feed the history-walk ceiling: that is governed by
@@ -441,7 +445,7 @@ impl AppState {
         config.ipfs_max_legacy_probes as u32
     }
 
-    /// Legacy-scan ROW budget wired from the `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS` knob,
+    /// Legacy-scan ROW budget wired from the `TWIGPINE_IPFS_MAX_LEGACY_SCAN_ROWS` knob,
     /// the same helper shape as the probe budget above so the knob cannot become a
     /// silent no-op if a struct literal drifts back to the bare constant.
     pub(crate) fn ipfs_legacy_scan_row_budget(config: &crate::config::Config) -> usize {
@@ -521,7 +525,7 @@ impl AppState {
     /// resolution per window, the provenance phase's walks plus a full legacy search
     /// (probes plus page tolls), so a single default-config resolution cannot
     /// self-throttle part-way and recreate the admit-then-429 for a legitimate caller.
-    /// `GITLAWB_IPFS_RATE_LIMIT=0`
+    /// `TWIGPINE_IPFS_RATE_LIMIT=0`
     /// disables the route brake and this derived bucket alike (a 0-capacity limiter admits
     /// everything).
     ///
@@ -831,7 +835,7 @@ pub struct RepoWriteLeases {
     // context, never across an await — the semaphore wait happens OUTSIDE this lock.
     repos: Arc<std::sync::Mutex<std::collections::HashMap<String, LeaseSlot>>>,
     /// Most handlers allowed to be PARKED on one repo's lease at once
-    /// (`GITLAWB_REPO_LEASE_MAX_WAITERS`). Past it `acquire` sheds instead of queueing.
+    /// (`TWIGPINE_REPO_LEASE_MAX_WAITERS`). Past it `acquire` sheds instead of queueing.
     max_waiters: usize,
 }
 

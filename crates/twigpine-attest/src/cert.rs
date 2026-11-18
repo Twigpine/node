@@ -14,6 +14,7 @@ use crate::verifier::{Registry, VerifiedAttestation};
 
 /// The discriminator the wrapped cert must carry. Matches the constant of the
 /// same name in `twigpine-core::cert`.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 pub const CERT_TYPE: &str = "gitlawb/ref-update/v1";
 
 /// A ref-update cert with optional attestations.

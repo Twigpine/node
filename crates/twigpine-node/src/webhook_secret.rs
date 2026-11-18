@@ -2,7 +2,7 @@
 //!
 //! Webhook secrets are signing keys: whoever holds one can forge delivery
 //! payloads to the receiver the hook points at. They are persisted in the
-//! `webhooks.secret` column and used to compute the `X-Gitlawb-Signature-256`
+//! `webhooks.secret` column and used to compute the `X-Twigpine-Signature-256`
 //! header on each delivery. That secret needs two properties:
 //!
 //!   * It must never reach a log line or an API response. [`WebhookSecret`]

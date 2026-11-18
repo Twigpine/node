@@ -32,7 +32,7 @@ type BlobTreeSets = (
 /// permit on the upload-pack serve path, the write permit on the receive-pack
 /// post-push replication path) past the deadline. Every caller funnels through
 /// `blob_paths`, so bounding here bounds both paths at one seam. Production callers
-/// pass the operator-configured `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` instead; this
+/// pass the operator-configured `TWIGPINE_GIT_SERVICE_TIMEOUT_SECS` instead; this
 /// fixed budget only backs the `git_bin`-less test wrappers.
 #[cfg(test)]
 const WALK_TIMEOUT: Duration = Duration::from_secs(600);
@@ -1545,7 +1545,7 @@ pub fn withheld_blob_oids(
 
 /// [`withheld_blob_oids`] with an injectable `git_bin` and walk `timeout`. Served
 /// handlers call this with the operator-configured git binary and
-/// `GITLAWB_GIT_SERVICE_TIMEOUT_SECS`, so the whole walk is bounded by the same
+/// `TWIGPINE_GIT_SERVICE_TIMEOUT_SECS`, so the whole walk is bounded by the same
 /// budget as the other served-git ops and a fake `git` can drive its teardown in
 /// tests. The `git_bin`-less wrapper above keeps the fixed [`WALK_TIMEOUT`] for the
 /// classification tests that run against real git.
@@ -3119,7 +3119,7 @@ esac\n";
     /// the stdout drain returns EOF early, `done_tx.send` stands the watchdog down
     /// before it ever fires (`recv` gets `Ok` -> `false`, no kill), and `child.wait()`
     /// then blocks on the still-alive leader — pinning the walk thread and its read/
-    /// write permit past the deadline, bypassing GITLAWB_GIT_SERVICE_TIMEOUT_SECS.
+    /// write permit past the deadline, bypassing TWIGPINE_GIT_SERVICE_TIMEOUT_SECS.
     /// This is distinct from the descendant case above: there the leader sleeps until
     /// the deadline so the watchdog DOES time out; here the drain-EOF races ahead of
     /// the deadline. The fix keeps the watchdog armed until the child is actually

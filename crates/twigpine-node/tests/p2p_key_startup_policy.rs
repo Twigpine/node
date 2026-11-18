@@ -107,7 +107,7 @@ impl Row {
         // harness set up.
         std::fs::create_dir_all(home.path().join("repos")).expect("repos dir");
         // The p2p key tree lives in its own subdirectory so the no-mutation
-        // assertions can watch exactly it. HOME also holds `.gitlawb`, which
+        // assertions can watch exactly it. HOME also holds `.twigpine`, which
         // the node creates for its NODE identity on every start; measuring the
         // whole home would read that legitimate write as a p2p storage
         // mutation.
@@ -140,16 +140,16 @@ impl Row {
             // fixture, not incidental setup.
             .env("RUST_LOG", "info")
             .env("HOME", self.home.path())
-            .env("GITLAWB_REPOS_DIR", &repos)
-            .env("GITLAWB_HOST", "127.0.0.1")
+            .env("TWIGPINE_REPOS_DIR", &repos)
+            .env("TWIGPINE_HOST", "127.0.0.1")
             // Ephemeral: the real port is read back from the ready log.
-            .env("GITLAWB_PORT", "0")
+            .env("TWIGPINE_PORT", "0")
             // A closed port, so the node stays on the degraded path for the
             // whole row instead of ever reaching a database.
             .env("DATABASE_URL", "postgres://127.0.0.1:1/nonexistent")
-            .env("GITLAWB_P2P_PORT", p2p_port)
-            .env("GITLAWB_P2P_KEY", p2p_key)
-            .env("GITLAWB_METRICS_ADDR", "")
+            .env("TWIGPINE_P2P_PORT", p2p_port)
+            .env("TWIGPINE_P2P_KEY", p2p_key)
+            .env("TWIGPINE_METRICS_ADDR", "")
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -512,7 +512,7 @@ fn terminal_dot_key_path_is_fatal_and_does_not_mutate() {
     }
 }
 
-/// GITLAWB_KEY has the same Path-retarget hole as GITLAWB_P2P_KEY: a terminal
+/// TWIGPINE_KEY has the same Path-retarget hole as TWIGPINE_P2P_KEY: a terminal
 /// `.` would publish a file named `keys` under `data`. Fatal before bind, and
 /// the parent tree is unchanged. p2p is off so it cannot chmod a shared dir.
 #[test]
@@ -523,19 +523,19 @@ fn identity_terminal_dot_is_fatal_and_does_not_mutate() {
     std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
     let key = format!("{}/keys/.", data.display());
     let cwd = row.home.path().to_path_buf();
-    let mut child = row.spawn_env("p2p.key", "0", &cwd, &[("GITLAWB_KEY", key.as_str())]);
+    let mut child = row.spawn_env("p2p.key", "0", &cwd, &[("TWIGPINE_KEY", key.as_str())]);
     let (status, err) = wait_for_exit(&mut child);
     assert!(
         !status.success(),
-        "GITLAWB_KEY={key:?} must exit non-zero\n--- stderr ---\n{err}"
+        "TWIGPINE_KEY={key:?} must exit non-zero\n--- stderr ---\n{err}"
     );
     assert!(
         err.contains("invalid configuration"),
-        "GITLAWB_KEY={key:?} must fail as invalid configuration\n--- stderr ---\n{err}"
+        "TWIGPINE_KEY={key:?} must fail as invalid configuration\n--- stderr ---\n{err}"
     );
     assert!(
         !err.contains("binding HTTP listener"),
-        "GITLAWB_KEY={key:?} must be refused BEFORE the listener binds\n--- stderr ---\n{err}"
+        "TWIGPINE_KEY={key:?} must be refused BEFORE the listener binds\n--- stderr ---\n{err}"
     );
     let mode = std::fs::metadata(&data).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode, 0o755, "rejection must not chmod the parent");
@@ -546,7 +546,7 @@ fn identity_terminal_dot_is_fatal_and_does_not_mutate() {
 }
 
 /// An existing 0755 identity parent is usable and must not be chmodded. p2p is
-/// off so a default `~/.gitlawb/p2p.key` cannot tighten the same directory.
+/// off so a default `~/.twigpine/p2p.key` cannot tighten the same directory.
 #[test]
 fn identity_existing_0755_parent_is_not_chmodded_on_boot() {
     let row = Row::new();
@@ -559,7 +559,7 @@ fn identity_existing_0755_parent_is_not_chmodded_on_boot() {
         "p2p.key",
         "0",
         &cwd,
-        &[("GITLAWB_KEY", key.to_str().unwrap())],
+        &[("TWIGPINE_KEY", key.to_str().unwrap())],
     );
     let (found, log) = read_until(&mut child, "degraded HTTP server ready");
     assert!(
@@ -593,7 +593,7 @@ fn identity_writable_parent_is_fatal_and_unchanged() {
         "p2p.key",
         "0",
         &cwd,
-        &[("GITLAWB_KEY", key.to_str().unwrap())],
+        &[("TWIGPINE_KEY", key.to_str().unwrap())],
     );
     let (status, err) = wait_for_exit(&mut child);
     assert!(

@@ -311,7 +311,7 @@ pub async fn announce(
     } else {
         tracing::warn!(
             did = %announced_did,
-            "accepted unsigned peer announce; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
+            "accepted unsigned peer announce; set TWIGPINE_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
         );
         None
     };
@@ -504,7 +504,7 @@ pub async fn notify_sync(
     } else {
         tracing::warn!(
             did = %req.node_did,
-            "accepted unsigned sync notify; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
+            "accepted unsigned sync notify; set TWIGPINE_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
         );
     }
 
@@ -603,14 +603,22 @@ pub async fn ping_peer(
     })))
 }
 
-/// The `x-gitlawb-error` code a peer put on a rejection, if it sent one.
+/// The `x-twigpine-error` code a peer put on a rejection, if it sent one.
 ///
 /// Kept verbatim: it is what separates a ledger rejection from a replay
 /// rejection on the same-ish status, and it is what an operator greps for. A
 /// peer behind a proxy that strips unknown `X-` headers returns `None`, which
 /// is why every caller logs the status too rather than relying on this alone.
+///
+/// A peer that predates the rename sends the code under the header's old name
+/// only, so that is read too. Missing it would turn that peer's "try again"
+/// answers into permanent failures.
 pub(crate) fn peer_error_code(headers: &reqwest::header::HeaderMap) -> Option<&str> {
-    headers.get("x-gitlawb-error")?.to_str().ok()
+    twigpine_core::legacy_headers::ERROR_READ_ORDER
+        .iter()
+        .find_map(|name| headers.get(*name))?
+        .to_str()
+        .ok()
 }
 
 #[cfg(test)]
@@ -621,8 +629,19 @@ mod tests {
     #[test]
     fn peer_error_code_reads_the_header_when_present() {
         let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-twigpine-error", "signature_ledger_full".parse().unwrap());
+        assert_eq!(peer_error_code(&headers), Some("signature_ledger_full"));
+    }
+
+    #[test]
+    fn peer_error_code_reads_the_old_header_name_from_an_older_peer() {
+        let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-gitlawb-error", "signature_ledger_full".parse().unwrap());
         assert_eq!(peer_error_code(&headers), Some("signature_ledger_full"));
+
+        // A peer that sends both: the current name is the one read.
+        headers.insert("x-twigpine-error", "rate_limited".parse().unwrap());
+        assert_eq!(peer_error_code(&headers), Some("rate_limited"));
     }
 
     #[test]
@@ -1636,7 +1655,7 @@ mod tests {
         // hit. Asserted end-to-end here, through the real router.
         assert_eq!(
             resp.headers()
-                .get("x-gitlawb-error")
+                .get("x-twigpine-error")
                 .and_then(|v| v.to_str().ok()),
             Some("rate_limited"),
         );

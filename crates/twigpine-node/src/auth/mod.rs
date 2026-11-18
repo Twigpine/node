@@ -79,7 +79,7 @@ pub struct SignatureMaterial {
     /// route that never stores the body has no use for a second handle to it.
     /// The unlike-sized field is this one: the three above are header-derived
     /// and bounded by the server's header limit, while a receive-pack POST
-    /// carries up to GITLAWB_MAX_PACK_BYTES (2 GB by default). `Bytes`, not
+    /// carries up to TWIGPINE_MAX_PACK_BYTES (2 GB by default). `Bytes`, not
     /// `Vec<u8>`, so the handle the marked routes do take is a refcount bump
     /// over the buffer the middleware already holds rather than a copy.
     pub body: Option<axum::body::Bytes>,
@@ -180,7 +180,7 @@ use twigpine_core::identity::verify;
 ///
 /// This is middleware state rather than a constant because a single number cannot
 /// serve both a 2 GB git push and a 2 MB profile update: the git write group
-/// passes `GITLAWB_MAX_PACK_BYTES`, every other signed group passes
+/// passes `TWIGPINE_MAX_PACK_BYTES`, every other signed group passes
 /// [`crate::server::SIGNED_BODY_LIMIT`]. Making it a required piece of state means
 /// a new signed route group cannot be wired up without choosing a limit.
 #[derive(Clone, Copy, Debug)]
@@ -708,12 +708,14 @@ fn ledger_key(identity: &SignatureIdentity) -> String {
     let mut hasher = Sha256::new();
     match unique_nonce(identity) {
         Some(nonce) => {
+            // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
             hasher.update(b"gitlawb/sig-nonce\x00");
             hasher.update(identity.key_fingerprint.as_bytes());
             hasher.update(b"\x00");
             hasher.update(nonce.as_bytes());
         }
         None => {
+            // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
             hasher.update(b"gitlawb/sig-string\x00");
             hasher.update(identity.signing_string_hash.as_bytes());
         }
@@ -733,7 +735,7 @@ fn ledger_rejection(denial: NodeDenial, message: &str) -> Response {
         // which `denial_statuses_are_valid_http_codes` proves over every
         // variant.
         StatusCode::from_u16(denial.status()).expect("NodeDenial status is a valid HTTP code"),
-        [("X-Gitlawb-Error", code)],
+        [("X-Twigpine-Error", code)],
         Json(json!({ "error": code, "message": message })),
     )
         .into_response()
@@ -995,9 +997,9 @@ fn human_detected(message: &str) -> impl IntoResponse {
         [
             (
                 "WWW-Authenticate",
-                "Signature realm=\"gitlawb-alpha\", alg=\"ed25519\"",
+                "Signature realm=\"twigpine-alpha\", alg=\"ed25519\"",
             ),
-            ("X-Gitlawb-Error", "human_detected"),
+            ("X-Twigpine-Error", "human_detected"),
         ],
         Json(json!({
             "error": "not_an_agent",
@@ -1076,7 +1078,7 @@ mod tests {
     }
 
     /// The exact bytes `consume_signature` puts on the wire for each denial:
-    /// the `X-Gitlawb-Error` header, the body's `error` field, and the status
+    /// the `X-Twigpine-Error` header, the body's `error` field, and the status
     /// must all agree, because `twigpine` keys on the header and `twigpine init` keys on the
     /// body field.
     #[tokio::test]
@@ -1085,7 +1087,7 @@ mod tests {
             let resp = ledger_rejection(denial, "why it was refused");
             assert_eq!(resp.status().as_u16(), denial.status(), "{denial}");
             assert_eq!(
-                resp.headers().get("X-Gitlawb-Error").unwrap(),
+                resp.headers().get("X-Twigpine-Error").unwrap(),
                 denial.as_str(),
                 "{denial}",
             );

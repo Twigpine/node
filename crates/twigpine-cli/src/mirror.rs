@@ -33,7 +33,7 @@ pub struct MirrorArgs {
     #[arg(
         long,
         default_value = "https://node.twigpine.com",
-        env = "GITLAWB_NODE"
+        env = "TWIGPINE_NODE"
     )]
     pub node: String,
 
@@ -128,6 +128,8 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     let push_status = Command::new("git")
         .args(["push", "--mirror", &gitlawb_url])
         .current_dir(&mirror_path)
+        .env("TWIGPINE_NODE", &args.node)
+        // The helper on PATH may be a build from before the rename.
         .env("GITLAWB_NODE", &args.node)
         .status()
         .context("failed to run git push")?;

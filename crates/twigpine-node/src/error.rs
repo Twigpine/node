@@ -60,7 +60,7 @@ pub enum AppError {
     /// The signature replay ledger refused a write whose handler spends the
     /// signature itself (see `auth::LedgerTicket`). Carries the shared
     /// [`NodeDenial`](twigpine_core::node_denial::NodeDenial) so the status, the
-    /// `X-Gitlawb-Error` header and the body code are exactly what the
+    /// `X-Twigpine-Error` header and the body code are exactly what the
     /// `consume_signature` layer answers on every other route.
     #[error("signature ledger refused: {message}")]
     LedgerDenial {
@@ -341,13 +341,13 @@ impl IntoResponse for AppError {
             use axum::http::HeaderValue;
             let code = twigpine_core::node_denial::NodeDenial::RateLimited.as_str();
             if let Ok(v) = HeaderValue::from_str(code) {
-                resp.headers_mut().insert("X-Gitlawb-Error", v);
+                resp.headers_mut().insert("X-Twigpine-Error", v);
             }
         }
         if let AppError::LedgerDenial { denial, .. } = &self {
             use axum::http::HeaderValue;
             if let Ok(v) = HeaderValue::from_str(denial.as_str()) {
-                resp.headers_mut().insert("X-Gitlawb-Error", v);
+                resp.headers_mut().insert("X-Twigpine-Error", v);
             }
         }
         // Both retryable 503s advertise when to retry: Overloaded (capacity shed) and
@@ -412,7 +412,7 @@ mod tests {
         let resp = AppError::TooManyRequests("slow down".into()).into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            resp.headers().get("X-Gitlawb-Error"),
+            resp.headers().get("X-Twigpine-Error"),
             Some(&HeaderValue::from_static("rate_limited"))
         );
     }
@@ -423,7 +423,7 @@ mod tests {
         let resp = AppError::RateLimited(std::time::Duration::from_secs(7)).into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            resp.headers().get("X-Gitlawb-Error"),
+            resp.headers().get("X-Twigpine-Error"),
             Some(&HeaderValue::from_static("rate_limited"))
         );
         assert_eq!(

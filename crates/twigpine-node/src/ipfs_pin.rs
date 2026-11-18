@@ -1655,7 +1655,7 @@ pub async fn pin_git_object(
     // Kubo returns newline-delimited JSON; we only care about the last object
     // (there's typically just one for a single-file add).
     //
-    // The response MUST carry a real `Hash`: a misconfigured `GITLAWB_IPFS_API`
+    // The response MUST carry a real `Hash`: a misconfigured `TWIGPINE_IPFS_API`
     // (proxy returning HTML, health check on the wrong port, truncated gateway)
     // can otherwise answer 2xx with no JSON, and falling back to the locally
     // computed `expected_cid` would record a row for bytes the backend never
@@ -1694,7 +1694,7 @@ pub async fn pin_git_object(
         None => {
             return Err(anyhow::anyhow!(
                 "IPFS /api/v0/add returned 2xx without a Hash field; refusing to record \
-                 a CID the backend never acknowledged (misconfigured GITLAWB_IPFS_API?)"
+                 a CID the backend never acknowledged (misconfigured TWIGPINE_IPFS_API?)"
             ));
         }
     };
@@ -2623,7 +2623,7 @@ mod tests {
         );
     }
 
-    /// The misconfigured-`GITLAWB_IPFS_API` false positive (P3): a 2xx response
+    /// The misconfigured-`TWIGPINE_IPFS_API` false positive (P3): a 2xx response
     /// that carries no `Hash` field (proxy returning HTML, health check on the
     /// wrong port, truncated gateway) must FAIL the pin, not fall back to the
     /// locally computed `expected_cid`. Falling back records a `pinned_cids`

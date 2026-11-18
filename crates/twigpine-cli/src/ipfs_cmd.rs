@@ -25,10 +25,10 @@ pub enum IpfsCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
-        /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+        /// Identity directory (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
         #[arg(long)]
         dir: Option<PathBuf>,
     },
@@ -76,10 +76,10 @@ pub enum IpfsCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
-        /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+        /// Identity directory (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Resume token from a scan that stopped at a bound, as printed by a
@@ -120,7 +120,7 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
 
     if pins.is_empty() {
         println!("No IPFS pins recorded on {node}");
-        println!("(Push to a repo with GITLAWB_IPFS_API set to start pinning)");
+        println!("(Push to a repo with TWIGPINE_IPFS_API set to start pinning)");
         return Ok(());
     }
 

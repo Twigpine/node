@@ -146,9 +146,9 @@ pub async fn cmd_register(
     println!("  Operator wallet: {operator_addr}");
     println!();
     println!("Next: set these env vars on the node:");
-    println!("  export GITLAWB_CONTRACT_NODE_STAKING={contract}");
-    println!("  export GITLAWB_OPERATOR_PRIVATE_KEY=<your-key>");
-    println!("  export GITLAWB_CHAIN_RPC_URL={rpc_url}");
+    println!("  export TWIGPINE_CONTRACT_NODE_STAKING={contract}");
+    println!("  export TWIGPINE_OPERATOR_PRIVATE_KEY=<your-key>");
+    println!("  export TWIGPINE_CHAIN_RPC_URL={rpc_url}");
 
     Ok(())
 }
@@ -328,8 +328,8 @@ pub async fn cmd_unstake(
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn load_did(dir: Option<PathBuf>) -> Result<String> {
-    // The shared resolver, not a local `~/.gitlawb`: `twigpine identity new` writes the
-    // key wherever `GITLAWB_KEY` points, and the old fallback to `.` on a missing
+    // The shared resolver, not a local `~/.twigpine`: `twigpine identity new` writes the
+    // key wherever `TWIGPINE_KEY` points, and the old fallback to `.` on a missing
     // home made the answer depend on the working directory.
     let path = crate::identity::key_path_for(dir.as_deref())?;
     let pem = std::fs::read_to_string(&path).with_context(|| {

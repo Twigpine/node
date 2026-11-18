@@ -19,7 +19,7 @@ pub enum AgentCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         /// Filter by capability (e.g. git:push)
@@ -35,7 +35,7 @@ pub enum AgentCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
     },
@@ -69,7 +69,7 @@ async fn cmd_list(node: String, capability: Option<String>) -> Result<()> {
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!(
             "this node does not yet support the agents API (v0.3+)\n\
-             upgrade the node or check GITLAWB_NODE is pointing to the right server"
+             upgrade the node or check TWIGPINE_NODE is pointing to the right server"
         );
     }
 
@@ -120,7 +120,7 @@ async fn cmd_show(did: String, node: String) -> Result<()> {
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!(
             "agent not found, or this node does not yet support the agents API (v0.3+)\n\
-             upgrade the node or check GITLAWB_NODE is pointing to the right server"
+             upgrade the node or check TWIGPINE_NODE is pointing to the right server"
         );
     }
 

@@ -405,7 +405,7 @@ pub fn build_router(state: AppState) -> Router {
             auth::optional_signature,
         ));
 
-    // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
+    // Body limit is raised to TWIGPINE_MAX_PACK_BYTES (default 2 GB) for git
     // routes only — all other API routes keep axum's default 2 MB cap.
     // HTTP Signature is enforced on receive-pack (push) — the git-remote-twigpine
     // helper signs requests with RFC 9421 signatures using the agent's keypair.
@@ -804,7 +804,34 @@ pub fn build_router(state: AppState) -> Router {
                 .on_response(DefaultOnResponse::new().level(Level::DEBUG))
                 .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
         )
+        // Outermost, so it sees every response, including the ones the layers
+        // above build themselves (auth, rate limits, body limits).
+        .layer(middleware::from_fn(send_legacy_header_names))
         .with_state(state)
+}
+
+/// Send each renamed response header under its old name too.
+///
+/// Handlers set only the current name. A client written before the rename
+/// reads the old one, and for the error header that read is what turns a
+/// refusal into an error instead of something that looks like success.
+pub(crate) async fn send_legacy_header_names(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    for (name, legacy) in twigpine_core::legacy_headers::RESPONSE_PAIRS {
+        let values: Vec<_> = response.headers().get_all(name).iter().cloned().collect();
+        if values.is_empty() {
+            continue;
+        }
+        let legacy = axum::http::HeaderName::from_static(legacy);
+        response.headers_mut().remove(&legacy);
+        for value in values {
+            response.headers_mut().append(legacy.clone(), value);
+        }
+    }
+    response
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -834,7 +861,7 @@ async fn ready(State(state): State<AppState>) -> axum::response::Response {
 async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {
     let p2p_peer_id = state.p2p.as_ref().map(|h| h.local_peer_id.to_string());
     let mut body = json!({
-        "name": "gitlawb-node",
+        "name": "twigpine-node",
         "version": env!("CARGO_PKG_VERSION"),
         "did": state.node_did.to_string(),
         "network": "alpha",
@@ -1271,9 +1298,81 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+
+    /// Every response carries the renamed headers under their old names too,
+    /// with the same values, and an old-name header a handler might still set
+    /// cannot disagree with the current one.
+    #[tokio::test]
+    async fn renamed_response_headers_also_go_out_under_their_old_names() {
+        let app = Router::new()
+            .route(
+                "/refused",
+                get(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        [
+                            ("X-Twigpine-Error", "signature_replayed"),
+                            ("X-Gitlawb-Error", "stale"),
+                        ],
+                    )
+                }),
+            )
+            .route("/plain", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(send_legacy_header_names));
+
+        let refused = app
+            .clone()
+            .oneshot(Request::get("/refused").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let h = refused.headers();
+        assert_eq!(h.get("x-twigpine-error").unwrap(), "signature_replayed");
+        let old: Vec<_> = h.get_all("x-gitlawb-error").iter().collect();
+        assert_eq!(old, ["signature_replayed"]);
+
+        let plain = app
+            .oneshot(Request::get("/plain").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(plain.headers().get("x-gitlawb-error").is_none());
+        assert!(plain.headers().get("x-twigpine-error").is_none());
+    }
     use tower::ServiceExt;
 
     use crate::db::RepoRecord;
+
+    /// The real router, not a hand-built one: a refusal carries its code under
+    /// the error header's current name and under the name from before the
+    /// rename. Removing the layer from `build_router` fails this.
+    #[sqlx::test]
+    async fn a_refusal_through_build_router_carries_both_error_header_names(pool: PgPool) {
+        let state = test_state(pool).await;
+        let router = build_router(state);
+        // An unsigned write: refused by the auth layer before any handler runs.
+        let resp = router
+            .oneshot(
+                Request::post("/api/v1/bounties/some-id/claim")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{}", resp.status());
+        let code = resp
+            .headers()
+            .get("x-twigpine-error")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .expect("the refusal names its reason in x-twigpine-error");
+        assert_eq!(
+            resp.headers()
+                .get("x-gitlawb-error")
+                .and_then(|v| v.to_str().ok()),
+            Some(code.as_str()),
+            "the old header name must carry the same code"
+        );
+    }
 
     /// Regression: anonymous callers must not see the pin/anchor index (#121, #134).
     #[sqlx::test]
