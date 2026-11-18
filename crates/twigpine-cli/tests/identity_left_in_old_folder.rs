@@ -35,7 +35,11 @@ fn twigpine(home: &Path, args: &[&str]) -> Output {
     }
     // Nothing here may reach a network; a node that refuses connections makes
     // any attempt fail fast instead of hanging.
-    cmd.env("TWIGPINE_NODE", "http://127.0.0.1:1");
+    // doctor also looks up iCaptcha and the latest release; both go to the
+    // same refusing address.
+    cmd.env("TWIGPINE_NODE", "http://127.0.0.1:1")
+        .env("TWIGPINE_ICAPTCHA_URL", "http://127.0.0.1:1")
+        .env("TWIGPINE_GITHUB_API_URL", "http://127.0.0.1:1");
     cmd.output().unwrap()
 }
 
