@@ -1790,6 +1790,28 @@ fn build_http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+/// Build the HTTP client for the operator's own endpoints (the Kubo API).
+///
+/// It has the same timeout and no-redirect settings as `build_http_client`, no
+/// address policy on resolved hosts, and it keeps the system proxy settings. The
+/// Kubo endpoint is documented as co-located, so its hostname may legitimately
+/// resolve to a loopback or private address. Only URLs the operator configured
+/// belong on this client. Never hand it a URL that a peer, a repo owner or any
+/// other remote party chose; those go through `build_http_client`.
+fn build_operator_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(OUTBOUND_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Process-wide operator client, built once. See `build_operator_http_client`.
+pub(crate) fn operator_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| build_operator_http_client().expect("failed to build operator http client"))
+}
+
 const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Ping a peer's DB-aware `/ready` endpoint and report whether it answered 2xx.
@@ -4319,5 +4341,146 @@ mod identity_key_storage_tests {
             !data.join("keys").exists(),
             "rejection must not create a file named keys"
         );
+    }
+}
+
+/// Test helper for tests that must not see the runner's proxy environment.
+///
+/// Environment variables are shared by every test thread in the process, so a
+/// test cannot clear them in place. `run_isolated` instead re-runs the current
+/// test binary as a child process, filtered to one test by exact name, with all
+/// eight proxy variables removed and a marker set. The test body calls
+/// `in_child()` and runs its real assertions only when it is true; in the parent
+/// it calls `run_isolated` and returns.
+#[cfg(test)]
+pub(crate) mod isolated_child {
+    const MARKER: &str = "TWIGPINE_ISOLATED_CHILD";
+
+    const PROXY_VARS: [&str; 8] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+
+    /// True inside the child process started by `run_isolated`.
+    pub(crate) fn in_child() -> bool {
+        std::env::var_os(MARKER).is_some()
+    }
+
+    /// Re-run `test_name` (the full path as `cargo test` lists it, for example
+    /// `some_tests::some_test`) in a child process with no proxy variables, then
+    /// set `extra_env` on top. Panics unless the child exits with success and
+    /// reports that exactly one test ran, so a misspelled name cannot pass by
+    /// matching nothing.
+    pub(crate) fn run_isolated(test_name: &str, extra_env: &[(&str, &str)]) {
+        let exe = std::env::current_exe().expect("current test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([test_name, "--exact", "--nocapture", "--test-threads=1"]);
+        for var in PROXY_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.env(MARKER, "1");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        let out = cmd
+            .output()
+            .expect("failed to start the child test process");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "child test {test_name} failed with {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "child test {test_name} did not run exactly one test\n--- stdout ---\n{stdout}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod operator_client_tests {
+    use super::isolated_child::{in_child, run_isolated};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // The operator's Kubo endpoint is documented as co-located, so a hostname
+    // that resolves to loopback must stay reachable through this client.
+    #[tokio::test]
+    async fn operator_client_reaches_a_hostname_that_resolves_to_loopback() {
+        if !in_child() {
+            run_isolated(
+                "operator_client_tests::operator_client_reaches_a_hostname_that_resolves_to_loopback",
+                &[],
+            );
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let resp = super::operator_http_client()
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await
+            .expect("the operator client must reach a loopback hostname");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_client_does_not_follow_a_redirect() {
+        if !in_child() {
+            run_isolated(
+                "operator_client_tests::operator_client_does_not_follow_a_redirect",
+                &[],
+            );
+            return;
+        }
+        let mut server = mockito::Server::new_async().await;
+        let target = server
+            .mock("GET", "/landed")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let redirect = server
+            .mock("GET", "/start")
+            .with_status(302)
+            .with_header("location", &format!("{}/landed", server.url()))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let resp = super::operator_http_client()
+            .get(format!("{}/start", server.url()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 302);
+        redirect.assert_async().await;
+        target.assert_async().await;
     }
 }

@@ -1572,18 +1572,19 @@ impl PolicyFence {
 /// and documented rather than guessed separately in each loop.
 pub(crate) const PIN_READ_FLOOR: Duration = Duration::from_millis(1100);
 
-/// The shared outbound client for both IPFS sinks.
+/// The outbound client for both IPFS sinks.
 ///
 /// `pin_new_objects` runs while holding a `pin_semaphore` permit and that pool
 /// defers rather than sheds, so an unbounded await here parks the pool. A bare
-/// `reqwest::Client::new()` has no timeout, which is exactly that. Built from
-/// `crate::build_http_client` rather than a local builder: its docstring forbids
-/// hand-rolling an equivalent, so that the redirect and timeout guarantees the
-/// node's tests bind stay bound to the client every outbound path actually uses.
+/// `reqwest::Client::new()` has no timeout, which is exactly that. This is the
+/// operator client from `crate::operator_http_client`, not the shared peer client:
+/// the Kubo endpoint is operator-configured and may be a hostname that resolves
+/// to a loopback or private address, which the shared client refuses. Both sinks
+/// only ever send to the configured `GITLAWB_IPFS_API` URL, so no remote party
+/// picks a destination here. Keep it that way.
 fn http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| crate::build_http_client().expect("failed to build production http client"))
+    static CLIENT: std::sync::OnceLock<&'static reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(crate::operator_http_client)
 }
 
 /// Pin a single git object to the local IPFS/Kubo node.
