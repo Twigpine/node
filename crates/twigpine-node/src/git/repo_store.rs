@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
@@ -64,6 +64,12 @@ pub struct RepoStore {
     lock_pool: PgPool,
     /// Bound on any object-storage transfer that runs while the lock is HELD.
     lock_held_transfer_timeout: Duration,
+    /// Wall-clock cap on HOLDING the lock, stamped onto every guard at
+    /// lock-take. One deadline covers every phase under the lock, so a slow
+    /// caller cannot pin a lock-pool slot for the sum of every per-phase
+    /// bound. A field rather than a bare const so the bound is configurable
+    /// (`TWIGPINE_WRITE_LOCK_HOLD_TIMEOUT_SECS`) and testable.
+    lock_hold_timeout: Duration,
     /// Wall-clock cap on WAITING for the lock. A field rather than a bare const so
     /// the busy path can be driven in a test without a 90s wait.
     lock_acquire_deadline: Duration,
@@ -116,6 +122,17 @@ impl RepoStore {
         self
     }
 
+    /// Bound on how long a `RepoWriteGuard` from this store may hold its lock,
+    /// stamped as a deadline at lock-take. Every phase under the lock consumes
+    /// `min(its own bound, the deadline's remaining budget)`.
+    ///
+    /// Production: set from `Config::write_lock_hold_timeout_secs`. Tests: a
+    /// small value drives the expired-deadline path without a 600s wait.
+    pub fn with_lock_hold_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_hold_timeout = timeout;
+        self
+    }
+
     /// Test-only: how many write guards from this store have reached the Tigris upload
     /// site. See [`RepoWriteGuard::release`].
     #[cfg(all(test, unix))]
@@ -135,6 +152,7 @@ impl RepoStore {
             tigris,
             lock_pool,
             lock_held_transfer_timeout,
+            lock_hold_timeout: LOCK_HOLD_TIMEOUT,
             lock_acquire_deadline: LOCK_ACQUIRE_DEADLINE,
             migrated: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
@@ -648,6 +666,7 @@ impl RepoStore {
             conn: Some(lock_conn),
             tigris: self.tigris.clone(),
             lock_held_transfer_timeout: self.lock_held_transfer_timeout,
+            lock_hold_deadline: Instant::now() + self.lock_hold_timeout,
             // Overwritten by the refresh below with the generation actually
             // observed under the lock. Only reachable unset when no backend is
             // configured, in which case `release` publishes nothing at all.
@@ -678,11 +697,17 @@ impl RepoStore {
             // bounding only the download would leave a mute endpoint able to hold
             // both indefinitely on the HEAD, and bounding them separately would make
             // worst-case occupancy two budgets instead of one.
-            let refreshed = bounded_transfer(
-                "acquire-refresh",
-                repo_name,
-                self.lock_held_transfer_timeout,
-                async {
+            // The refresh's own bound, clamped to what is left of this
+            // guard's lock-hold deadline: the two compose, they do not add.
+            let refresh_bound = guard.hold_bounded(self.lock_held_transfer_timeout);
+            let refreshed = match refresh_bound {
+                None => None,
+                Some(bound) => {
+                    bounded_transfer(
+                        "acquire-refresh",
+                        repo_name,
+                        bound,
+                        async {
                     // The HEAD and the download fail for epistemically DIFFERENT
                     // reasons, so they are kept apart rather than collapsed into one
                     // `Result`. A failed HEAD leaves us not knowing whether an archive
@@ -721,8 +746,10 @@ impl RepoStore {
                         Err(e) => Err(RefreshFailure::Unknown(e)),
                     }
                 },
-            )
-            .await;
+                    )
+                    .await
+                }
+            };
 
             match refreshed {
                 Some(Ok(fence)) => {
@@ -784,16 +811,30 @@ impl RepoStore {
                     // the whole bound is not that: it pinned a lock-pool slot for the
                     // full duration, and this raise-site `error!` is what keeps it
                     // paging. Do NOT "fix" it to match the arm above.
-                    tracing::error!(
-                        repo = %repo_name,
-                        owner = %owner_slug,
-                        bound_secs = self.lock_held_transfer_timeout.as_secs(),
-                        "under-lock tigris refresh exceeded the transfer bound, refusing the write"
-                    );
-                    return Err(anyhow::Error::new(RepoUnavailable).context(format!(
-                        "tigris refresh exceeded the {}s under-lock bound for {owner_slug}/{repo_name}",
-                        self.lock_held_transfer_timeout.as_secs()
-                    )));
+                    match refresh_bound {
+                        Some(bound) => {
+                            tracing::error!(
+                                repo = %repo_name,
+                                owner = %owner_slug,
+                                bound_secs = bound.as_secs(),
+                                "under-lock tigris refresh exceeded its bound, refusing the write"
+                            );
+                            return Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                                "tigris refresh exceeded the {}s under-lock bound for {owner_slug}/{repo_name}",
+                                bound.as_secs()
+                            )));
+                        }
+                        None => {
+                            tracing::error!(
+                                repo = %repo_name,
+                                owner = %owner_slug,
+                                "under-lock tigris refresh never started: the lock-hold deadline left no budget, refusing the write"
+                            );
+                            return Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                                "the lock-hold deadline left no budget for the under-lock tigris refresh for {owner_slug}/{repo_name}"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -2054,6 +2095,13 @@ pub struct RepoWriteGuard {
     tigris: Option<TigrisClient>,
     /// Bound on the release-side upload, which runs with the lock still held.
     lock_held_transfer_timeout: Duration,
+    /// The instant this guard's lock-pool hold expires, stamped at lock-take
+    /// from `RepoStore::lock_hold_timeout`. Every phase that runs while the
+    /// lock is held consumes `min(its own bound, the deadline's remaining
+    /// budget)` through `hold_bounded`, so one deadline covers refresh, the
+    /// caller's under-lock work, and release rather than letting each spend a
+    /// full budget of its own.
+    lock_hold_deadline: Instant,
     /// The generation of the stored archive as observed by the HEAD inside
     /// `acquire_write`, under the lock. `release` publishes fenced on it, so a
     /// PUT abandoned by an earlier writer's timeout cannot land on top of a
@@ -2108,6 +2156,20 @@ pub struct RepoWriteGuard {
 }
 
 impl RepoWriteGuard {
+    /// The deadline stamped at lock-take. Exposed so a caller that keeps the
+    /// guard in shared state (the receive-pack reaper bundle) can clamp every
+    /// under-lock phase against the same instant instead of a duration that
+    /// silently ages.
+    pub(crate) fn lock_hold_deadline(&self) -> Instant {
+        self.lock_hold_deadline
+    }
+
+    /// `own` clamped to what this guard's lock-hold deadline still funds; see
+    /// the module-level `hold_bounded` for the rule a `None` carries.
+    fn hold_bounded(&self, own: Duration) -> Option<Duration> {
+        hold_bounded(self.lock_hold_deadline, own)
+    }
+
     /// Backend pid of the session holding the lock. Test-only observable for the
     /// must-not-over-close check: if `release` closed the session instead of
     /// returning it, consecutive writes would report different pids.
@@ -2122,6 +2184,25 @@ impl RepoWriteGuard {
             .await
             .expect("backend pid");
         pid.0
+    }
+
+    /// Backend pid PLUS its start timestamp. `pg_backend_pid` alone cannot tell
+    /// "the same session" from "the kernel recycled the pid for the next
+    /// backend", which the pool-exhaustion tests hit under parallel load; a
+    /// recycled pid still gets a fresh `backend_start`.
+    #[cfg(test)]
+    async fn backend_identity_for_test(&mut self) -> (i32, String) {
+        let conn = self
+            .conn
+            .as_mut()
+            .expect("guard still holds its connection");
+        sqlx::query_as(
+            "SELECT pid, backend_start::text FROM pg_stat_activity \
+             WHERE pid = pg_backend_pid()",
+        )
+        .fetch_one(&mut **conn)
+        .await
+        .expect("backend identity")
     }
 
     /// Path to the bare repo on local disk.
@@ -2315,15 +2396,23 @@ impl RepoWriteGuard {
         // A separate, deliberately small slice rather than a share of the
         // already-exhausted publish budget: this runs with the lock still held,
         // and a store that just stalled for the whole bound must not be able to
-        // hold it for a second one.
-        match bounded_transfer(
-            "release-reconcile",
-            &self.repo_name,
-            RECONCILE_BOUND,
-            tigris.attempt_landed(&self.owner_slug, &self.repo_name, &attempt),
-        )
-        .await
-        {
+        // hold it for a second one. An expired lock-hold deadline starts
+        // nothing: `hold_bounded` returns None rather than let `timeout(0)`
+        // poll the probe once and possibly land an answer the deadline no
+        // longer funds.
+        let reconciled = match self.hold_bounded(RECONCILE_BOUND) {
+            None => None,
+            Some(bound) => {
+                bounded_transfer(
+                    "release-reconcile",
+                    &self.repo_name,
+                    bound,
+                    tigris.attempt_landed(&self.owner_slug, &self.repo_name, &attempt),
+                )
+                .await
+            }
+        };
+        match reconciled {
             Some(Ok(true)) => {
                 info!(
                     repo = %self.repo_name,
@@ -2382,14 +2471,24 @@ impl RepoWriteGuard {
                 // refresh uses one for its HEAD and download together: this runs
                 // with the lock held and a lock-pool slot pinned, so bounding
                 // each attempt separately would double the worst-case occupancy.
-                match bounded_transfer(
-                    "release-upload",
-                    &self.repo_name,
-                    self.lock_held_transfer_timeout,
-                    self.publish(&tigris),
-                )
-                .await
-                {
+                // The bound also composes with the lock-hold deadline: a guard
+                // whose deadline has passed starts nothing, classified through
+                // `resolve_unfinished_publish` as definite non-publication at
+                // stage Idle. The skip is explicit because `timeout(0)` would
+                // still poll the publish once.
+                let published = match self.hold_bounded(self.lock_held_transfer_timeout) {
+                    None => None,
+                    Some(bound) => {
+                        bounded_transfer(
+                            "release-upload",
+                            &self.repo_name,
+                            bound,
+                            self.publish(&tigris),
+                        )
+                        .await
+                    }
+                };
+                match published {
                     Some(Ok(())) => {}
                     // Both attempts were definitively refused. The raise site
                     // already logged which and why, so this only has to carry
@@ -2519,18 +2618,26 @@ impl RepoWriteGuard {
         if let Some(gate) = self.test_pre_unlock_gate.clone() {
             gate.notified().await;
         }
-        let unlock = if let Some(conn) = self.conn.as_mut() {
-            bounded_transfer(
-                "advisory-unlock",
-                &self.repo_name,
-                self.lock_held_transfer_timeout,
-                sqlx::query_as::<_, (bool,)>("SELECT pg_advisory_unlock($1)")
-                    .bind(lock_key)
-                    .fetch_one(&mut **conn),
-            )
-            .await
-        } else {
-            None
+        // A lock-hold deadline already past is excluded by `hold_bounded`
+        // rather than left to `timeout(0)`, which would still poll the
+        // query once and could land it.
+        let unlock_bound = self.hold_bounded(self.lock_held_transfer_timeout);
+        let unlock = match (self.conn.as_mut(), unlock_bound) {
+            (Some(conn), Some(bound)) => {
+                bounded_transfer(
+                    "advisory-unlock",
+                    &self.repo_name,
+                    bound,
+                    sqlx::query_as::<_, (bool,)>("SELECT pg_advisory_unlock($1)")
+                        .bind(lock_key)
+                        .fetch_one(&mut **conn),
+                )
+                .await
+            }
+            // No connection, or an expired deadline with nothing left to
+            // fund the wire call: the `None` arms below close the session,
+            // which frees lock and slot regardless.
+            _ => None,
         };
         match unlock {
             Some(Ok((true,))) => {
@@ -2553,11 +2660,14 @@ impl RepoWriteGuard {
                 );
             }
             None if self.conn.is_some() => {
+                // `unlock` is None on a bounded_transfer timeout AND on a
+                // deadline-expired skip; log the effective bound so a
+                // zero says which happened.
                 warn!(
                     repo = %self.repo_name,
                     lock_key,
-                    bound_secs = self.lock_held_transfer_timeout.as_secs(),
-                    "advisory unlock exceeded its bound — closing the session so the lock-pool slot is not held longer"
+                    bound_secs = unlock_bound.map(|b| b.as_secs()).unwrap_or(0),
+                    "advisory unlock did not finish inside its bound; closing the session so the lock-pool slot is not held longer"
                 );
             }
             None => {}
@@ -2739,6 +2849,29 @@ impl Drop for RepoWriteGuard {
 /// promise that `acquire_write` returns inside the 120s proxy idle timeout in
 /// `infra/fly/fly.toml`; it is not, and reconciling the two is tracked separately.
 const LOCK_ACQUIRE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Production `RepoStore::new` sites override this from
+/// `Config::write_lock_hold_timeout_secs`; the fallback matches that knob's
+/// default so a store built without it keeps the shipped bound.
+const LOCK_HOLD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// `own` clamped to what `deadline` still funds, or `None` once nothing is
+/// left. This is the one body that carries the lock-hold rule every under-lock
+/// phase follows: a `tokio::time::timeout` at exactly zero polls the future
+/// once before noticing (and a process runner has already spawned by then), so
+/// an expired deadline must short-circuit here rather than race inside the
+/// bound. Callers keep their own `None` policy: refuse, warn-and-skip, or bail.
+pub(crate) fn hold_bounded(deadline: Instant, own: Duration) -> Option<Duration> {
+    let bound = own.min(deadline.saturating_duration_since(Instant::now()));
+    (!bound.is_zero()).then_some(bound)
+}
+
+/// `hold_bounded` for callees that take an `Instant` deadline rather than a
+/// `Duration`: the phase's own bound as an instant, never past `deadline`, or
+/// `None` once the hold deadline has passed.
+pub(crate) fn hold_deadline(deadline: Instant, own: Duration) -> Option<Instant> {
+    Instant::now().checked_add(hold_bounded(deadline, own)?)
+}
 
 /// Why an under-lock refresh did not complete, split by what it leaves us knowing.
 ///
@@ -4081,6 +4214,7 @@ pub(crate) mod tests {
             conn: Some(pool.acquire().await.expect("conn")),
             tigris: None,
             lock_held_transfer_timeout: Duration::from_secs(300),
+            lock_hold_deadline: Instant::now() + Duration::from_secs(600),
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
@@ -4451,6 +4585,7 @@ pub(crate) mod tests {
             conn: Some(lock_pool.acquire().await.unwrap()),
             tigris: None,
             lock_held_transfer_timeout: Duration::from_secs(300),
+            lock_hold_deadline: Instant::now() + Duration::from_secs(600),
             // No backend, so nothing is ever published and the fence is unread.
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
@@ -9238,5 +9373,123 @@ pub(crate) mod tests {
         );
 
         mock.shutdown();
+    }
+
+    /// #282: every phase under the lock consumes the guard's one lock-hold
+    /// deadline. A guard whose deadline has already passed must not START a
+    /// publish the bound cannot finish: the `None` (timed out) arm routes
+    /// through `resolve_unfinished_publish`, where stage `Idle` reads as a
+    /// definite non-publication (`UploadFailed`), and no PUT is dispatched.
+    ///
+    /// Load-bearing on the clamp: without the `hold_bounded` deadline the
+    /// publish would run against the mock and the counter below would move.
+    #[sqlx::test]
+    async fn release_after_lock_hold_deadline_starts_no_publish(pool: sqlx::PgPool) {
+        use axum::response::IntoResponse;
+
+        let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let puts_in = Arc::clone(&puts);
+        let app = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(move |method: axum::http::Method| {
+                let puts = Arc::clone(&puts_in);
+                async move {
+                    if method == axum::http::Method::PUT {
+                        puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    axum::http::StatusCode::OK.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let guard = RepoWriteGuard {
+            owner_slug: "did_key_z6MkHoldExpired".to_string(),
+            repo_name: "expired-hold".to_string(),
+            local_path: validated_repo_disk_path(
+                dir.path(),
+                "did:key:z6MkHoldExpired",
+                "expired-hold",
+            )
+            .expect("test path"),
+            lock_key: 995_777,
+            conn: Some(pool.acquire().await.unwrap()),
+            tigris: Some(TigrisClient::for_testing_with_endpoint(
+                "test-bucket",
+                &endpoint,
+            )),
+            lock_held_transfer_timeout: Duration::from_secs(300),
+            // Already past: the publish's budget must clamp to zero.
+            lock_hold_deadline: Instant::now() - Duration::from_secs(1),
+            publish_fence: UploadPrecondition::Unconditional,
+            refresh_swap_authority: None,
+            publish_stage: Arc::new(PublishStageCell::new()),
+            tree_settled: false,
+            settlement_armed: Arc::new(AtomicBool::new(true)),
+            path_handed_out: Arc::new(AtomicBool::new(true)),
+            #[cfg(test)]
+            test_pre_unlock_gate: None,
+            #[cfg(test)]
+            upload_site_reached: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        let outcome = guard.release(true).await;
+        assert_eq!(
+            outcome,
+            ReleaseOutcome::UploadFailed,
+            "an expired lock-hold deadline makes the publish a definite non-publication, got {outcome:?}"
+        );
+        assert_eq!(
+            puts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no PUT may be dispatched once the lock-hold deadline has passed"
+        );
+        server.abort();
+    }
+
+    /// #282: the unlock is also a phase under the deadline. A release entered
+    /// after the deadline has passed leaves no budget to await the wire, so
+    /// the session must close rather than return to the pool, freeing lock
+    /// AND slot even though `pg_advisory_unlock` never ran.
+    ///
+    /// The observable is the backend identity on a one-connection pool: a
+    /// returned connection is handed back as the same session; a closed one
+    /// forces the next acquire onto a fresh backend. The identity carries
+    /// `backend_start` alongside the pid because the kernel recycles pids, so
+    /// an equal pid alone cannot separate same-session from new-backend.
+    /// Load-bearing on the clamp: without it the unlock succeeds, the
+    /// connection returns, and the identity repeats.
+    #[sqlx::test]
+    async fn release_after_lock_hold_deadline_closes_the_session(pool: sqlx::PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 1).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), lock_pool.clone())
+            .with_lock_hold_timeout(Duration::from_millis(200));
+
+        let owner = "did:key:z6MkHoldDeadlineSessionAAAAAAAAAAAAAAAAA";
+        let name = "holddeadline";
+        let mut guard = store.acquire_write(owner, name).await.expect("acquire");
+        let identity_before = guard.backend_identity_for_test().await;
+
+        // Let the deadline pass, then release: the unlock gets no budget.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = guard.release(false).await;
+
+        let mut next = store
+            .acquire_write(owner, name)
+            .await
+            .expect("the lock must be free once the expired session closes");
+        let identity_after = next.backend_identity_for_test().await;
+        assert_ne!(
+            identity_before, identity_after,
+            "an expired-deadline release must close the session, not pool it"
+        );
+        let _ = next.release(false).await;
     }
 }

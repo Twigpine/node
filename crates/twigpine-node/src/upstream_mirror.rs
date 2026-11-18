@@ -295,7 +295,14 @@ fn run_fetch(
     repo_path: &Path,
     upstream: &PinnedUpstream,
     timeout: Duration,
+    lock_hold_deadline: Instant,
 ) -> Result<()> {
+    // An already-expired hold deadline starts nothing: without this check
+    // the preflight probes and the fetch child would each spawn once
+    // before their own zero deadlines noticed.
+    if Instant::now() >= lock_hold_deadline {
+        anyhow::bail!("upstream mirror fetch: the lock-hold deadline already expired");
+    }
     let command = fetch_command(upstream);
     let args: Vec<&str> = command.args.iter().map(String::as_str).collect();
     let config: Vec<(&str, &str)> = command
@@ -303,17 +310,22 @@ fn run_fetch(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    let rewrite_deadline = Instant::now()
-        .checked_add(PREFLIGHT_PROBE_TIMEOUT)
-        .context("mirror URL-rewrite probe timeout is not representable")?;
+    // Every phase under the write lock consumes the guard's lock-hold
+    // deadline: each keeps its own bound, recomputed per phase through
+    // `hold_deadline` so an expiry during one probe means the next child
+    // never spawns instead of starting on a deadline already past (#282).
+    let expired =
+        || anyhow::anyhow!("upstream mirror fetch: the lock-hold deadline already expired");
+    let rewrite_deadline =
+        crate::git::repo_store::hold_deadline(lock_hold_deadline, PREFLIGHT_PROBE_TIMEOUT)
+            .ok_or_else(expired)?;
     reject_local_url_rewrite(git_bin, repo_path, &upstream.url, rewrite_deadline)?;
-    let config_deadline = Instant::now()
-        .checked_add(PREFLIGHT_PROBE_TIMEOUT)
-        .context("mirror local-config probe timeout is not representable")?;
+    let config_deadline =
+        crate::git::repo_store::hold_deadline(lock_hold_deadline, PREFLIGHT_PROBE_TIMEOUT)
+            .ok_or_else(expired)?;
     reject_sensitive_local_config(git_bin, repo_path, config_deadline)?;
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .context("upstream mirror fetch timeout is not representable")?;
+    let deadline =
+        crate::git::repo_store::hold_deadline(lock_hold_deadline, timeout).ok_or_else(expired)?;
     let (status, _stdout, stderr) =
         crate::git::visibility_pack::run_bounded_git_raw_isolated_https_with_config(
             git_bin, &args, repo_path, b"", deadline, &config,
@@ -407,9 +419,21 @@ impl Worker {
         }
 
         let git_bin = self.git_bin.clone();
+        // The fetch holds the write lock the whole time, so it consumes the
+        // guard's lock-hold deadline rather than a fresh budget: a fetch
+        // running past that deadline pins its lock-pool slot exactly like a
+        // slow push (#282). `run_fetch` clamps each phase's own bound
+        // against this deadline internally.
         let fetch_timeout = Duration::from_secs(self.config.upstream_mirror_fetch_timeout_secs);
+        let lock_hold_deadline = guard.lock_hold_deadline();
         let fetch = tokio::task::spawn_blocking(move || {
-            run_fetch(&git_bin, &repo_path, &upstream, fetch_timeout)
+            run_fetch(
+                &git_bin,
+                &repo_path,
+                &upstream,
+                fetch_timeout,
+                lock_hold_deadline,
+            )
         })
         .await
         .context("upstream mirror fetch task panicked")?;
@@ -865,7 +889,14 @@ esac
             url: format!("https://127.0.0.1:{port}/org/repo=mirror.git"),
             curlopt_resolve: None,
         };
-        let error = run_fetch("git", repo.path(), &upstream, Duration::from_secs(5)).unwrap_err();
+        let error = run_fetch(
+            "git",
+            repo.path(),
+            &upstream,
+            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(600),
+        )
+        .unwrap_err();
         assert!(
             accepted.join().unwrap(),
             "real Git must reach the HTTPS transport; got {error:#}"
@@ -963,6 +994,83 @@ esac
 
         let calls = std::fs::read_to_string(calls).unwrap();
         assert_eq!(calls.lines().collect::<Vec<_>>(), ["fail", "ok"]);
+        assert!(worker.repo_write_leases.is_empty());
+    }
+
+    /// #282: a mirror fetch holds the write lock for its whole run, so it
+    /// consumes the guard's lock-hold deadline, not a fresh
+    /// `upstream_mirror_fetch_timeout_secs` budget. With the hold bound below
+    /// the fetch timeout, a sleeping fetch must die at the hold bound, not at
+    /// the fetch timeout. Load-bearing on the clamp: without the
+    /// `lock_hold_deadline` phase clamps the fetch runs to the 5s timeout and
+    /// the elapsed assertion below fails.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn fetch_respects_the_guard_lock_hold_deadline(pool: sqlx::PgPool) {
+        let bootstrap = tempfile::tempdir().unwrap();
+        let git = bootstrap.path().join("fake-git");
+        let fetch_marker = bootstrap.path().join("fetch-started");
+        // Answer the preflight probes like `fake_git` does (a bare repo with
+        // no rewrites and no sensitive config), then mark and sleep on the
+        // fetch so the test can tell "the fetch child ran" from "the run
+        // bailed before spawning anything".
+        std::fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"ls-remote\" ]; then printf '%s\\n' \"$3\"; exit 0; fi\n\
+                 if [ \"$1\" = \"config\" ]; then exit 1; fi\n\
+                 : > \"{}\"\n\
+                 sleep 30\n",
+                fetch_marker.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&git, permissions).unwrap();
+        }
+
+        // Fetch timeout is 5s from `test_worker`; the hold bound is tighter.
+        let (mut worker, db, _repos) = test_worker(pool, git, 1).await;
+        worker.repo_store = worker
+            .repo_store
+            .with_lock_hold_timeout(Duration::from_millis(800));
+        let target = add_inbound_mirror(
+            &worker,
+            &db,
+            "00000000-0000-0000-0000-000000000003",
+            "slowfetch",
+            "https://8.8.8.8/org/slow.git",
+        )
+        .await;
+
+        let started = Instant::now();
+        let result = worker.fetch_target(target).await;
+        let elapsed = started.elapsed();
+        assert!(
+            result.is_err(),
+            "a fetch cut by the lock-hold deadline must fail, got {result:?}"
+        );
+        // The preflight shims answer instantly, so a fast failure would
+        // return in milliseconds. The shim's marker plus reaching ~800ms
+        // prove the fetch child really started and the deadline is what cut
+        // it, not an expired-deadline bail before the spawn.
+        assert!(
+            fetch_marker.exists(),
+            "the fetch child must have started for the deadline to have cut it"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "a fetch that never started would fail fast, took only {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "a 800ms lock-hold bound must end the fetch well inside the 5s \
+             fetch timeout, took {elapsed:?}"
+        );
         assert!(worker.repo_write_leases.is_empty());
     }
 }
