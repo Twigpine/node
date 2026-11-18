@@ -13,9 +13,16 @@
 //! The last two exist for child processes. `git` runs the remote helper, and the
 //! helper on `PATH` may be an older build that reads only the old names.
 //!
-//! An empty new-name value counts as unset, the same rule the settings
-//! themselves follow (a shell leaves `FOO=` behind for an unset variable
-//! expanded into a wrapper script).
+//! When choosing between the two names, an empty new-name value counts as
+//! unset, so `TWIGPINE_KEY=` beside `GITLAWB_KEY=/k.pem` uses the old one (a
+//! shell leaves `FOO=` behind for an unset variable expanded into a wrapper
+//! script).
+//!
+//! That is the whole of the rule. This module only decides which name
+//! supplies a value; it never removes a variable. A setting that is empty
+//! under every name it was given reaches its reader empty, exactly as it did
+//! before the rename: some settings treat that as "off", and a numeric one
+//! such as the port rejects it at startup, as `GITLAWB_PORT=` always has.
 //!
 //! Everything about the old prefix lives in this module, so dropping it later
 //! is one deletion.
