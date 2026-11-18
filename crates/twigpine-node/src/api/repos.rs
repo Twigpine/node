@@ -3127,6 +3127,7 @@ pub async fn git_receive_pack(
     // fixed `push` message and ignores GIT_REFLOG_ACTION); causality
     // still relies on marker + tuple/timestamp + history guards. Marker
     // namespace hiding was verified above by `verify_recovery_prereqs`.
+    // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
     let reflog_action = format!("gitlawb-request:{request_id}");
     // Phase-flip the drop-guard: git is about to start, so a dropped future
     // from here forward is a mid-git disconnect (not a pre-git shed). The
@@ -5907,6 +5908,7 @@ impl Drop for IntentDropGuard {
 /// no internal refs yet. Extracted so the gate predicate is unit-testable;
 /// the handler denies any push naming such a ref before intent is written.
 fn ref_is_internal_namespace(ref_name: &str) -> bool {
+    // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
     ref_name == "refs/gitlawb" || ref_name.starts_with("refs/gitlawb/")
 }
 

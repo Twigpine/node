@@ -361,6 +361,7 @@ const PUSH_CURSOR_VERSION: &str = "1";
 fn push_cursor_tag(node_did: &str, repo_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
+    // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
     h.update(b"gitlawb-push-cursor:v1:");
     h.update(node_did.as_bytes());
     h.update([0u8]);

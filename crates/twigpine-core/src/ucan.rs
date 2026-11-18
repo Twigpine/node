@@ -79,7 +79,10 @@ impl Capability {
     /// granted it. Since `nb` has no interpreted semantics yet, "different" cannot
     /// be shown to be narrower and is refused with it.
     pub fn is_attenuated_by(&self, parent: &Capability) -> bool {
-        let resource_ok = parent.with == self.with || parent.with == "*";
+        // `twigpine://repos/...` and `gitlawb://repos/...` name the same
+        // repository, so a chain that mixes the two spellings still attenuates.
+        let resource_ok =
+            crate::url_scheme::same_resource(&parent.with, &self.with) || parent.with == "*";
         let action_ok =
             parent.can == self.can || parent.can == "*" || parent.can == caps::REPO_ADMIN;
         let constraints_ok = match (&parent.constraints, &self.constraints) {
@@ -148,12 +151,12 @@ pub mod push {
         can == caps::GIT_PUSH || can == "*" || can == caps::REPO_ADMIN
     }
 
-    /// `gitlawb://repos/<owner>/<repo>` → `(owner, repo)`, or `None` for any other
-    /// shape. Exactly two non-empty segments: an owner DID never contains `/`, so
+    /// `twigpine://repos/<owner>/<repo>` (or the `gitlawb://` spelling from
+    /// before the rename) → `(owner, repo)`, or `None` for any other shape. Exactly two non-empty segments: an owner DID never contains `/`, so
     /// a third segment, a trailing slash, or an empty half is malformed rather than
     /// something to interpret.
     pub fn parse_repo_resource(with: &str) -> Option<(&str, &str)> {
-        let rest = with.strip_prefix("gitlawb://repos/")?;
+        let rest = crate::url_scheme::strip_resource_prefix(with)?;
         let (owner, repo) = rest.split_once('/')?;
         if owner.is_empty() || repo.is_empty() || repo.contains('/') {
             return None;
@@ -410,7 +413,8 @@ impl Ucan {
     /// exactly that capability (see `is_attenuated_by`).
     pub fn can(&self, resource: &str, action: &str) -> bool {
         self.payload.att.iter().any(|cap| {
-            let resource_ok = cap.with == resource || cap.with == "*";
+            let resource_ok =
+                crate::url_scheme::same_resource(&cap.with, resource) || cap.with == "*";
             let action_ok = cap.can == action || cap.can == "*" || cap.can == caps::REPO_ADMIN;
             resource_ok && action_ok
         })
@@ -1171,6 +1175,10 @@ mod push_scope_tests {
             parse_repo_resource("gitlawb://repos/did:key:z6Mk/r"),
             Some(("did:key:z6Mk", "r"))
         );
+        assert_eq!(
+            parse_repo_resource("twigpine://repos/did:key:z6Mk/r"),
+            Some(("did:key:z6Mk", "r"))
+        );
         for bad in [
             "*",
             "",
@@ -1253,6 +1261,55 @@ mod push_scope_tests {
             !Capability::new("gitlawb://repos/did:key:z6MkOwner/foo.git", caps::GIT_PUSH)
                 .grants_push_to(owner, "foo.git")
         );
+    }
+
+    #[test]
+    fn a_chain_mixing_the_two_resource_spellings_verifies_and_grants() {
+        let owner = Keypair::generate();
+        let a = Keypair::generate();
+        let node = Keypair::generate();
+        let owner_s = owner.did().to_string();
+        let old = format!("gitlawb://repos/{owner_s}/r");
+        let new = format!("twigpine://repos/{owner_s}/r");
+
+        // A delegation issued before the rename, re-delegated after it.
+        let proof = Ucan::issue(
+            &owner,
+            a.did(),
+            vec![Capability::new(&old, caps::GIT_PUSH)],
+            Some(hour()),
+        )
+        .unwrap();
+        let leaf = Ucan::delegate(
+            &a,
+            node.did(),
+            vec![Capability::new(&new, caps::GIT_PUSH)],
+            Some(hour()),
+            &proof,
+        )
+        .unwrap();
+        assert!(leaf.verify_chain().is_ok());
+        assert!(leaf.chain_grants_push_to(&owner_s, "r"));
+
+        // The spelling is all that may differ: another repository is still
+        // not covered.
+        let other = format!("twigpine://repos/{owner_s}/other");
+        let stray = Ucan::delegate(
+            &a,
+            node.did(),
+            vec![Capability::new(&other, caps::GIT_PUSH)],
+            Some(hour()),
+            &proof,
+        )
+        .unwrap();
+        assert!(stray.verify_chain().is_err());
+        assert!(!stray.chain_grants_push_to(&owner_s, "other"));
+        assert!(!leaf.chain_grants_push_to(&owner_s, "other"));
+
+        // `Ucan::can` follows the same rule.
+        assert!(leaf.can(&old, caps::GIT_PUSH));
+        assert!(leaf.can(&new, caps::GIT_PUSH));
+        assert!(!leaf.can(&other, caps::GIT_PUSH));
     }
 
     /// The chain walk, at every depth: a wildcard anywhere denies; concrete

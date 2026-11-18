@@ -22,6 +22,7 @@ pub mod scan_token;
 #[cfg(any(feature = "redirect", test))]
 pub mod transport_policy;
 pub mod ucan;
+pub mod url_scheme;
 
 /// Node URL the git transport falls back to when `TWIGPINE_NODE` is unset.
 ///

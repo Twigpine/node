@@ -11,6 +11,7 @@ use crate::rate_limit::RateLimiter;
 /// HKDF salt for [`AppState::derive_scan_token_key`]. A constant, not a secret: HKDF's
 /// salt is a domain qualifier, and the confidentiality of the derived key rests entirely
 /// on the node's private seed being the input keying material.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
 
 /// HKDF `info` for [`AppState::derive_scan_token_key`]: the domain separation AND the
@@ -19,11 +20,13 @@ const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
 /// trailing version rotates every node's token key on its next boot, which invalidates
 /// outstanding continuations (they simply fail to open and the caller restarts at the
 /// front) and needs no migration, no config, and no change to this function.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const SCAN_TOKEN_KEY_INFO: &[u8] = b"gitlawb/ipfs-scan-token/v1";
 
 /// HKDF salt for [`AppState::derive_webhook_secret_key`]. A constant, not a
 /// secret: the confidentiality of the derived key rests on the node's private
 /// seed being the input keying material, exactly as for the scan-token key.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const WEBHOOK_SECRET_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/webhook-secret";
 
 /// HKDF `info` for [`AppState::derive_webhook_secret_key`]: the domain
@@ -32,6 +35,7 @@ const WEBHOOK_SECRET_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/webhook-secret";
 /// rotation: sealed secrets persist, `open` has no old-key fallback, and a new
 /// version renders every stored ciphertext permanently unopenable until a
 /// re-seal path exists.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const WEBHOOK_SECRET_KEY_INFO: &[u8] = b"gitlawb/webhook-secret/v1";
 
 #[derive(Clone, Debug)]

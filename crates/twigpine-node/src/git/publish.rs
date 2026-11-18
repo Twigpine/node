@@ -80,6 +80,7 @@ impl std::fmt::Display for PublishAttemptId {
 ///
 /// S3 lowercases user-metadata keys, so this must already be lowercase or the
 /// read back would never match what was written.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 pub const ATTEMPT_METADATA_KEY: &str = "gitlawb-attempt";
 
 /// The precondition an upload is fenced on.

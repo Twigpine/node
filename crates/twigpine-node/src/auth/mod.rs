@@ -708,12 +708,14 @@ fn ledger_key(identity: &SignatureIdentity) -> String {
     let mut hasher = Sha256::new();
     match unique_nonce(identity) {
         Some(nonce) => {
+            // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
             hasher.update(b"gitlawb/sig-nonce\x00");
             hasher.update(identity.key_fingerprint.as_bytes());
             hasher.update(b"\x00");
             hasher.update(nonce.as_bytes());
         }
         None => {
+            // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
             hasher.update(b"gitlawb/sig-string\x00");
             hasher.update(identity.signing_string_hash.as_bytes());
         }
@@ -995,7 +997,7 @@ fn human_detected(message: &str) -> impl IntoResponse {
         [
             (
                 "WWW-Authenticate",
-                "Signature realm=\"gitlawb-alpha\", alg=\"ed25519\"",
+                "Signature realm=\"twigpine-alpha\", alg=\"ed25519\"",
             ),
             ("X-Twigpine-Error", "human_detected"),
         ],

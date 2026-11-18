@@ -218,7 +218,7 @@ impl NodeClient {
         let mut builder = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::custom(same_origin_redirect))
-            .user_agent(format!("gl/{} gitlawb-cli", env!("CARGO_PKG_VERSION")));
+            .user_agent(format!("twigpine/{}", env!("CARGO_PKG_VERSION")));
         // A loopback node is reached directly, ignoring HTTP_PROXY/ALL_PROXY, so
         // a proxy can never carry its signed requests off this machine and the
         // guard needs no model of the proxy environment. Redirects cannot leave

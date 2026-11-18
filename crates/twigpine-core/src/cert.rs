@@ -39,6 +39,7 @@ use crate::identity::{verify, Keypair};
 use crate::{Error, Result};
 
 /// The certificate type discriminant. Always `"gitlawb/ref-update/v1"`.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 pub const CERT_TYPE: &str = "gitlawb/ref-update/v1";
 
 /// Exact url-safe unpadded base64 length of a 64-byte Ed25519 signature.

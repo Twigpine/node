@@ -110,13 +110,52 @@ fn detect_repo_from_remote() -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let url = String::from_utf8(out.stdout).ok()?;
-    let rest = url.trim().strip_prefix("gitlawb://")?;
+    repo_from_remote_url(&String::from_utf8(out.stdout).ok()?)
+}
+
+/// `twigpine://did:key:z6Mk.../repo[.git]` (or `gitlawb://...`) → `z6Mk.../repo`.
+/// One trailing `.git` is dropped, as the node's own names have none.
+fn repo_from_remote_url(url: &str) -> Option<String> {
+    let rest = twigpine_core::url_scheme::strip_scheme(url.trim())?;
     let slash = rest.rfind('/')?;
     let did = &rest[..slash];
-    let repo = &rest[slash + 1..];
+    let repo = twigpine_core::ucan::push::canonical_repo_name(&rest[slash + 1..]);
+    if did.is_empty() || repo.is_empty() {
+        return None;
+    }
     let short_did = did.split(':').next_back().unwrap_or(did);
     Some(format!("{short_did}/{repo}"))
+}
+
+#[cfg(test)]
+mod remote_url_tests {
+    use super::repo_from_remote_url;
+
+    #[test]
+    fn either_scheme_and_one_git_suffix() {
+        for url in [
+            "twigpine://did:key:z6MkA/repo\n",
+            "gitlawb://did:key:z6MkA/repo",
+            "twigpine://did:key:z6MkA/repo.git",
+        ] {
+            assert_eq!(
+                repo_from_remote_url(url).as_deref(),
+                Some("z6MkA/repo"),
+                "{url:?}"
+            );
+        }
+        assert_eq!(
+            repo_from_remote_url("twigpine://did:key:z6MkA/foo.git.git").as_deref(),
+            Some("z6MkA/foo.git")
+        );
+        for bad in [
+            "https://x/did/repo",
+            "twigpine://",
+            "twigpine://did:key:z6MkA/",
+        ] {
+            assert_eq!(repo_from_remote_url(bad), None, "{bad:?}");
+        }
+    }
 }
 
 #[cfg(test)]

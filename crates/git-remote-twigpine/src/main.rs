@@ -1,11 +1,13 @@
-//! git-remote-twigpine — git remote helper for gitlawb:// URLs
+//! git-remote-twigpine — git remote helper for twigpine:// URLs
 //!
-//! Git calls this binary when it encounters a remote URL with the "gitlawb://" scheme.
-//! It implements the git remote helper protocol, translating gitlawb:// URLs into
-//! HTTP smart-protocol requests against a twigpine-node.
+//! Git calls this binary when it encounters a remote URL with the "twigpine://"
+//! scheme, and runs it as `git-remote-gitlawb` for the "gitlawb://" spelling
+//! from before the rename. It implements the git remote helper protocol,
+//! translating those URLs into HTTP smart-protocol requests against a
+//! twigpine-node.
 //!
 //! # URL format
-//!   gitlawb://did:key:z6Mk.../repo-name
+//!   twigpine://did:key:z6Mk.../repo-name   (or gitlawb://...)
 //!
 //! # v0.1 resolution
 //!   DID → http://127.0.0.1:7545  (hardcoded; v0.2 will use DHT)
@@ -207,11 +209,12 @@ fn help_text() -> String {
     format!(
         "{}\n\
          \n\
-         Git remote helper for gitlawb:// URLs. Git invokes this automatically\n\
-         when it encounters a gitlawb:// remote; you normally do not run it directly.\n\
+         Git remote helper for twigpine:// URLs, and for gitlawb:// from before the\n\
+         rename. Git invokes it automatically for such a remote; you normally do not\n\
+         run it directly.\n\
          \n\
          USAGE:\n\
-         \x20   git clone gitlawb://did:key:z6Mk.../<repo>\n\
+         \x20   git clone twigpine://did:key:z6Mk.../<repo>\n\
          \n\
          ENVIRONMENT:\n\
          \x20   TWIGPINE_NODE   Node base URL (default: {DEFAULT_LOCAL_NODE})\n\
@@ -480,7 +483,7 @@ fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::red
 
 // ── Smart-protocol request builders ───────────────────────────────────────────
 
-const USER_AGENT: &str = "git/2.0 git-remote-gitlawb/0.1.0";
+const USER_AGENT: &str = concat!("git/2.0 git-remote-twigpine/", env!("CARGO_PKG_VERSION"));
 
 /// Build the Phase-1 ref-advertisement GET, signing it when an identity is
 /// present. The node gates the ref advertisement on read visibility for BOTH
@@ -773,18 +776,19 @@ fn build_pack_post_request(
 
 // ── URL helpers ───────────────────────────────────────────────────────────────
 
-/// Parse a `gitlawb://did:key:z6Mk.../repo-name` URL.
+/// Parse a `twigpine://did:key:z6Mk.../repo-name` URL, or its `gitlawb://`
+/// spelling from before the rename. Git runs this helper as
+/// `git-remote-twigpine` for the first and `git-remote-gitlawb` for the second.
 ///
 /// Returns `(did_string, short_owner, repo_name)`.
 fn parse_gitlawb_url(url: &str) -> Result<(String, String, String)> {
-    let without_scheme = url
-        .strip_prefix("gitlawb://")
-        .ok_or_else(|| anyhow::anyhow!("not a gitlawb:// URL: {url}"))?;
+    let without_scheme = twigpine_core::url_scheme::strip_scheme(url)
+        .ok_or_else(|| anyhow::anyhow!("not a twigpine:// or gitlawb:// URL: {url}"))?;
 
     // without_scheme = "did:key:z6Mk.../repo-name"
     let (did_string, repo_name) = without_scheme
         .rsplit_once('/')
-        .ok_or_else(|| anyhow::anyhow!("gitlawb:// URL must be did:.../repo-name, got: {url}"))?;
+        .ok_or_else(|| anyhow::anyhow!("twigpine:// URL must be did:.../repo-name, got: {url}"))?;
 
     // short_owner = last colon-delimited segment, e.g. "z6Mk..."
     // The node's DB uses a LIKE '%<short_owner>' query to match the full DID.
@@ -794,7 +798,12 @@ fn parse_gitlawb_url(url: &str) -> Result<(String, String, String)> {
         .unwrap_or(did_string)
         .to_string();
 
-    let repo_name = repo_name.trim_end_matches(".git").to_string();
+    // The path segment goes to the node as written. The node strips at most one
+    // `.git` (`smart_http_repo_name`), the same rule as the delegation lookup
+    // below (`canonical_repo_name`), so `my-repo.git` reaches `my-repo` and a
+    // repository literally named `foo.git` is reached as `foo.git.git`.
+    // Stripping here as well would send `foo.git.git` to `foo`.
+    let repo_name = repo_name.to_string();
 
     tracing::debug!("parsed URL → did={did_string}, owner={short_owner}, repo={repo_name}");
     Ok((did_string.to_string(), short_owner, repo_name))
@@ -2386,9 +2395,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_url_strips_dot_git() {
-        let (_, _, repo) = parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo.git").unwrap();
+    fn parse_url_under_the_new_scheme() {
+        let (did, owner, repo) =
+            parse_gitlawb_url("twigpine://did:key:z6MkFoo123/my-repo").unwrap();
+        assert_eq!(did, "did:key:z6MkFoo123");
+        assert_eq!(owner, "z6MkFoo123");
         assert_eq!(repo, "my-repo");
+    }
+
+    /// The path segment reaches the node as written, and the node's
+    /// at-most-one `.git` rule names the repository: `my-repo.git` is
+    /// `my-repo`, and `foo.git.git` is the repository literally named
+    /// `foo.git`, not `foo`.
+    #[test]
+    fn parse_url_leaves_the_git_suffix_to_the_node() {
+        use twigpine_core::ucan::push::canonical_repo_name;
+        for (url, segment, repository) in [
+            (
+                "gitlawb://did:key:z6MkFoo123/my-repo.git",
+                "my-repo.git",
+                "my-repo",
+            ),
+            (
+                "twigpine://did:key:z6MkFoo123/my-repo",
+                "my-repo",
+                "my-repo",
+            ),
+            (
+                "twigpine://did:key:z6MkFoo123/foo.git.git",
+                "foo.git.git",
+                "foo.git",
+            ),
+        ] {
+            let (_, _, repo) = parse_gitlawb_url(url).unwrap();
+            assert_eq!(repo, segment, "{url}");
+            assert_eq!(canonical_repo_name(&repo), repository, "{url}");
+        }
     }
 
     #[test]

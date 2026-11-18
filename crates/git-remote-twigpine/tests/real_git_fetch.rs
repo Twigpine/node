@@ -1146,6 +1146,40 @@ fn real_git_multi_round_fetch_completes() {
     // No manual cleanup: `repos` drops here (or on unwind) and removes the tree.
 }
 
+/// A `twigpine://` remote: git runs `git-remote-twigpine` for it, and the
+/// fetch completes exactly as it does under the old scheme.
+#[test]
+fn real_git_fetch_through_a_twigpine_remote() {
+    let repos = build_divergent_repos(3);
+    let (server, clone) = (repos.server.clone(), repos.clone.clone());
+    git(
+        &clone,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "twigpine://did:key:zTESTOWNER/myrepo",
+        ],
+    );
+    // Both helper names sit in the same build directory, which
+    // `fetch_with_helper` puts on PATH; the scheme alone picks this one.
+    assert!(
+        PathBuf::from(env!("CARGO_BIN_EXE_git-remote-twigpine")).is_file(),
+        "the helper must exist under its new name"
+    );
+    let shim = start_shim(server.clone(), ShimMode::Normal);
+
+    let (completed, out) = fetch_with_helper(&clone, &shim.base_url);
+    assert!(
+        completed && out.status.success(),
+        "fetch through twigpine:// failed. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let server_head = String::from_utf8(git(&server, &["rev-parse", "HEAD"])).unwrap();
+    let fetched = String::from_utf8(git(&clone, &["rev-parse", "FETCH_HEAD"])).unwrap();
+    assert_eq!(server_head.trim(), fetched.trim());
+}
+
 /// #192 (F3): a panic (any unwind) mid-test still removes the repos. The old
 /// success-only `cleanup()` ran after the assertions, so a failing test leaked real
 /// git repos; the RAII `TempDir` drops during unwind instead. Load-bearing: the

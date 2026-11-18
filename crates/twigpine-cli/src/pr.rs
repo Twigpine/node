@@ -229,8 +229,12 @@ fn detect_remote_owner() -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let url = String::from_utf8(out.stdout).ok()?;
-    let rest = url.trim().strip_prefix("gitlawb://")?;
+    owner_from_remote_url(&String::from_utf8(out.stdout).ok()?)
+}
+
+/// `twigpine://did:key:z6Mk.../repo` (or `gitlawb://...`) → `z6Mk...`.
+fn owner_from_remote_url(url: &str) -> Option<String> {
+    let rest = twigpine_core::url_scheme::strip_scheme(url.trim())?;
     let slash = rest.rfind('/')?;
     let did = &rest[..slash];
     Some(did.split(':').next_back().unwrap_or(did).to_string())
@@ -581,6 +585,24 @@ async fn cmd_comments(repo: String, number: u64, node: String, dir: Option<PathB
         println!();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod remote_url_tests {
+    use super::owner_from_remote_url;
+
+    #[test]
+    fn either_scheme() {
+        assert_eq!(
+            owner_from_remote_url("twigpine://did:key:z6MkA/repo\n").as_deref(),
+            Some("z6MkA")
+        );
+        assert_eq!(
+            owner_from_remote_url("gitlawb://did:key:z6MkA/repo").as_deref(),
+            Some("z6MkA")
+        );
+        assert_eq!(owner_from_remote_url("https://x/repo"), None);
+    }
 }
 
 #[cfg(test)]

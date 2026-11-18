@@ -328,15 +328,10 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     // Git picks its helper by URL scheme, so a `gitlawb://` remote runs the helper
     // under the scheme's name. It is the same program as git-remote-twigpine;
     // probing this name is what tells us clone and push will work.
-    if which_in_path("git-remote-gitlawb") {
-        checks.push(Check::pass("git-remote-gitlawb", "found in PATH"));
-    } else {
-        checks.push(Check::fail(
-            "git-remote-gitlawb",
-            "not found in PATH — gitlawb:// clone/push will not work",
-            "curl -fsSL https://twigpine.com/install.sh | sh",
-        ));
-    }
+    checks.push(helper_check(
+        which_in_path("git-remote-gitlawb"),
+        which_in_path("git-remote-twigpine"),
+    ));
 
     // ── 6. git ────────────────────────────────────────────────────────────
     match std::process::Command::new("git")
@@ -509,7 +504,7 @@ async fn probe_transport(url: &str) -> TransportVerdict {
             if body.truncated || body.read_failed {
                 return TransportVerdict {
                     usable: false,
-                    detail: "response too large or incomplete for a gitlawb node".to_string(),
+                    detail: "response too large or incomplete for a Twigpine node".to_string(),
                 };
             }
             let info = serde_json::from_slice::<serde_json::Value>(&body.bytes).unwrap_or_default();
@@ -524,7 +519,7 @@ async fn probe_transport(url: &str) -> TransportVerdict {
             } else {
                 TransportVerdict {
                     usable: false,
-                    detail: "something is listening but it is not a gitlawb node".to_string(),
+                    detail: "something is listening but it is not a Twigpine node".to_string(),
                 }
             }
         }
@@ -603,6 +598,27 @@ fn is_loopback_url(value: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The git helper row. Git runs `git-remote-gitlawb` for `gitlawb://` remotes,
+/// which is what every remote created so far uses, so without it clone and push
+/// fail now: a failure. `git-remote-twigpine` runs `twigpine://` remotes, which
+/// new remotes will use from a coming release: a warning until then.
+fn helper_check(has_old_name: bool, has_new_name: bool) -> Check {
+    const INSTALL: &str = "curl -fsSL https://twigpine.com/install.sh | sh";
+    match (has_old_name, has_new_name) {
+        (true, true) => Check::pass("git helper", "git-remote-twigpine and git-remote-gitlawb found in PATH"),
+        (false, _) => Check::fail(
+            "git helper",
+            "git-remote-gitlawb not found in PATH — clone and push of gitlawb:// remotes will not work",
+            INSTALL,
+        ),
+        (true, false) => Check::warn(
+            "git helper",
+            "git-remote-twigpine not found in PATH — twigpine:// remotes will not work",
+            INSTALL,
+        ),
+    }
+}
+
 /// Check if a binary name exists anywhere on PATH.
 fn which_in_path(name: &str) -> bool {
     std::env::var_os("PATH")
@@ -645,7 +661,7 @@ fn legacy_settings_check(report: &twigpine_core::legacy_env::Report) -> Option<C
 
 async fn check_version(current: &'static str, github_api_base: &str) -> Check {
     let client = match reqwest::Client::builder()
-        .user_agent(format!("gl/{current}"))
+        .user_agent(format!("twigpine/{current}"))
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {
@@ -924,6 +940,14 @@ mod tests {
     /// re-tier so flipping it back to `Check::fail` breaks the suite — the
     /// previous `has_failures`-only tests built their own `Check::warn` rows
     /// and could not see the re-tier at all.
+    #[test]
+    fn helper_row_needs_the_old_name_and_wants_the_new_one() {
+        assert!(matches!(helper_check(true, true).state, CheckState::Ok));
+        assert!(matches!(helper_check(false, true).state, CheckState::Fail));
+        assert!(matches!(helper_check(false, false).state, CheckState::Fail));
+        assert!(matches!(helper_check(true, false).state, CheckState::Warn));
+    }
+
     #[test]
     fn legacy_settings_row_appears_only_when_an_old_name_is_in_use() {
         use twigpine_core::legacy_env::Report;

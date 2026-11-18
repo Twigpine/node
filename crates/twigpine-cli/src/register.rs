@@ -110,7 +110,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
     match &saved_to {
         Some(path) => {
             println!("  Bootstrap UCAN saved to {}", path.display());
-            println!("  You are now a verified agent on the gitlawb network.");
+            println!("  You are now a verified agent on the Twigpine network.");
         }
         None => {
             println!("  The node returned no bootstrap UCAN, so this identity is not");

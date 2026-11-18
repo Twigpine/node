@@ -109,13 +109,14 @@ fn is_safe_component(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
 }
 
-/// Pull the repo this capability names out of `gitlawb://repos/<owner>/<repo>`.
+/// Pull the repo this capability names out of `twigpine://repos/<owner>/<repo>`
+/// (or the `gitlawb://` spelling from before the rename).
 ///
 /// Requires exactly two components after the prefix. Anything else — extra
 /// segments, a trailing slash, an empty half — is refused rather than
 /// interpreted, so no input can address a location the caller did not intend.
 fn repo_from_resource(with: &str) -> Option<(String, String)> {
-    let rest = with.strip_prefix("gitlawb://repos/")?;
+    let rest = twigpine_core::url_scheme::strip_resource_prefix(with)?;
     let mut parts = rest.split('/');
     let owner = parts.next()?;
     let name = parts.next()?;
@@ -139,7 +140,18 @@ fn repo_from_resource(with: &str) -> Option<(String, String)> {
 /// before.
 pub(crate) fn canonical_resource(with: &str) -> String {
     match repo_from_resource(with) {
-        Some((owner, repo)) => format!("gitlawb://repos/{owner}/{repo}"),
+        Some((owner, repo)) => {
+            // Read back, the resource loses at most one `.git`
+            // (`Capability::grants_push_to`). A repository whose name itself
+            // ends in `.git` is therefore written with one more, or the token
+            // would name the repository without it.
+            let written = if repo.ends_with(".git") {
+                format!("{repo}.git")
+            } else {
+                repo
+            };
+            format!("gitlawb://repos/{owner}/{written}")
+        }
         None => with.to_string(),
     }
 }
@@ -992,6 +1004,41 @@ async fn cmd_verify(token: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_resource_typed_with_the_new_scheme_is_issued_under_the_old_one() {
+        // UCAN resources keep the old spelling: the node hosting a repository
+        // checks it, and that node may not read the new one yet.
+        assert_eq!(
+            super::canonical_resource("twigpine://repos/did:key:z6MkA/r.git"),
+            "gitlawb://repos/did:key:z6MkA/r"
+        );
+        assert_eq!(
+            super::canonical_resource("gitlawb://repos/did:key:z6MkA/r"),
+            "gitlawb://repos/did:key:z6MkA/r"
+        );
+    }
+
+    /// The resource a token is minted with names the same repository when the
+    /// node reads it back: `r.git` is `r`, and `foo.git.git` is the repository
+    /// literally named `foo.git`.
+    #[test]
+    fn a_minted_resource_reads_back_as_the_repository_it_was_given() {
+        use twigpine_core::ucan::{caps, Capability};
+        for (typed, repository, not) in [
+            ("twigpine://repos/did:key:z6MkA/r.git", "r", "r.git"),
+            (
+                "twigpine://repos/did:key:z6MkA/foo.git.git",
+                "foo.git",
+                "foo",
+            ),
+            ("gitlawb://repos/did:key:z6MkA/plain", "plain", "plain.git"),
+        ] {
+            let cap = Capability::new(super::canonical_resource(typed), caps::GIT_PUSH);
+            assert!(cap.grants_push_to("did:key:z6MkA", repository), "{typed}");
+            assert!(!cap.grants_push_to("did:key:z6MkA", not), "{typed}");
+        }
+    }
+
     use super::*;
     use tempfile::TempDir;
     use twigpine_core::identity::Keypair;
