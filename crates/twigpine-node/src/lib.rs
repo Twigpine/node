@@ -1783,10 +1783,27 @@ fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool
 /// `reqwest::Client::new()` — its default follows redirects. Kept as a named
 /// builder so tests bind the redirect guarantee to the real client the node
 /// runs, not a hand-rolled equivalent.
+///
+/// Two more guarantees sit next to the redirect one. Hostnames resolve through
+/// the resolver policy, which refuses any answer that is empty, oversized or
+/// holds a non-public address, so a name that points at loopback, a private
+/// range or cloud metadata never gets a connection. And environment proxies
+/// are ignored: a proxy would receive the hostname and resolve it itself,
+/// which skips the policy.
 fn build_http_client() -> reqwest::Result<reqwest::Client> {
+    build_http_client_with(resolver_policy::ResolverPolicy::production())
+}
+
+/// `build_http_client` over a caller-supplied resolver, so tests can inject the
+/// lookup. Production code passes `ResolverPolicy::production()`.
+fn build_http_client_with(
+    resolver: resolver_policy::ResolverPolicy,
+) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(OUTBOUND_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(resolver))
         .build()
 }
 
@@ -2379,6 +2396,160 @@ mod gossip_ssrf_tests {
     async fn ping_peer_readiness_reports_unready_on_connection_error() {
         let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
         assert!(!ok, "a connection error must count as an unready peer");
+    }
+
+    // A loopback listener that counts accepted connections and answers 200, so
+    // a refused request shows as a zero count and a leak shows as a hit.
+    async fn counting_listener() -> (u16, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        (port, accepted)
+    }
+
+    // A policy client whose lookup answers `answers` for every host, plus the
+    // count of lookups it was asked to make.
+    fn fake_policy_client(answers: Vec<std::net::IpAddr>) -> (reqwest::Client, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let policy = crate::resolver_policy::ResolverPolicy::new(
+            move |_host| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let answers = answers.clone();
+                Box::pin(async move { Ok(answers) })
+            },
+            Duration::from_secs(5),
+            32,
+        );
+        let client =
+            super::build_http_client_with(policy).expect("failed to build policy http client");
+        (client, calls)
+    }
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    // The witness host passes the string gate, so only resolution can refuse it.
+    const WITNESS_HOST: &str = "rebind.invalid";
+
+    #[tokio::test]
+    async fn shared_client_refuses_a_name_that_resolves_to_loopback() {
+        let (port, accepted) = counting_listener().await;
+        let url = format!("http://{WITNESS_HOST}:{port}/");
+        assert!(crate::api::peers::is_public_http_url(&url));
+        let (client, calls) = fake_policy_client(vec![ip("127.0.0.1")]);
+
+        let res = client.get(&url).send().await;
+
+        assert!(res.is_err(), "a loopback answer must be refused");
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the policy was not asked");
+    }
+
+    #[tokio::test]
+    async fn shared_client_refuses_each_non_public_answer_shape() {
+        let cases: [(&str, Vec<std::net::IpAddr>); 4] = [
+            ("link-local metadata", vec![ip("169.254.169.254")]),
+            ("rfc1918", vec![ip("10.0.0.1")]),
+            ("mapped loopback", vec![ip("::ffff:127.0.0.1")]),
+            (
+                "public plus loopback",
+                vec![ip("93.184.216.34"), ip("127.0.0.1")],
+            ),
+        ];
+        for (label, answers) in cases {
+            let (port, accepted) = counting_listener().await;
+            let url = format!("http://{WITNESS_HOST}:{port}/");
+            assert!(crate::api::peers::is_public_http_url(&url));
+            let (client, calls) = fake_policy_client(answers);
+
+            let res = client.get(&url).send().await;
+
+            assert!(res.is_err(), "{label}: the request must be refused");
+            assert_eq!(accepted.load(Ordering::SeqCst), 0, "{label}: leaked");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{label}: not consulted");
+        }
+    }
+
+    // Drives the real production lookup: localhost resolves from /etc/hosts
+    // with no network query. Run in a child so a proxy in the runner's
+    // environment cannot intercept the request.
+    #[tokio::test]
+    async fn production_client_refuses_localhost() {
+        use crate::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            run_isolated(
+                "gossip_ssrf_tests::production_client_refuses_localhost",
+                &[],
+            );
+            return;
+        }
+        let (port, accepted) = counting_listener().await;
+
+        let res = production_http_client()
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await;
+
+        assert!(res.is_err(), "the production client must refuse localhost");
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+    }
+
+    // The announce funnel stores a hostname the string gate accepts. The ping
+    // rounds must then never reach the listener it resolves to.
+    #[sqlx::test]
+    async fn gossip_ping_round_never_reaches_a_name_that_resolves_to_loopback(pool: PgPool) {
+        let (port, accepted) = counting_listener().await;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let did = "did:key:z6Mkrmsd28nDTPBjk55EJCSjtJLVJDZffyczjBEHvywhutM4";
+        let url = format!("http://{WITNESS_HOST}:{port}");
+        state
+            .db
+            .upsert_peer(did, &url, crate::db::PeerWriteAuthority::Unproven)
+            .await
+            .expect("the string gate accepts the witness host");
+        // Start reachable so the final false is a change the rounds caused.
+        state.db.mark_peer_ping(did, true).await.unwrap();
+        let (client, calls) = fake_policy_client(vec![ip("127.0.0.1")]);
+
+        let mut failed_once = HashSet::new();
+        for _ in 0..2 {
+            gossip_ping_round(
+                state.db.as_ref(),
+                &client,
+                &mut failed_once,
+                state.db.list_peers().await.unwrap(),
+            )
+            .await;
+        }
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        let peer = state
+            .db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .unwrap();
+        assert!(!peer.last_ping_ok, "a refused peer must end up unreachable");
     }
 }
 

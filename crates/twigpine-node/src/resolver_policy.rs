@@ -7,9 +7,6 @@
 //! passes `is_public_ip`; otherwise the whole answer is refused, never
 //! filtered or truncated.
 
-// The clients that install this resolver are wired in by later changes.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
