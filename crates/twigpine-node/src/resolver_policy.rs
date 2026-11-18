@@ -25,7 +25,6 @@ const MAX_ANSWERS: usize = 32;
 type LookupFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<IpAddr>>> + Send>>;
 type LookupFn = dyn Fn(String) -> LookupFuture + Send + Sync;
 
-/// Why an answer was refused. Each variant has a fixed log reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Denial {
     NonPublic,
@@ -36,7 +35,7 @@ pub(crate) enum Denial {
 }
 
 impl Denial {
-    pub(crate) fn reason(self) -> &'static str {
+    fn reason(self) -> &'static str {
         match self {
             Denial::NonPublic => "non-public answer",
             Denial::Empty => "empty answer",
@@ -55,9 +54,7 @@ impl std::fmt::Display for Denial {
 
 impl std::error::Error for Denial {}
 
-/// Deduplicate `answers` and accept them only when there are 1 to `max`
-/// distinct addresses and every one is public.
-pub(crate) fn check_answers(answers: &[IpAddr], max: usize) -> Result<Vec<IpAddr>, Denial> {
+fn check_answers(answers: &[IpAddr], max: usize) -> Result<Vec<IpAddr>, Denial> {
     let mut seen = HashSet::new();
     let distinct: Vec<IpAddr> = answers
         .iter()
@@ -95,7 +92,6 @@ impl ResolverPolicy {
         }
     }
 
-    /// The system resolver under the production deadline and answer cap.
     pub(crate) fn production() -> Self {
         Self::new(
             |host| {
@@ -109,8 +105,6 @@ impl ResolverPolicy {
         )
     }
 
-    /// Look `host` up and return the checked addresses, or the reason for
-    /// refusal. Logs each refusal once.
     pub(crate) async fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, Denial> {
         let result =
             match tokio::time::timeout(self.deadline, (self.lookup)(host.to_string())).await {
@@ -131,13 +125,7 @@ impl Resolve for ResolverPolicy {
         Box::pin(async move {
             let addrs = this.resolve_host(name.as_str()).await?;
             // reqwest replaces the port with the URL's port.
-            let addrs: Addrs = Box::new(
-                addrs
-                    .into_iter()
-                    .map(|ip| SocketAddr::new(ip, 0))
-                    .collect::<Vec<_>>()
-                    .into_iter(),
-            );
+            let addrs: Addrs = Box::new(addrs.into_iter().map(|ip| SocketAddr::new(ip, 0)));
             Ok(addrs)
         })
     }

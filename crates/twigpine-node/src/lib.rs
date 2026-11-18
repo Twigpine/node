@@ -1844,7 +1844,7 @@ fn build_operator_http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// Process-wide operator client, built once. See `build_operator_http_client`.
+/// Process-wide operator client. See `build_operator_http_client`.
 pub(crate) fn operator_http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT
@@ -2547,7 +2547,10 @@ mod gossip_ssrf_tests {
             let proxy = format!("http://127.0.0.1:{proxy_port}");
             run_isolated(
                 "gossip_ssrf_tests::shared_client_ignores_env_proxy",
-                &[("HTTP_PROXY", proxy.as_str()), ("ALL_PROXY", proxy.as_str())],
+                &[
+                    ("HTTP_PROXY", proxy.as_str()),
+                    ("ALL_PROXY", proxy.as_str()),
+                ],
             );
             assert_eq!(
                 proxy_hits.load(Ordering::SeqCst),

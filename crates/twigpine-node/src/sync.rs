@@ -245,7 +245,6 @@ fn sync_lag_from_origin_timestamp(
     (lag <= MAX_SYNC_LAG_OBSERVATION).then_some(lag)
 }
 
-/// Where `process_batch` gets the git handle for a peer row.
 enum GitSource {
     Hardened {
         resolver: crate::resolver_policy::ResolverPolicy,
@@ -462,7 +461,8 @@ impl NetworkGit {
                 .await
                 .map_err(|d| anyhow::anyhow!("peer host {host} refused: {d}"))?;
             // Same entry format as the upstream mirror worker's pin.
-            let addrs: std::collections::BTreeSet<std::net::IpAddr> = addrs.into_iter().collect();
+            let mut addrs = addrs;
+            addrs.sort_unstable();
             let list = addrs
                 .iter()
                 .map(|ip| match ip {
@@ -986,8 +986,8 @@ async fn replicate_encrypted_blobs(
 }
 
 /// Run a git subprocess, returning an error with stderr on non-zero exit.
-async fn git_run(args: &[&str]) -> anyhow::Result<()> {
-    let out = tokio::process::Command::new("git")
+async fn git_output(mut cmd: tokio::process::Command, args: &[&str]) -> anyhow::Result<()> {
+    let out = cmd
         .args(args)
         .output()
         .await
@@ -999,19 +999,12 @@ async fn git_run(args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run a git subprocess that contacts the peer, through `net`.
+async fn git_run(args: &[&str]) -> anyhow::Result<()> {
+    git_output(tokio::process::Command::new("git"), args).await
+}
+
 async fn git_run_net(net: &NetworkGit, args: &[&str]) -> anyhow::Result<()> {
-    let out = net
-        .command()
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("git failed to spawn: {e}"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow::anyhow!("git {args:?} failed: {stderr}"));
-    }
-    Ok(())
+    git_output(net.command(), args).await
 }
 
 /// Observe `gitlawb_sync_lag_seconds` for one dequeued row, but only when the
@@ -3561,7 +3554,10 @@ mod tests {
             let proxy = format!("http://127.0.0.1:{proxy_port}");
             run_isolated(
                 "sync::tests::sync_client_ignores_env_proxy",
-                &[("HTTP_PROXY", proxy.as_str()), ("ALL_PROXY", proxy.as_str())],
+                &[
+                    ("HTTP_PROXY", proxy.as_str()),
+                    ("ALL_PROXY", proxy.as_str()),
+                ],
             );
             assert_eq!(
                 proxy_hits.load(std::sync::atomic::Ordering::SeqCst),
