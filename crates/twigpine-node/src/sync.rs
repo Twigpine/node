@@ -3549,6 +3549,35 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    // Same proxy-bypass guard as the shared client: a configured proxy would
+    // resolve the peer's hostname itself, skipping the resolver policy. The
+    // parent binds the decoy proxy listener and sets HTTP_PROXY/ALL_PROXY on
+    // the child; the child requests an IP-literal URL on a second listener.
+    #[tokio::test]
+    async fn sync_client_ignores_env_proxy() {
+        use crate::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            let (proxy_port, proxy_hits) = counting_listener().await;
+            let proxy = format!("http://127.0.0.1:{proxy_port}");
+            run_isolated(
+                "sync::tests::sync_client_ignores_env_proxy",
+                &[("HTTP_PROXY", proxy.as_str()), ("ALL_PROXY", proxy.as_str())],
+            );
+            assert_eq!(
+                proxy_hits.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the client must not dial the configured proxy"
+            );
+            return;
+        }
+        let (port, accepted) = counting_listener().await;
+        let _ = build_sync_http_client()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn sync_client_refuses_a_name_that_resolves_to_loopback_in_register_replica() {
         let (resolver, calls) = loopback_resolver();

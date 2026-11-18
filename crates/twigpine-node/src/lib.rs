@@ -2533,6 +2533,38 @@ mod gossip_ssrf_tests {
         assert_eq!(accepted.load(Ordering::SeqCst), 0);
     }
 
+    // A configured proxy receives the target hostname and resolves it itself,
+    // which bypasses the resolver policy, so the shared client must ignore
+    // proxy env vars. The parent binds the decoy "proxy" listener and points
+    // HTTP_PROXY/ALL_PROXY at it; the child requests an IP-literal URL on a
+    // second listener, which needs no resolution. If the client honored the
+    // proxy, the decoy sees a connection.
+    #[tokio::test]
+    async fn shared_client_ignores_env_proxy() {
+        use crate::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            let (proxy_port, proxy_hits) = counting_listener().await;
+            let proxy = format!("http://127.0.0.1:{proxy_port}");
+            run_isolated(
+                "gossip_ssrf_tests::shared_client_ignores_env_proxy",
+                &[("HTTP_PROXY", proxy.as_str()), ("ALL_PROXY", proxy.as_str())],
+            );
+            assert_eq!(
+                proxy_hits.load(Ordering::SeqCst),
+                0,
+                "the client must not dial the configured proxy"
+            );
+            return;
+        }
+        let (port, accepted) = counting_listener().await;
+        production_http_client()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect("an IP-literal request must succeed");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
     // The announce funnel stores a hostname the string gate accepts. The ping
     // rounds must then never reach the listener it resolves to.
     #[sqlx::test]
