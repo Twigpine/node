@@ -26,6 +26,7 @@ mod p2p;
 mod pinata;
 mod rate_limit;
 mod reconciliation;
+mod resolver_policy;
 pub mod server;
 pub mod state;
 mod sync;
