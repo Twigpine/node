@@ -95,7 +95,7 @@ fn is_loopback_http(url: &str) -> bool {
 }
 
 /// Refuse to sign a request destined for a cleartext hop off this machine
-/// unless the operator has opted in. `GITLAWB_ALLOW_INSECURE_HTTP` exists for a
+/// unless the operator has opted in. `TWIGPINE_ALLOW_INSECURE_HTTP` exists for a
 /// private LAN where the operator has decided that is acceptable; only `1` or
 /// `true` opts in. A loopback node is never proxied (see
 /// [`is_loopback_http`]), so a proxy cannot carry its signed requests
@@ -109,12 +109,12 @@ fn ensure_signing_transport(node_base: &str, allow_insecure: bool) -> Result<()>
          The request is signed but not encrypted, so the Signature header and \
          the body are readable by anyone on the path, and a captured signature \
          can be replayed.\n\
-         Use https://, or set GITLAWB_ALLOW_INSECURE_HTTP=1 to accept the risk \
+         Use https://, or set TWIGPINE_ALLOW_INSECURE_HTTP=1 to accept the risk \
          (for a trusted private network only)."
     )
 }
 
-/// Parse a `GITLAWB_ALLOW_INSECURE_HTTP` value. Only `1` or `true`
+/// Parse a `TWIGPINE_ALLOW_INSECURE_HTTP` value. Only `1` or `true`
 /// (case-insensitive, after trim) opens the gate. Presence alone is not
 /// consent: `=0`, `=false` and an empty value read as "not opting in" to the
 /// operator, and the README and the refusal message document `=1`. A non-empty
@@ -137,7 +137,7 @@ fn allow_insecure_http_from_str(raw: Option<&str>) -> bool {
 /// Fixed warning for a set but non-truthy value. The raw value is never printed.
 fn warn_allow_insecure_http_non_truthy() {
     eprintln!(
-        "warning: GITLAWB_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); \
+        "warning: TWIGPINE_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); \
          plaintext http to a remote node remains refused"
     );
 }
@@ -146,7 +146,7 @@ fn warn_allow_insecure_http_non_truthy() {
 /// or shell can set it without rebuilding the client. A non-UTF-8 value fails
 /// closed and warns like any other non-truthy one.
 fn insecure_http_allowed() -> bool {
-    match std::env::var("GITLAWB_ALLOW_INSECURE_HTTP") {
+    match std::env::var("TWIGPINE_ALLOW_INSECURE_HTTP") {
         Ok(v) => allow_insecure_http_from_str(Some(&v)),
         Err(std::env::VarError::NotUnicode(_)) => {
             warn_allow_insecure_http_non_truthy();
@@ -2174,7 +2174,7 @@ mod tests {
 
     // ── #413 plaintext-remote signing guard ──────────────────────────────
 
-    /// Holds [`ICAPTCHA_ENV_LOCK`] while it points `GITLAWB_ALLOW_INSECURE_HTTP`
+    /// Holds [`ICAPTCHA_ENV_LOCK`] while it points `TWIGPINE_ALLOW_INSECURE_HTTP`
     /// at `value` (or removes it), restoring the prior value on drop.
     struct InsecureHttpEnv {
         _lock: MutexGuard<'static, ()>,
@@ -2184,10 +2184,10 @@ mod tests {
     impl InsecureHttpEnv {
         fn set(value: Option<&str>) -> Self {
             let lock = ICAPTCHA_ENV_LOCK.lock().unwrap();
-            let prev = std::env::var_os("GITLAWB_ALLOW_INSECURE_HTTP");
+            let prev = std::env::var_os("TWIGPINE_ALLOW_INSECURE_HTTP");
             match value {
-                Some(v) => std::env::set_var("GITLAWB_ALLOW_INSECURE_HTTP", v),
-                None => std::env::remove_var("GITLAWB_ALLOW_INSECURE_HTTP"),
+                Some(v) => std::env::set_var("TWIGPINE_ALLOW_INSECURE_HTTP", v),
+                None => std::env::remove_var("TWIGPINE_ALLOW_INSECURE_HTTP"),
             }
             InsecureHttpEnv { _lock: lock, prev }
         }
@@ -2196,8 +2196,8 @@ mod tests {
     impl Drop for InsecureHttpEnv {
         fn drop(&mut self) {
             match self.prev.take() {
-                Some(v) => std::env::set_var("GITLAWB_ALLOW_INSECURE_HTTP", v),
-                None => std::env::remove_var("GITLAWB_ALLOW_INSECURE_HTTP"),
+                Some(v) => std::env::set_var("TWIGPINE_ALLOW_INSECURE_HTTP", v),
+                None => std::env::remove_var("TWIGPINE_ALLOW_INSECURE_HTTP"),
             }
         }
     }
@@ -2235,7 +2235,7 @@ mod tests {
         let err = ensure_signing_transport("http://10.0.0.36:7777", false).unwrap_err();
         assert!(
             err.to_string().contains("plaintext http")
-                && err.to_string().contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+                && err.to_string().contains("TWIGPINE_ALLOW_INSECURE_HTTP"),
             "the refusal names the risk and the opt-in: {err}"
         );
         // Opted in, loopback, and https all pass.
@@ -2322,7 +2322,7 @@ mod tests {
             "all_proxy",
             "NO_PROXY",
             "no_proxy",
-            "GITLAWB_ALLOW_INSECURE_HTTP",
+            "TWIGPINE_ALLOW_INSECURE_HTTP",
         ] {
             cmd.env_remove(k);
         }
@@ -2495,7 +2495,7 @@ mod tests {
             &[
                 ("GL_ROUTE_REMOTE", "1"),
                 ("GL_ROUTE_ALLOW", "1"),
-                ("GITLAWB_ALLOW_INSECURE_HTTP", "1"),
+                ("TWIGPINE_ALLOW_INSECURE_HTTP", "1"),
             ],
         );
     }

@@ -35,7 +35,7 @@ mod git_shim;
 /// Runs the schema migrations first, because the per-test database starts empty.
 ///
 /// **The config here is parsed from the process environment.** `Config` sources 47
-/// fields from `GITLAWB_*` variables, so a developer or CI environment that sets one
+/// fields from `TWIGPINE_*` variables, so a developer or CI environment that sets one
 /// silently changes what this state does. Never assert a behaviour that a config
 /// field controls on top of this state — use [`test_state_with`] and set the field,
 /// so the test states the configuration it is about instead of inheriting it.
