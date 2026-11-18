@@ -55,6 +55,7 @@ use crate::error::AppError;
 type HmacSha256 = Hmac<Sha256>;
 
 const CURSOR_PREFIX: &str = "v1";
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const KEY_DERIVATION_LABEL: &[u8] = b"gitlawb/tasks-cursor-key/v1";
 const TAG_DOMAIN: &[u8] = b"gitlawb/tasks-cursor-tag/v1";
 const STREAM_DOMAIN: &[u8] = b"gitlawb/tasks-cursor-stream/v1";

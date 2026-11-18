@@ -111,7 +111,7 @@ fn detect_repo_from_remote() -> Option<String> {
         return None;
     }
     let url = String::from_utf8(out.stdout).ok()?;
-    let rest = url.trim().strip_prefix("gitlawb://")?;
+    let rest = twigpine_core::url_scheme::strip_scheme(url.trim())?;
     let slash = rest.rfind('/')?;
     let did = &rest[..slash];
     let repo = &rest[slash + 1..];

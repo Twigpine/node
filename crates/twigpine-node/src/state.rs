@@ -19,6 +19,7 @@ const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
 /// trailing version rotates every node's token key on its next boot, which invalidates
 /// outstanding continuations (they simply fail to open and the caller restarts at the
 /// front) and needs no migration, no config, and no change to this function.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const SCAN_TOKEN_KEY_INFO: &[u8] = b"gitlawb/ipfs-scan-token/v1";
 
 /// HKDF salt for [`AppState::derive_webhook_secret_key`]. A constant, not a
@@ -32,6 +33,7 @@ const WEBHOOK_SECRET_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/webhook-secret";
 /// rotation: sealed secrets persist, `open` has no old-key fallback, and a new
 /// version renders every stored ciphertext permanently unopenable until a
 /// re-seal path exists.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const WEBHOOK_SECRET_KEY_INFO: &[u8] = b"gitlawb/webhook-secret/v1";
 
 #[derive(Clone, Debug)]

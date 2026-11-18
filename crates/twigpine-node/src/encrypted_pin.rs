@@ -25,6 +25,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// Order-insensitive (the input `BTreeSet` is already sorted).
 pub fn recipients_tag(node_seed: &[u8; 32], dids: &BTreeSet<String>) -> String {
     let mut mac = HmacSha256::new_from_slice(node_seed).expect("HMAC accepts any key length");
+    // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
     mac.update(b"gitlawb/recipients-tag/v1");
     for did in dids {
         mac.update(b"\n");

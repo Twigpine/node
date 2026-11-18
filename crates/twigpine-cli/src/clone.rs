@@ -237,16 +237,17 @@ pub fn setup_partial_clone(
 }
 
 /// Parse `repo` into (gitlawb_url, owner, name). Accepts a full
-/// `gitlawb://<owner>/<name>` URL or a bare `<owner>/<name>`. The owner DID may
+/// `twigpine://<owner>/<name>` URL (or the `gitlawb://` spelling) or a bare
+/// `<owner>/<name>`. The owner DID may
 /// itself contain colons but no slash, so split on the first slash.
 fn parse_repo(repo: &str) -> Result<(String, String, String)> {
-    let stripped = repo.strip_prefix("gitlawb://").unwrap_or(repo);
+    let stripped = twigpine_core::url_scheme::strip_scheme(repo).unwrap_or(repo);
     let (owner, name) = stripped
         .trim_end_matches('/')
         .split_once('/')
-        .context("repo must be <owner>/<name> or gitlawb://<owner>/<name>")?;
+        .context("repo must be <owner>/<name> or twigpine://<owner>/<name>")?;
     if owner.is_empty() || name.is_empty() || name.contains('/') {
-        bail!("repo must be <owner>/<name> or gitlawb://<owner>/<name>");
+        bail!("repo must be <owner>/<name> or twigpine://<owner>/<name>");
     }
     Ok((
         format!("gitlawb://{owner}/{name}"),
@@ -489,7 +490,7 @@ const ARWEAVE_PAGE_SIZE: usize = 100;
 
 /// Paginated discovery query: manifests tagged for this repo, newest first, with
 /// `pageInfo` for cursor pagination and `block{height}` for the recency tie-break.
-const ARWEAVE_DISCOVERY_QUERY: &str = r#"query($repo:String!,$cursor:String){transactions(tags:[{name:"App-Name",values:["gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100,after:$cursor){pageInfo{hasNextPage endCursor}edges{cursor node{id block{height}}}}}"#;
+const ARWEAVE_DISCOVERY_QUERY: &str = r#"query($repo:String!,$cursor:String){transactions(tags:[{name:"App-Name",values:["twigpine","gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100,after:$cursor){pageInfo{hasNextPage endCursor}edges{cursor node{id block{height}}}}}"#;
 
 /// A parsed page of an Arweave GraphQL `transactions` response: the edge refs
 /// plus pagination state. `has_next` is `None` when the response omitted

@@ -5907,6 +5907,7 @@ impl Drop for IntentDropGuard {
 /// no internal refs yet. Extracted so the gate predicate is unit-testable;
 /// the handler denies any push naming such a ref before intent is written.
 fn ref_is_internal_namespace(ref_name: &str) -> bool {
+    // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
     ref_name == "refs/gitlawb" || ref_name.starts_with("refs/gitlawb/")
 }
 

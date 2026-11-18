@@ -109,13 +109,14 @@ fn is_safe_component(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
 }
 
-/// Pull the repo this capability names out of `gitlawb://repos/<owner>/<repo>`.
+/// Pull the repo this capability names out of `twigpine://repos/<owner>/<repo>`
+/// (or the `gitlawb://` spelling from before the rename).
 ///
 /// Requires exactly two components after the prefix. Anything else — extra
 /// segments, a trailing slash, an empty half — is refused rather than
 /// interpreted, so no input can address a location the caller did not intend.
 fn repo_from_resource(with: &str) -> Option<(String, String)> {
-    let rest = with.strip_prefix("gitlawb://repos/")?;
+    let rest = twigpine_core::url_scheme::strip_resource_prefix(with)?;
     let mut parts = rest.split('/');
     let owner = parts.next()?;
     let name = parts.next()?;

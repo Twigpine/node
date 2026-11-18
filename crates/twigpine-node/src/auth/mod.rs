@@ -995,7 +995,7 @@ fn human_detected(message: &str) -> impl IntoResponse {
         [
             (
                 "WWW-Authenticate",
-                "Signature realm=\"gitlawb-alpha\", alg=\"ed25519\"",
+                "Signature realm=\"twigpine-alpha\", alg=\"ed25519\"",
             ),
             ("X-Twigpine-Error", "human_detected"),
         ],

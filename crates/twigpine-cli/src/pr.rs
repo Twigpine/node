@@ -230,7 +230,7 @@ fn detect_remote_owner() -> Option<String> {
         return None;
     }
     let url = String::from_utf8(out.stdout).ok()?;
-    let rest = url.trim().strip_prefix("gitlawb://")?;
+    let rest = twigpine_core::url_scheme::strip_scheme(url.trim())?;
     let slash = rest.rfind('/')?;
     let did = &rest[..slash];
     Some(did.split(':').next_back().unwrap_or(did).to_string())

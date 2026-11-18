@@ -198,7 +198,9 @@ fn detect_gitlawb_remote() -> Option<(String, String)> {
         .map(str::to_string)
         .collect();
 
-    let preferred = ["origin", "gitlawb"];
+    // `twigpine init` names its remote `gitlawb` today and `twigpine` once
+    // writers move to the new name; either is ours.
+    let preferred = ["origin", "twigpine", "gitlawb"];
     let ordered = preferred
         .iter()
         .filter(|p| names.iter().any(|n| n == *p))
@@ -240,7 +242,7 @@ fn detect_gitlawb_remote() -> Option<(String, String)> {
 
 /// Parse a gitlawb:// URL string into (did, repo).
 fn parse_gitlawb_url(url: &str) -> Option<(String, String)> {
-    let rest = url.trim().strip_prefix("gitlawb://")?;
+    let rest = twigpine_core::url_scheme::strip_scheme(url.trim())?;
     let slash = rest.rfind('/')?;
     let did = rest[..slash].to_string();
     let repo = rest[slash + 1..].to_string();

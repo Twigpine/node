@@ -405,6 +405,8 @@ The default key folder is `~/.twigpine`. An existing `~/.gitlawb` keeps being us
 
 Response headers and webhook deliveries carry both `X-Twigpine-*` and the older `X-Gitlawb-*` names with the same values.
 
+Repository URLs and UCAN resources accept `twigpine://` as well as `gitlawb://`; new ones are still written as `gitlawb://` until a later release. [`docs/LEGACY-NAMES.md`](docs/LEGACY-NAMES.md) lists every name kept from before the rename and why.
+
 Minimum required for a persistent node:
 
 ```env

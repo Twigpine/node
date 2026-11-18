@@ -136,11 +136,8 @@ async fn dispatch(
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
-            // Wire-visible, like the CLI's user agent: it moves to "twigpine"
-            // with the other names peers and clients can see, in the protocol
-            // step of the rename, not here.
             "serverInfo": {
-                "name": "gitlawb",
+                "name": "twigpine",
                 "version": env!("CARGO_PKG_VERSION"),
             }
         })),
@@ -1825,7 +1822,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["protocolVersion"], "2024-11-05");
-        assert_eq!(result["serverInfo"]["name"], "gitlawb");
+        assert_eq!(result["serverInfo"]["name"], "twigpine");
     }
 
     #[tokio::test]

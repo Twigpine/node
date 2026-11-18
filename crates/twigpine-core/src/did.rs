@@ -58,6 +58,7 @@ impl Did {
     }
 
     /// Construct a `did:gitlawb` DID from a DHT key (base58btc-encoded).
+    // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
     pub fn gitlawb(key: &str) -> Self {
         Self(format!("did:gitlawb:{key}"))
     }

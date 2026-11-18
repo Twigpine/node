@@ -480,7 +480,7 @@ fn same_origin_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::red
 
 // ── Smart-protocol request builders ───────────────────────────────────────────
 
-const USER_AGENT: &str = "git/2.0 git-remote-gitlawb/0.1.0";
+const USER_AGENT: &str = concat!("git/2.0 git-remote-twigpine/", env!("CARGO_PKG_VERSION"));
 
 /// Build the Phase-1 ref-advertisement GET, signing it when an identity is
 /// present. The node gates the ref advertisement on read visibility for BOTH
@@ -773,18 +773,19 @@ fn build_pack_post_request(
 
 // ── URL helpers ───────────────────────────────────────────────────────────────
 
-/// Parse a `gitlawb://did:key:z6Mk.../repo-name` URL.
+/// Parse a `twigpine://did:key:z6Mk.../repo-name` URL, or its `gitlawb://`
+/// spelling from before the rename. Git runs this helper as
+/// `git-remote-twigpine` for the first and `git-remote-gitlawb` for the second.
 ///
 /// Returns `(did_string, short_owner, repo_name)`.
 fn parse_gitlawb_url(url: &str) -> Result<(String, String, String)> {
-    let without_scheme = url
-        .strip_prefix("gitlawb://")
-        .ok_or_else(|| anyhow::anyhow!("not a gitlawb:// URL: {url}"))?;
+    let without_scheme = twigpine_core::url_scheme::strip_scheme(url)
+        .ok_or_else(|| anyhow::anyhow!("not a twigpine:// URL: {url}"))?;
 
     // without_scheme = "did:key:z6Mk.../repo-name"
     let (did_string, repo_name) = without_scheme
         .rsplit_once('/')
-        .ok_or_else(|| anyhow::anyhow!("gitlawb:// URL must be did:.../repo-name, got: {url}"))?;
+        .ok_or_else(|| anyhow::anyhow!("twigpine:// URL must be did:.../repo-name, got: {url}"))?;
 
     // short_owner = last colon-delimited segment, e.g. "z6Mk..."
     // The node's DB uses a LIKE '%<short_owner>' query to match the full DID.
@@ -2380,6 +2381,15 @@ mod tests {
     #[test]
     fn parse_standard_url() {
         let (did, owner, repo) = parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo").unwrap();
+        assert_eq!(did, "did:key:z6MkFoo123");
+        assert_eq!(owner, "z6MkFoo123");
+        assert_eq!(repo, "my-repo");
+    }
+
+    #[test]
+    fn parse_url_under_the_new_scheme() {
+        let (did, owner, repo) =
+            parse_gitlawb_url("twigpine://did:key:z6MkFoo123/my-repo.git").unwrap();
         assert_eq!(did, "did:key:z6MkFoo123");
         assert_eq!(owner, "z6MkFoo123");
         assert_eq!(repo, "my-repo");

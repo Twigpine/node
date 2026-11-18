@@ -32,6 +32,7 @@ use twigpine_core::identity::Keypair;
 use crate::db::{Db, PeerWriteDenied, ReceivedRefUpdate};
 
 /// Topic for ref-update notifications published after every push.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 pub const REF_UPDATES_TOPIC: &str = "gitlawb/ref-updates/v1";
 
 /// Pre-parse budget, keyed on the mesh peer that HANDED us the message: 2000
@@ -1661,6 +1662,7 @@ impl P2pHandle {
 
 /// Derive a stable Kademlia record key from a DID string.
 fn did_to_kad_key(did: &str) -> kad::RecordKey {
+    // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
     kad::RecordKey::new(&format!("/gitlawb/did/{did}").as_bytes())
 }
 
@@ -4135,8 +4137,9 @@ pub async fn start(
     )
     .expect("gossipsub behaviour");
 
+    // Informational: libp2p reports it to peers, and nothing compares it.
     let identify = identify::Behaviour::new(identify::Config::new(
-        "/gitlawb/1.0.0".to_string(),
+        "/twigpine/1.0.0".to_string(),
         local_key.public(),
     ));
 

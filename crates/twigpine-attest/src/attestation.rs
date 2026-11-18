@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 
 /// Domain-separation tag prepended to the JCS signing input. Bumped to
 /// `v2` if the signing-input shape changes.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const SIGNING_DOMAIN: &[u8] = b"gitlawb-attest-sig/v1\n";
 
 /// Multicodec varint prefix for Ed25519 public keys (0xed 0x01).
