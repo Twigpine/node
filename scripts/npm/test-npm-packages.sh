@@ -40,6 +40,7 @@ field() { node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1]
 fake_program() {
   cat > "$1" <<EOF
 #!/bin/sh
+if [ -n "\${FAKE_PIDFILE:-}" ]; then echo \$\$ > "\$FAKE_PIDFILE"; sleep 30; exit 0; fi
 if [ -n "\${FAKE_SIGNAL:-}" ]; then kill -"\$FAKE_SIGNAL" \$\$; fi
 echo "$2 \$*"
 if [ -n "\${FAKE_STDIN:-}" ]; then cat; fi
@@ -96,6 +97,13 @@ check "a payload carries the CLI and the helper, executable" \
 check "a payload leaves the daemon out" test ! -e "$OUT/platforms/cli-linux-x64/twigpine-node"
 check "the Windows payload carries .exe programs" \
   test -f "$OUT/platforms/cli-win32-x64/twigpine.exe" -a -f "$OUT/platforms/cli-win32-x64/git-remote-twigpine.exe"
+check "the Windows payload also installs on Windows on ARM" \
+  test "$(field "$OUT/platforms/cli-win32-x64/package.json" cpu)" = '["x64","arm64"]'
+check "payloads ask Yarn not to keep them zipped" test "$(field "$LP" preferUnplugged)" = true
+check "the wrapper installs on every published platform" test "$(field "$WP" os)" = '["darwin","linux","win32"]'
+packed="$(cd "$OUT/wrapper" && npm pack --dry-run --json 2>/dev/null | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d)[0].files.map(f=>f.path).sort().join(" ")))')"
+check "the wrapper tarball carries the launchers and both licence files" test "$packed" = \
+  "LICENSE-APACHE LICENSE-MIT README.md bin/git-remote-twigpine.js bin/gl.js bin/launch.js bin/twigpine.js package.json"
 
 cp -R "$ART" "$W/art-bad"
 printf 'tampered' >> "$W/art-bad/twigpine-node-$VERSION-x86_64-unknown-linux-musl.tar.gz"
@@ -103,10 +111,34 @@ if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-bad" --out-dir "$W
   bad "refuses an archive that does not match its checksum"
 elif grep -q "checksum mismatch" "$W/out"; then ok "refuses an archive that does not match its checksum"
 else bad "refuses an archive that does not match its checksum"; fi
-rm "$W/art-bad/twigpine-node-$VERSION-x86_64-apple-darwin.tar.gz"
-if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-bad" --out-dir "$W/npm-bad" > "$W/out" 2>&1; then
+cp -R "$ART" "$W/art-missing"
+rm "$W/art-missing/twigpine-node-$VERSION-x86_64-apple-darwin.tar.gz"
+if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-missing" --out-dir "$W/npm-bad" > "$W/out" 2>&1; then
   bad "refuses a missing archive"
-else ok "refuses a missing archive"; fi
+elif grep -q "missing release archive" "$W/out"; then ok "refuses a missing archive"
+else bad "refuses a missing archive"; fi
+
+# The release builds Windows best-effort.
+cp -R "$ART" "$W/art-nowin"
+rm "$W/art-nowin/twigpine-node-$VERSION-x86_64-pc-windows-msvc.zip"*
+if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-nowin" --out-dir "$W/npm-nowin" > "$W/out" 2>&1; then
+  bad "without --allow-missing, a missing Windows archive is an error"
+else ok "without --allow-missing, a missing Windows archive is an error"; fi
+if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-nowin" --out-dir "$W/npm-nowin" \
+  --allow-missing win32-x64 > "$W/out" 2>&1 \
+  && [ ! -d "$W/npm-nowin/platforms/cli-win32-x64" ] \
+  && [ "$(field "$W/npm-nowin/wrapper/package.json" os)" = '["darwin","linux"]' ] \
+  && ! grep -q win32 <<< "$(field "$W/npm-nowin/wrapper/package.json" optionalDependencies)"; then
+  ok "a release without Windows is packaged without it, and the wrapper says so"
+else bad "a release without Windows is packaged without it, and the wrapper says so"; fi
+
+# Called through a symlinked path (macOS temp and checkout paths often are).
+ln -s "$ROOT" "$W/linked-root"
+if node "$W/linked-root/scripts/npm/build-platform-packages.mjs" --version "$VERSION" \
+  --artifacts-dir "$ART" --out-dir "$W/npm-linked" > "$W/out" 2>&1 \
+  && [ -f "$W/npm-linked/wrapper/package.json" ]; then
+  ok "builds when called through a symlinked path"
+else bad "builds when called through a symlinked path"; fi
 for v in 9.9 v9.9.0 9.9.0-rc.1 09.9.0; do
   if node "$BUILD" --version "$v" --artifacts-dir "$ART" --out-dir "$W/npm-bad" > "$W/out" 2>&1; then
     bad "refuses version $v"
@@ -140,6 +172,19 @@ check "the helper gets git's stdin and answers on stdout" \
 # test's own shell does not report a killed job.
 status="$(sh -c 'FAKE_SIGNAL=TERM node "$1" > /dev/null 2>&1; echo $?' _ "$INSTALL/bin/twigpine.js" 2>/dev/null)"
 check "a program killed by a signal ends the launcher the same way" test "$status" = 143
+status="$(sh -c 'FAKE_SIGNAL=PIPE node "$1" > /dev/null 2>&1; echo $?' _ "$INSTALL/bin/twigpine.js" 2>/dev/null)"
+check "a program killed by SIGPIPE ends the launcher with 141, as a shell expects" test "$status" = 141
+
+FAKE_PIDFILE="$W/child.pid" node "$INSTALL/bin/twigpine.js" > /dev/null 2>&1 &
+launcher=$!
+for _ in $(seq 1 50); do [ -s "$W/child.pid" ] && break; sleep 0.1; done
+child="$(cat "$W/child.pid" 2>/dev/null || true)"
+kill -TERM "$launcher" 2>/dev/null || true
+wait "$launcher" 2>/dev/null || true
+gone=no
+for _ in $(seq 1 30); do kill -0 "$child" 2>/dev/null || { gone=yes; break; }; sleep 0.1; done
+[ "$gone" = yes ] || kill -KILL "$child" 2>/dev/null || true
+check "a signal sent to the launcher alone reaches the program" test -n "$child" -a "$gone" = yes
 
 rm -rf "$PAYLOAD"
 status=0
@@ -228,6 +273,16 @@ touch "$REG/versions/9.10.0"; echo "9.10.0" > "$REG/tags/latest"
 if run_publish "$OUT" && grep -q '^published 9.9.0 backfill$' "$REG/log" && [ "$(cat "$REG/tags/latest")" = 9.10.0 ]; then
   ok "a backfill of an older release leaves latest where it is"
 else bad "a backfill of an older release leaves latest where it is"; fi
+
+REG="$W/reg3b"; mkdir -p "$REG/versions" "$REG/tags"
+for v in 9.9.0 9.9.0-darwin-arm64 9.9.0-darwin-x64 9.9.0-linux-arm64 9.9.0-linux-x64 9.9.0-win32-x64 9.10.0; do
+  touch "$REG/versions/$v"
+done
+echo "9.10.0" > "$REG/tags/latest"
+start=$SECONDS
+if run_publish "$OUT" && [ -z "$(published_order)" ] && [ $((SECONDS - start)) -lt 4 ]; then
+  ok "re-running a backfill that already went out finishes at once"
+else bad "re-running a backfill that already went out finishes at once"; fi
 
 REG="$W/reg4"; mkdir -p "$REG"
 cp -R "$OUT" "$W/npm-short"; rm -rf "$W/npm-short/platforms/cli-win32-x64"

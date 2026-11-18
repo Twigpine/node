@@ -11,7 +11,13 @@ twigpine quickstart
 ```
 
 npm installs one prebuilt program for your platform: macOS (arm64, x64),
-Linux (arm64, x64) or Windows (x64). There is no install script.
+Linux (arm64, x64) or Windows (x64, which also runs on Windows on ARM).
+There is no install script. Without a global install:
+`npx -p @twigpine/cli twigpine doctor`.
+
+The git helper runs through Node, so git needs `node` on its PATH. A GUI git
+client started with a minimal PATH may not find it; the installers below put
+the native helper on PATH instead.
 
 The package also provides `gl`, the command's name before the rename, and the
 helper under both names git looks for: `git-remote-twigpine` and

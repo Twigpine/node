@@ -17,15 +17,21 @@
 // aliases, so one package name needs one trusted-publisher setting. See
 // docs/NPM_PACKAGING.md.
 //
-// Each archive is checked against its .sha256 file before extraction. All five
-// platforms are required unless --only narrows the set (tests only); the
-// wrapper always references all five.
+// Each archive is checked against its .sha256 file before extraction. Every
+// platform is required except those named in --allow-missing: the release
+// builds Windows best-effort, so CI passes --allow-missing win32-x64. A
+// platform left out is left out of the wrapper too, its aliases and its `os`
+// list, so npm on that platform refuses the install with a clear error
+// instead of installing commands with no program. --only narrows the set for
+// tests the same way.
 //
 // Usage:
 //   node scripts/npm/build-platform-packages.mjs --version X.Y.Z \
-//     --artifacts-dir <dir> [--out-dir dist/npm] [--only linux-x64,...]
+//     --artifacts-dir <dir> [--out-dir dist/npm] [--allow-missing win32-x64] \
+//     [--only linux-x64,...]
 
 import {
+  realpathSync,
   chmodSync,
   cpSync,
   existsSync,
@@ -64,7 +70,13 @@ function fail(message) {
 }
 
 function parseArgs(argv) {
-  const args = { version: '', artifactsDir: '', outDir: join(repoRoot, 'dist', 'npm'), only: null };
+  const args = {
+    version: '',
+    artifactsDir: '',
+    outDir: join(repoRoot, 'dist', 'npm'),
+    only: null,
+    allowMissing: new Set(),
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = () => {
@@ -84,6 +96,9 @@ function parseArgs(argv) {
         break;
       case '--only':
         args.only = new Set(next().split(',').map((entry) => entry.trim()).filter(Boolean));
+        break;
+      case '--allow-missing':
+        args.allowMissing = new Set(next().split(',').map((entry) => entry.trim()).filter(Boolean));
         break;
       default:
         fail(`unknown argument ${arg}`);
@@ -108,9 +123,9 @@ export function platformVersion(version, entry) {
   return `${version}-${entry.platform}-${entry.arch}`;
 }
 
-export function optionalDependencies(packageName, version) {
+export function optionalDependencies(packageName, version, entries = MATRIX) {
   const aliases = {};
-  for (const entry of MATRIX) {
+  for (const entry of entries) {
     aliases[`${packageName}-${entry.platform}-${entry.arch}`] =
       `npm:${packageName}@${platformVersion(version, entry)}`;
   }
@@ -145,7 +160,9 @@ function extract(archivePath, ext, destDir) {
   let lastError = '';
   for (const [command, commandArgs] of attempts) {
     const result = spawnSync(command, commandArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
-    if (result.status === 0) return;
+    // unzip exits 1 for warnings (a backslash in a stored path, say) after
+    // extracting everything; whether the programs are there is checked next.
+    if (result.status === 0 || (command === 'unzip' && result.status === 1)) return;
     lastError = result.error ? result.error.message : String(result.stderr || '').trim();
   }
   fail(`could not extract ${archivePath}: ${lastError}`);
@@ -164,10 +181,14 @@ function programsDir(extracted, packageDirName, probe) {
   fail(`${packageDirName} does not contain ${probe}`);
 }
 
+function archivePathFor(entry, version, artifactsDir) {
+  return join(artifactsDir, `twigpine-node-${version}-${entry.target}.${entry.ext}`);
+}
+
 function buildPlatformPackage(entry, source, version, artifactsDir, outDir) {
   const base = `twigpine-node-${version}-${entry.target}`;
   const assetName = `${base}.${entry.ext}`;
-  const archivePath = join(artifactsDir, assetName);
+  const archivePath = archivePathFor(entry, version, artifactsDir);
   if (!existsSync(archivePath)) fail(`missing release archive ${archivePath}`);
   verifyChecksum(archivePath, assetName);
 
@@ -193,9 +214,14 @@ function buildPlatformPackage(entry, source, version, artifactsDir, outDir) {
       version: platformVersion(version, entry),
       description: `Twigpine programs for ${entry.platform}-${entry.arch} (installed by ${source.name}@${version})`,
       os: [entry.platform],
-      cpu: [entry.arch],
+      // Windows on ARM has no build of its own and runs the x64 one under
+      // emulation; npm installs a payload only when its cpu list matches.
+      cpu: entry.platform === 'win32' && entry.arch === 'x64' ? ['x64', 'arm64'] : [entry.arch],
       license: source.license,
       repository: source.repository,
+      // Yarn's Plug'n'Play keeps packages in zip files unless told otherwise,
+      // and a program inside a zip cannot be started.
+      preferUnplugged: true,
       // No bin, no scripts, no dependencies: the wrapper runs the programs.
     };
     writeFileSync(join(packageDir, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
@@ -205,7 +231,7 @@ function buildPlatformPackage(entry, source, version, artifactsDir, outDir) {
   }
 }
 
-function buildWrapper(source, version, outDir) {
+function buildWrapper(source, version, outDir, entries) {
   const wrapperDir = join(outDir, 'wrapper');
   rmSync(wrapperDir, { recursive: true, force: true });
   mkdirSync(join(wrapperDir, 'bin'), { recursive: true });
@@ -226,7 +252,10 @@ function buildWrapper(source, version, outDir) {
   delete pkg.scripts;
   delete pkg.dependencies;
   pkg.version = version;
-  pkg.optionalDependencies = optionalDependencies(source.name, version);
+  pkg.optionalDependencies = optionalDependencies(source.name, version, entries);
+  // Install only where a payload was published.
+  const platforms = new Set(entries.map((entry) => entry.platform));
+  pkg.os = (pkg.os || []).filter((platform) => platforms.has(platform));
   writeFileSync(join(wrapperDir, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
   return wrapperDir;
 }
@@ -234,20 +263,30 @@ function buildWrapper(source, version, outDir) {
 function main() {
   const args = parseArgs(process.argv.slice(2));
   const source = readSourceManifest();
-  const selected = MATRIX.filter((e) => !args.only || args.only.has(`${e.platform}-${e.arch}`));
-  if (args.only) {
-    for (const key of args.only) {
-      if (!MATRIX.some((e) => `${e.platform}-${e.arch}` === key)) fail(`--only lists unknown platform ${key}`);
+  for (const [flag, keys] of [['--only', args.only], ['--allow-missing', args.allowMissing]]) {
+    for (const key of keys || []) {
+      if (!MATRIX.some((e) => `${e.platform}-${e.arch}` === key)) fail(`${flag} lists unknown platform ${key}`);
     }
   }
-  if (selected.length === 0) fail('--only matched no platforms');
+  const selected = MATRIX.filter((e) => {
+    const key = `${e.platform}-${e.arch}`;
+    if (args.only && !args.only.has(key)) return false;
+    if (args.allowMissing.has(key) && !existsSync(archivePathFor(e, args.version, args.artifactsDir))) {
+      console.error(`[build-platform-packages] no ${key} archive in this release; leaving that platform out`);
+      return false;
+    }
+    return true;
+  });
+  if (selected.length === 0) fail('no platforms to build');
   const platformDirs = selected.map((e) => buildPlatformPackage(e, source, args.version, args.artifactsDir, args.outDir));
-  const wrapperDir = buildWrapper(source, args.version, args.outDir);
+  const wrapperDir = buildWrapper(source, args.version, args.outDir, selected);
   process.stdout.write(
     JSON.stringify({ name: source.name, version: args.version, wrapperDir, platformDirs }, null, 2) + '\n',
   );
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+// Run when executed, not when imported. Both sides through realpath: macOS
+// reaches temp and checkout paths through symlinks.
+if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])) {
   main();
 }

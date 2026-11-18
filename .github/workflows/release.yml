@@ -862,18 +862,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p _art
+          windows="twigpine-node-${VERSION}-x86_64-pc-windows-msvc.zip"
           for archive in \
             "twigpine-node-${VERSION}-aarch64-apple-darwin.tar.gz" \
             "twigpine-node-${VERSION}-x86_64-apple-darwin.tar.gz" \
             "twigpine-node-${VERSION}-aarch64-unknown-linux-musl.tar.gz" \
             "twigpine-node-${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            "twigpine-node-${VERSION}-x86_64-pc-windows-msvc.zip"; do
+            "$windows"; do
             for file in "$archive" "$archive.sha256"; do
               # By the asset id the resolver captured and uploader-checked, not
               # by name: release assets are mutable, an id is not.
               want="$(printf '%s' "$file" | base64 -w0)"
               asset_id="$(printf '%s\n' "$ASSETS" | awk -v n="$want" '$1 == n {print $2; exit}')"
               if [ -z "$asset_id" ]; then
+                # Windows is built best-effort (release-binaries); without it
+                # the package is published for the other platforms.
+                if [ "$archive" = "$windows" ]; then
+                  echo "::warning::release $TAG has no $file; publishing without Windows"
+                  rm -f "_art/$windows" "_art/$windows.sha256"
+                  continue 2
+                fi
                 echo "::error::release $TAG has no asset $file captured at resolve time"
                 exit 1
               fi
@@ -888,7 +896,8 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/npm/build-platform-packages.mjs \
-            --version "$VERSION" --artifacts-dir _art --out-dir _npm
+            --version "$VERSION" --artifacts-dir _art --out-dir _npm \
+            --allow-missing win32-x64
 
       - name: Publish @twigpine/cli
         env:

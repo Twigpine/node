@@ -189,7 +189,12 @@ case "$latest" in
 esac
 echo "dist-tag latest is ${latest:-unset} (unchanged by the platform publishes)."
 
-publish "$wrapper_dir" "$version" --tag "$wrapper_tag"
-
-wait_until "${name}@${version} as dist-tag ${wrapper_tag}" tag_is "$wrapper_tag" "$version"
-echo "dist-tag ${wrapper_tag} is ${version}."
+if already_published "$version"; then
+  # Out already, under whatever tag it went out with then (a re-run, or a
+  # backfill of a release published at the time): nothing to wait for.
+  echo "${name}@${version} is already on the registry; not publishing it again."
+else
+  publish "$wrapper_dir" "$version" --tag "$wrapper_tag"
+  wait_until "${name}@${version} as dist-tag ${wrapper_tag}" tag_is "$wrapper_tag" "$version"
+  echo "dist-tag ${wrapper_tag} is ${version}."
+fi

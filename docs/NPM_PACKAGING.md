@@ -36,20 +36,34 @@ and without a fallback downloader.
   and `cpu`, so npm installs exactly one.
 - A payload holds `twigpine` and `git-remote-twigpine` (`.exe` on Windows),
   copied from that platform's release archive after its checksum is checked,
-  plus the licence files. It has no `bin`, no scripts and no dependencies.
+  plus the licence files. It has no `bin`, no scripts and no dependencies,
+  and sets `preferUnplugged` so Yarn's Plug'n'Play does not keep it zipped.
   The node daemon is not on npm.
+- The release builds Windows best-effort. A release without the Windows
+  archive is published without Windows: the wrapper then leaves `win32` out
+  of its aliases and its `os`, so npm on Windows refuses the install instead
+  of installing commands with no program.
 - The wrapper holds the launchers in `npm/cli/bin/` and a manifest with no
   scripts and no dependencies, only the exact-version `optionalDependencies`.
   `scripts/npm/build-platform-packages.mjs` writes both from the release
   archives.
 - A launcher finds its payload from `process.platform`/`process.arch` and runs
-  the program with stdio, the exit status and a terminating signal passed
-  straight through, so git can drive the helper through it. `gl` starts the
-  program under the name `gl`, which prints a note about the new name on a
-  terminal. Windows on ARM runs the x64 payload.
-- There is no downloader. If the payload is missing (`--omit=optional`, an
-  unsupported platform), the launcher says how to reinstall or install
-  without npm.
+  the program with stdio and the exit status passed straight through, so git
+  can drive the helper through it (checked with an 80 MB clone). SIGINT,
+  SIGTERM and SIGHUP sent to the launcher alone are forwarded to the program,
+  and a program ended by a signal ends the launcher the same way (SIGPIPE,
+  which Node ignores, as exit status 141). `gl` starts the program under the
+  name `gl`, which prints a note about the new name on a terminal.
+- Windows on ARM installs the x64 payload, whose `cpu` lists both, and runs it
+  under emulation.
+- The git helper is a Node script on PATH, so git needs `node` on its PATH as
+  well. A GUI git client started with a minimal PATH may not find it; the
+  installers (`install.sh`, `install.ps1`, Homebrew) put the native helper on
+  PATH instead.
+- There is no downloader. If the payload is missing (`--omit=optional`, a
+  release without that platform's build), the launcher says how to reinstall
+  or install without npm.
+- `npx` needs the command named: `npx -p @twigpine/cli twigpine doctor`.
 
 ## Publishing rules
 
@@ -76,17 +90,22 @@ and without a fallback downloader.
 
 ## Before the first publish
 
-Done once, by a maintainer:
+Done once, by a maintainer, in this order:
 
-1. Publish a placeholder `@twigpine/cli@0.0.0` by hand; npm only lets a
-   trusted publisher be configured on a package that exists.
-2. On npmjs.com, add a trusted publisher to `@twigpine/cli`: repository
-   `Twigpine/node`, workflow `release.yml`, environment `npm-publish`.
-3. In the GitHub repository settings, create the `npm-publish` environment,
-   limited to the `main` branch, with a required reviewer.
+1. In the GitHub repository settings, create the `npm-publish` environment,
+   limited to the `main` branch, with a required reviewer. First: GitHub
+   creates an environment a job names on first use, with no protection.
+2. Publish a placeholder `@twigpine/cli@0.0.0` by hand with
+   `npm publish --access public`; npm only lets a trusted publisher be set on
+   a package that exists. The placeholder is a manifest and a README, with no
+   `bin`, so it cannot install commands that do nothing.
+3. Add the trusted publisher with publish permission: on npmjs.com under the
+   package's settings, or
+   `npm trust github @twigpine/cli --file release.yml --repo Twigpine/node --env npm-publish --allow-publish`.
 
 Until then the `npm-publish-cli` job fails on its own; the rest of the release
-is unaffected.
+is unaffected. The `npm-publish` job publishing `@gitlawb/gl` needs that
+package's trusted publishers to name `Twigpine/node` the same way.
 
 ## The move from `@gitlawb/gl`
 
@@ -107,6 +126,7 @@ To reach existing users:
 - A CLI installed from `@gitlawb/gl` prints the two commands above on a
   terminal.
 - After that release, a maintainer deprecates every `@gitlawb/gl*` version
-  with a pointer to `@twigpine/cli`, and the `npm-publish` job and
+  with a pointer to `@twigpine/cli`, the install line in the README and the
+  website moves to `@twigpine/cli`, and the `npm-publish` job and
   `npm/packages/` are removed. The old versions stay on the registry: existing
   installs resolve their platform packages through them.

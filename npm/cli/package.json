@@ -11,7 +11,8 @@
     "git-remote-gitlawb": "bin/git-remote-twigpine.js"
   },
   "files": [
-    "bin/*.js"
+    "bin/*.js",
+    "LICENSE-*"
   ],
   "engines": {
     "node": ">=18"

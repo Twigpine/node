@@ -1,24 +1,36 @@
 // Shared by the command launchers in this directory. Finds the native program
-// in this platform's payload and runs it, passing arguments, stdio, the exit
-// status and any terminating signal straight through.
+// in this platform's payload and runs it, passing arguments, stdio and the exit
+// status straight through, forwarding termination signals to it, and ending
+// the way it ended.
 //
 // The payload is a version of this same package, installed under an npm:
 // alias named after process.platform and process.arch (see
 // docs/NPM_PACKAGING.md). There is no install script and no downloader: if
 // npm did not install the payload, the launcher says how to fix it.
 
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { constants } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_PACKAGE_NAME = '@twigpine/cli';
 
-// The platforms a payload is published for. Anything else has no prebuilt
-// program; Windows on ARM runs the x64 one under emulation.
+// The platforms a payload is published for. Windows on ARM installs the x64
+// payload (its manifest accepts arm64) and runs it under emulation.
 export const SUPPORTED = ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-x64'];
+
+// Signals that, sent to the launcher alone (a supervisor, an MCP client or
+// git stopping it by pid), must reach the program too. A terminal's Ctrl-C
+// already reaches both, as they share a process group.
+const FORWARDED = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
+// Signals the launcher can re-raise on itself to end the same way. Node
+// ignores SIGPIPE and turns SIGUSR1 into its debugger, so for any other
+// signal the launcher exits with the shell's 128 + number instead.
+const RERAISED = new Set(['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT', 'SIGABRT', 'SIGKILL']);
 
 // The npm name this wrapper was published under, read from its own manifest
 // so the name lives in one place.
@@ -32,7 +44,7 @@ export function readPackageName(root = packageRoot) {
   return DEFAULT_PACKAGE_NAME;
 }
 
-// The payload alias for a platform. Windows on ARM falls back to x64.
+// The payload alias for a platform. Windows on ARM uses the x64 payload.
 export function payloadName(packageName, platform = process.platform, arch = process.arch) {
   const effectiveArch = platform === 'win32' && arch === 'arm64' ? 'x64' : arch;
   return `${packageName}-${platform}-${effectiveArch}`;
@@ -59,24 +71,32 @@ export function nativeProgram(program, {
 
 export function missingProgramMessage(command, packageName, platform = process.platform, arch = process.arch) {
   const here = `${platform}-${arch}`;
-  const supported = SUPPORTED.includes(here) || (platform === 'win32' && arch === 'arm64');
-  const lines = [`${command}: the Twigpine program for ${here} is not installed.`];
-  if (supported) {
-    lines.push(
-      `npm installs it as an optional dependency (${payloadName(packageName, platform, arch)}).`,
-      'Reinstall without omitting optional dependencies:',
-      `  npm install -g ${packageName}`,
-    );
-  } else {
-    lines.push(`No prebuilt program is published for ${here} (supported: ${SUPPORTED.join(', ')}).`);
-  }
-  lines.push(
-    'Or install without npm:',
+  return [
+    `${command}: the Twigpine program for ${here} is not installed.`,
+    `npm installs it as an optional dependency (${payloadName(packageName, platform, arch)}),`,
+    'so reinstall without omitting optional dependencies, for example:',
+    `  npm install -g ${packageName}`,
+    'If this release has no build for your platform, install without npm:',
     platform === 'win32'
       ? '  irm https://twigpine.com/install.ps1 | iex'
       : '  curl -fsSL https://twigpine.com/install.sh | sh',
-  );
-  return lines.join('\n');
+  ].join('\n');
+}
+
+// End this process the way the program ended.
+function endLike(code, signal) {
+  if (signal) {
+    if (RERAISED.has(signal)) {
+      for (const name of FORWARDED) process.removeAllListeners(name);
+      try {
+        process.kill(process.pid, signal);
+      } catch {
+        // Fall through to the exit status below.
+      }
+    }
+    process.exit(128 + (constants.signals[signal] ?? 0));
+  }
+  process.exit(code ?? 1);
 }
 
 // Run `program` with this process's arguments. `argv0` is what the program
@@ -88,14 +108,15 @@ export function run(program, argv0) {
     process.stderr.write(missingProgramMessage(argv0, packageName) + '\n');
     process.exit(1);
   }
-  const child = spawnSync(binary, process.argv.slice(2), { stdio: 'inherit', argv0 });
-  if (child.error) {
-    process.stderr.write(`${argv0}: could not start ${binary}: ${child.error.message}\n`);
+  const child = spawn(binary, process.argv.slice(2), { stdio: 'inherit', argv0 });
+  for (const name of FORWARDED) {
+    process.on(name, () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill(name);
+    });
+  }
+  child.on('error', (error) => {
+    process.stderr.write(`${argv0}: could not start ${binary}: ${error.message}\n`);
     process.exit(1);
-  }
-  if (child.signal) {
-    // End the same way the program did, so a shell or git sees the signal.
-    process.kill(process.pid, child.signal);
-  }
-  process.exit(child.status ?? 1);
+  });
+  child.on('exit', endLike);
 }
