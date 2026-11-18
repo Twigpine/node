@@ -54,6 +54,13 @@ fn emit_warning(line: &str) {
     let _ = writeln!(warn_sink(), "{line}");
 }
 
+/// Warn-and-degrade for the recovery arms in `run`: a failed recovery source
+/// is reported and yields no paths, never silently empty (#400).
+fn warn_recovery_failed(what: &str, e: &anyhow::Error) -> Vec<String> {
+    emit_warning(&format!("warning: {what} failed: {e}"));
+    Vec::new()
+}
+
 #[cfg(not(test))]
 fn warn_sink() -> impl std::io::Write {
     std::io::stderr()
@@ -874,8 +881,7 @@ pub async fn run(args: CloneArgs) -> Result<()> {
                 // fallback still runs), but the strict /encrypted-blobs parse now
                 // fails closed on schema drift, so surface it rather than letting
                 // `.unwrap_or_default()` silently swallow it into "no paths".
-                eprintln!("warning: encrypted-blobs recovery failed: {e}");
-                Vec::new()
+                warn_recovery_failed("encrypted-blobs recovery", &e)
             });
         let from_arweave = recover_from_arweave(
             &args.arweave_gateway,
@@ -886,7 +892,10 @@ pub async fn run(args: CloneArgs) -> Result<()> {
             &keypair,
         )
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            // Same rule as the node-recovery arm above: warn, never abort.
+            warn_recovery_failed("arweave/ipfs gateway recovery", &e)
+        });
         paths.extend(from_arweave);
 
         if !paths.is_empty() {
@@ -965,6 +974,21 @@ mod tests {
 
     fn warnings() -> String {
         WARNINGS.with(|w| w.borrow().clone())
+    }
+
+    // #400: the recovery-arm degrade must warn, not silently become "no
+    // paths". `warn_recovery_failed` is the write both arms go through.
+    #[test]
+    fn warn_recovery_failed_warns_and_returns_empty() {
+        reset_warnings();
+        let out =
+            super::warn_recovery_failed("arweave/ipfs gateway recovery", &anyhow::anyhow!("boom"));
+        assert!(out.is_empty());
+        assert!(
+            warnings().contains("arweave/ipfs gateway recovery failed: boom"),
+            "a recovery failure must warn, got: {:?}",
+            warnings()
+        );
     }
 
     fn g(args: &[&str], dir: &Path) {
