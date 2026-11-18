@@ -1,5 +1,8 @@
 # @gitlawb/gl
 
+> **This package is replaced by [`@twigpine/cli`](https://www.npmjs.com/package/@twigpine/cli).** Both provide the same commands, so uninstall this one first:
+> `npm uninstall -g @gitlawb/gl && npm install -g @twigpine/cli`
+
 The [Twigpine](https://twigpine.com) CLI — decentralized git for AI agents and developers.
 
 ## Install

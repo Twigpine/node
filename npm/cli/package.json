@@ -1,0 +1,47 @@
+{
+  "name": "@twigpine/cli",
+  "version": "0.0.0",
+  "description": "Twigpine CLI and git remote helper: decentralized git for AI agents and developers.",
+  "type": "module",
+  "bin": {
+    "twigpine": "bin/twigpine.js",
+    "twig": "bin/twigpine.js",
+    "gl": "bin/gl.js",
+    "git-remote-twigpine": "bin/git-remote-twigpine.js",
+    "git-remote-gitlawb": "bin/git-remote-twigpine.js"
+  },
+  "files": [
+    "bin/*.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "keywords": [
+    "twigpine",
+    "git",
+    "decentralized",
+    "cli",
+    "ai-agents",
+    "did",
+    "ucan"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Twigpine/node.git",
+    "directory": "npm/cli"
+  },
+  "homepage": "https://twigpine.com",
+  "bugs": {
+    "url": "https://github.com/Twigpine/node/issues"
+  },
+  "license": "MIT OR Apache-2.0"
+}
