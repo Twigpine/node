@@ -18,13 +18,13 @@ pub struct RegisterArgs {
     #[arg(
         long,
         default_value = "https://node.twigpine.com",
-        env = "GITLAWB_NODE"
+        env = "TWIGPINE_NODE"
     )]
     pub node: String,
 
     /// A pre-obtained iCaptcha proof token, forwarded on the register request
     /// instead of making the client solve a fresh challenge.
-    #[arg(long, env = "GITLAWB_ICAPTCHA_PROOF")]
+    #[arg(long, env = "TWIGPINE_ICAPTCHA_PROOF")]
     pub icaptcha_proof: Option<String>,
 
     /// Capabilities to advertise (comma-separated)
@@ -39,7 +39,7 @@ pub struct RegisterArgs {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+    /// Identity directory (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 }
@@ -103,8 +103,8 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
     println!("  Trust score:  {trust:.2}");
     println!("  UCAN expires: {}", sanitize_node_msg(expires));
     println!();
-    // The real path, not the default one: `GITLAWB_KEY` moves it, and an operator
-    // told to look in `~/.gitlawb` would find nothing there.
+    // The real path, not the default one: `TWIGPINE_KEY` moves it, and an operator
+    // told to look in `~/.twigpine` would find nothing there.
     // Registration without a stored token means the registration-gated
     // capabilities never arrived, so the closing line must not claim they did.
     match &saved_to {
@@ -125,13 +125,13 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
 
 /// Where the bootstrap UCAN is stored: beside the identity key, always.
 ///
-/// Routed through `gitlawb_dir` rather than resolving `~/.gitlawb` locally. The
-/// key is READ from the parent of `GITLAWB_KEY`, so writing the token anywhere
+/// Routed through `identity_dir` rather than resolving `~/.twigpine` locally. The
+/// key is READ from the parent of `TWIGPINE_KEY`, so writing the token anywhere
 /// else splits the two: registration succeeds, and `twigpine doctor`, `twigpine ucan show`,
 /// `twigpine init`, and `twigpine mcp ucan_show` all read `ucan.json` from the key's
 /// directory and report an unregistered identity.
 fn ucan_path(dir: Option<&std::path::Path>) -> Result<PathBuf> {
-    let base = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?;
+    let base = crate::identity::identity_dir(dir.map(std::path::Path::to_path_buf))?;
     crate::secret_file::create_dir(&base)
         .with_context(|| format!("failed to create {}", base.display()))?;
     Ok(base.join("ucan.json"))
@@ -211,8 +211,8 @@ mod tests {
         m.assert();
     }
 
-    /// `twigpine register` READS the identity from the parent of `GITLAWB_KEY`, so it has
-    /// to WRITE the bootstrap token there too. Sending it to `~/.gitlawb` instead is
+    /// `twigpine register` READS the identity from the parent of `TWIGPINE_KEY`, so it has
+    /// to WRITE the bootstrap token there too. Sending it to `~/.twigpine` instead is
     /// silent split-brain: registration prints success, and every command that later
     /// reads `ucan.json` — `twigpine doctor`, `twigpine ucan show`, `twigpine init`, `twigpine mcp` — looks
     /// beside the key, finds nothing, and reports an unregistered identity.
@@ -220,7 +220,7 @@ mod tests {
     async fn register_saves_the_bootstrap_ucan_beside_the_key() {
         let dir = TempDir::new().unwrap();
         write_identity(&dir);
-        // No --dir: the destination has to come from GITLAWB_KEY alone.
+        // No --dir: the destination has to come from TWIGPINE_KEY alone.
         let _env = crate::identity::test_env::set_key(Some(dir.path().join("identity.pem")));
 
         let mut server = mockito::Server::new_async().await;
@@ -247,7 +247,7 @@ mod tests {
         let beside_the_key = dir.path().join("ucan.json");
         assert!(
             beside_the_key.exists(),
-            "the bootstrap UCAN must land beside GITLAWB_KEY, not in ~/.gitlawb"
+            "the bootstrap UCAN must land beside TWIGPINE_KEY, not in ~/.twigpine"
         );
         let content: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(beside_the_key).unwrap()).unwrap();

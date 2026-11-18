@@ -33,7 +33,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-# Home-directory lookup for the shared GITLAWB_KEY resolver in twigpine-core,
+# Home-directory lookup for the shared TWIGPINE_KEY resolver in twigpine-core,
 # which takes `home` as an argument so core's dependency allowlist stays lean.
 dirs = "5"
 

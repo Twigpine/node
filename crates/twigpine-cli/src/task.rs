@@ -42,7 +42,7 @@ pub enum TaskCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -65,7 +65,7 @@ pub enum TaskCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -77,7 +77,7 @@ pub enum TaskCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -89,7 +89,7 @@ pub enum TaskCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -103,7 +103,7 @@ pub enum TaskCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]
@@ -117,7 +117,7 @@ pub enum TaskCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
         #[arg(long)]

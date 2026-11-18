@@ -62,7 +62,7 @@ pub enum ProfileCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
 
@@ -77,7 +77,7 @@ pub enum ProfileCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
 
@@ -95,7 +95,7 @@ pub enum ProfileCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
     },
@@ -113,7 +113,7 @@ pub enum ProfileCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
 
@@ -128,7 +128,7 @@ pub enum ProfileCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
 
@@ -508,7 +508,7 @@ mod tests {
         // Header present: the client recognises the code up front.
         let err = set_against(
             429,
-            &[("x-gitlawb-error", "rate_limited")],
+            &[("x-twigpine-error", "rate_limited")],
             r#"{"error":"rate_limited","message":"rate limit exceeded — try again later"}"#,
         )
         .await;

@@ -23,10 +23,10 @@ pub enum NodeCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
-        /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+        /// Identity directory (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
         #[arg(long)]
         dir: Option<PathBuf>,
     },
@@ -36,7 +36,7 @@ pub enum NodeCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
     },
@@ -46,7 +46,7 @@ pub enum NodeCmd {
         #[arg(
             long,
             default_value = "https://node.twigpine.com",
-            env = "GITLAWB_NODE"
+            env = "TWIGPINE_NODE"
         )]
         node: String,
     },
@@ -61,16 +61,16 @@ pub enum NodeCmd {
         #[arg(long)]
         http_url: String,
         /// Operator private key (0x-prefixed hex)
-        #[arg(long, env = "GITLAWB_OPERATOR_PRIVATE_KEY")]
+        #[arg(long, env = "TWIGPINE_OPERATOR_PRIVATE_KEY")]
         private_key: String,
         /// $GITLAWB ERC20 address
-        #[arg(long, env = "GITLAWB_TOKEN")]
+        #[arg(long, env = "TWIGPINE_TOKEN")]
         token: String,
         /// GitlawbNodeStaking contract address
-        #[arg(long, env = "GITLAWB_CONTRACT_NODE_STAKING")]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NODE_STAKING")]
         contract: String,
         /// Base RPC URL
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
         rpc_url: String,
         /// Identity dir (reads DID)
         #[arg(long)]
@@ -79,11 +79,11 @@ pub enum NodeCmd {
 
     /// Manually post a heartbeat (usually automatic once the node is running)
     Heartbeat {
-        #[arg(long, env = "GITLAWB_OPERATOR_PRIVATE_KEY")]
+        #[arg(long, env = "TWIGPINE_OPERATOR_PRIVATE_KEY")]
         private_key: String,
-        #[arg(long, env = "GITLAWB_CONTRACT_NODE_STAKING")]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NODE_STAKING")]
         contract: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
         rpc_url: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -91,9 +91,9 @@ pub enum NodeCmd {
 
     /// View your node's on-chain stake, rewards, and active flag
     OnchainStatus {
-        #[arg(long, env = "GITLAWB_CONTRACT_NODE_STAKING")]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NODE_STAKING")]
         contract: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
         rpc_url: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -101,11 +101,11 @@ pub enum NodeCmd {
 
     /// Claim accumulated PoS rewards without unstaking
     Claim {
-        #[arg(long, env = "GITLAWB_OPERATOR_PRIVATE_KEY")]
+        #[arg(long, env = "TWIGPINE_OPERATOR_PRIVATE_KEY")]
         private_key: String,
-        #[arg(long, env = "GITLAWB_CONTRACT_NODE_STAKING")]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NODE_STAKING")]
         contract: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
         rpc_url: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -113,11 +113,11 @@ pub enum NodeCmd {
 
     /// Request unstake — starts the 7-day cooldown
     UnstakeRequest {
-        #[arg(long, env = "GITLAWB_OPERATOR_PRIVATE_KEY")]
+        #[arg(long, env = "TWIGPINE_OPERATOR_PRIVATE_KEY")]
         private_key: String,
-        #[arg(long, env = "GITLAWB_CONTRACT_NODE_STAKING")]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NODE_STAKING")]
         contract: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
         rpc_url: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -125,11 +125,11 @@ pub enum NodeCmd {
 
     /// Complete unstake after the 7-day cooldown — returns stake + pending rewards
     Unstake {
-        #[arg(long, env = "GITLAWB_OPERATOR_PRIVATE_KEY")]
+        #[arg(long, env = "TWIGPINE_OPERATOR_PRIVATE_KEY")]
         private_key: String,
-        #[arg(long, env = "GITLAWB_CONTRACT_NODE_STAKING")]
+        #[arg(long, env = "TWIGPINE_CONTRACT_NODE_STAKING")]
         contract: String,
-        #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
+        #[arg(long, env = "TWIGPINE_CHAIN_RPC_URL", default_value = node_stake::default_rpc_url())]
         rpc_url: String,
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -700,7 +700,7 @@ mod tests {
     // Mirror of the above for the absent-`--dir` case: `None` must never resolve to
     // DirUnusable — it degrades to Anonymous (no default keystore) or Keyed (one
     // present). Env-independent: only the None->DirUnusable mapping is guarded, so it
-    // holds whether or not the runner has a default `~/.gitlawb` identity.
+    // holds whether or not the runner has a default `~/.twigpine` identity.
     #[test]
     fn resolve_pins_auth_none_is_never_dir_unusable() {
         assert!(

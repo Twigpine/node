@@ -3,8 +3,8 @@
 How a gitlawb node's **optional post-push pinning tiers** work. This documents
 the behavior implemented in `crates/twigpine-node/src/ipfs_pin.rs` and
 `crates/twigpine-node/src/pinata.rs`; it does not change any behavior. Primary
-git storage for clone/fetch lives in bare repos under `GITLAWB_REPOS_DIR`
-(with optional `GITLAWB_TIGRIS_BUCKET` backing), covered in the README
+git storage for clone/fetch lives in bare repos under `TWIGPINE_REPOS_DIR`
+(with optional `TWIGPINE_TIGRIS_BUCKET` backing), covered in the README
 Configuration table.
 
 ## Two-tier model
@@ -29,19 +29,19 @@ scope.
 
 | Tier | Sink | Module | Enabled by | Purpose |
 |------|------|--------|-----------|---------|
-| Hot  | Local Kubo (IPFS) | `ipfs_pin.rs` | `GITLAWB_IPFS_API` set | Node-local availability; the node is an HTTP client of a co-located Kubo daemon |
-| Warm | Pinata (IPFS) | `pinata.rs` | `GITLAWB_PINATA_JWT` set | Off-node durability + public IPFS gateway reachability |
+| Hot  | Local Kubo (IPFS) | `ipfs_pin.rs` | `TWIGPINE_IPFS_API` set | Node-local availability; the node is an HTTP client of a co-located Kubo daemon |
+| Warm | Pinata (IPFS) | `pinata.rs` | `TWIGPINE_PINATA_JWT` set | Off-node durability + public IPFS gateway reachability |
 
 If a sink's config value is empty, its **upload** step is a no-op, so leaving
-`GITLAWB_PINATA_JWT` unset disables warm-tier *uploads*. The tail's cost is
+`TWIGPINE_PINATA_JWT` unset disables warm-tier *uploads*. The tail's cost is
 conditional on the same admission gates above: only when the push was admitted
 to replication does the warm worker still take a global pin permit and run the
 full object-list re-derivation walk before the upload step returns empty,
 because its gate is the announce/walk state, not the JWT. On a push that was
 not admitted, no warm worker runs at all. Note the no-op applies to pinning
 only, not reads: the hot-tier read path (`ipfs_pin::cat`) returns an error rather
-than a no-op when `GITLAWB_IPFS_API` is unset, so a node that serves the
-encrypted-blob read endpoint needs Kubo configured. An empty `GITLAWB_IPFS_API`
+than a no-op when `TWIGPINE_IPFS_API` is unset, so a node that serves the
+encrypted-blob read endpoint needs Kubo configured. An empty `TWIGPINE_IPFS_API`
 can still briefly touch the pin pool: the hot worker may take a permit when the
 built object list is non-empty even though the upload call returns immediately.
 
@@ -49,10 +49,10 @@ built object list is non-empty even though the upload call returns immediately.
 
 | Env var | Default | Meaning |
 |---------|---------|---------|
-| `GITLAWB_IPFS_API` | `""` (disabled) | Base URL of the local Kubo HTTP API, e.g. `http://127.0.0.1:5001` |
-| `GITLAWB_PINATA_JWT` | `""` (disabled) | Pinata bearer JWT enabling the warm tier |
-| `GITLAWB_PINATA_UPLOAD_URL` | `https://uploads.pinata.cloud/v3/files` | Pinata v3 upload endpoint |
-| `GITLAWB_MAX_CONCURRENT_PIN_TASKS` | `8` | Cap on concurrent post-push pin loops across all repos |
+| `TWIGPINE_IPFS_API` | `""` (disabled) | Base URL of the local Kubo HTTP API, e.g. `http://127.0.0.1:5001` |
+| `TWIGPINE_PINATA_JWT` | `""` (disabled) | Pinata bearer JWT enabling the warm tier |
+| `TWIGPINE_PINATA_UPLOAD_URL` | `https://uploads.pinata.cloud/v3/files` | Pinata v3 upload endpoint |
+| `TWIGPINE_MAX_CONCURRENT_PIN_TASKS` | `8` | Cap on concurrent post-push pin loops across all repos |
 
 ## How pinning runs
 
@@ -91,7 +91,7 @@ objects whose successful pin is already recorded for that sink. The isolation is
 one-directional: a hot-only pin does not suppress the warm tier (`pinata_cid`
 stays null), and a warm-tier pin does not suppress the hot tier either: a row
 with only `pinata_cid` set has `local_ipfs_provenance = FALSE`, so an object
-warm-pinned while `GITLAWB_IPFS_API` was unset can still enter the hot upload
+warm-pinned while `TWIGPINE_IPFS_API` was unset can still enter the hot upload
 path once Kubo is configured, provided a later push selects it (the hot walk
 covers objects new to that push) or the enabled reconciliation sweep picks it
 up among eligible public objects, subject to visibility checks, budgets, and

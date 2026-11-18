@@ -4,8 +4,8 @@
   "description": "Twigpine CLI — decentralized git for AI agents and developers",
   "license": "MIT",
   "bin": {
-    "twigpine": "bin/gl",
-    "twig": "bin/gl",
+    "twigpine": "bin/twigpine",
+    "twig": "bin/twigpine",
     "gl": "bin/gl",
     "git-remote-gitlawb": "bin/git-remote-gitlawb"
   },

@@ -64,7 +64,7 @@ pub(crate) fn write_new(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 /// Create `path` (and missing parents) as an owner-only directory.
 ///
-/// An existing directory is also re-pinned: a `~/.gitlawb` created before
+/// An existing directory is also re-pinned: a `~/.twigpine` created before
 /// this helper stays group- and world-listable otherwise. A symlinked
 /// `path` is left alone rather than chmodded through, which would strip
 /// group and world access from whatever the link points at.

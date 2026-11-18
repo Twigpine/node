@@ -95,7 +95,7 @@ fn is_loopback_http(url: &str) -> bool {
 }
 
 /// Refuse to sign a request destined for a cleartext hop off this machine
-/// unless the operator has opted in. `GITLAWB_ALLOW_INSECURE_HTTP` exists for a
+/// unless the operator has opted in. `TWIGPINE_ALLOW_INSECURE_HTTP` exists for a
 /// private LAN where the operator has decided that is acceptable; only `1` or
 /// `true` opts in. A loopback node is never proxied (see
 /// [`is_loopback_http`]), so a proxy cannot carry its signed requests
@@ -109,12 +109,12 @@ fn ensure_signing_transport(node_base: &str, allow_insecure: bool) -> Result<()>
          The request is signed but not encrypted, so the Signature header and \
          the body are readable by anyone on the path, and a captured signature \
          can be replayed.\n\
-         Use https://, or set GITLAWB_ALLOW_INSECURE_HTTP=1 to accept the risk \
+         Use https://, or set TWIGPINE_ALLOW_INSECURE_HTTP=1 to accept the risk \
          (for a trusted private network only)."
     )
 }
 
-/// Parse a `GITLAWB_ALLOW_INSECURE_HTTP` value. Only `1` or `true`
+/// Parse a `TWIGPINE_ALLOW_INSECURE_HTTP` value. Only `1` or `true`
 /// (case-insensitive, after trim) opens the gate. Presence alone is not
 /// consent: `=0`, `=false` and an empty value read as "not opting in" to the
 /// operator, and the README and the refusal message document `=1`. A non-empty
@@ -137,7 +137,7 @@ fn allow_insecure_http_from_str(raw: Option<&str>) -> bool {
 /// Fixed warning for a set but non-truthy value. The raw value is never printed.
 fn warn_allow_insecure_http_non_truthy() {
     eprintln!(
-        "warning: GITLAWB_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); \
+        "warning: TWIGPINE_ALLOW_INSECURE_HTTP is set but not truthy (expected 1 or true); \
          plaintext http to a remote node remains refused"
     );
 }
@@ -146,7 +146,7 @@ fn warn_allow_insecure_http_non_truthy() {
 /// or shell can set it without rebuilding the client. A non-UTF-8 value fails
 /// closed and warns like any other non-truthy one.
 fn insecure_http_allowed() -> bool {
-    match std::env::var("GITLAWB_ALLOW_INSECURE_HTTP") {
+    match std::env::var("TWIGPINE_ALLOW_INSECURE_HTTP") {
         Ok(v) => allow_insecure_http_from_str(Some(&v)),
         Err(std::env::VarError::NotUnicode(_)) => {
             warn_allow_insecure_http_non_truthy();
@@ -325,7 +325,7 @@ impl NodeClient {
     /// signs afresh, so the retry is a new signature over the same bytes, not a
     /// resend of the original one. Emits an actionable hint on a 401 "not an
     /// agent" (the old-CLI / unregistered failure mode), and converts every
-    /// denial the node names in `x-gitlawb-error` into an error.
+    /// denial the node names in `x-twigpine-error` into an error.
     async fn send_signed(
         &self,
         method: &str,
@@ -354,11 +354,7 @@ impl NodeClient {
             let status = resp.status();
 
             if status == reqwest::StatusCode::UNAUTHORIZED
-                && resp
-                    .headers()
-                    .get("x-gitlawb-error")
-                    .and_then(|v| v.to_str().ok())
-                    == Some("human_detected")
+                && node_error_code(resp.headers()) == Some("human_detected")
             {
                 eprintln!(
                     "note: this node requires signed requests (RFC 9421). If writes keep \
@@ -437,7 +433,7 @@ impl NodeClient {
 
 /// A write the node refused with a code this build recognises.
 struct SignatureRejection {
-    /// Which denial it was. Its `as_str` is the `x-gitlawb-error` code, printed
+    /// Which denial it was. Its `as_str` is the `x-twigpine-error` code, printed
     /// verbatim so scripts can match on it.
     denial: NodeDenial,
     /// What the user should actually do next.
@@ -471,7 +467,7 @@ impl SignatureRejection {
 }
 
 /// Recognise a node rejection from the status and the
-/// `x-gitlawb-error` header, before anything reads the body.
+/// `x-twigpine-error` header, before anything reads the body.
 ///
 /// Known limit: the node also puts the same code in the body's `error` field,
 /// and this does not look at it, so a proxy or CDN that strips unknown `X-`
@@ -501,8 +497,18 @@ impl SignatureRejection {
 /// the caller's instructions for it. That is the whole point of the type, since
 /// the previous arrangement (a list of literals in each crate) silently missed
 /// `signature_nonce_too_short` for several commits and returned `Ok(400)` for it.
+/// The code the node put in its error header: `x-twigpine-error`, or the
+/// header's name before the rename when the node is older than that.
+fn node_error_code(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    twigpine_core::legacy_headers::ERROR_READ_ORDER
+        .iter()
+        .find_map(|name| headers.get(*name))?
+        .to_str()
+        .ok()
+}
+
 fn signature_rejection(resp: &reqwest::Response) -> Option<SignatureRejection> {
-    let code = resp.headers().get("x-gitlawb-error")?.to_str().ok()?;
+    let code = node_error_code(resp.headers())?;
     // A code this build does not know: not our denial to describe. The header
     // came from a node the user chose, which may be newer, older, or hostile,
     // so the response goes back to the caller untouched.
@@ -805,7 +811,7 @@ mod tests {
     use twigpine_core::identity::Keypair;
 
     /// Serializes the two integration tests that touch the process-global
-    /// `GITLAWB_ICAPTCHA_URL` / `GITLAWB_ICAPTCHA_INSECURE` env vars so they
+    /// `TWIGPINE_ICAPTCHA_URL` / `TWIGPINE_ICAPTCHA_INSECURE` env vars so they
     /// never race.
     static ICAPTCHA_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1058,7 +1064,7 @@ mod tests {
     async fn send_signed_errors_on_replayed_signature_and_never_retries() {
         let (resp, _server) = send_signed_once(
             409,
-            &[("x-gitlawb-error", "signature_replayed")],
+            &[("x-twigpine-error", "signature_replayed")],
             r#"{"error":"signature_replayed","message":"this signature was already used"}"#,
         )
         .await;
@@ -1080,7 +1086,7 @@ mod tests {
     async fn send_signed_errors_on_ledger_full_and_never_retries() {
         let (resp, _server) = send_signed_once(
             429,
-            &[("x-gitlawb-error", "signature_ledger_full")],
+            &[("x-twigpine-error", "signature_ledger_full")],
             r#"{"error":"signature_ledger_full","message":"ledger at capacity"}"#,
         )
         .await;
@@ -1098,7 +1104,7 @@ mod tests {
     async fn send_signed_errors_on_ledger_unavailable_and_never_retries() {
         let (resp, _server) = send_signed_once(
             503,
-            &[("x-gitlawb-error", "signature_ledger_unavailable")],
+            &[("x-twigpine-error", "signature_ledger_unavailable")],
             r#"{"error":"signature_ledger_unavailable","message":"ledger down"}"#,
         )
         .await;
@@ -1112,7 +1118,7 @@ mod tests {
     async fn send_signed_errors_on_nonce_required_and_never_retries() {
         let (resp, _server) = send_signed_once(
             400,
-            &[("x-gitlawb-error", "signature_nonce_required")],
+            &[("x-twigpine-error", "signature_nonce_required")],
             r#"{"error":"signature_nonce_required","message":"this node requires a nonce"}"#,
         )
         .await;
@@ -1130,7 +1136,7 @@ mod tests {
     async fn send_signed_errors_on_identity_missing_and_never_retries() {
         let (resp, _server) = send_signed_once(
             500,
-            &[("x-gitlawb-error", "signature_identity_missing")],
+            &[("x-twigpine-error", "signature_identity_missing")],
             r#"{"error":"signature_identity_missing","message":"no verified identity"}"#,
         )
         .await;
@@ -1148,7 +1154,7 @@ mod tests {
     async fn send_signed_errors_on_nonce_too_short_and_never_retries() {
         let (resp, _server) = send_signed_once(
             400,
-            &[("x-gitlawb-error", "signature_nonce_too_short")],
+            &[("x-twigpine-error", "signature_nonce_too_short")],
             r#"{"error":"signature_nonce_too_short","message":"the nonce must be at least 16 characters"}"#,
         )
         .await;
@@ -1173,7 +1179,7 @@ mod tests {
     async fn send_signed_tells_a_rate_limit_brake_apart_from_a_full_ledger() {
         let (brake, _s1) = send_signed_once(
             429,
-            &[("x-gitlawb-error", "rate_limited")],
+            &[("x-twigpine-error", "rate_limited")],
             r#"{"error":"rate_limited","message":"rate limit exceeded — try again later"}"#,
         )
         .await;
@@ -1183,7 +1189,7 @@ mod tests {
 
         let (ledger, _s2) = send_signed_once(
             429,
-            &[("x-gitlawb-error", "signature_ledger_full")],
+            &[("x-twigpine-error", "signature_ledger_full")],
             r#"{"error":"signature_ledger_full","message":"ledger at capacity"}"#,
         )
         .await;
@@ -1233,7 +1239,7 @@ mod tests {
         for (status, code) in all_denials() {
             let body = format!(r#"{{"error":"{code}","message":"node says no"}}"#);
             let (resp, _server) =
-                send_signed_once(status, &[("x-gitlawb-error", code)], &body).await;
+                send_signed_once(status, &[("x-twigpine-error", code)], &body).await;
             let err = match resp {
                 Ok(r) => panic!("{code} returned Ok({}) instead of an error", r.status()),
                 Err(e) => e.to_string(),
@@ -1249,7 +1255,7 @@ mod tests {
     #[tokio::test]
     async fn send_signed_does_not_see_a_denial_carried_only_in_the_body() {
         // Documents a known limit rather than a wanted behaviour: detection is
-        // header-keyed, so a proxy stripping `x-gitlawb-error` leaves the denial
+        // header-keyed, so a proxy stripping `x-twigpine-error` leaves the denial
         // to the caller (see `signature_rejection`). The callers that must not
         // read one as a success handle it themselves: `twigpine init` compares
         // `error` from the body, `twigpine task` checks the status before parsing.
@@ -1278,7 +1284,15 @@ mod tests {
         })
         .to_string();
         let (resp, _server) =
+            send_signed_once(409, &[("x-twigpine-error", "signature_replayed")], &body).await;
+        // A node from before the rename names the denial in the old header.
+        // It must be refused just the same, not handed back as a response.
+        let (old, _old_server) =
             send_signed_once(409, &[("x-gitlawb-error", "signature_replayed")], &body).await;
+        assert!(
+            old.is_err(),
+            "a denial under the old header name must still be an error"
+        );
         let err = resp.expect_err("a replay must error").to_string();
         assert!(
             !err.contains('\u{1b}'),
@@ -1319,10 +1333,10 @@ mod tests {
     #[tokio::test]
     async fn send_signed_returns_409_with_other_error_header_unchanged() {
         // Only the three signature_* codes are converted; any other
-        // x-gitlawb-error on a 409 is left to the caller.
+        // x-twigpine-error on a 409 is left to the caller.
         let (resp, _server) = send_signed_once(
             409,
-            &[("x-gitlawb-error", "repo_exists")],
+            &[("x-twigpine-error", "repo_exists")],
             r#"{"error":"repo_exists"}"#,
         )
         .await;
@@ -1334,7 +1348,7 @@ mod tests {
     async fn send_signed_returns_401_invalid_signature_unchanged() {
         let (resp, _server) = send_signed_once(
             401,
-            &[("x-gitlawb-error", "invalid_signature")],
+            &[("x-twigpine-error", "invalid_signature")],
             r#"{"error":"invalid_signature"}"#,
         )
         .await;
@@ -1351,7 +1365,7 @@ mod tests {
             .mock("POST", "/api/v1/repos")
             .with_status(401)
             .with_header("content-type", "application/json")
-            .with_header("x-gitlawb-error", "human_detected")
+            .with_header("x-twigpine-error", "human_detected")
             .with_body(r#"{"error":"human_detected"}"#)
             .expect(1)
             .create_async()
@@ -1371,7 +1385,7 @@ mod tests {
         // match too, so a 200 carrying a stray header stays a success.
         let (resp, _server) = send_signed_once(
             200,
-            &[("x-gitlawb-error", "signature_replayed")],
+            &[("x-twigpine-error", "signature_replayed")],
             r#"{"ok":true}"#,
         )
         .await;
@@ -1381,7 +1395,7 @@ mod tests {
 
     // ── send_signed iCaptcha retry (full integration) ────────────────────
 
-    /// Set GITLAWB_ICAPTCHA_URL and GITLAWB_ICAPTCHA_INSECURE so the iCaptcha
+    /// Set TWIGPINE_ICAPTCHA_URL and TWIGPINE_ICAPTCHA_INSECURE so the iCaptcha
     /// client trusts a local mockito HTTP server, restoring any prior values on
     /// drop so a test run launched with those variables keeps working.
     /// Holds [`ICAPTCHA_ENV_LOCK`] for its lifetime so concurrent tests don't
@@ -1395,10 +1409,10 @@ mod tests {
     impl IcaptchaEnv {
         fn new(url: &str) -> Self {
             let lock = ICAPTCHA_ENV_LOCK.lock().unwrap();
-            let prev_url = std::env::var_os("GITLAWB_ICAPTCHA_URL");
-            let prev_insecure = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
-            std::env::set_var("GITLAWB_ICAPTCHA_URL", url);
-            std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", "1");
+            let prev_url = std::env::var_os("TWIGPINE_ICAPTCHA_URL");
+            let prev_insecure = std::env::var_os("TWIGPINE_ICAPTCHA_INSECURE");
+            std::env::set_var("TWIGPINE_ICAPTCHA_URL", url);
+            std::env::set_var("TWIGPINE_ICAPTCHA_INSECURE", "1");
             IcaptchaEnv {
                 _lock: lock,
                 prev_url,
@@ -1410,12 +1424,12 @@ mod tests {
     impl Drop for IcaptchaEnv {
         fn drop(&mut self) {
             match self.prev_url.take() {
-                Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_URL", v),
-                None => std::env::remove_var("GITLAWB_ICAPTCHA_URL"),
+                Some(v) => std::env::set_var("TWIGPINE_ICAPTCHA_URL", v),
+                None => std::env::remove_var("TWIGPINE_ICAPTCHA_URL"),
             }
             match self.prev_insecure.take() {
-                Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", v),
-                None => std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE"),
+                Some(v) => std::env::set_var("TWIGPINE_ICAPTCHA_INSECURE", v),
+                None => std::env::remove_var("TWIGPINE_ICAPTCHA_INSECURE"),
             }
         }
     }
@@ -2160,7 +2174,7 @@ mod tests {
 
     // ── #413 plaintext-remote signing guard ──────────────────────────────
 
-    /// Holds [`ICAPTCHA_ENV_LOCK`] while it points `GITLAWB_ALLOW_INSECURE_HTTP`
+    /// Holds [`ICAPTCHA_ENV_LOCK`] while it points `TWIGPINE_ALLOW_INSECURE_HTTP`
     /// at `value` (or removes it), restoring the prior value on drop.
     struct InsecureHttpEnv {
         _lock: MutexGuard<'static, ()>,
@@ -2170,10 +2184,10 @@ mod tests {
     impl InsecureHttpEnv {
         fn set(value: Option<&str>) -> Self {
             let lock = ICAPTCHA_ENV_LOCK.lock().unwrap();
-            let prev = std::env::var_os("GITLAWB_ALLOW_INSECURE_HTTP");
+            let prev = std::env::var_os("TWIGPINE_ALLOW_INSECURE_HTTP");
             match value {
-                Some(v) => std::env::set_var("GITLAWB_ALLOW_INSECURE_HTTP", v),
-                None => std::env::remove_var("GITLAWB_ALLOW_INSECURE_HTTP"),
+                Some(v) => std::env::set_var("TWIGPINE_ALLOW_INSECURE_HTTP", v),
+                None => std::env::remove_var("TWIGPINE_ALLOW_INSECURE_HTTP"),
             }
             InsecureHttpEnv { _lock: lock, prev }
         }
@@ -2182,8 +2196,8 @@ mod tests {
     impl Drop for InsecureHttpEnv {
         fn drop(&mut self) {
             match self.prev.take() {
-                Some(v) => std::env::set_var("GITLAWB_ALLOW_INSECURE_HTTP", v),
-                None => std::env::remove_var("GITLAWB_ALLOW_INSECURE_HTTP"),
+                Some(v) => std::env::set_var("TWIGPINE_ALLOW_INSECURE_HTTP", v),
+                None => std::env::remove_var("TWIGPINE_ALLOW_INSECURE_HTTP"),
             }
         }
     }
@@ -2221,7 +2235,7 @@ mod tests {
         let err = ensure_signing_transport("http://10.0.0.36:7777", false).unwrap_err();
         assert!(
             err.to_string().contains("plaintext http")
-                && err.to_string().contains("GITLAWB_ALLOW_INSECURE_HTTP"),
+                && err.to_string().contains("TWIGPINE_ALLOW_INSECURE_HTTP"),
             "the refusal names the risk and the opt-in: {err}"
         );
         // Opted in, loopback, and https all pass.
@@ -2251,11 +2265,14 @@ mod tests {
     async fn get_signed_proceeds_when_insecure_http_opted_in() {
         let _env = InsecureHttpEnv::set(Some("1"));
         let client = NodeClient::new("http://gl-nonexistent-node.invalid", Some(test_keypair()));
-        let err = client.get_signed("/api/v1/x").await.unwrap_err();
-        assert!(
-            !err.to_string().contains("plaintext http"),
-            "the opt-in should let the request attempt the hop, got: {err}"
-        );
+        // Under HTTP_PROXY the proxy may answer instead of DNS failing; either
+        // way the guard let the request go, which is all this test is about.
+        if let Err(err) = client.get_signed("/api/v1/x").await {
+            assert!(
+                !err.to_string().contains("plaintext http"),
+                "the opt-in should let the request attempt the hop, got: {err}"
+            );
+        }
     }
 
     /// Unsigned calls are not this guard's business: no keypair means no
@@ -2264,11 +2281,12 @@ mod tests {
     async fn unsigned_call_to_plaintext_remote_is_ungated() {
         let _env = InsecureHttpEnv::set(None);
         let client = NodeClient::new("http://gl-nonexistent-node.invalid", None);
-        let err = client.post("/api/v1/x", b"{}").await.unwrap_err();
-        assert!(
-            !err.to_string().contains("plaintext http"),
-            "an unsigned request should not hit the signing guard, got: {err}"
-        );
+        if let Err(err) = client.post("/api/v1/x", b"{}").await {
+            assert!(
+                !err.to_string().contains("plaintext http"),
+                "an unsigned request should not hit the signing guard, got: {err}"
+            );
+        }
     }
 
     /// The opt-in is read as a value, not as presence, with the same contract as
@@ -2308,7 +2326,7 @@ mod tests {
             "all_proxy",
             "NO_PROXY",
             "no_proxy",
-            "GITLAWB_ALLOW_INSECURE_HTTP",
+            "TWIGPINE_ALLOW_INSECURE_HTTP",
         ] {
             cmd.env_remove(k);
         }
@@ -2481,7 +2499,7 @@ mod tests {
             &[
                 ("GL_ROUTE_REMOTE", "1"),
                 ("GL_ROUTE_ALLOW", "1"),
-                ("GITLAWB_ALLOW_INSECURE_HTTP", "1"),
+                ("TWIGPINE_ALLOW_INSECURE_HTTP", "1"),
             ],
         );
     }

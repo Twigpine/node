@@ -36,7 +36,7 @@ use anyhow::Result;
 /// Env var that forces the push path to always full-scan, bypassing the delta
 /// optimization (KTD7 kill-switch). Reuses the already-tested fallback branch
 /// rather than introducing a second enumeration path. Does not gate the sweep.
-const FORCE_FULL_SCAN_ENV: &str = "GITLAWB_PIN_FORCE_FULLSCAN";
+const FORCE_FULL_SCAN_ENV: &str = "TWIGPINE_PIN_FORCE_FULLSCAN";
 
 /// The objects a push introduced, or a signal that the delta could not be
 /// computed safely and the caller should fall back to a full scan.

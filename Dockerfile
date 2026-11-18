@@ -86,7 +86,16 @@ RUN ln -s twigpine /usr/local/bin/twig \
 USER gitlawb
 WORKDIR /data
 
-ENV GITLAWB_REPOS_DIR=/data/repos \
+# Image defaults, kept under the settings' names from before the rename on
+# purpose. A value the operator gives under either name must override them:
+# TWIGPINE_* wins over GITLAWB_* when both are set, so defaults under the new
+# names would silently beat an existing deployment's GITLAWB_PORT or
+# GITLAWB_KEY. Under the old names, GITLAWB_* replaces them and TWIGPINE_*
+# outranks them. They move to the new names when the old ones are dropped.
+# TWIGPINE_CONTAINER_IMAGE tells the node these six came from the image, so it
+# does not list them as old names the operator still uses.
+ENV TWIGPINE_CONTAINER_IMAGE=1 \
+    GITLAWB_REPOS_DIR=/data/repos \
     GITLAWB_KEY=/data/keys/identity.pem \
     GITLAWB_P2P_KEY=/data/keys/p2p.key \
     GITLAWB_HOST=0.0.0.0 \
@@ -98,7 +107,7 @@ EXPOSE 7545 7546/udp
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:${GITLAWB_PORT}/health || exit 1
+    CMD curl -fsS http://127.0.0.1:${TWIGPINE_PORT:-${GITLAWB_PORT}}/health || exit 1
 
 # Run under tini so the node is never PID 1. As PID 1 a process must reap
 # reparented orphans itself; the node does not, so git's reparented grandchildren

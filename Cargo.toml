@@ -55,7 +55,7 @@ uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "multipart", "rustls-tls"], default-features = false }
 # URL parsing (what reqwest::Url re-exports, so the shared redirect predicate can
 # take a parsed URL without pulling reqwest into twigpine-core; also used for the
-# absolute-browser-url validation on GITLAWB_WEB_URL in the node and CLI)
+# absolute-browser-url validation on TWIGPINE_WEB_URL in the node and CLI)
 url = "2"
 percent-encoding = "2"
 # HMAC

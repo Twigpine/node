@@ -4,7 +4,7 @@
 //! merges its contents into the runtime config so a fresh `docker compose up`
 //! joins the network without any manual peer configuration.
 //!
-//! Operators can opt out by setting `GITLAWB_BOOTSTRAP_DISABLE_SEEDS=true` in
+//! Operators can opt out by setting `TWIGPINE_BOOTSTRAP_DISABLE_SEEDS=true` in
 //! their environment — useful for isolated dev networks or testing.
 //!
 //! Add a node to the canonical list via PR to `bootstrap-peers.json`.
@@ -47,9 +47,9 @@ struct MergeCounts {
     p2p: usize,
 }
 
-/// Returns true when `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` is set to a truthy value.
+/// Returns true when `TWIGPINE_BOOTSTRAP_DISABLE_SEEDS` is set to a truthy value.
 fn seeds_disabled() -> bool {
-    std::env::var("GITLAWB_BOOTSTRAP_DISABLE_SEEDS")
+    std::env::var("TWIGPINE_BOOTSTRAP_DISABLE_SEEDS")
         .ok()
         .filter(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .is_some()
@@ -112,10 +112,10 @@ fn merge_into_vecs(
 /// - Appends any `http_url` to `config.bootstrap_peers` (used by gossip_task)
 /// - Appends any valid `p2p_multiaddr` to `config.p2p_bootstrap` (used by libp2p)
 /// - Dedupes against entries already present (env / CLI takes precedence)
-/// - No-op when `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` is set to a truthy value
+/// - No-op when `TWIGPINE_BOOTSTRAP_DISABLE_SEEDS` is set to a truthy value
 pub fn merge_seeds(config: &mut Config) {
     if seeds_disabled() {
-        info!("bootstrap seed list disabled via GITLAWB_BOOTSTRAP_DISABLE_SEEDS");
+        info!("bootstrap seed list disabled via TWIGPINE_BOOTSTRAP_DISABLE_SEEDS");
         return;
     }
 

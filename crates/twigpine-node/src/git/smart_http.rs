@@ -131,7 +131,7 @@ pub async fn info_refs(
         .status(StatusCode::OK)
         .header("Content-Type", content_type)
         .header("Cache-Control", "no-cache")
-        .header("X-Gitlawb-Node", "v0.1.0")
+        .header("X-Twigpine-Node", "v0.1.0")
         .body(Body::from(body))?)
 }
 

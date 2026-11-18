@@ -60,7 +60,7 @@ pub struct RepoStore {
     /// separate from the pool serving ordinary request handlers. Each write guard
     /// pins one connection here for its whole lifetime, so a push burst consumes
     /// this pool rather than starving application queries. Sized by
-    /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS`.
+    /// `TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS`.
     lock_pool: PgPool,
     /// Bound on any object-storage transfer that runs while the lock is HELD.
     lock_held_transfer_timeout: Duration,
@@ -553,7 +553,7 @@ impl RepoStore {
                         pool_idle = self.lock_pool.num_idle(),
                         err = %e,
                         "advisory-lock pool acquire failed — writes are being shed; \
-                         raise GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS or investigate long-held write locks"
+                         raise TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS or investigate long-held write locks"
                     );
                     return Err(anyhow::Error::new(LockPoolBusy))
                         .context(format!("advisory-lock pool exhausted or unreachable: {e}"));

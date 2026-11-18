@@ -44,7 +44,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use clap::Parser;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -101,7 +100,29 @@ pub async fn run() -> Result<()> {
         )
         .init();
 
-    let mut config = Config::parse();
+    let mut config = Config::parse_with_sources();
+
+    // Settings given under their names from before the rename still work
+    // (`main` copied them over before anything read a setting). Say which, by
+    // name only, so an operator can update the unit file at leisure.
+    let legacy = twigpine_core::legacy_env::report();
+    if !legacy.legacy_only.is_empty() {
+        info!(
+            settings = %legacy.legacy_only.join(", "),
+            "these settings were given under their old GITLAWB_ names, which still work; \
+             the names are TWIGPINE_ now"
+        );
+    }
+    if !legacy.conflicts.is_empty() {
+        // A warning: the value in use may not be the one the operator meant,
+        // for example a GITLAWB_ setting in an override file that a TWIGPINE_
+        // default now outranks. (The image's own defaults are not counted.)
+        warn!(
+            settings = %legacy.conflicts.join(", "),
+            "these settings have a different value under their old GITLAWB_ name; \
+             the TWIGPINE_ value is used. Remove or rename the GITLAWB_ one"
+        );
+    }
 
     // Admin subcommands run out-of-band and exit, never starting the node. The
     // no-subcommand path below is the unchanged daemon startup.
@@ -110,7 +131,7 @@ pub async fn run() -> Result<()> {
     }
 
     // Merge the embedded seed list of public network nodes into the runtime
-    // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
+    // bootstrap peers. Operators can opt out via TWIGPINE_BOOTSTRAP_DISABLE_SEEDS.
     bootstrap::merge_seeds(&mut config);
 
     // Fail fast on config combinations that are individually in-range but jointly
@@ -122,7 +143,7 @@ pub async fn run() -> Result<()> {
 
     if !config.public_read {
         warn!(
-            "GITLAWB_PUBLIC_READ=false has no effect; reads are gated per repository by is_public and path-scoped visibility rules, not this flag"
+            "TWIGPINE_PUBLIC_READ=false has no effect; reads are gated per repository by is_public and path-scoped visibility rules, not this flag"
         );
     }
 
@@ -136,7 +157,7 @@ pub async fn run() -> Result<()> {
 
     // One-time metrics init. Must run before any handler that calls into
     // `metrics::record_*` so the registry exists when the first event fires.
-    // Safe to call even when GITLAWB_METRICS_ADDR is unset — those helpers
+    // Safe to call even when TWIGPINE_METRICS_ADDR is unset — those helpers
     // are simply no-ops until something reads from the registry.
     metrics::init(env!("CARGO_PKG_VERSION"), &node_did.to_string());
 
@@ -186,7 +207,7 @@ pub async fn run() -> Result<()> {
             }
         }
     } else {
-        info!("metrics endpoint disabled (GITLAWB_METRICS_ADDR not set)");
+        info!("metrics endpoint disabled (TWIGPINE_METRICS_ADDR not set)");
         None
     };
 
@@ -398,8 +419,8 @@ pub async fn run() -> Result<()> {
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory. Max and window
-    // are operator-configurable via GITLAWB_RATE_LIMIT_MAX /
-    // GITLAWB_RATE_LIMIT_WINDOW_SECS; both reject 0 at parse time.
+    // are operator-configurable via TWIGPINE_RATE_LIMIT_MAX /
+    // TWIGPINE_RATE_LIMIT_WINDOW_SECS; both reject 0 at parse time.
     let rate_limiter = rate_limit::RateLimiter::new_bounded(
         config.rate_limit_max_requests as usize,
         std::time::Duration::from_secs(config.rate_limit_window_secs),
@@ -411,9 +432,9 @@ pub async fn run() -> Result<()> {
     // exactly how the recurring spam-repo floods get past both it and the
     // iCaptcha gate. Keyed on the resolved client IP so a single-source flood is
     // capped regardless of how many identities it mints. Sized well above any
-    // legitimate per-IP creation rate; GITLAWB_CREATE_RATE_LIMIT overrides, 0
+    // legitimate per-IP creation rate; TWIGPINE_CREATE_RATE_LIMIT overrides, 0
     // disables. Bounded key set — the key is a client-influenced IP.
-    let create_ip_rate_limiter = build_ip_limiter("GITLAWB_CREATE_RATE_LIMIT", 120, "creation");
+    let create_ip_rate_limiter = build_ip_limiter("TWIGPINE_CREATE_RATE_LIMIT", 120, "creation");
 
     // Per-IP brake for the authenticated non-creation write surface (issue/PR
     // comments, issue close, labels, stars, merges, protect, replicas, webhook
@@ -423,20 +444,20 @@ pub async fn run() -> Result<()> {
     // creation brake, so a write flood cannot drain the creation budget and vice
     // versa (same rationale as the sync_trigger / peer_write split). Sized above
     // any legitimate per-IP write rate — real agent automation makes many small
-    // writes per hour. GITLAWB_WRITE_RATE_LIMIT overrides; 0 disables. Bounded
+    // writes per hour. TWIGPINE_WRITE_RATE_LIMIT overrides; 0 disables. Bounded
     // key set — the key is a client-influenced IP.
-    let write_rate_limiter = build_ip_limiter("GITLAWB_WRITE_RATE_LIMIT", 600, "write");
+    let write_rate_limiter = build_ip_limiter("TWIGPINE_WRITE_RATE_LIMIT", 600, "write");
 
     // Push-path flood brake: max git-receive-pack requests per client IP per
     // hour (counts both the info/refs advertisement and the push POST). Sized
     // for heavy agent automation while still stopping flood traffic (the June
-    // 2026 attack pushed several times per second per IP). GITLAWB_PUSH_RATE_LIMIT
+    // 2026 attack pushed several times per second per IP). TWIGPINE_PUSH_RATE_LIMIT
     // overrides; 0 disables. Bounded key set — the key is a client-influenced IP.
-    let push_rate_limiter = build_ip_limiter("GITLAWB_PUSH_RATE_LIMIT", 600, "push");
+    let push_rate_limiter = build_ip_limiter("TWIGPINE_PUSH_RATE_LIMIT", 600, "push");
 
     // close_issue drives a full archive download for non-owner author pre-checks.
     // Keep it on its own bucket so it cannot drain the receive-pack limit.
-    let close_issue_limit = std::env::var("GITLAWB_CLOSE_ISSUE_RATE_LIMIT")
+    let close_issue_limit = std::env::var("TWIGPINE_CLOSE_ISSUE_RATE_LIMIT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(120);
@@ -447,15 +468,15 @@ pub async fn run() -> Result<()> {
     );
     if close_issue_limit == 0 {
         tracing::warn!(
-            "GITLAWB_CLOSE_ISSUE_RATE_LIMIT=0 — per-IP close_issue rate limiting disabled"
+            "TWIGPINE_CLOSE_ISSUE_RATE_LIMIT=0 — per-IP close_issue rate limiting disabled"
         );
     }
 
     // Which forwarded header the edge is trusted to set. Default None (trust
-    // nothing, key on the socket peer). Fly nodes set GITLAWB_TRUSTED_PROXY=fly;
+    // nothing, key on the socket peer). Fly nodes set TWIGPINE_TRUSTED_PROXY=fly;
     // a node behind Caddy/NGINX sets it to x-forwarded-for.
     let push_limiter_trust = rate_limit::TrustedProxy::from_env_value(
-        &std::env::var("GITLAWB_TRUSTED_PROXY").unwrap_or_default(),
+        &std::env::var("TWIGPINE_TRUSTED_PROXY").unwrap_or_default(),
     );
     tracing::info!(trust = ?push_limiter_trust, "push rate limiter trust configured");
 
@@ -477,11 +498,11 @@ pub async fn run() -> Result<()> {
         rate_limit::RateLimiter::new_bounded(12, std::time::Duration::from_secs(60), 10_000);
     if config.sync_trigger_rate_limit == 0 {
         tracing::warn!(
-            "GITLAWB_SYNC_TRIGGER_RATE_LIMIT=0 — /sync/trigger IP rate limiting disabled"
+            "TWIGPINE_SYNC_TRIGGER_RATE_LIMIT=0 — /sync/trigger IP rate limiting disabled"
         );
     }
     if config.peer_write_rate_limit == 0 {
-        tracing::warn!("GITLAWB_PEER_WRITE_RATE_LIMIT=0 — peer-write IP rate limiting disabled");
+        tracing::warn!("TWIGPINE_PEER_WRITE_RATE_LIMIT=0 — peer-write IP rate limiting disabled");
     }
 
     // Initialize the iCaptcha proof gate (inert unless ICAPTCHA_MODE is set).
@@ -619,10 +640,10 @@ pub async fn run() -> Result<()> {
     }
 
     if config.ipfs_rate_limit == 0 {
-        tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+        tracing::warn!("TWIGPINE_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
     }
     if config.task_read_rate_limit == 0 {
-        tracing::warn!("GITLAWB_TASK_READ_RATE_LIMIT=0 — per-IP task read rate limiting disabled");
+        tracing::warn!("TWIGPINE_TASK_READ_RATE_LIMIT=0 — per-IP task read rate limiting disabled");
     }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
@@ -811,7 +832,7 @@ pub async fn run() -> Result<()> {
             }
         }
     } else {
-        info!("on-chain PoS disabled (GITLAWB_CONTRACT_NODE_STAKING or GITLAWB_OPERATOR_PRIVATE_KEY unset)");
+        info!("on-chain PoS disabled (TWIGPINE_CONTRACT_NODE_STAKING or TWIGPINE_OPERATOR_PRIVATE_KEY unset)");
     }
 
     // axum's `with_graceful_shutdown` waits for in-flight requests to
@@ -924,7 +945,7 @@ fn resolve_rate_limit(raw: Option<&str>, default: usize) -> (usize, bool) {
 }
 
 /// Read a rate-limit env var, warning on a present-but-unparseable value. A typo
-/// like `GITLAWB_WRITE_RATE_LIMIT=5O` must not silently revert to the default and
+/// like `TWIGPINE_WRITE_RATE_LIMIT=5O` must not silently revert to the default and
 /// leave the operator believing a stricter cap is in force.
 fn rate_limit_from_env(var: &str, default: usize) -> usize {
     let raw = std::env::var(var).ok();
@@ -986,7 +1007,7 @@ async fn run_admin_command(command: config::Command, config: &Config) -> Result<
                         // on a Tigris deployment is the stale-view delete this
                         // guards against. Refuse to run rather than fall back.
                         anyhow::bail!(
-                                "purge-spam: GITLAWB_TIGRIS_BUCKET is set but the object-store client failed to initialize ({e}); refusing to run a local-only purge on a Tigris deployment"
+                                "purge-spam: TWIGPINE_TIGRIS_BUCKET is set but the object-store client failed to initialize ({e}); refusing to run a local-only purge on a Tigris deployment"
                             );
                     }
                 }
@@ -994,7 +1015,7 @@ async fn run_admin_command(command: config::Command, config: &Config) -> Result<
             // Give the purge-spam store a dedicated advisory-lock pool, separate
             // from `db`'s app pool. The guard then holds a lock-pool connection
             // while `delete_repo_by_id` runs on the app pool, so a purge at
-            // GITLAWB_DB_MAX_CONNECTIONS=1 does not self-deadlock (KTD3).
+            // TWIGPINE_DB_MAX_CONNECTIONS=1 does not self-deadlock (KTD3).
             let lock_pool = Db::lock_pool(
                 &config.database_url,
                 config.db_lock_pool_max_connections,
@@ -1223,7 +1244,7 @@ async fn connect_db_with_retry(
         {
             Ok(result) => result,
             Err(_) => Err(anyhow!(
-                "connect + migrate attempt exceeded {}s (GITLAWB_DB_CONNECT_TIMEOUT_SECS); \
+                "connect + migrate attempt exceeded {}s (TWIGPINE_DB_CONNECT_TIMEOUT_SECS); \
                  is another instance holding the migration lock?",
                 attempt_timeout.as_secs()
             )),
@@ -1393,6 +1414,7 @@ fn build_degraded_router(
     Router::new()
         .route("/", get(degraded_node_info))
         .fallback(degraded_unavailable)
+        .layer(axum::middleware::from_fn(server::send_legacy_header_names))
         .with_state(state)
 }
 
@@ -1429,7 +1451,7 @@ fn degraded_body(db_startup: &DbStartupStatus) -> serde_json::Value {
 async fn degraded_node_info(State(state): State<DegradedState>) -> impl IntoResponse {
     let mut body = degraded_body(&state.db_startup);
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("name".into(), "gitlawb-node".into());
+        obj.insert("name".into(), "twigpine-node".into());
         obj.insert("version".into(), env!("CARGO_PKG_VERSION").into());
         obj.insert("did".into(), state.node_did.clone().into());
         if let Some(web_url) = &state.web_url {
@@ -1889,7 +1911,7 @@ fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
             .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         anyhow::bail!(
-            "GITLAWB_KEY ({}) must name a key file, not a directory; a trailing separator, \
+            "TWIGPINE_KEY ({}) must name a key file, not a directory; a trailing separator, \
              a final `.` or `..` component, and `..` traversal are refused so the path \
              cannot retarget a parent",
             key_path.display()
@@ -2575,7 +2597,7 @@ mod identity_key_storage_tests {
     /// Fixture: one (layout, umask, phase) row of the identity lifecycle
     /// matrix.
     ///
-    /// `~/.gitlawb` holds BOTH keys, and `load_or_create_keypair` runs before
+    /// `~/.twigpine` holds BOTH keys, and `load_or_create_keypair` runs before
     /// the listener binds, so a mask that strips owner bits here takes the
     /// whole node down before any p2p code is reached. `umask` is
     /// process-global, so every row is a child. Double-gated like the p2p
@@ -2584,20 +2606,20 @@ mod identity_key_storage_tests {
     /// a process-global umask inside the shared test process.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-umask"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=identity-key-umask"]
     fn fixture_identity_key_under_hostile_umask() {
         use std::os::unix::fs::PermissionsExt;
 
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-umask") {
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref() != Some("identity-key-umask") {
             return;
         }
         let base = std::path::PathBuf::from(
-            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+            std::env::var("TWIGPINE_TEST_BASE").expect("TWIGPINE_TEST_BASE"),
         );
         let umask_val =
-            u32::from_str_radix(&std::env::var("GITLAWB_TEST_UMASK").unwrap(), 8).unwrap();
-        let layout = std::env::var("GITLAWB_TEST_LAYOUT").expect("GITLAWB_TEST_LAYOUT");
-        let phase = std::env::var("GITLAWB_TEST_PHASE").expect("GITLAWB_TEST_PHASE");
+            u32::from_str_radix(&std::env::var("TWIGPINE_TEST_UMASK").unwrap(), 8).unwrap();
+        let layout = std::env::var("TWIGPINE_TEST_LAYOUT").expect("TWIGPINE_TEST_LAYOUT");
+        let phase = std::env::var("TWIGPINE_TEST_PHASE").expect("TWIGPINE_TEST_PHASE");
 
         // SAFETY: `umask` only reads and replaces the process-wide value, and
         // this process exists solely for this probe. No restore: the value dies
@@ -2608,7 +2630,7 @@ mod identity_key_storage_tests {
 
         match layout.as_str() {
             "one-missing" => {
-                let dir = base.join(".gitlawb");
+                let dir = base.join(".twigpine");
                 let key = dir.join("identity.pem");
                 let did = run_identity_success_row(&base, &key, &key, &[dir], &phase);
                 println!("identity-key-umask: asserted did={did}");
@@ -2852,10 +2874,11 @@ mod identity_key_storage_tests {
             // only it knows the race has finished.
             "concurrent-first-boot" => {
                 let barrier = std::path::PathBuf::from(
-                    std::env::var("GITLAWB_TEST_BARRIER").expect("GITLAWB_TEST_BARRIER"),
+                    std::env::var("TWIGPINE_TEST_BARRIER").expect("TWIGPINE_TEST_BARRIER"),
                 );
-                let id = std::env::var("GITLAWB_TEST_RACE_ID").expect("GITLAWB_TEST_RACE_ID");
-                let role = std::env::var("GITLAWB_TEST_RACE_ROLE").expect("GITLAWB_TEST_RACE_ROLE");
+                let id = std::env::var("TWIGPINE_TEST_RACE_ID").expect("TWIGPINE_TEST_RACE_ID");
+                let role =
+                    std::env::var("TWIGPINE_TEST_RACE_ROLE").expect("TWIGPINE_TEST_RACE_ROLE");
                 let key = base.join("one").join("two").join("identity.pem");
 
                 // Two-phase rendezvous: each child announces itself with
@@ -2931,14 +2954,14 @@ mod identity_key_storage_tests {
         }
     }
 
-    /// GITLAWB_KEY names a PEM file, not a dedicated key directory. An existing
+    /// TWIGPINE_KEY names a PEM file, not a dedicated key directory. An existing
     /// 0755 parent is usable (no group/world write) and must not be chmodded.
     #[cfg(unix)]
     #[test]
     fn existing_identity_parent_is_not_chmodded() {
         use std::os::unix::fs::PermissionsExt;
 
-        for parent_name in [".gitlawb", "shared"] {
+        for parent_name in [".twigpine", "shared"] {
             let base = tempfile::tempdir().unwrap();
             std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let dir = base.path().join(parent_name);
@@ -2978,7 +3001,7 @@ mod identity_key_storage_tests {
 
         let base = tempfile::tempdir().unwrap();
         std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let dir = base.path().join(".gitlawb");
+        let dir = base.path().join(".twigpine");
         let key = dir.join("identity.pem");
         load_or_create_keypair_at(&key).expect("first boot creates the identity parent");
         let mode = std::fs::symlink_metadata(&dir)
@@ -3028,7 +3051,7 @@ mod identity_key_storage_tests {
 
         let base = tempfile::tempdir().unwrap();
         std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let key = base.path().join(".gitlawb").join("identity.pem");
+        let key = base.path().join(".twigpine").join("identity.pem");
 
         let created = load_or_create_keypair_at(&key).expect("first boot");
         let before = std::fs::read(&key).unwrap();
@@ -3090,18 +3113,18 @@ mod identity_key_storage_tests {
         // Both filters are optional and both panic on a value that names
         // nothing: a typo that quietly ran no child would be an empty green,
         // which is the failure this matrix exists to rule out.
-        let layout_only = std::env::var("GITLAWB_TEST_LAYOUT_ONLY").ok();
-        let umask_only = std::env::var("GITLAWB_TEST_UMASK_ONLY").ok();
+        let layout_only = std::env::var("TWIGPINE_TEST_LAYOUT_ONLY").ok();
+        let umask_only = std::env::var("TWIGPINE_TEST_UMASK_ONLY").ok();
         if let Some(l) = layout_only.as_deref() {
             assert!(
                 rows.iter().any(|r| r.0 == l),
-                "GITLAWB_TEST_LAYOUT_ONLY={l} names no row in the matrix"
+                "TWIGPINE_TEST_LAYOUT_ONLY={l} names no row in the matrix"
             );
         }
         if let Some(u) = umask_only.as_deref() {
             assert!(
                 ALL_UMASKS.contains(&u),
-                "GITLAWB_TEST_UMASK_ONLY={u} names no umask in the matrix"
+                "TWIGPINE_TEST_UMASK_ONLY={u} names no umask in the matrix"
             );
         }
 
@@ -3120,11 +3143,11 @@ mod identity_key_storage_tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
-            .env("GITLAWB_TEST_BASE", base)
-            .env("GITLAWB_TEST_UMASK", umask)
-            .env("GITLAWB_TEST_LAYOUT", layout)
-            .env("GITLAWB_TEST_PHASE", phase);
+            .env("TWIGPINE_TEST_FIXTURE", "identity-key-umask")
+            .env("TWIGPINE_TEST_BASE", base)
+            .env("TWIGPINE_TEST_UMASK", umask)
+            .env("TWIGPINE_TEST_LAYOUT", layout)
+            .env("TWIGPINE_TEST_PHASE", phase);
             let output = cmd.output().expect("spawn the identity-key fixture");
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3244,11 +3267,11 @@ mod identity_key_storage_tests {
         // A single run of a nondeterministic test proves very little, so the
         // default loops the whole race; raise it through the env for a longer
         // shake without editing the test.
-        let iterations: usize = std::env::var("GITLAWB_TEST_RACE_ITERATIONS")
+        let iterations: usize = std::env::var("TWIGPINE_TEST_RACE_ITERATIONS")
             .ok()
             .map(|v| {
                 v.parse()
-                    .expect("GITLAWB_TEST_RACE_ITERATIONS must be a count")
+                    .expect("TWIGPINE_TEST_RACE_ITERATIONS must be a count")
             })
             .unwrap_or(50);
         assert!(iterations > 0, "a race run zero times proves nothing");
@@ -3288,14 +3311,14 @@ mod identity_key_storage_tests {
                         "--ignored",
                         "--nocapture",
                     ])
-                    .env("GITLAWB_TEST_FIXTURE", "identity-key-umask")
-                    .env("GITLAWB_TEST_BASE", base.path())
-                    .env("GITLAWB_TEST_UMASK", RACE_UMASK)
-                    .env("GITLAWB_TEST_LAYOUT", "concurrent-first-boot")
-                    .env("GITLAWB_TEST_PHASE", "create")
-                    .env("GITLAWB_TEST_BARRIER", barrier.path())
-                    .env("GITLAWB_TEST_RACE_ID", id.to_string())
-                    .env("GITLAWB_TEST_RACE_ROLE", *role)
+                    .env("TWIGPINE_TEST_FIXTURE", "identity-key-umask")
+                    .env("TWIGPINE_TEST_BASE", base.path())
+                    .env("TWIGPINE_TEST_UMASK", RACE_UMASK)
+                    .env("TWIGPINE_TEST_LAYOUT", "concurrent-first-boot")
+                    .env("TWIGPINE_TEST_PHASE", "create")
+                    .env("TWIGPINE_TEST_BARRIER", barrier.path())
+                    .env("TWIGPINE_TEST_RACE_ID", id.to_string())
+                    .env("TWIGPINE_TEST_RACE_ROLE", *role)
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
                     children.push(cmd.spawn().expect("spawn a racing identity boot"));
@@ -3447,25 +3470,25 @@ mod identity_key_storage_tests {
         }
     }
 
-    /// Bare `GITLAWB_KEY=identity.pem` (and `./identity.pem`) must still create
+    /// Bare `TWIGPINE_KEY=identity.pem` (and `./identity.pem`) must still create
     /// the identity in the working directory. The p2p key refuses that form on
     /// purpose; the node identity has always allowed it.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=identity-key-bare"]
     fn fixture_bare_identity_key_in_cwd() {
         use std::os::unix::fs::PermissionsExt;
 
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("identity-key-bare") {
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref() != Some("identity-key-bare") {
             return;
         }
         let cwd = std::path::PathBuf::from(
-            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+            std::env::var("TWIGPINE_TEST_BASE").expect("TWIGPINE_TEST_BASE"),
         );
         std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
         let cwd_mode_before = std::fs::symlink_metadata(".").unwrap().permissions().mode() & 0o7777;
 
-        let name = std::env::var("GITLAWB_TEST_KEY_NAME").expect("GITLAWB_TEST_KEY_NAME");
+        let name = std::env::var("TWIGPINE_TEST_KEY_NAME").expect("TWIGPINE_TEST_KEY_NAME");
         let kp = load_or_create_keypair_at(std::path::Path::new(&name))
             .unwrap_or_else(|e| panic!("bare identity path {name:?} must create, got: {e:#}"));
         assert!(
@@ -3511,9 +3534,9 @@ mod identity_key_storage_tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("GITLAWB_TEST_FIXTURE", "identity-key-bare")
-            .env("GITLAWB_TEST_BASE", base.path())
-            .env("GITLAWB_TEST_KEY_NAME", name);
+            .env("TWIGPINE_TEST_FIXTURE", "identity-key-bare")
+            .env("TWIGPINE_TEST_BASE", base.path())
+            .env("TWIGPINE_TEST_KEY_NAME", name);
             let output = cmd.output().expect("spawn the bare-identity fixture");
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3547,17 +3570,17 @@ mod identity_key_storage_tests {
     /// cwd must fail, and must not leave a key behind. Do not chmod cwd.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-key-bare-writable"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=identity-key-bare-writable"]
     fn fixture_bare_identity_key_in_writable_cwd_is_refused() {
         use std::os::unix::fs::PermissionsExt;
 
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref()
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref()
             != Some("identity-key-bare-writable")
         {
             return;
         }
         let cwd = std::path::PathBuf::from(
-            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+            std::env::var("TWIGPINE_TEST_BASE").expect("TWIGPINE_TEST_BASE"),
         );
         std::env::set_current_dir(&cwd).expect("chdir into isolated tempdir");
         std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -3597,8 +3620,8 @@ mod identity_key_storage_tests {
             "--ignored",
             "--nocapture",
         ])
-        .env("GITLAWB_TEST_FIXTURE", "identity-key-bare-writable")
-        .env("GITLAWB_TEST_BASE", base.path());
+        .env("TWIGPINE_TEST_FIXTURE", "identity-key-bare-writable")
+        .env("TWIGPINE_TEST_BASE", base.path());
         let output = cmd
             .output()
             .expect("spawn the writable-cwd identity fixture");
@@ -3898,15 +3921,15 @@ mod identity_key_storage_tests {
     /// process.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=identity-symlink-relative"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=identity-symlink-relative"]
     fn fixture_identity_relative_path_with_interior_symlink() {
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref()
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref()
             != Some("identity-symlink-relative")
         {
             return;
         }
         let base = std::path::PathBuf::from(
-            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+            std::env::var("TWIGPINE_TEST_BASE").expect("TWIGPINE_TEST_BASE"),
         );
         let evil = plant_interior_symlink_layout(&base);
         std::env::set_current_dir(&base).expect("chdir into the row's base");
@@ -3949,8 +3972,8 @@ mod identity_key_storage_tests {
             "--ignored",
             "--nocapture",
         ])
-        .env("GITLAWB_TEST_FIXTURE", "identity-symlink-relative")
-        .env("GITLAWB_TEST_BASE", base.path());
+        .env("TWIGPINE_TEST_FIXTURE", "identity-symlink-relative")
+        .env("TWIGPINE_TEST_BASE", base.path());
         let output = cmd
             .output()
             .expect("spawn the relative-path symlink fixture");

@@ -989,7 +989,7 @@ impl Db {
     ///
     /// Kept separate from the main pool so a burst of lock-holding connections
     /// cannot starve ordinary request handlers. See
-    /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` for the sizing tradeoff.
+    /// `TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS` for the sizing tradeoff.
     pub fn lock_pool(
         database_url: &str,
         max_connections: u32,

@@ -22,11 +22,27 @@ $ErrorActionPreference = "Stop"
 # Windows PowerShell 5.1 may default to TLS 1.0; GitHub requires TLS 1.2+.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$Repo = if ($env:GITLAWB_RELEASE_REPO) { $env:GITLAWB_RELEASE_REPO } else { "Twigpine/node" }
-$DownloadBase = if ($env:GITLAWB_DOWNLOAD_BASE) { $env:GITLAWB_DOWNLOAD_BASE.TrimEnd("/") } else { "https://github.com/$Repo/releases/download" }
-$ChecksumsUrl = if ($env:GITLAWB_CHECKSUMS_URL) { $env:GITLAWB_CHECKSUMS_URL } else { "https://twigpine.com/install-checksums.txt" }
-$InstallDir = if ($env:GITLAWB_INSTALL_DIR) { $env:GITLAWB_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\gitlawb" }
-$Headers = @{ "User-Agent" = "gitlawb-installer" }
+# Settings are TWIGPINE_*; the GITLAWB_* names from before the rename still work.
+function Get-Setting([string]$Name, [string]$Default) {
+  foreach ($prefix in @("TWIGPINE_", "GITLAWB_")) {
+    $value = [Environment]::GetEnvironmentVariable("$prefix$Name")
+    if ($value) { return $value }
+  }
+  return $Default
+}
+
+$Repo = Get-Setting "RELEASE_REPO" "Twigpine/node"
+$DownloadBase = (Get-Setting "DOWNLOAD_BASE" "https://github.com/$Repo/releases/download").TrimEnd("/")
+$ChecksumsUrl = Get-Setting "CHECKSUMS_URL" "https://twigpine.com/install-checksums.txt"
+# The default folder was Programs\gitlawb before the rename. An install that is
+# already there is upgraded in place, so the PATH entry it added stays valid.
+$DefaultDir = "$env:LOCALAPPDATA\Programs\twigpine"
+$OldDefaultDir = "$env:LOCALAPPDATA\Programs\gitlawb"
+if (-not (Test-Path -LiteralPath $DefaultDir) -and (Test-Path -LiteralPath $OldDefaultDir -PathType Container)) {
+  $DefaultDir = $OldDefaultDir
+}
+$InstallDir = Get-Setting "INSTALL_DIR" $DefaultDir
+$Headers = @{ "User-Agent" = "twigpine-installer" }
 
 $arch = if ($env:PROCESSOR_ARCHITEW6432) {
   $env:PROCESSOR_ARCHITEW6432
@@ -38,7 +54,7 @@ if ($arch -ne "AMD64") {
 }
 $target = "x86_64-pc-windows-msvc"
 
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("gitlawb-" + [System.Guid]::NewGuid().ToString("N"))
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("twigpine-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
   # The checksum list comes first: it names the latest version and is the only
@@ -143,7 +159,7 @@ try {
   foreach ($item in $plan) {
     $dst = Join-Path $InstallDir $item.Name
     if (Test-Path -LiteralPath $dst -PathType Container) {
-      throw "$dst is a directory, and the installer needs that name for a program. Move it away or set GITLAWB_INSTALL_DIR. Nothing was installed."
+      throw "$dst is a directory, and the installer needs that name for a program. Move it away or set TWIGPINE_INSTALL_DIR. Nothing was installed."
     }
   }
 

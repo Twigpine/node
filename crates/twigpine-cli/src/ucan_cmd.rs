@@ -445,7 +445,7 @@ pub(crate) async fn import_delegation(
     // already holds `identity.pem`, whose disclosure is strictly worse than a
     // delegation's. `create_private_dir` and `write_private_file` below carry the
     // per-platform reasoning.
-    let base = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?;
+    let base = crate::identity::identity_dir(dir.map(std::path::Path::to_path_buf))?;
     let store = base.join("delegations");
     create_private_dir(&store).with_context(|| format!("could not create {}", store.display()))?;
 
@@ -646,7 +646,7 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
     Ok(())
 }
 
-// `std::fs` has no portable ACL API, and `gitlawb_dir` accepts any directory, so
+// `std::fs` has no portable ACL API, and `identity_dir` accepts any directory, so
 // the contract off Unix is that the caller supplies a user-private directory —
 // which is what the platform's per-user profile gives by default. The private key
 // sits in the same directory under the same assumption, and its disclosure is
@@ -773,7 +773,7 @@ async fn cmd_delegate(
 }
 
 async fn cmd_show(dir: Option<PathBuf>) -> Result<()> {
-    let ucan_path = crate::identity::gitlawb_dir(dir)?.join("ucan.json");
+    let ucan_path = crate::identity::identity_dir(dir)?.join("ucan.json");
 
     if !ucan_path.exists() {
         println!("No UCAN saved. Run `twigpine register` first.");

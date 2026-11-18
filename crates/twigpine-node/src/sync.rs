@@ -1,6 +1,6 @@
 //! Multi-node repo sync worker.
 //!
-//! When `GITLAWB_AUTO_SYNC=true`, this background task polls the `sync_queue`
+//! When `TWIGPINE_AUTO_SYNC=true`, this background task polls the `sync_queue`
 //! table and mirrors repos from peer nodes after receiving Gossipsub ref-update
 //! events. Each sync item represents one ref update that arrived from a peer.
 //!

@@ -67,7 +67,7 @@ Good today:
 
 Known limitations:
 
-- Repository write authorization is one switch: `GITLAWB_ENFORCE_OWNER_PUSH`, which defaults to `true`. With it off — rolling upgrades only — a valid HTTP Signature identifies a pusher but does not authorize one, so every signed caller may push everywhere.
+- Repository write authorization is one switch: `TWIGPINE_ENFORCE_OWNER_PUSH`, which defaults to `true`. With it off — rolling upgrades only — a valid HTTP Signature identifies a pusher but does not authorize one, so every signed caller may push everywhere.
 - UCAN capabilities are consulted on the push path only. There, the chain's root issuer is anchored to the repository owner, so an owner-rooted, time-bounded delegation that names the repository grants scoped collaborator access for pushing to it, for the `git/push`, `*`, or `repo/admin` actions. A `*` *resource* is refused: a delegation must name the repository it applies to, so it cannot grow to cover repos created later. Push-only cuts the other way too: a delegation grants no read access, so on a private repository the delegate must also be a reader (`twigpine visibility set`) — the two gates a push crosses are described in [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). The rest is unchanged: there is no revocation path, `nb` constraints are refused rather than interpreted, and no other route — reads, pull requests, issues, agents — consults capabilities at all.
 - Agent lifecycle revocation is not enforced by HTTP Signature authorization; do not rely on removing or revoking an agent record to block a compromised signer.
 - Task list/get reads (REST and GraphQL) are repository/task-gated and omit `ucan_token`. Slash-form `repo_id` rows (mirror-hosted tasks) can appear on list for the delegator or trimmed assignee, but `GET /api/v1/tasks/{id}` and GraphQL `task` fail closed for every caller because there is no local repository backing to serve. Read visibility is not a blanket data-classification boundary: IPFS-pin and Arweave-anchor listings are not repository-gated; withheld path names can be visible to a root reader; and later visibility changes cannot retract content already announced or externally anchored.
@@ -188,15 +188,15 @@ twigpine repo create my-repo --description "My first Twigpine repo" --node http:
 Use the git remote helper:
 
 ```bash
-export GITLAWB_NODE=http://localhost:7545
+export TWIGPINE_NODE=http://localhost:7545
 git clone gitlawb://did:key:z6Mk.../my-repo
 ```
 
-For public-network use, make sure `GITLAWB_NODE` points to the node you want, over
+For public-network use, make sure `TWIGPINE_NODE` points to the node you want, over
 `https://`. The helper defaults to localhost for local development, and plaintext
 `http://` is allowed only to this machine: requests are signed but not encrypted, so
 a cleartext hop to a remote node exposes the pack contents and the `Signature`
-header. A remote `http://` node is refused, and `GITLAWB_ALLOW_INSECURE_HTTP=1`
+header. A remote `http://` node is refused, and `TWIGPINE_ALLOW_INSECURE_HTTP=1`
 overrides that for a trusted private network.
 
 ### Full lifecycle against an iCaptcha-enforcing node
@@ -232,8 +232,8 @@ Notes:
   `git push` is **signed-only** (owner signature is the gate, no per-push challenge);
   reads (clone / fetch / `repo info`) need no proof. A non-existent repo returns a
   clear `404`, never a placeholder.
-- **API-key iCaptcha deployments:** set `GITLAWB_ICAPTCHA_URL` to your iCaptcha
-  origin and `GITLAWB_ICAPTCHA_API_KEY` to its key. The client only talks to an
+- **API-key iCaptcha deployments:** set `TWIGPINE_ICAPTCHA_URL` to your iCaptcha
+  origin and `TWIGPINE_ICAPTCHA_API_KEY` to its key. The client only talks to an
   `https` origin whose host is allowlisted (that URL or the public default), and
   sends the bearer token **only** to your configured origin, never to a URL a
   node advertises, so a hostile node can't capture the key or redirect the solve.
@@ -371,33 +371,39 @@ POST /api/v1/peers/announce
 POST /api/v1/sync/notify
 ```
 
-When `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=false`, unsigned legacy peers are accepted on those two routes, but signed requests are verified when signature headers are present. Staged rollout relaxes who may announce, not who owns a peer row. An unsigned announce may register a previously unseen peer, and it may refresh an existing row whose `http_url` is unchanged, but changing an existing peer's `http_url` requires an RFC 9421 signature from that peer's own DID and is refused with 403 otherwise. An unsigned announce can only register a `did:key`, since that is the only method whose verifying key can be resolved and therefore the only kind of row anyone could ever correct through the signed path; any other DID is refused with 400. Once all live peers upgrade, operators can set:
+When `TWIGPINE_REQUIRE_SIGNED_PEER_WRITES=false`, unsigned legacy peers are accepted on those two routes, but signed requests are verified when signature headers are present. Staged rollout relaxes who may announce, not who owns a peer row. An unsigned announce may register a previously unseen peer, and it may refresh an existing row whose `http_url` is unchanged, but changing an existing peer's `http_url` requires an RFC 9421 signature from that peer's own DID and is refused with 403 otherwise. An unsigned announce can only register a `did:key`, since that is the only method whose verifying key can be resolved and therefore the only kind of row anyone could ever correct through the signed path; any other DID is refused with 400. Once all live peers upgrade, operators can set:
 
 ```bash
-GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true
+TWIGPINE_REQUIRE_SIGNED_PEER_WRITES=true
 ```
 
 `POST /api/v1/sync/trigger` is not part of the staged rollout: it always requires a signature in both config modes and returns 401 without one, because each call drives an O(peers) outbound fan-out.
 
-A verified signature is spent once on the write routes that require one: repo, issue, PR, task, bounty, profile, webhook, label, star, replica, visibility and agent mutations, plus git push and `POST /api/v1/sync/trigger`. A captured request to any of those cannot be replayed. The two peer-write routes are the exception. `POST /api/v1/peers/announce` and `POST /api/v1/sync/notify` reach the ledger only when `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true`; under the default (`false`) they verify a signature when the headers are present but never spend it, so a captured signed peer write is still replayable there until the fleet upgrades and the flag is turned on. The ledger keys on the RFC 9421 `nonce` parameter when the client signs one and falls back to the signing-string hash when it does not. The fallback is correct but coarser: a client that repeats a byte-identical mutation within the same second is rejected as a replay and has to re-sign. `GITLAWB_REQUIRE_SIGNATURE_NONCE` closes that fallback once every client emits a nonce:
+A verified signature is spent once on the write routes that require one: repo, issue, PR, task, bounty, profile, webhook, label, star, replica, visibility and agent mutations, plus git push and `POST /api/v1/sync/trigger`. A captured request to any of those cannot be replayed. The two peer-write routes are the exception. `POST /api/v1/peers/announce` and `POST /api/v1/sync/notify` reach the ledger only when `TWIGPINE_REQUIRE_SIGNED_PEER_WRITES=true`; under the default (`false`) they verify a signature when the headers are present but never spend it, so a captured signed peer write is still replayable there until the fleet upgrades and the flag is turned on. The ledger keys on the RFC 9421 `nonce` parameter when the client signs one and falls back to the signing-string hash when it does not. The fallback is correct but coarser: a client that repeats a byte-identical mutation within the same second is rejected as a replay and has to re-sign. `TWIGPINE_REQUIRE_SIGNATURE_NONCE` closes that fallback once every client emits a nonce:
 
 ```bash
-GITLAWB_REQUIRE_SIGNATURE_NONCE=true
+TWIGPINE_REQUIRE_SIGNATURE_NONCE=true
 ```
 
-With it on, a nonce-less signature on a write route is rejected with 400 and `X-Gitlawb-Error: signature_nonce_required`. Signed reads are never affected. Flipping it on has a federation precondition: three of the node's own outbound signed calls (peer announce, replica registration, sync-notify) are peer traffic, so a node running with both this and `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` set to true will reject peer writes from any node still on a pre-nonce binary. Upgrade the fleet before enabling it.
+With it on, a nonce-less signature on a write route is rejected with 400 and `X-Twigpine-Error: signature_nonce_required`. Signed reads are never affected. Flipping it on has a federation precondition: three of the node's own outbound signed calls (peer announce, replica registration, sync-notify) are peer traffic, so a node running with both this and `TWIGPINE_REQUIRE_SIGNED_PEER_WRITES` set to true will reject peer writes from any node still on a pre-nonce binary. Upgrade the fleet before enabling it.
 
-`GITLAWB_REQUIRE_SIGNED_PEER_WRITES` is not HTTP-only. It also gates inbound gossip ref-update events on the libp2p mesh, which carry an Ed25519 payload signature rather than RFC 9421 headers because there are no HTTP headers to sign. Set to `true`, an unsigned gossip event is dropped. Set to `false`, an unsigned event is accepted with a warning during the rolling-upgrade window, and the write budget it consumes is charged to the forwarding peer rather than to the DID it claims, since an unsigned event's claimed DID is asserted and not proven. A present-but-invalid signature is refused in both modes; that is forgery, not an un-upgraded peer.
+`TWIGPINE_REQUIRE_SIGNED_PEER_WRITES` is not HTTP-only. It also gates inbound gossip ref-update events on the libp2p mesh, which carry an Ed25519 payload signature rather than RFC 9421 headers because there are no HTTP headers to sign. Set to `true`, an unsigned gossip event is dropped. Set to `false`, an unsigned event is accepted with a warning during the rolling-upgrade window, and the write budget it consumes is charged to the forwarding peer rather than to the DID it claims, since an unsigned event's claimed DID is asserted and not proven. A present-but-invalid signature is refused in both modes; that is forgery, not an un-upgraded peer.
 
-Because `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` now spans both transports, the rollout order matters in one direction: **upgrade every gossip-publishing peer to a build that signs events before you set `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` to `true`.** Enabling it while an old publisher is still live drops that publisher's ref-updates on arrival, and the publisher sees no error, because gossip has no response to carry one. Upgrading the HTTP peers alone is not sufficient.
+Because `TWIGPINE_REQUIRE_SIGNED_PEER_WRITES` now spans both transports, the rollout order matters in one direction: **upgrade every gossip-publishing peer to a build that signs events before you set `TWIGPINE_REQUIRE_SIGNED_PEER_WRITES` to `true`.** Enabling it while an old publisher is still live drops that publisher's ref-updates on arrival, and the publisher sees no error, because gossip has no response to carry one. Upgrading the HTTP peers alone is not sufficient.
 
-There is a second precondition on gossip ingest that the flag does not control. A publisher's `node_did` must already exist in the receiving node's peers table, or the event is dropped as an unknown peer DID. This holds in both modes, signed and unsigned alike: a valid signature proves key possession, not membership. Rows reach that table over HTTP, either from `GITLAWB_BOOTSTRAP_PEERS` when this node contacts a bootstrap peer and records the DID it reports, or from a prior `POST /api/v1/peers/announce`. So a peer that only ever joined the libp2p mesh, with no HTTP announce and no bootstrap contact in either direction, will have its ref-updates dropped even with a good signature and the flag off. If gossip is silently not landing from a peer you can see on the mesh, check that its DID is in `GET /api/v1/peers` on the receiving side first.
+There is a second precondition on gossip ingest that the flag does not control. A publisher's `node_did` must already exist in the receiving node's peers table, or the event is dropped as an unknown peer DID. This holds in both modes, signed and unsigned alike: a valid signature proves key possession, not membership. Rows reach that table over HTTP, either from `TWIGPINE_BOOTSTRAP_PEERS` when this node contacts a bootstrap peer and records the DID it reports, or from a prior `POST /api/v1/peers/announce`. So a peer that only ever joined the libp2p mesh, with no HTTP announce and no bootstrap contact in either direction, will have its ref-updates dropped even with a good signature and the flag off. If gossip is silently not landing from a peer you can see on the mesh, check that its DID is in `GET /api/v1/peers` on the receiving side first.
 
 ---
 
 ## Configuration
 
 All configuration is via environment variables. See [`.env.example`](.env.example) for the full reference.
+
+**Names from before the rename still work.** Settings were `GITLAWB_*` and are `TWIGPINE_*` now. The node, `twigpine` and the git helper accept both; when both are set and differ, the `TWIGPINE_*` value is used. The node logs which old names it was given, and `twigpine doctor` lists them. One case needs a manual rename: a `GITLAWB_*` entry under `environment:` in a `docker-compose.override.yml` no longer replaces the matching entry in the shipped `docker-compose.yml`, which now uses the `TWIGPINE_*` name. The node warns at startup about every setting it was given under both names with different values. Releases up to 0.7.1 know only the `GITLAWB_*` names.
+
+The default key folder is `~/.twigpine`. An existing `~/.gitlawb` keeps being used as long as there is no `~/.twigpine`; nothing is moved. To switch, stop the node and rename the folder. Once `~/.twigpine` exists it is the only one read: if a key is missing there but present in `~/.gitlawb`, the node refuses to start and says so, and it never creates a second identity beside the first.
+
+Response headers and webhook deliveries carry both `X-Twigpine-*` and the older `X-Gitlawb-*` names with the same values.
 
 Minimum required for a persistent node:
 
@@ -409,40 +415,40 @@ Important node settings:
 
 | Variable | Purpose |
 |---|---|
-| `GITLAWB_HOST` / `GITLAWB_PORT` | HTTP bind address and port. |
-| `GITLAWB_REPOS_DIR` | Local bare repo storage directory. |
-| `GITLAWB_PUBLIC_URL` | Public HTTP URL announced to peers. |
-| `GITLAWB_P2P_PORT` | libp2p QUIC/UDP port. Use `0` to disable. |
-| `GITLAWB_BOOTSTRAP_PEERS` | Comma-separated HTTP peer URLs. |
-| `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
-| `GITLAWB_P2P_KEY` | Path to the node's persistent libp2p identity key file, which fixes the PeerId across restarts. Must name a key file inside a directory, such as `/data/keys/p2p.key` or `./keys/p2p.key`. Two kinds of problem are handled differently. A value that cannot name a securable key file at all (a bare filename, `..` traversal, a trailing `/`, the filesystem root, or a `~/` path that escapes home) is refused before the node binds, so the process exits. Anything wrong with the storage itself (a symlinked or non-directory parent, an unsafe ancestor or working directory, an unreadable or malformed key) leaves p2p off while HTTP keeps serving; the node logs it at error level as `p2p_identity_key_load_failed` and sets the `gitlawb_p2p_identity_key_load_failed` metric to 1. Note that `/health` still reports healthy in that state, so alert on the log event or the metric rather than on the health check. Correcting the storage and restarting restores the same PeerId. On Unix a new key is created `0600` inside a `0700` directory. A key directory that grants access beyond its owner is tightened to `0700` on start; one that is closed too far is refused with a `chmod 700` remedy rather than widened, since a directory locked down on purpose is an operator decision. Rotate the key only when the node logs that the directory was group- or world-writable (or the key file itself was group- or world-readable). An ordinary `0755` directory is tightened too, but others could not read a `0600` key or replace its directory entry. An existing key file is never modified: one with group or other bits set is rejected (`chmod 600`), and so is one this node cannot read. On other platforms no permissions are enforced. Default `~/.gitlawb/p2p.key`; point it at a persistent volume when running in a container. |
-| `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
-| `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. Defaults to `false` during the staged rollout below. |
-| `GITLAWB_REQUIRE_SIGNATURE_NONCE` | Require a signed `nonce` on write routes. Default false; see the staged rollout note above. |
-| `GITLAWB_ENFORCE_OWNER_PUSH` | Require the pusher on `git-receive-pack` to be the repo owner, or to present an owner-rooted, time-bounded UCAN `git/push` capability naming the repository (`X-Ucan`). **Defaults to `true`.** A `did:key` signature is authentication, not authorization — anyone can mint a key and sign — so with this off every signed caller may push to every repository, private ones included. A CI or delegated key with no such delegation counts as a non-owner and cannot push while this is on. The delegation clears the push gate only; on a private repository the delegate must also be a reader. Set `false` only for a rolling upgrade; see [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
-| `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
-| `GITLAWB_RECONCILIATION_SWEEP` | Enable the hourly durability sweep that re-pins/backstops missing objects (default `true`; disabled when no IPFS/Pinata backend is configured). Public pin repair runs against any configured backend (IPFS, Pinata, or both). Encrypted recovery repair requires local IPFS (`GITLAWB_IPFS_API`); Pinata-only nodes reconcile public pins only. |
-| `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
-| `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack, receive-pack, or `info/refs` advertisement may run before it is aborted (504). Default 600. Also bounds the withheld-blob classification walk (on both the upload-pack serve and receive-pack replication paths) and the push-side pin-candidate discovery (`rev-list` / `cat-file`), each reaped via process-group teardown at the deadline. On the path-scoped upload-pack path the classification walk and the pack serve share ONE deadline, so this value bounds their combined duration rather than granting each stage a full budget: a walk that consumes it leaves the serve nothing and the clone gets a 504. Serving large path-scoped repos may therefore need a higher value than they did when each stage was budgeted separately. Accepted range is 1 to 3153600000 (100 years), since the node derives deadlines from this value and a larger one cannot be represented. |
-| `GITLAWB_GIT_ACQUIRE_TIMEOUT_SECS` | Max seconds the storage-acquisition phase (Tigris HEAD/GET, push advisory-lock) of a served git op may run before the request is shed with a 503, separate from the git-run timeout. The concurrency permit is released on expiry so a stalled backend cannot pin the pool. Default 30. |
-| `GITLAWB_MAX_CONCURRENT_GIT_OPS` | Max concurrent served git READ ops (upload-pack and its `info/refs` advertisement) across all callers; over-cap sheds a 503 + Retry-After. Anonymous reads draw from this pool, so pair it with `GITLAWB_MAX_CONCURRENT_READS_PER_CALLER`. Pushes and the receive-pack advertisement have their own pools, so a read flood cannot shed an authenticated push. Default 128. |
-| `GITLAWB_MAX_CONCURRENT_GIT_PUSHES` | Max concurrent `git-receive-pack` POST operations, in a pool separate from the read pool. The anon receive-pack `info/refs` advertisement runs in a third pool of the same size, disjoint from both, so an advertisement flood cannot shed a push either. Two per-source push caps are derived from this value (`/8`, floor 1) and have no env var of their own. Over-cap sheds a 503 + Retry-After. Default 32. |
-| `GITLAWB_MAX_CONCURRENT_READS_PER_CALLER` | Max concurrent read ops a single caller may hold, so one caller cannot monopolize the read pool. Keyed on the resolved source IP, never the DID, and only as granular as `GITLAWB_TRUSTED_PROXY`: left unset, a node behind an edge or NAT keys every caller on the edge IP and this collapses to one global cap. Default 16. |
-| `GITLAWB_MAX_CONCURRENT_PIN_TASKS` | Max post-push pin loops (IPFS + Pinata) running concurrently across all repos. This caps how many loops RUN at once, not how much object-id list memory the node retains: on the local IPFS path a loop parked waiting for a permit still holds its full list. Do not size memory from this knob alone. A loop over cap waits, never drops a pin. Up to two loops run per push that starts its own encrypt/pin task when both IPFS and Pinata are configured; a push coalesced onto an in-flight task adds at most one warm loop. See [docs/STORAGE-AND-PINNING.md](docs/STORAGE-AND-PINNING.md) for the two-tier model, dedup, and parked-list memory. Default 8. |
-| `GITLAWB_REPO_LEASE_MAX_WAITERS` | Max pushes parked at once waiting for the same repo's write lease. Each waiter pins its buffered pack body, so this bounds that memory for a hot repo; past the cap the newest push sheds a 503 + Retry-After instead of queueing. Pushes to other repos are unaffected, and the lease holder is not counted. Default 8. |
-| `GITLAWB_MAX_CONCURRENT_IPFS_WALKS` | Max concurrent `GET /ipfs/{cid}` visibility walks across all callers (own pool, disjoint from the served-git pools); over-cap sheds 503. Default 32. |
-| `GITLAWB_IPFS_WALK_PER_SOURCE` | Max concurrent `/ipfs` walks a single source IP may hold. Default 4. |
-| `GITLAWB_IPFS_MAX_LEGACY_PROBES` | Max legacy (NULL-provenance) repos probed per `/ipfs/{cid}` request, bounding the scan-fallback fan-out. A truncated scan returns a retryable 503, not a false 404. Default 256. |
-| `GITLAWB_IPFS_MAX_LEGACY_SCAN_ROWS` | Max repo rows one `/ipfs/{cid}` request's legacy scan may read from the database. The probe ceiling above only starts counting once a probe runs, and quarantined or private repos are denied before that, so this is what bounds a scan over an inventory that denies the caller everywhere. A truncated scan sheds a retryable 503 carrying an opaque `continuation` token; echoing it as `?scan=` resumes the scan where it stopped. Every per-request ceiling on this path (rows, probes, visits, retained rule bytes) mints one, so each request advances the ladder by at least the rows it read and a holder buried past a ceiling is reached in a bounded number of requests, `ceil(repos / ceiling) + 1` when this row ceiling is the one that binds. No ceiling ever produces a 404. Every page is charged to the caller's `/ipfs` work allowance, so raising this raises that allowance too. Lowering it sharpens an oracle: because a truncation emits a token and a completed wrap does not, laddering to the end reveals the node's total repo count (private and quarantined included) to within one ceiling. Default 2048. |
-| `GITLAWB_IPFS_MAX_REPOS_WALKED` | Max expensive path-scope visibility walks a `/ipfs/{cid}` request may run per phase; over-cap repos are skipped and the scan continues, shedding a retryable 503 (not a false 404) if the object is then found nowhere. The effective cap is the tighter of this knob and the node's internal history-walk ceiling of 17 (`MAX_PIN_SOURCES + 1`), so a value above 17 has no effect while a value below it does tighten the cap. It is charged per phase: the provenance lookup and the legacy-scan fallback get separate equal budgets, so one request can run up to twice the cap in total. Default 64. |
-| `GITLAWB_IPFS_MAX_REPO_VISITS` | Ceiling on repos one `/ipfs/{cid}` request may visit (acquire + probe) past the visibility gate. Also the worst-case per-request Tigris fetch count. On exhaustion the scan stops with a retryable 503. Default 1024. |
-| `GITLAWB_IPFS_REQUEST_BUDGET_SECS` | Absolute wall-clock budget for one admitted `/ipfs/{cid}` request's acquire+walk lifetime. Per-stage clamps bound the acquire and walk stages to the remaining budget, and no stage starts once it is exhausted; the scan then stops with a retryable 503. The object-type probe and content-read `cat-file` subprocesses are budget-checked before starting and each also run under their own deadline (the lesser of `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` and the remaining budget), reaped via process-group teardown, so a hung `cat-file` cannot hold the request's walk slot past it. One hang path is still unbounded: the probe's object-store readability check is a plain filesystem sweep with nothing to reap, so a wedged filesystem can hold the slot past the deadline. Default 600. Accepted range is 1 to 3153600000 (100 years), since the node derives a deadline from this value and a larger one cannot be represented. |
-| `GITLAWB_IPFS_RESOLVE_BUDGET_SECS` | Shorter budget for the pre-walk CID resolve inside an admitted `/ipfs/{cid}` request: the lookup that maps the requested CID to its git oid(s), which runs while the scarce walk admission is already held. A well-formed CID with no pin row does no probe and no walk work, so without this it could hold a walk slot for the whole request budget while nothing walked, and enough such requests shed every real retrieval at admission. The effective deadline is the lesser of this and the remaining request budget, so a value above `GITLAWB_IPFS_REQUEST_BUDGET_SECS` degrades to the request budget. Only the resolve is on this clock; walk and probe work stay on the request budget, so a slow but progressing scan is never shed by it. Default 10. Accepted range is 1 to 3153600000 (100 years). |
-| `GITLAWB_IPFS_RATE_LIMIT` | Max `/ipfs/{cid}` requests per client IP per hour (route flood brake). 0 disables. Default 600. |
-| `GITLAWB_TASK_READ_RATE_LIMIT` | Max anonymous task-read requests (`GET /api/v1/tasks`, `GET /api/v1/tasks/{id}`) per client IP per hour, sharing the budget with the GraphQL/WS task-read brake. Uses `GITLAWB_TRUSTED_PROXY` to resolve the client IP. 0 disables. Default 1200 (above the `/ipfs` budget to allow list pages followed by per-task reads). |
-| `GITLAWB_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |
-| `GITLAWB_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
-| `GITLAWB_IRYS_URL` | Optional Irys/Arweave permanent anchoring. |
+| `TWIGPINE_HOST` / `TWIGPINE_PORT` | HTTP bind address and port. |
+| `TWIGPINE_REPOS_DIR` | Local bare repo storage directory. |
+| `TWIGPINE_PUBLIC_URL` | Public HTTP URL announced to peers. |
+| `TWIGPINE_P2P_PORT` | libp2p QUIC/UDP port. Use `0` to disable. |
+| `TWIGPINE_BOOTSTRAP_PEERS` | Comma-separated HTTP peer URLs. |
+| `TWIGPINE_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
+| `TWIGPINE_P2P_KEY` | Path to the node's persistent libp2p identity key file, which fixes the PeerId across restarts. Must name a key file inside a directory, such as `/data/keys/p2p.key` or `./keys/p2p.key`. Two kinds of problem are handled differently. A value that cannot name a securable key file at all (a bare filename, `..` traversal, a trailing `/`, the filesystem root, or a `~/` path that escapes home) is refused before the node binds, so the process exits. Anything wrong with the storage itself (a symlinked or non-directory parent, an unsafe ancestor or working directory, an unreadable or malformed key) leaves p2p off while HTTP keeps serving; the node logs it at error level as `p2p_identity_key_load_failed` and sets the `gitlawb_p2p_identity_key_load_failed` metric to 1. Note that `/health` still reports healthy in that state, so alert on the log event or the metric rather than on the health check. Correcting the storage and restarting restores the same PeerId. On Unix a new key is created `0600` inside a `0700` directory. A key directory that grants access beyond its owner is tightened to `0700` on start; one that is closed too far is refused with a `chmod 700` remedy rather than widened, since a directory locked down on purpose is an operator decision. Rotate the key only when the node logs that the directory was group- or world-writable (or the key file itself was group- or world-readable). An ordinary `0755` directory is tightened too, but others could not read a `0600` key or replace its directory entry. An existing key file is never modified: one with group or other bits set is rejected (`chmod 600`), and so is one this node cannot read. On other platforms no permissions are enforced. Default `~/.twigpine/p2p.key`; point it at a persistent volume when running in a container. |
+| `TWIGPINE_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
+| `TWIGPINE_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. Defaults to `false` during the staged rollout below. |
+| `TWIGPINE_REQUIRE_SIGNATURE_NONCE` | Require a signed `nonce` on write routes. Default false; see the staged rollout note above. |
+| `TWIGPINE_ENFORCE_OWNER_PUSH` | Require the pusher on `git-receive-pack` to be the repo owner, or to present an owner-rooted, time-bounded UCAN `git/push` capability naming the repository (`X-Ucan`). **Defaults to `true`.** A `did:key` signature is authentication, not authorization — anyone can mint a key and sign — so with this off every signed caller may push to every repository, private ones included. A CI or delegated key with no such delegation counts as a non-owner and cannot push while this is on. The delegation clears the push gate only; on a private repository the delegate must also be a reader. Set `false` only for a rolling upgrade; see [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md). |
+| `TWIGPINE_AUTO_SYNC` | Enable automatic sync from known peers. |
+| `TWIGPINE_RECONCILIATION_SWEEP` | Enable the hourly durability sweep that re-pins/backstops missing objects (default `true`; disabled when no IPFS/Pinata backend is configured). Public pin repair runs against any configured backend (IPFS, Pinata, or both). Encrypted recovery repair requires local IPFS (`TWIGPINE_IPFS_API`); Pinata-only nodes reconcile public pins only. |
+| `TWIGPINE_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
+| `TWIGPINE_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack, receive-pack, or `info/refs` advertisement may run before it is aborted (504). Default 600. Also bounds the withheld-blob classification walk (on both the upload-pack serve and receive-pack replication paths) and the push-side pin-candidate discovery (`rev-list` / `cat-file`), each reaped via process-group teardown at the deadline. On the path-scoped upload-pack path the classification walk and the pack serve share ONE deadline, so this value bounds their combined duration rather than granting each stage a full budget: a walk that consumes it leaves the serve nothing and the clone gets a 504. Serving large path-scoped repos may therefore need a higher value than they did when each stage was budgeted separately. Accepted range is 1 to 3153600000 (100 years), since the node derives deadlines from this value and a larger one cannot be represented. |
+| `TWIGPINE_GIT_ACQUIRE_TIMEOUT_SECS` | Max seconds the storage-acquisition phase (Tigris HEAD/GET, push advisory-lock) of a served git op may run before the request is shed with a 503, separate from the git-run timeout. The concurrency permit is released on expiry so a stalled backend cannot pin the pool. Default 30. |
+| `TWIGPINE_MAX_CONCURRENT_GIT_OPS` | Max concurrent served git READ ops (upload-pack and its `info/refs` advertisement) across all callers; over-cap sheds a 503 + Retry-After. Anonymous reads draw from this pool, so pair it with `TWIGPINE_MAX_CONCURRENT_READS_PER_CALLER`. Pushes and the receive-pack advertisement have their own pools, so a read flood cannot shed an authenticated push. Default 128. |
+| `TWIGPINE_MAX_CONCURRENT_GIT_PUSHES` | Max concurrent `git-receive-pack` POST operations, in a pool separate from the read pool. The anon receive-pack `info/refs` advertisement runs in a third pool of the same size, disjoint from both, so an advertisement flood cannot shed a push either. Two per-source push caps are derived from this value (`/8`, floor 1) and have no env var of their own. Over-cap sheds a 503 + Retry-After. Default 32. |
+| `TWIGPINE_MAX_CONCURRENT_READS_PER_CALLER` | Max concurrent read ops a single caller may hold, so one caller cannot monopolize the read pool. Keyed on the resolved source IP, never the DID, and only as granular as `TWIGPINE_TRUSTED_PROXY`: left unset, a node behind an edge or NAT keys every caller on the edge IP and this collapses to one global cap. Default 16. |
+| `TWIGPINE_MAX_CONCURRENT_PIN_TASKS` | Max post-push pin loops (IPFS + Pinata) running concurrently across all repos. This caps how many loops RUN at once, not how much object-id list memory the node retains: on the local IPFS path a loop parked waiting for a permit still holds its full list. Do not size memory from this knob alone. A loop over cap waits, never drops a pin. Up to two loops run per push that starts its own encrypt/pin task when both IPFS and Pinata are configured; a push coalesced onto an in-flight task adds at most one warm loop. See [docs/STORAGE-AND-PINNING.md](docs/STORAGE-AND-PINNING.md) for the two-tier model, dedup, and parked-list memory. Default 8. |
+| `TWIGPINE_REPO_LEASE_MAX_WAITERS` | Max pushes parked at once waiting for the same repo's write lease. Each waiter pins its buffered pack body, so this bounds that memory for a hot repo; past the cap the newest push sheds a 503 + Retry-After instead of queueing. Pushes to other repos are unaffected, and the lease holder is not counted. Default 8. |
+| `TWIGPINE_MAX_CONCURRENT_IPFS_WALKS` | Max concurrent `GET /ipfs/{cid}` visibility walks across all callers (own pool, disjoint from the served-git pools); over-cap sheds 503. Default 32. |
+| `TWIGPINE_IPFS_WALK_PER_SOURCE` | Max concurrent `/ipfs` walks a single source IP may hold. Default 4. |
+| `TWIGPINE_IPFS_MAX_LEGACY_PROBES` | Max legacy (NULL-provenance) repos probed per `/ipfs/{cid}` request, bounding the scan-fallback fan-out. A truncated scan returns a retryable 503, not a false 404. Default 256. |
+| `TWIGPINE_IPFS_MAX_LEGACY_SCAN_ROWS` | Max repo rows one `/ipfs/{cid}` request's legacy scan may read from the database. The probe ceiling above only starts counting once a probe runs, and quarantined or private repos are denied before that, so this is what bounds a scan over an inventory that denies the caller everywhere. A truncated scan sheds a retryable 503 carrying an opaque `continuation` token; echoing it as `?scan=` resumes the scan where it stopped. Every per-request ceiling on this path (rows, probes, visits, retained rule bytes) mints one, so each request advances the ladder by at least the rows it read and a holder buried past a ceiling is reached in a bounded number of requests, `ceil(repos / ceiling) + 1` when this row ceiling is the one that binds. No ceiling ever produces a 404. Every page is charged to the caller's `/ipfs` work allowance, so raising this raises that allowance too. Lowering it sharpens an oracle: because a truncation emits a token and a completed wrap does not, laddering to the end reveals the node's total repo count (private and quarantined included) to within one ceiling. Default 2048. |
+| `TWIGPINE_IPFS_MAX_REPOS_WALKED` | Max expensive path-scope visibility walks a `/ipfs/{cid}` request may run per phase; over-cap repos are skipped and the scan continues, shedding a retryable 503 (not a false 404) if the object is then found nowhere. The effective cap is the tighter of this knob and the node's internal history-walk ceiling of 17 (`MAX_PIN_SOURCES + 1`), so a value above 17 has no effect while a value below it does tighten the cap. It is charged per phase: the provenance lookup and the legacy-scan fallback get separate equal budgets, so one request can run up to twice the cap in total. Default 64. |
+| `TWIGPINE_IPFS_MAX_REPO_VISITS` | Ceiling on repos one `/ipfs/{cid}` request may visit (acquire + probe) past the visibility gate. Also the worst-case per-request Tigris fetch count. On exhaustion the scan stops with a retryable 503. Default 1024. |
+| `TWIGPINE_IPFS_REQUEST_BUDGET_SECS` | Absolute wall-clock budget for one admitted `/ipfs/{cid}` request's acquire+walk lifetime. Per-stage clamps bound the acquire and walk stages to the remaining budget, and no stage starts once it is exhausted; the scan then stops with a retryable 503. The object-type probe and content-read `cat-file` subprocesses are budget-checked before starting and each also run under their own deadline (the lesser of `TWIGPINE_GIT_SERVICE_TIMEOUT_SECS` and the remaining budget), reaped via process-group teardown, so a hung `cat-file` cannot hold the request's walk slot past it. One hang path is still unbounded: the probe's object-store readability check is a plain filesystem sweep with nothing to reap, so a wedged filesystem can hold the slot past the deadline. Default 600. Accepted range is 1 to 3153600000 (100 years), since the node derives a deadline from this value and a larger one cannot be represented. |
+| `TWIGPINE_IPFS_RESOLVE_BUDGET_SECS` | Shorter budget for the pre-walk CID resolve inside an admitted `/ipfs/{cid}` request: the lookup that maps the requested CID to its git oid(s), which runs while the scarce walk admission is already held. A well-formed CID with no pin row does no probe and no walk work, so without this it could hold a walk slot for the whole request budget while nothing walked, and enough such requests shed every real retrieval at admission. The effective deadline is the lesser of this and the remaining request budget, so a value above `TWIGPINE_IPFS_REQUEST_BUDGET_SECS` degrades to the request budget. Only the resolve is on this clock; walk and probe work stay on the request budget, so a slow but progressing scan is never shed by it. Default 10. Accepted range is 1 to 3153600000 (100 years). |
+| `TWIGPINE_IPFS_RATE_LIMIT` | Max `/ipfs/{cid}` requests per client IP per hour (route flood brake). 0 disables. Default 600. |
+| `TWIGPINE_TASK_READ_RATE_LIMIT` | Max anonymous task-read requests (`GET /api/v1/tasks`, `GET /api/v1/tasks/{id}`) per client IP per hour, sharing the budget with the GraphQL/WS task-read brake. Uses `TWIGPINE_TRUSTED_PROXY` to resolve the client IP. 0 disables. Default 1200 (above the `/ipfs` budget to allow list pages followed by per-task reads). |
+| `TWIGPINE_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |
+| `TWIGPINE_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
+| `TWIGPINE_IRYS_URL` | Optional Irys/Arweave permanent anchoring. |
 
 Production note: change the default Postgres password before exposing a node publicly.
 
@@ -451,23 +457,23 @@ Legacy-pin window: releases before the CID-resolver work stored the provider CID
 ### Upgrading: the PeerId rotates once
 
 This node's libp2p identity is now a keypair generated on first start and kept
-at `GITLAWB_P2P_KEY`, rather than one derived from the node DID. Every node
+at `TWIGPINE_P2P_KEY`, rather than one derived from the node DID. Every node
 therefore gets a new PeerId once, on the first start after upgrading, and keeps
 it from then on as long as that key file survives (put it on a persistent volume
 in a container).
 
 Two things to check before upgrading:
 
-- Any `GITLAWB_P2P_BOOTSTRAP` multiaddr that pins a peer's old PeerId with a
+- Any `TWIGPINE_P2P_BOOTSTRAP` multiaddr that pins a peer's old PeerId with a
   `/p2p/<PeerId>` suffix stops matching once that peer upgrades. Update the
   suffix, or drop it and let identify supply the current one. Addresses without
   the suffix keep working untouched.
-- `GITLAWB_P2P_KEY` must name a key file inside a directory, such as
+- `TWIGPINE_P2P_KEY` must name a key file inside a directory, such as
   `/data/keys/p2p.key` or `./keys/p2p.key`. A bare filename is refused at
   startup, since the node will not keep its identity key in the working
   directory.
 
-Peers found over `GITLAWB_BOOTSTRAP_PEERS` and the embedded seed list are
+Peers found over `TWIGPINE_BOOTSTRAP_PEERS` and the embedded seed list are
 unaffected, since those are HTTP URLs and carry no PeerId.
 
 ---
@@ -479,16 +485,16 @@ Twigpine Node includes optional Base L2 node-operator hooks. Operators can regis
 PoS is disabled unless these are configured:
 
 ```env
-GITLAWB_CONTRACT_NODE_STAKING=0x...
-GITLAWB_OPERATOR_PRIVATE_KEY=0x...
-GITLAWB_CHAIN_RPC_URL=https://mainnet.base.org
+TWIGPINE_CONTRACT_NODE_STAKING=0x...
+TWIGPINE_OPERATOR_PRIVATE_KEY=0x...
+TWIGPINE_CHAIN_RPC_URL=https://mainnet.base.org
 ```
 
 Recommended for operators:
 
 ```env
-GITLAWB_OPERATOR_STRICT_MODE=true
-GITLAWB_HEARTBEAT_INTERVAL_HOURS=20
+TWIGPINE_OPERATOR_STRICT_MODE=true
+TWIGPINE_HEARTBEAT_INTERVAL_HOURS=20
 ```
 
 Read:

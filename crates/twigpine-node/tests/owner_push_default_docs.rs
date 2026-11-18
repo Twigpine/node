@@ -1,4 +1,4 @@
-//! #26 Split PR 4 — `GITLAWB_ENFORCE_OWNER_PUSH` default is consistent across surfaces.
+//! #26 Split PR 4 — `TWIGPINE_ENFORCE_OWNER_PUSH` default is consistent across surfaces.
 //!
 //! Reviewer 2 (2026-08-28) closed PR #224 with a P2 finding: SECURITY.md and
 //! README.md both stated the default was `false`, while `Config::enforce_owner_push`
@@ -15,7 +15,7 @@
 //! 1. `SECURITY.md` says the default is `true`.
 //! 2. `README.md` says the default is `true` in the known-limitations prose.
 //! 3. `README.md` says the default is `true` in the env-var table row.
-//! 4. `.env.example` sets `GITLAWB_ENFORCE_OWNER_PUSH=true`.
+//! 4. `.env.example` sets `TWIGPINE_ENFORCE_OWNER_PUSH=true`.
 //!
 //! The runtime declared default (`Config::enforce_owner_push`'s
 //! `default_value_t = true`) is protected by the
@@ -42,7 +42,7 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
-/// Pin the prose mentions of `GITLAWB_ENFORCE_OWNER_PUSH` so a future doc
+/// Pin the prose mentions of `TWIGPINE_ENFORCE_OWNER_PUSH` so a future doc
 /// edit cannot reintroduce the "defaults to false" wording the reviewer
 /// flagged. The wording in the test is what the docs MUST say about the
 /// default; absence of any prose mention is also a fail because operators
@@ -76,10 +76,10 @@ fn readme_known_limitations_states_owner_push_default_is_true() {
     // the claim, not a substring of unrelated text.
     let line = limitations
         .lines()
-        .find(|l| l.contains("GITLAWB_ENFORCE_OWNER_PUSH"))
+        .find(|l| l.contains("TWIGPINE_ENFORCE_OWNER_PUSH"))
         .unwrap_or_else(|| {
             panic!(
-                "README.md Known limitations must mention GITLAWB_ENFORCE_OWNER_PUSH.\n\
+                "README.md Known limitations must mention TWIGPINE_ENFORCE_OWNER_PUSH.\n\
                  Got:\n{limitations}"
             )
         });
@@ -101,19 +101,19 @@ fn readme_env_var_table_states_owner_push_default_is_true() {
     let readme = read("README.md");
     let line = readme
         .lines()
-        .find(|l| l.contains("GITLAWB_ENFORCE_OWNER_PUSH") && l.contains("|"))
+        .find(|l| l.contains("TWIGPINE_ENFORCE_OWNER_PUSH") && l.contains("|"))
         .unwrap_or_else(|| {
-            panic!("README.md is missing the env-var-table row for GITLAWB_ENFORCE_OWNER_PUSH")
+            panic!("README.md is missing the env-var-table row for TWIGPINE_ENFORCE_OWNER_PUSH")
         });
 
     assert!(
         line.contains("Defaults to `true`") || line.contains("defaults to `true`"),
-        "README env-var-table row for GITLAWB_ENFORCE_OWNER_PUSH must state the default is true. \
+        "README env-var-table row for TWIGPINE_ENFORCE_OWNER_PUSH must state the default is true. \
          Found:\n{line}"
     );
     assert!(
         !section_claims_default_is_false(line),
-        "README env-var-table row for GITLAWB_ENFORCE_OWNER_PUSH must not claim the default is false. \
+        "README env-var-table row for TWIGPINE_ENFORCE_OWNER_PUSH must not claim the default is false. \
          Found:\n{line}"
     );
 }
@@ -123,12 +123,12 @@ fn env_example_sets_owner_push_true() {
     let env = read(".env.example");
     let line = env
         .lines()
-        .find(|l| l.trim_start().starts_with("GITLAWB_ENFORCE_OWNER_PUSH"))
-        .unwrap_or_else(|| panic!(".env.example is missing GITLAWB_ENFORCE_OWNER_PUSH"));
+        .find(|l| l.trim_start().starts_with("TWIGPINE_ENFORCE_OWNER_PUSH"))
+        .unwrap_or_else(|| panic!(".env.example is missing TWIGPINE_ENFORCE_OWNER_PUSH"));
 
     assert!(
         line.contains("=true"),
-        ".env.example GITLAWB_ENFORCE_OWNER_PUSH must be set to true. Found:\n{line}"
+        ".env.example TWIGPINE_ENFORCE_OWNER_PUSH must be set to true. Found:\n{line}"
     );
 }
 

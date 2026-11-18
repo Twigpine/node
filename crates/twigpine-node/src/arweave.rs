@@ -8,7 +8,7 @@
 //! Irys allows free uploads for data < 100 KiB on both devnet and mainnet
 //! (via Turbo). No wallet is required for payloads under the free threshold.
 //!
-//! Set `GITLAWB_IRYS_URL` to override the default endpoint:
+//! Set `TWIGPINE_IRYS_URL` to override the default endpoint:
 //!   - devnet (free, no cost): https://devnet.irys.xyz
 //!   - mainnet:                https://node2.irys.xyz
 //!

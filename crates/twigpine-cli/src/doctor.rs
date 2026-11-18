@@ -1,10 +1,10 @@
 //! `twigpine doctor` — check your Twigpine installation and connectivity.
 //!
 //! Checks:
-//!   1. Identity        — ~/.gitlawb/identity.pem exists, DID parseable
-//!   2. Registration    — ~/.gitlawb/ucan.json exists (registered with a node)
-//!   3. GITLAWB_NODE    — env var points at a public node (unset is advisory)
-//!   4. Node            — GITLAWB_NODE is reachable (default: https://node.twigpine.com)
+//!   1. Identity        — ~/.twigpine/identity.pem exists, DID parseable
+//!   2. Registration    — ~/.twigpine/ucan.json exists (registered with a node)
+//!   3. TWIGPINE_NODE    — env var points at a public node (unset is advisory)
+//!   4. Node            — TWIGPINE_NODE is reachable (default: https://node.twigpine.com)
 //!   5. git helper      — git-remote-gitlawb (the name git runs) is in PATH
 //!   6. git             — git is installed
 //!   7. version         — twigpine is up to date with latest GitHub release
@@ -24,10 +24,10 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 #[derive(Args)]
 pub struct DoctorArgs {
     /// Node URL to check connectivity against
-    #[arg(long, default_value = PUBLIC_NODE, env = "GITLAWB_NODE")]
+    #[arg(long, default_value = PUBLIC_NODE, env = "TWIGPINE_NODE")]
     pub node: String,
 
-    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+    /// Identity directory (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 }
@@ -73,13 +73,13 @@ impl Check {
 }
 
 /// Resolve the config dir and key path without aborting on a refused resolver.
-/// The whole point of doctor is to explain a broken setup, so a `GITLAWB_KEY`
+/// The whole point of doctor is to explain a broken setup, so a `TWIGPINE_KEY`
 /// or `--dir` the resolvers reject becomes `Check::fail` rows for the checks
 /// that depend on them, while node/git checks still run.
 fn resolve_config_paths(
     args_dir: Option<PathBuf>,
 ) -> (Option<PathBuf>, Option<PathBuf>, Vec<Check>) {
-    let dir = crate::identity::gitlawb_dir(args_dir.clone());
+    let dir = crate::identity::identity_dir(args_dir.clone());
     let mut checks = Vec::new();
     let dir = match dir {
         Ok(d) => Some(d),
@@ -87,12 +87,12 @@ fn resolve_config_paths(
             checks.push(Check::fail(
                 "identity",
                 format!("could not resolve config dir: {e}"),
-                "fix GITLAWB_KEY or --dir",
+                "fix TWIGPINE_KEY or --dir",
             ));
             checks.push(Check::fail(
                 "registration",
                 "skipped: config dir unresolved",
-                "fix GITLAWB_KEY or --dir",
+                "fix TWIGPINE_KEY or --dir",
             ));
             None
         }
@@ -104,7 +104,7 @@ fn resolve_config_paths(
                 checks.push(Check::fail(
                     "identity",
                     format!("could not resolve key path: {e}"),
-                    "fix GITLAWB_KEY or --dir",
+                    "fix TWIGPINE_KEY or --dir",
                 ));
             }
             None
@@ -118,7 +118,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     println!();
 
     // The same resolver every other command uses. `doctor` reporting on
-    // `~/.gitlawb` while `twigpine register` writes to the parent of `GITLAWB_KEY` would
+    // `~/.twigpine` while `twigpine register` writes to the parent of `TWIGPINE_KEY` would
     // make the one command whose job is to explain a broken setup the one that
     // misreports it.
     let args_dir = args.dir.clone();
@@ -146,11 +146,25 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             }
         }
     } else if let Some(pem_path) = &pem_path {
-        checks.push(Check::fail(
-            "identity",
-            format!("not found at {}", pem_path.display()),
-            "twigpine identity new",
-        ));
+        let home = dirs::home_dir();
+        match twigpine_core::identity_path::stranded_legacy_key(pem_path, home.as_deref()) {
+            // The key is in the folder from before the rename. "identity new"
+            // would be the wrong advice: it means a second identity.
+            Some(legacy) => checks.push(Check::fail(
+                "identity",
+                format!(
+                    "not found at {}, but there is one at {}",
+                    pem_path.display(),
+                    legacy.display()
+                ),
+                twigpine_core::identity_path::stranded_legacy_key_message(pem_path, &legacy),
+            )),
+            None => checks.push(Check::fail(
+                "identity",
+                format!("not found at {}", pem_path.display()),
+                "twigpine identity new",
+            )),
+        }
     }
 
     // ── 2. Registration ───────────────────────────────────────────────────
@@ -185,14 +199,14 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         }
     }
 
-    // ── 3. GITLAWB_NODE env var ───────────────────────────────────────────
+    // ── 3. TWIGPINE_NODE env var ───────────────────────────────────────────
     // The node `git clone` / `git push` will contact is not always the node `twigpine`
     // contacts: `--node` defaults to the public node and an explicit flag outranks
     // the environment, so the two diverge whenever the variable is unset, blank, or
     // overridden. Probing only `twigpine`'s node is what let doctor greenlight an install
     // whose transport was dead, so resolve the transport's node through the same
     // function the helper uses and report on that one.
-    let env_node = std::env::var("GITLAWB_NODE").ok();
+    let env_node = std::env::var("TWIGPINE_NODE").ok();
     let transport_node = resolve_transport_node(env_node.as_deref());
     let gl_node = sanitize_node_msg(&args.node);
 
@@ -201,7 +215,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     if transport_node == args.node.trim() {
         // twigpine and the transport agree, so one row covers both. Classify the row from
         // the variable itself: `--node` matching the transport default does not mean
-        // the user set `GITLAWB_NODE`.
+        // the user set `TWIGPINE_NODE`.
         let env_val = env_node
             .as_deref()
             .map(str::trim)
@@ -219,7 +233,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         // quoted for the shell. The display string above is capped and stripped for
         // the terminal, which is a different encoding and must not be reused here.
         let fix = format!(
-            "export GITLAWB_NODE={}",
+            "export TWIGPINE_NODE={}",
             shell_single_quote(&recovery_target(&args.node))
         );
         // Tiering follows who chose the broken value. An unset variable on a stock
@@ -231,14 +245,14 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             .map(str::trim)
             .is_some_and(|v| !v.is_empty());
         if verdict.usable || !env_was_set {
-            checks.push(Check::warn("GITLAWB_NODE", detail, fix));
+            checks.push(Check::warn("TWIGPINE_NODE", detail, fix));
         } else {
-            checks.push(Check::fail("GITLAWB_NODE", detail, fix));
+            checks.push(Check::fail("TWIGPINE_NODE", detail, fix));
         }
     }
 
     // ── 4. Node connectivity ──────────────────────────────────────────────
-    // GITLAWB_NODE="" binds args.node to "" through clap, and check 3 groups
+    // TWIGPINE_NODE="" binds args.node to "" through clap, and check 3 groups
     // empty with unset. The probe must apply the same normalization or it
     // would dial "" and Fail while the env row only Warns.
     let node_url = effective_node_url(&args.node);
@@ -271,14 +285,14 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             checks.push(Check::fail(
                 "node",
                 format!("{} returned HTTP {}", node_url, resp.status()),
-                "check GITLAWB_NODE env var or try twigpine register --node <url>",
+                "check TWIGPINE_NODE env var or try twigpine register --node <url>",
             ));
         }
         Err(e) => {
             checks.push(Check::fail(
                 "node",
                 format!("{} unreachable: {e}", node_url),
-                "check your internet connection or set GITLAWB_NODE",
+                "check your internet connection or set TWIGPINE_NODE",
             ));
         }
     }
@@ -286,7 +300,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     // ── 4b. iCaptcha capability ───────────────────────────────────────────
     // Gated writes (repo create / register / fork) auto-solve a challenge at the
     // iCaptcha service; check it's reachable so the failure mode is obvious.
-    let icaptcha_url = std::env::var("GITLAWB_ICAPTCHA_URL")
+    let icaptcha_url = std::env::var("TWIGPINE_ICAPTCHA_URL")
         .unwrap_or_else(|_| icaptcha_client::DEFAULT_URL.to_string());
     match NodeClient::new(&icaptcha_url, None).get("/v1/pubkey").await {
         Ok(resp) if resp.status().is_success() => {
@@ -303,7 +317,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             checks.push(Check::warn(
                 "iCaptcha",
                 format!("{icaptcha_url} unreachable: {e}"),
-                "set GITLAWB_ICAPTCHA_URL or check connectivity — repo create / register solve a challenge there",
+                "set TWIGPINE_ICAPTCHA_URL or check connectivity — repo create / register solve a challenge there",
             ));
         }
     }
@@ -347,11 +361,17 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     // Production uses the real endpoint; the override exists so the subprocess tests
     // can route the release lookup to a local fixture instead of the public API.
-    let github_api = std::env::var("GITLAWB_GITHUB_API_URL")
+    let github_api = std::env::var("TWIGPINE_GITHUB_API_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| GITHUB_API_BASE.to_string());
     checks.push(check_version(current, &github_api).await);
+
+    // Settings still given under their names from before the rename. They
+    // work; this row only appears when there is something to update.
+    if let Some(check) = legacy_settings_check(&twigpine_core::legacy_env::report()) {
+        checks.push(check);
+    }
 
     // ── Render ────────────────────────────────────────────────────────────
     for check in &checks {
@@ -440,7 +460,7 @@ fn recovery_target(node: &str) -> String {
 ///
 /// This models the git helper, so it takes the helper's transport policy: a
 /// plaintext http node off this machine is refused without a request unless
-/// `GITLAWB_ALLOW_INSECURE_HTTP` opts in; a loopback http node is dialed directly,
+/// `TWIGPINE_ALLOW_INSECURE_HTTP` opts in; a loopback http node is dialed directly,
 /// never through a proxy; every other node uses reqwest's default environment proxy
 /// discovery, as the helper does; redirects follow the shared same-origin decision
 /// and chain bound; and the identity must parse as a DID, which the helper requires
@@ -448,13 +468,13 @@ fn recovery_target(node: &str) -> String {
 /// must not inherit the 30s request timeout, which stalls every stock `twigpine doctor`
 /// run behind a hung listener, and it sends no credentials.
 async fn probe_transport(url: &str) -> TransportVerdict {
-    let allow_insecure = std::env::var("GITLAWB_ALLOW_INSECURE_HTTP")
+    let allow_insecure = std::env::var("TWIGPINE_ALLOW_INSECURE_HTTP")
         .is_ok_and(|v| transport_policy::allow_insecure_http_value(&v));
     if !allow_insecure && transport_policy::is_insecure_remote(url) {
         return TransportVerdict {
             usable: false,
             detail: "refused: plaintext http to a remote node (use https://, or set \
-                     GITLAWB_ALLOW_INSECURE_HTTP=1 for a trusted private network)"
+                     TWIGPINE_ALLOW_INSECURE_HTTP=1 for a trusted private network)"
                 .to_string(),
         };
     }
@@ -519,7 +539,7 @@ async fn probe_transport(url: &str) -> TransportVerdict {
     }
 }
 
-/// Classify the `GITLAWB_NODE` env var for `twigpine doctor`. Extracted so unit
+/// Classify the `TWIGPINE_NODE` env var for `twigpine doctor`. Extracted so unit
 /// tests can pin the Warn tier directly (#357): an unset env is advisory, not
 /// a failure, because `--node` defaults to `https://node.twigpine.com` and the
 /// CLI works without it. Flipping this back to `Check::fail` must break a
@@ -530,12 +550,12 @@ fn gitlawb_node_env_check(env_val: Option<&str>) -> Check {
         // harness) — the connectivity check below fails loudly if it is not
         // actually reachable, so don't red-flag the configuration itself.
         Some(v) if is_loopback_url(v) => Check::pass(
-            "GITLAWB_NODE",
+            "TWIGPINE_NODE",
             format!(
                 "{v} (local node — intentional for self-hosting/dev; unset to target the public network)"
             ),
         ),
-        Some(v) if !v.is_empty() => Check::pass("GITLAWB_NODE", v.to_string()),
+        Some(v) if !v.is_empty() => Check::pass("TWIGPINE_NODE", v.to_string()),
         // `--node` defaults to `https://node.twigpine.com` and the CLI works
         // fine without the variable, so an unset env is advisory, not a
         // failure. Warn-class keeps the exit code 0 for a stock working
@@ -543,14 +563,14 @@ fn gitlawb_node_env_check(env_val: Option<&str>) -> Check {
         // on any failure" change would have flipped to exit 1 on every
         // default-config install (#357).
         _ => Check::warn(
-            "GITLAWB_NODE",
+            "TWIGPINE_NODE",
             "not set — git-remote-twigpine will fall back to http://127.0.0.1:7545",
-            format!("export GITLAWB_NODE={PUBLIC_NODE}"),
+            format!("export TWIGPINE_NODE={PUBLIC_NODE}"),
         ),
     }
 }
 
-/// The URL the connectivity probe should dial. `GITLAWB_NODE` set but empty
+/// The URL the connectivity probe should dial. `TWIGPINE_NODE` set but empty
 /// (or whitespace-only) binds `args.node` to `""` through clap rather than
 /// to the `default_value`, and check 3 already groups empty with unset, so
 /// the probe applies the same normalization: an empty effective URL means
@@ -564,7 +584,7 @@ fn effective_node_url(node: &str) -> &str {
 }
 
 /// True when at least one check is Fail-class. Warn-only runs (iCaptcha offline,
-/// version drift, GITLAWB_NODE unset) keep exit 0;
+/// version drift, TWIGPINE_NODE unset) keep exit 0;
 /// this is the gating predicate for #357's exit-status fix.
 fn has_failures(checks: &[Check]) -> bool {
     checks.iter().any(|c| matches!(c.state, CheckState::Fail))
@@ -596,7 +616,33 @@ fn which_in_path(name: &str) -> bool {
 }
 
 /// Fetch the latest release tag from Twigpine/node (the actual release repo — see install.sh's
-/// `GITLAWB_RELEASE_REPO` default) and compare to current version.
+/// `TWIGPINE_RELEASE_REPO` default) and compare to current version.
+/// A warn row naming settings given under their old `GITLAWB_` names, or
+/// under both names with different values. `None` when there are none.
+fn legacy_settings_check(report: &twigpine_core::legacy_env::Report) -> Option<Check> {
+    if report.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !report.legacy_only.is_empty() {
+        parts.push(format!(
+            "set under the old GITLAWB_ name (still works): {}",
+            report.legacy_only.join(", ")
+        ));
+    }
+    if !report.conflicts.is_empty() {
+        parts.push(format!(
+            "set under both names with different values (TWIGPINE_ wins): {}",
+            report.conflicts.join(", ")
+        ));
+    }
+    Some(Check::warn(
+        "settings",
+        parts.join("; "),
+        "rename GITLAWB_* to TWIGPINE_* in your shell profile or service unit",
+    ))
+}
+
 async fn check_version(current: &'static str, github_api_base: &str) -> Check {
     let client = match reqwest::Client::builder()
         .user_agent(format!("gl/{current}"))
@@ -724,7 +770,7 @@ mod tests {
 
     #[test]
     fn refused_resolver_becomes_check_rows_not_abort() {
-        // A relative GITLAWB_KEY makes both resolvers Err; doctor must turn
+        // A relative TWIGPINE_KEY makes both resolvers Err; doctor must turn
         // that into fail rows for the dependent checks and keep going, not
         // exit before the node/git checks ever run.
         crate::identity::test_env::with_key(Some("relative/path"), || {
@@ -836,7 +882,7 @@ mod tests {
     }
 
     /// #357: Warn-class rows (iCaptcha offline, version drift,
-    /// GITLAWB_NODE unset on a default-config install) are NOT
+    /// TWIGPINE_NODE unset on a default-config install) are NOT
     /// exit-status failures — they are still printed to the user but the
     /// process exits 0. This is the rule that the previous "any
     /// Fail-or-Warn row → exit 1" change would have broken for stock
@@ -845,7 +891,7 @@ mod tests {
     fn exit_predicate_is_false_for_warn_only() {
         let checks = vec![
             Check::pass("identity", "ok"),
-            Check::warn("GITLAWB_NODE", "unset", "export GITLAWB_NODE=..."),
+            Check::warn("TWIGPINE_NODE", "unset", "export TWIGPINE_NODE=..."),
             Check::warn("iCaptcha", "offline", "check connectivity"),
             Check::warn("version", "drift", "upgrade"),
         ];
@@ -867,17 +913,32 @@ mod tests {
 
         let mixed_warns = vec![
             Check::pass("identity", "ok"),
-            Check::warn("GITLAWB_NODE", "unset", "export"),
+            Check::warn("TWIGPINE_NODE", "unset", "export"),
             Check::fail("node", "unreachable", "check network"),
             Check::warn("iCaptcha", "offline", "check"),
         ];
         assert!(has_failures(&mixed_warns));
     }
 
-    /// #357: `GITLAWB_NODE` unset must be Warn, not Fail. This pins the
+    /// #357: `TWIGPINE_NODE` unset must be Warn, not Fail. This pins the
     /// re-tier so flipping it back to `Check::fail` breaks the suite — the
     /// previous `has_failures`-only tests built their own `Check::warn` rows
     /// and could not see the re-tier at all.
+    #[test]
+    fn legacy_settings_row_appears_only_when_an_old_name_is_in_use() {
+        use twigpine_core::legacy_env::Report;
+        assert!(legacy_settings_check(&Report::default()).is_none());
+
+        let check = legacy_settings_check(&Report {
+            legacy_only: vec!["TWIGPINE_NODE".into()],
+            conflicts: vec!["TWIGPINE_KEY".into()],
+        })
+        .expect("a row");
+        assert!(matches!(check.state, CheckState::Warn));
+        assert!(check.detail.contains("TWIGPINE_NODE"), "{}", check.detail);
+        assert!(check.detail.contains("TWIGPINE_KEY"), "{}", check.detail);
+    }
+
     #[test]
     fn gitlawb_node_env_unset_is_warn() {
         let check = gitlawb_node_env_check(None);
@@ -887,7 +948,7 @@ mod tests {
         assert!(matches!(empty.state, CheckState::Warn));
     }
 
-    /// `GITLAWB_NODE=""` binds `args.node` to `""` through clap, and check 3
+    /// `TWIGPINE_NODE=""` binds `args.node` to `""` through clap, and check 3
     /// groups empty with unset. The probe must dial the same URL unset
     /// would — removing the normalization makes check 4 probe `""` and Fail
     /// while the env row only Warns, so an empty env install exits 1.

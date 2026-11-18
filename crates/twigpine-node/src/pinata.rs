@@ -3,7 +3,7 @@
 //! After git objects land on the node, this module uploads them to Pinata
 //! so they are pinned off-node and available via the public IPFS gateway.
 //!
-//! Set `GITLAWB_PINATA_JWT` to enable. Leave empty and every call is a
+//! Set `TWIGPINE_PINATA_JWT` to enable. Leave empty and every call is a
 //! no-op, so nodes without Pinata backing work fine.
 
 use anyhow::Result;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 /// Pin a single git object's raw bytes on Pinata (v3 API).
 ///
 /// - `client`:     shared reqwest client
-/// - `upload_url`: Pinata v3 upload URL (configured via `GITLAWB_PINATA_UPLOAD_URL`)
+/// - `upload_url`: Pinata v3 upload URL (configured via `TWIGPINE_PINATA_UPLOAD_URL`)
 /// - `jwt`:        Pinata bearer JWT; returns `Ok("")` immediately if empty
 /// - `sha`:        git object hash hex (used as the pin name)
 /// - `data`:       raw git object bytes

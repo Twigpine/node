@@ -15,10 +15,11 @@
 # Plain POSIX sh on purpose: `curl ... | sh` runs dash on Debian and Ubuntu.
 set -eu
 
-REPO="${GITLAWB_RELEASE_REPO:-Twigpine/node}"
-DOWNLOAD_BASE="${GITLAWB_DOWNLOAD_BASE:-https://github.com/${REPO}/releases/download}"
-CHECKSUMS_URL="${GITLAWB_CHECKSUMS_URL:-https://twigpine.com/install-checksums.txt}"
-INSTALL_DIR="${GITLAWB_INSTALL_DIR:-$HOME/.local/bin}"
+# Settings are TWIGPINE_*; the GITLAWB_* names from before the rename still work.
+REPO="${TWIGPINE_RELEASE_REPO:-${GITLAWB_RELEASE_REPO:-Twigpine/node}}"
+DOWNLOAD_BASE="${TWIGPINE_DOWNLOAD_BASE:-${GITLAWB_DOWNLOAD_BASE:-https://github.com/${REPO}/releases/download}}"
+CHECKSUMS_URL="${TWIGPINE_CHECKSUMS_URL:-${GITLAWB_CHECKSUMS_URL:-https://twigpine.com/install-checksums.txt}}"
+INSTALL_DIR="${TWIGPINE_INSTALL_DIR:-${GITLAWB_INSTALL_DIR:-$HOME/.local/bin}}"
 VERSION_ARG="latest"
 
 usage() {
@@ -30,11 +31,11 @@ Options:
   -h, --help        Show this help.
 
 Environment:
-  GITLAWB_INSTALL_DIR    Install directory (default: $HOME/.local/bin)
-  GITLAWB_RELEASE_REPO   GitHub repo to download from (default: Twigpine/node)
-  GITLAWB_DOWNLOAD_BASE  Release download base URL, for mirrors
+  TWIGPINE_INSTALL_DIR    Install directory (default: $HOME/.local/bin)
+  TWIGPINE_RELEASE_REPO   GitHub repo to download from (default: Twigpine/node)
+  TWIGPINE_DOWNLOAD_BASE  Release download base URL, for mirrors
                          (default: https://github.com/<repo>/releases/download)
-  GITLAWB_CHECKSUMS_URL  Checksum list every download must match
+  TWIGPINE_CHECKSUMS_URL  Checksum list every download must match
                          (default: https://twigpine.com/install-checksums.txt)
 EOF
 }
@@ -238,7 +239,7 @@ for NAME in twigpine twig gl git-remote-twigpine git-remote-gitlawb twigpine-nod
   twigpine.new gl.new git-remote-twigpine.new git-remote-gitlawb.new twigpine-node.new gitlawb-node.new; do
   if [ -d "$INSTALL_DIR/$NAME" ] && [ ! -L "$INSTALL_DIR/$NAME" ]; then
     echo "error: ${INSTALL_DIR}/${NAME} is a directory, and the installer needs that name for a program." >&2
-    echo "       Move it away or set GITLAWB_INSTALL_DIR. Nothing was installed." >&2
+    echo "       Move it away or set TWIGPINE_INSTALL_DIR. Nothing was installed." >&2
     exit 1
   fi
 done

@@ -22,11 +22,11 @@ pub struct InitArgs {
     #[arg(
         long,
         default_value = "https://node.twigpine.com",
-        env = "GITLAWB_NODE"
+        env = "TWIGPINE_NODE"
     )]
     pub node: String,
 
-    /// Identity directory (default: the parent of $GITLAWB_KEY, else ~/.gitlawb)
+    /// Identity directory (default: the parent of $TWIGPINE_KEY, else ~/.twigpine)
     #[arg(long)]
     pub dir: Option<PathBuf>,
 
@@ -78,7 +78,15 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
             println!("Identity found: {}", kp.did());
             kp
         }
-        Err(_) => {
+        Err(e) => {
+            // Only a key that is really absent may be created. A file that
+            // exists but does not load is reported, never replaced, and a key
+            // left in the folder from before the rename is pointed at.
+            let path = crate::identity::key_path_for(args.dir.as_deref())?;
+            if path.exists() {
+                return Err(e);
+            }
+            crate::identity::refuse_if_stranded(&path)?;
             println!("No identity found — generating new keypair...");
             let kp = generate_identity(args.dir.as_deref())?;
             println!("  DID: {}", kp.did());
@@ -109,7 +117,7 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
     // Save UCAN if returned
     if let Some(ucan) = payload.get("ucan").and_then(|v| v.as_str()) {
         if !ucan.is_empty() {
-            let ucan_dir = crate::identity::gitlawb_dir(args.dir.clone())?;
+            let ucan_dir = crate::identity::identity_dir(args.dir.clone())?;
             crate::secret_file::create_dir(&ucan_dir)?;
             let record = json!({
                 "ucan": ucan,
@@ -392,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn init_fails_on_replay_409_without_the_error_header() {
         // The node refused the create (the signature was already spent) and a
-        // proxy stripped `x-gitlawb-error`, so the client layer cannot see the
+        // proxy stripped `x-twigpine-error`, so the client layer cannot see the
         // denial and hands the 409 straight back. `twigpine init` used to read
         // "already" out of the prose, print "Repository already exists —
         // continuing", add the remote, print "Ready! Push with", and exit 0 for

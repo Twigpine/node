@@ -1456,7 +1456,7 @@ pub(crate) async fn ingest_ref_update(
     if unsigned {
         warn!(
             did = %event.node_did,
-            "accepted unsigned gossip ref-update; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
+            "accepted unsigned gossip ref-update; set TWIGPINE_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
         );
     }
 
@@ -1981,7 +1981,7 @@ const MAX_P2P_KEY_BYTES: usize = 4096;
 /// [`load_or_create_p2p_keypair`]): a `~/`-prefixed path must stay beneath the
 /// resolved home directory. `PathBuf::join` does not guarantee that on its
 /// own — an absolute right-hand operand *replaces* the left-hand side, so
-/// `home.join("/etc/p2p.key")` (from `GITLAWB_P2P_KEY=~//etc/p2p.key`, whose
+/// `home.join("/etc/p2p.key")` (from `TWIGPINE_P2P_KEY=~//etc/p2p.key`, whose
 /// doubled separator leaves a rooted suffix after the `~/` is stripped) is
 /// `/etc/p2p.key`. On Windows a drive or UNC prefix replaces the base the same
 /// way even without a root, and `..` walks back out of home lexically. So the
@@ -2017,9 +2017,9 @@ fn foreign_ownership_error(what: &str, path: &Path, owner_uid: u32, euid: u32) -
         owner_uid,
         euid,
         if what == "key directory" {
-            "GITLAWB_P2P_KEY's directory"
+            "TWIGPINE_P2P_KEY's directory"
         } else {
-            "GITLAWB_P2P_KEY"
+            "TWIGPINE_P2P_KEY"
         }
     ))
 }
@@ -2492,7 +2492,7 @@ fn nofollow_component_error(e: std::io::Error, component: &Path) -> std::io::Err
 /// target while its own key stays untouched on disk.
 ///
 /// Resolution only. No component is created here, and an existing one is
-/// adopted with NO ownership or mode judgment: `GITLAWB_KEY` is a file path
+/// adopted with NO ownership or mode judgment: `TWIGPINE_KEY` is a file path
 /// rather than a dedicated-directory setting, so its ancestors are allowed to
 /// be a shared volume or owned by another uid, and the p2p `verify_component`
 /// predicate deliberately does not apply. The single refusal this adds is a
@@ -2786,7 +2786,7 @@ pub(crate) fn path_denotes_a_directory(key_path: &Path, configured_raw: Option<&
 
 /// Validate the resolved key path before creating or chmodding anything.
 ///
-/// `configured_raw` is the operator's `GITLAWB_P2P_KEY` string when available.
+/// `configured_raw` is the operator's `TWIGPINE_P2P_KEY` string when available.
 /// A key path that cannot name a securable key file, whatever is on disk.
 ///
 /// A distinct type rather than a `String` so the two failure domains cannot be
@@ -2813,7 +2813,7 @@ pub(crate) fn validate_p2p_key_config(
 
     if names_no_usable_directory(key_path) {
         return Err(P2pKeyConfigError(format!(
-            "GITLAWB_P2P_KEY ({display}) must include a directory that does not walk back through \
+            "TWIGPINE_P2P_KEY ({display}) must include a directory that does not walk back through \
              `..`, such as ./keys/p2p.key or /data/keys/p2p.key: the node will not store its p2p \
              identity key in the working directory, where the directory holding it cannot be secured."
         )));
@@ -2821,14 +2821,14 @@ pub(crate) fn validate_p2p_key_config(
 
     if key_parent_is_filesystem_root(key_path) {
         return Err(P2pKeyConfigError(format!(
-            "GITLAWB_P2P_KEY ({display}) must not place the key in the filesystem root; use a \
+            "TWIGPINE_P2P_KEY ({display}) must not place the key in the filesystem root; use a \
              dedicated directory such as /data/keys/p2p.key"
         )));
     }
 
     if path_denotes_a_directory(key_path, configured_raw) {
         return Err(P2pKeyConfigError(format!(
-            "GITLAWB_P2P_KEY ({display}) must name a key file, not a directory"
+            "TWIGPINE_P2P_KEY ({display}) must name a key file, not a directory"
         )));
     }
 
@@ -2845,7 +2845,7 @@ pub(crate) fn validate_p2p_key_config(
         .filter(|n| !n.is_empty())
         .ok_or_else(|| {
             P2pKeyConfigError(format!(
-                "GITLAWB_P2P_KEY ({display}) must name a key file, not a directory"
+                "TWIGPINE_P2P_KEY ({display}) must name a key file, not a directory"
             ))
         })?;
     Ok(P2pKeyTarget {
@@ -2860,7 +2860,7 @@ pub(crate) fn validate_p2p_key_config(
 /// This is the enforcement point for the key-storage contract. Rules 1 and 2
 /// live in configuration, rules 3–5 here:
 ///
-///   1. Disabled p2p (`GITLAWB_P2P_PORT=0`) never resolves, inspects, or
+///   1. Disabled p2p (`TWIGPINE_P2P_PORT=0`) never resolves, inspects, or
 ///      mutates key storage at all (`Config::validate` gates on the port).
 ///   2. A `~/`-relative path is parsed exactly once, and the suffix is proven
 ///      relative before it is joined, so expansion cannot land outside home
@@ -2978,7 +2978,7 @@ impl KeyDirHandle {
     /// Publish into an already-existing directory without creating or chmodding
     /// it. Identity-key paths use this for cwd, `/`, and any nominated parent
     /// that already exists, so the p2p key's dedicated-directory contract (pin
-    /// to 0700) is not imported onto `GITLAWB_KEY`. Write-authority is still
+    /// to 0700) is not imported onto `TWIGPINE_KEY`. Write-authority is still
     /// checked: a 0600 key is unprotected if this directory is group/world
     /// writable, so [`pin::verify_trusted_parent`] runs on the held descriptor
     /// before the handle is returned.
@@ -3230,7 +3230,7 @@ fn describe_unusable_key_dir(dir: &Path, e: std::io::Error) -> anyhow::Error {
         match e.raw_os_error() {
             Some(code) if code == libc::ELOOP => {
                 return anyhow::anyhow!(
-                    "GITLAWB_P2P_KEY's directory {} must be a real directory, not a symlink",
+                    "TWIGPINE_P2P_KEY's directory {} must be a real directory, not a symlink",
                     dir.display()
                 );
             }
@@ -3243,18 +3243,18 @@ fn describe_unusable_key_dir(dir: &Path, e: std::io::Error) -> anyhow::Error {
                 // for.
                 if std::fs::symlink_metadata(dir).is_ok_and(|md| md.is_symlink()) {
                     return anyhow::anyhow!(
-                        "GITLAWB_P2P_KEY's directory {} must be a real directory, not a symlink",
+                        "TWIGPINE_P2P_KEY's directory {} must be a real directory, not a symlink",
                         dir.display()
                     );
                 }
                 return anyhow::anyhow!(
-                    "GITLAWB_P2P_KEY's directory {} must be a directory, not another file type",
+                    "TWIGPINE_P2P_KEY's directory {} must be a directory, not another file type",
                     dir.display()
                 );
             }
             Some(code) if code == libc::EACCES => {
                 return anyhow::anyhow!(
-                    "GITLAWB_P2P_KEY's directory {} cannot be opened by this node; run \
+                    "TWIGPINE_P2P_KEY's directory {} cannot be opened by this node; run \
                      `chmod 700 {}` if it should own it. Check the directory's current mode \
                      first: two node processes starting at once can produce this transiently, \
                      in which case the directory is already 0700 and the next start succeeds.",
@@ -3268,7 +3268,7 @@ fn describe_unusable_key_dir(dir: &Path, e: std::io::Error) -> anyhow::Error {
     #[cfg(not(unix))]
     if e.kind() == std::io::ErrorKind::InvalidInput {
         return anyhow::anyhow!(
-            "GITLAWB_P2P_KEY's directory {} must be a real directory, not a symlink \
+            "TWIGPINE_P2P_KEY's directory {} must be a real directory, not a symlink \
              or another file type",
             dir.display()
         );
@@ -3301,7 +3301,7 @@ fn dir_mode_allows_untrusted_replace(mode: u32) -> bool {
 /// run by hand. Failure to tighten is fatal, since at that point the key cannot
 /// be protected.
 ///
-/// `~/.gitlawb/identity.pem` lives in this directory too, so this covers both
+/// `~/.twigpine/identity.pem` lives in this directory too, so this covers both
 /// keys. Issue #231 owns the sibling gap in `main.rs`'s own creation path for
 /// that file; nothing here touches it.
 #[cfg(unix)]
@@ -3597,11 +3597,11 @@ fn identity_parent_step(p: &Path) -> &Path {
 /// what stops an attacker who can repoint a single interior component from
 /// redirecting the walk into a tree of their choosing. Ancestors above the
 /// anchor are still neither judged nor mutated: the resolver applies no
-/// ownership or mode predicate, because `GITLAWB_KEY` names a file rather than
+/// ownership or mode predicate, because `TWIGPINE_KEY` names a file rather than
 /// a dedicated directory and its ancestors are allowed to be a shared volume or
 /// owned by another uid. That is the difference from
 /// [`verify_and_create_ancestor_chain`], which walks the same way but applies
-/// the full `GITLAWB_P2P_KEY` ancestor policy and creates what is missing.
+/// the full `TWIGPINE_P2P_KEY` ancestor policy and creates what is missing.
 ///
 /// Pass 2 walks back down calling [`pin::create_dir_pinned_at`] per component
 /// against the descriptor of the one before it, so from the anchor down no
@@ -3686,7 +3686,7 @@ fn create_missing_identity_parents(
 /// Every component below the deepest existing ancestor is created pinned to
 /// 0700 on one descriptor chain, so a two-deep missing prefix lands at the
 /// mode this process chose rather than at the ambient umask. A pre-existing
-/// ancestor is adopted as-is and never chmodded: `GITLAWB_KEY` is a file path,
+/// ancestor is adopted as-is and never chmodded: `TWIGPINE_KEY` is a file path,
 /// not a dedicated-directory setting. Write-authority is still required on the
 /// directory each component is created in. Anything this invocation created is
 /// removed again if the boot fails past it, except a directory that has since
@@ -3702,7 +3702,7 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
 
     // A bare filename (`identity.pem` / `./identity.pem`) or a root-adjacent
     // path (`/identity.pem`) publishes into an already-nominated directory.
-    // That form is legal for GITLAWB_KEY and illegal for GITLAWB_P2P_KEY; this
+    // That form is legal for TWIGPINE_KEY and illegal for TWIGPINE_P2P_KEY; this
     // helper must not chmod cwd or `/` as if they were a nominated key
     // directory.
     let parent = key_parent(key_path);
@@ -3720,7 +3720,7 @@ pub(crate) fn create_pinned_dir_and_publish(key_path: &Path, bytes: &[u8]) -> Re
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} names no final directory component", dir.display()))?;
 
-    // An existing nominated parent is used as-is. GITLAWB_KEY is a file path,
+    // An existing nominated parent is used as-is. TWIGPINE_KEY is a file path,
     // not a dedicated-directory setting, so this must not chmod `/etc` or a
     // shared 0755 volume. Write-authority still refuses a group/world-writable
     // parent. A missing parent is created at 0700 below.
@@ -5011,15 +5011,15 @@ mod tests {
     #[cfg(unix)]
     fn fixture_command_with_env(fixture_test: &str, fixture_name: &str) -> std::process::Command {
         let mut cmd = fixture_command(fixture_test);
-        cmd.env("GITLAWB_TEST_FIXTURE", fixture_name);
+        cmd.env("TWIGPINE_TEST_FIXTURE", fixture_name);
         cmd
     }
 
     /// Fixture: refuse key paths that name no directory inside an isolated cwd.
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-backstop"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=p2p-key-backstop"]
     fn fixture_p2p_key_backstop_refuses_no_directory() {
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-backstop") {
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-backstop") {
             return;
         }
 
@@ -5106,11 +5106,11 @@ mod tests {
     /// zero the umask inside the shared test process.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-perms"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=p2p-key-perms"]
     fn fixture_p2p_key_perms_under_zero_umask() {
         use std::os::unix::fs::PermissionsExt;
 
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-perms") {
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-perms") {
             return;
         }
 
@@ -5164,11 +5164,11 @@ mod tests {
     /// component at 0700 and verify it.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-multilevel"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=p2p-key-multilevel"]
     fn fixture_p2p_key_multilevel_ancestors_under_zero_umask() {
         use std::os::unix::fs::PermissionsExt;
 
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-multilevel") {
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-multilevel") {
             return;
         }
 
@@ -5434,19 +5434,19 @@ mod tests {
     /// inside the shared test process.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-umask"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=p2p-key-umask"]
     fn fixture_p2p_key_umask_lifecycle() {
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-umask") {
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-umask") {
             return;
         }
 
         let base = std::path::PathBuf::from(
-            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+            std::env::var("TWIGPINE_TEST_BASE").expect("TWIGPINE_TEST_BASE"),
         );
-        let umask_str = std::env::var("GITLAWB_TEST_UMASK").expect("GITLAWB_TEST_UMASK");
+        let umask_str = std::env::var("TWIGPINE_TEST_UMASK").expect("TWIGPINE_TEST_UMASK");
         let umask_val = u32::from_str_radix(&umask_str, 8).expect("octal umask");
-        let layout = std::env::var("GITLAWB_TEST_LAYOUT").expect("GITLAWB_TEST_LAYOUT");
-        let phase = std::env::var("GITLAWB_TEST_PHASE").expect("GITLAWB_TEST_PHASE");
+        let layout = std::env::var("TWIGPINE_TEST_LAYOUT").expect("TWIGPINE_TEST_LAYOUT");
+        let phase = std::env::var("TWIGPINE_TEST_PHASE").expect("TWIGPINE_TEST_PHASE");
 
         // The EACCES rows are meaningless as root, which bypasses mode checks.
         // Fail loudly rather than skipping: a silent skip here would make the
@@ -5577,17 +5577,17 @@ mod tests {
     /// term alone and watching it go red is the INV-21(i) precondition.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-skip-pin"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=p2p-key-skip-pin"]
     fn fixture_p2p_key_skip_pin_is_caught_by_the_verify() {
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-skip-pin") {
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-skip-pin") {
             return;
         }
         let base = std::path::PathBuf::from(
-            std::env::var("GITLAWB_TEST_BASE").expect("GITLAWB_TEST_BASE"),
+            std::env::var("TWIGPINE_TEST_BASE").expect("TWIGPINE_TEST_BASE"),
         );
-        let target = std::env::var("GITLAWB_TEST_TARGET").expect("GITLAWB_TEST_TARGET");
+        let target = std::env::var("TWIGPINE_TEST_TARGET").expect("TWIGPINE_TEST_TARGET");
         let umask_val =
-            u32::from_str_radix(&std::env::var("GITLAWB_TEST_UMASK").unwrap(), 8).unwrap();
+            u32::from_str_radix(&std::env::var("TWIGPINE_TEST_UMASK").unwrap(), 8).unwrap();
 
         // SAFETY: `umask` only reads and replaces the process-wide value, and
         // this process exists solely for this probe.
@@ -5634,9 +5634,9 @@ mod tests {
                 "p2p::tests::fixture_p2p_key_skip_pin_is_caught_by_the_verify",
                 "p2p-key-skip-pin",
             )
-            .env("GITLAWB_TEST_BASE", base.path())
-            .env("GITLAWB_TEST_TARGET", target)
-            .env("GITLAWB_TEST_UMASK", umask)
+            .env("TWIGPINE_TEST_BASE", base.path())
+            .env("TWIGPINE_TEST_TARGET", target)
+            .env("TWIGPINE_TEST_UMASK", umask)
             .output()
             .expect("spawn the skip-pin fixture");
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5826,10 +5826,10 @@ mod tests {
                 "p2p::tests::fixture_p2p_key_umask_lifecycle",
                 "p2p-key-umask",
             )
-            .env("GITLAWB_TEST_BASE", base)
-            .env("GITLAWB_TEST_UMASK", umask)
-            .env("GITLAWB_TEST_LAYOUT", layout)
-            .env("GITLAWB_TEST_PHASE", phase)
+            .env("TWIGPINE_TEST_BASE", base)
+            .env("TWIGPINE_TEST_UMASK", umask)
+            .env("TWIGPINE_TEST_LAYOUT", layout)
+            .env("TWIGPINE_TEST_PHASE", phase)
             .output()
             .expect("spawn the lifecycle fixture");
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5917,11 +5917,11 @@ mod tests {
     /// be refused before anything is created.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-cwd-writable"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=p2p-key-cwd-writable"]
     fn fixture_p2p_key_relative_under_writable_cwd_is_refused() {
         use std::os::unix::fs::PermissionsExt;
 
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-cwd-writable") {
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-cwd-writable") {
             return;
         }
 
@@ -5955,11 +5955,11 @@ mod tests {
     /// the same PeerId.
     #[cfg(unix)]
     #[test]
-    #[ignore = "self-exec fixture: only runs under GITLAWB_TEST_FIXTURE=p2p-key-cwd-safe"]
+    #[ignore = "self-exec fixture: only runs under TWIGPINE_TEST_FIXTURE=p2p-key-cwd-safe"]
     fn fixture_p2p_key_relative_under_safe_cwd_boots() {
         use std::os::unix::fs::PermissionsExt;
 
-        if std::env::var("GITLAWB_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-cwd-safe") {
+        if std::env::var("TWIGPINE_TEST_FIXTURE").ok().as_deref() != Some("p2p-key-cwd-safe") {
             return;
         }
 
@@ -6137,7 +6137,7 @@ mod tests {
             ("a/../p2p.key", "must include a directory"),
             ("/data/keys/.", "must name a key file"),
             ("/data/keys/./.", "must name a key file"),
-            ("~/.gitlawb/.", "must name a key file"),
+            ("~/.twigpine/.", "must name a key file"),
         ] {
             let err = validate_p2p_key_config(Path::new(raw), Some(raw))
                 .expect_err("a lexically invalid key path must be refused");
@@ -6600,7 +6600,7 @@ mod tests {
     /// back out lexically, so those are exactly the rejected classes.
     #[test]
     fn tilde_suffix_escapes_home_matches_the_join_invariant() {
-        let accepted = [".gitlawb/p2p.key", "keys/p2p.key", "./keys/p2p.key"];
+        let accepted = [".twigpine/p2p.key", "keys/p2p.key", "./keys/p2p.key"];
         for suffix in accepted {
             assert!(
                 !tilde_suffix_escapes_home(suffix),

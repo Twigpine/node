@@ -13,7 +13,7 @@ pub struct StatusArgs {
     #[arg(
         long,
         default_value = "https://node.twigpine.com",
-        env = "GITLAWB_NODE"
+        env = "TWIGPINE_NODE"
     )]
     pub node: String,
     #[arg(long)]
