@@ -78,7 +78,15 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
             println!("Identity found: {}", kp.did());
             kp
         }
-        Err(_) => {
+        Err(e) => {
+            // Only a key that is really absent may be created. A file that
+            // exists but does not load is reported, never replaced, and a key
+            // left in the folder from before the rename is pointed at.
+            let path = crate::identity::key_path_for(args.dir.as_deref())?;
+            if path.exists() {
+                return Err(e);
+            }
+            crate::identity::refuse_if_stranded(&path)?;
             println!("No identity found — generating new keypair...");
             let kp = generate_identity(args.dir.as_deref())?;
             println!("  DID: {}", kp.did());
@@ -109,7 +117,7 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
     // Save UCAN if returned
     if let Some(ucan) = payload.get("ucan").and_then(|v| v.as_str()) {
         if !ucan.is_empty() {
-            let ucan_dir = crate::identity::gitlawb_dir(args.dir.clone())?;
+            let ucan_dir = crate::identity::identity_dir(args.dir.clone())?;
             crate::secret_file::create_dir(&ucan_dir)?;
             let record = json!({
                 "ucan": ucan,

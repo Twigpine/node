@@ -79,7 +79,7 @@ impl Check {
 fn resolve_config_paths(
     args_dir: Option<PathBuf>,
 ) -> (Option<PathBuf>, Option<PathBuf>, Vec<Check>) {
-    let dir = crate::identity::gitlawb_dir(args_dir.clone());
+    let dir = crate::identity::identity_dir(args_dir.clone());
     let mut checks = Vec::new();
     let dir = match dir {
         Ok(d) => Some(d),
@@ -146,11 +146,25 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
             }
         }
     } else if let Some(pem_path) = &pem_path {
-        checks.push(Check::fail(
-            "identity",
-            format!("not found at {}", pem_path.display()),
-            "twigpine identity new",
-        ));
+        let home = dirs::home_dir();
+        match twigpine_core::identity_path::stranded_legacy_key(pem_path, home.as_deref()) {
+            // The key is in the folder from before the rename. "identity new"
+            // would be the wrong advice: it means a second identity.
+            Some(legacy) => checks.push(Check::fail(
+                "identity",
+                format!(
+                    "not found at {}, but there is one at {}",
+                    pem_path.display(),
+                    legacy.display()
+                ),
+                twigpine_core::identity_path::stranded_legacy_key_message(pem_path, &legacy),
+            )),
+            None => checks.push(Check::fail(
+                "identity",
+                format!("not found at {}", pem_path.display()),
+                "twigpine identity new",
+            )),
+        }
     }
 
     // ── 2. Registration ───────────────────────────────────────────────────

@@ -2265,11 +2265,14 @@ mod tests {
     async fn get_signed_proceeds_when_insecure_http_opted_in() {
         let _env = InsecureHttpEnv::set(Some("1"));
         let client = NodeClient::new("http://gl-nonexistent-node.invalid", Some(test_keypair()));
-        let err = client.get_signed("/api/v1/x").await.unwrap_err();
-        assert!(
-            !err.to_string().contains("plaintext http"),
-            "the opt-in should let the request attempt the hop, got: {err}"
-        );
+        // Under HTTP_PROXY the proxy may answer instead of DNS failing; either
+        // way the guard let the request go, which is all this test is about.
+        if let Err(err) = client.get_signed("/api/v1/x").await {
+            assert!(
+                !err.to_string().contains("plaintext http"),
+                "the opt-in should let the request attempt the hop, got: {err}"
+            );
+        }
     }
 
     /// Unsigned calls are not this guard's business: no keypair means no
@@ -2278,11 +2281,12 @@ mod tests {
     async fn unsigned_call_to_plaintext_remote_is_ungated() {
         let _env = InsecureHttpEnv::set(None);
         let client = NodeClient::new("http://gl-nonexistent-node.invalid", None);
-        let err = client.post("/api/v1/x", b"{}").await.unwrap_err();
-        assert!(
-            !err.to_string().contains("plaintext http"),
-            "an unsigned request should not hit the signing guard, got: {err}"
-        );
+        if let Err(err) = client.post("/api/v1/x", b"{}").await {
+            assert!(
+                !err.to_string().contains("plaintext http"),
+                "an unsigned request should not hit the signing guard, got: {err}"
+            );
+        }
     }
 
     /// The opt-in is read as a value, not as presence, with the same contract as

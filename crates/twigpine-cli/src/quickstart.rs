@@ -34,7 +34,7 @@ pub struct QuickstartArgs {
 
 pub async fn run(args: QuickstartArgs) -> Result<()> {
     println!();
-    println!("Welcome to gitlawb.");
+    println!("Welcome to Twigpine.");
     println!("This wizard will set up your identity, register you with a node,");
     println!("and create your first repository.");
     println!();
@@ -42,7 +42,7 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     // The wizard generates the identity AND stores the bootstrap UCAN, so it has to
     // land where every later command reads from — the parent of `TWIGPINE_KEY`, not
     // an unconditional `~/.twigpine`.
-    let dir = crate::identity::gitlawb_dir(args.dir.clone())?;
+    let dir = crate::identity::identity_dir(args.dir.clone())?;
 
     // ── Step 1: Identity ──────────────────────────────────────────────────
     println!("── Step 1: Identity ─────────────────────────────────────────────────");
@@ -74,6 +74,7 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             }
         }
     } else {
+        crate::identity::refuse_if_stranded(&pem_path)?;
         println!("  No identity found. Generating a new Ed25519 keypair...");
         generate_identity(&dir, &pem_path)?
     };

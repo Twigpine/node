@@ -136,6 +136,9 @@ async fn dispatch(
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
+            // Wire-visible, like the CLI's user agent: it moves to "twigpine"
+            // with the other names peers and clients can see, in the protocol
+            // step of the rename, not here.
             "serverInfo": {
                 "name": "gitlawb",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -803,7 +806,7 @@ async fn call_tool(
             // The directory the server was started with, like every sibling tool.
             // Reading the default here while the rest honour `--dir` splits one MCP
             // session across two identity directories.
-            let ucan_path = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?
+            let ucan_path = crate::identity::identity_dir(dir.map(std::path::Path::to_path_buf))?
                 .join("ucan.json");
             if !ucan_path.exists() {
                 return Ok(

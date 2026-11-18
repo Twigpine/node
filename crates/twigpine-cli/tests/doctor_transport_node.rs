@@ -112,6 +112,17 @@ fn doctor_with(env_node: Option<&str>, node_flag: Option<&str>, extra_env: &[(&s
     if let Some(n) = node_flag {
         cmd.args(["--node", n]);
     }
+    // No setting from the developer's shell reaches the run, under either
+    // name: an exported TWIGPINE_ALLOW_INSECURE_HTTP or GITLAWB_NODE would
+    // change what these tests observe. Cleared first, so the settings the
+    // test sets below survive. Upper-cased because Windows treats names as
+    // case-insensitive.
+    for (name, _) in std::env::vars_os() {
+        let upper = name.to_string_lossy().to_ascii_uppercase();
+        if upper.starts_with("GITLAWB_") || upper.starts_with("TWIGPINE_") {
+            cmd.env_remove(name);
+        }
+    }
     cmd.arg("--dir")
         .arg(dir.path().join("gitlawb"))
         .env("TWIGPINE_ICAPTCHA_URL", "http://127.0.0.1:1")
@@ -121,19 +132,6 @@ fn doctor_with(env_node: Option<&str>, node_flag: Option<&str>, extra_env: &[(&s
         );
     for v in PROXY_VARS {
         cmd.env_remove(v);
-    }
-    // The setting's name from before the rename is read too, so a developer
-    // shell that still exports it must not leak into the run.
-    for (name, _) in std::env::vars_os() {
-        // Upper-cased first: Windows treats names as case-insensitive, and the
-        // binary reads `Gitlawb_Node` as this setting there.
-        if name
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GITLAWB_")
-        {
-            cmd.env_remove(name);
-        }
     }
     match env_node {
         Some(v) => cmd.env("TWIGPINE_NODE", v),

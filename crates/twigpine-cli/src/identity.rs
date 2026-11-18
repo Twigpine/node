@@ -76,7 +76,7 @@ pub async fn run(cmd: IdentityCmd) -> Result<()> {
 /// `~/.twigpine/delegations` while the helper reads `/data/keys/delegations` and
 /// finds it empty. The push then goes out with no `X-Ucan` and the delegate is
 /// refused, with nothing on either side to indicate why.
-pub fn gitlawb_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
+pub fn identity_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(d) = override_dir {
         return Ok(d);
     }
@@ -111,6 +111,24 @@ pub(crate) fn key_path_for(dir: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+/// Refuse to create a key at `path` when it is the key file in `~/.twigpine`
+/// and the identity is still in `~/.gitlawb` from before the rename.
+///
+/// Every command that can generate a key calls this first. Generating there
+/// would give the user a second DID beside the one their repositories and
+/// delegations belong to, which is the outcome the folder rule must never
+/// produce.
+pub(crate) fn refuse_if_stranded(path: &Path) -> Result<()> {
+    let home = dirs::home_dir();
+    match twigpine_core::identity_path::stranded_legacy_key(path, home.as_deref()) {
+        Some(legacy) => anyhow::bail!(
+            "not creating a new identity: {}",
+            twigpine_core::identity_path::stranded_legacy_key_message(path, &legacy)
+        ),
+        None => Ok(()),
+    }
+}
+
 fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
     load_keypair_from_dir(dir.as_deref())
 }
@@ -118,7 +136,7 @@ fn load_keypair(dir: Option<PathBuf>) -> Result<Keypair> {
 /// Load keypair from an optional directory override.
 /// Used by other modules (register, repo, mcp).
 ///
-/// Routed through [`gitlawb_dir`] rather than reaching for `~/.twigpine` directly:
+/// Routed through [`identity_dir`] rather than reaching for `~/.twigpine` directly:
 /// `twigpine identity new` writes the key wherever `TWIGPINE_KEY` points, so a second
 /// resolver here would have every other command read a different file than the one
 /// just created — `twigpine ucan delegate` would either fail to find an identity or sign
@@ -168,7 +186,22 @@ pub fn load_optional_keypair(dir: Option<&std::path::Path>) -> Result<Option<Key
         Ok(pem) => Keypair::from_pem(&pem)
             .context("failed to load keypair from PEM")
             .map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Missing means anonymous, unless the key is sitting in the folder from
+        // before the rename: then going anonymous would hide a real identity.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            refuse_if_stranded(&path).map_err(|_| {
+                let home = dirs::home_dir();
+                let legacy =
+                    twigpine_core::identity_path::stranded_legacy_key(&path, home.as_deref())
+                        .unwrap_or_default();
+                anyhow::anyhow!(
+                    "no identity found at {}\n{}",
+                    path.display(),
+                    twigpine_core::identity_path::stranded_legacy_key_message(&path, &legacy)
+                )
+            })?;
+            Ok(None)
+        }
         Err(e) => Err(anyhow::Error::from(e)
             .context(format!("failed to read identity from {}", path.display()))),
     }
@@ -207,6 +240,10 @@ async fn cmd_new_with_reader(
             println!("Aborted.");
             return Ok(());
         }
+    } else if !force {
+        // `--force` is the deliberate way to start over; without it, a key left
+        // in the folder from before the rename stops a second identity.
+        refuse_if_stranded(&path)?;
     }
 
     crate::secret_file::create_dir(&dir)
@@ -642,8 +679,8 @@ pub(crate) mod test_env {
 }
 
 #[cfg(test)]
-mod gitlawb_dir_tests {
-    use super::{gitlawb_dir, load_keypair_from_dir};
+mod identity_dir_tests {
+    use super::{identity_dir, load_keypair_from_dir};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -658,7 +695,7 @@ mod gitlawb_dir_tests {
     #[test]
     fn explicit_override_wins() {
         let d = PathBuf::from("/tmp/explicit");
-        assert_eq!(gitlawb_dir(Some(d.clone())).unwrap(), d);
+        assert_eq!(identity_dir(Some(d.clone())).unwrap(), d);
     }
 
     /// A relative TWIGPINE_KEY must fail loudly. `twigpine` and `git-remote-twigpine` run
@@ -668,7 +705,7 @@ mod gitlawb_dir_tests {
     #[test]
     fn relative_key_paths_are_refused() {
         for raw in ["identity.pem", "keys/identity.pem"] {
-            let result = with_key_env(Some(OsString::from(raw)), || gitlawb_dir(None));
+            let result = with_key_env(Some(OsString::from(raw)), || identity_dir(None));
             assert!(result.is_err(), "{raw} is relative and must be refused");
         }
     }
@@ -681,7 +718,7 @@ mod gitlawb_dir_tests {
         // rule resolves to anonymous there, so this assertion has nothing to
         // compare against and is a pass, not a panic.
         let Some(home) = dirs::home_dir() else { return };
-        let result = with_key_env(Some(OsString::new()), || gitlawb_dir(None));
+        let result = with_key_env(Some(OsString::new()), || identity_dir(None));
         assert_eq!(
             result.unwrap(),
             // `~/.twigpine`, or an existing `~/.gitlawb` from before the rename.
@@ -690,7 +727,7 @@ mod gitlawb_dir_tests {
         );
     }
 
-    /// The reason `gitlawb_dir` reads through `var_os`: `env::var` folds a non-UTF-8
+    /// The reason `identity_dir` reads through `var_os`: `env::var` folds a non-UTF-8
     /// value into the same `Err` as unset, so a bad path would silently resolve to
     /// `~/.twigpine` instead of being reported. Byte 0xFF is not valid UTF-8 in any
     /// position, so this value is unreachable through `env::var`.
@@ -700,7 +737,7 @@ mod gitlawb_dir_tests {
         use std::os::unix::ffi::OsStringExt;
 
         let raw = OsString::from_vec(b"keys/\xFF/identity.pem".to_vec());
-        let result = with_key_env(Some(raw), || gitlawb_dir(None));
+        let result = with_key_env(Some(raw), || identity_dir(None));
 
         let err = result.expect_err("a non-UTF-8 relative path must be refused");
         assert!(
@@ -711,7 +748,7 @@ mod gitlawb_dir_tests {
         let mut absolute = OsString::from("/data/");
         absolute.push(OsString::from_vec(vec![0xFF]));
         absolute.push("/identity.pem");
-        let resolved = with_key_env(Some(absolute.clone()), || gitlawb_dir(None)).unwrap();
+        let resolved = with_key_env(Some(absolute.clone()), || identity_dir(None)).unwrap();
         assert_eq!(
             resolved,
             PathBuf::from(&absolute).parent().unwrap(),

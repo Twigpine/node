@@ -125,13 +125,13 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
 
 /// Where the bootstrap UCAN is stored: beside the identity key, always.
 ///
-/// Routed through `gitlawb_dir` rather than resolving `~/.twigpine` locally. The
+/// Routed through `identity_dir` rather than resolving `~/.twigpine` locally. The
 /// key is READ from the parent of `TWIGPINE_KEY`, so writing the token anywhere
 /// else splits the two: registration succeeds, and `twigpine doctor`, `twigpine ucan show`,
 /// `twigpine init`, and `twigpine mcp ucan_show` all read `ucan.json` from the key's
 /// directory and report an unregistered identity.
 fn ucan_path(dir: Option<&std::path::Path>) -> Result<PathBuf> {
-    let base = crate::identity::gitlawb_dir(dir.map(std::path::Path::to_path_buf))?;
+    let base = crate::identity::identity_dir(dir.map(std::path::Path::to_path_buf))?;
     crate::secret_file::create_dir(&base)
         .with_context(|| format!("failed to create {}", base.display()))?;
     Ok(base.join("ucan.json"))
