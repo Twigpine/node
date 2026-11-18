@@ -132,6 +132,14 @@ if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-nowin" --out-dir "
   ok "a release without Windows is packaged without it, and the wrapper says so"
 else bad "a release without Windows is packaged without it, and the wrapper says so"; fi
 
+# Rebuilt into a directory that held a full build: the old Windows payload goes.
+cp -R "$OUT" "$W/npm-rebuild"
+if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-nowin" --out-dir "$W/npm-rebuild" \
+  --allow-missing win32-x64 > "$W/out" 2>&1 && [ ! -e "$W/npm-rebuild/platforms/cli-win32-x64" ] \
+  && [ -d "$W/npm-rebuild/platforms/cli-linux-x64" ]; then
+  ok "a rebuild without Windows removes the earlier Windows payload"
+else bad "a rebuild without Windows removes the earlier Windows payload"; fi
+
 # Called through a symlinked path (macOS temp and checkout paths often are).
 ln -s "$ROOT" "$W/linked-root"
 if node "$W/linked-root/scripts/npm/build-platform-packages.mjs" --version "$VERSION" \

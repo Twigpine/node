@@ -278,6 +278,13 @@ function main() {
     return true;
   });
   if (selected.length === 0) fail('no platforms to build');
+  // A payload left from an earlier build into the same directory must not be
+  // published beside a wrapper that no longer names it.
+  for (const entry of MATRIX) {
+    if (!selected.includes(entry)) {
+      rmSync(join(args.outDir, 'platforms', `cli-${entry.platform}-${entry.arch}`), { recursive: true, force: true });
+    }
+  }
   const platformDirs = selected.map((e) => buildPlatformPackage(e, source, args.version, args.artifactsDir, args.outDir));
   const wrapperDir = buildWrapper(source, args.version, args.outDir, selected);
   process.stdout.write(
