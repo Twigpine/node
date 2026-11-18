@@ -789,7 +789,10 @@ pub async fn run() -> Result<()> {
     {
         let db = state.db.clone();
         let config = Arc::clone(&state.config);
-        let http_client = Arc::clone(&state.http_client);
+        // The sweep only talks to operator-configured endpoints (Pinata,
+        // Irys, Kubo), which may legitimately be private: it gets the
+        // operator client, not the peer-traffic policy client.
+        let http_client = Arc::new(operator_http_client().clone());
         let node_keypair = Arc::clone(&state.node_keypair);
         let node_did = state.node_did.clone();
         let pin_sem = Arc::clone(&state.pin_semaphore);
@@ -2444,6 +2447,22 @@ mod gossip_ssrf_tests {
         (port, accepted)
     }
 
+    // A loopback listener on a plain std thread, for the parent arm of an
+    // isolated-child test: the tokio listener above cannot be polled while
+    // `run_isolated` blocks the current-thread runtime waiting on the child.
+    fn std_counting_listener() -> (u16, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for _ in listener.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (port, accepted)
+    }
+
     // A policy client whose lookup answers `answers` for every host, plus the
     // count of lookups it was asked to make.
     fn fake_policy_client(answers: Vec<std::net::IpAddr>) -> (reqwest::Client, Arc<AtomicUsize>) {
@@ -2543,7 +2562,7 @@ mod gossip_ssrf_tests {
     async fn shared_client_ignores_env_proxy() {
         use crate::isolated_child::{in_child, run_isolated};
         if !in_child() {
-            let (proxy_port, proxy_hits) = counting_listener().await;
+            let (proxy_port, proxy_hits) = std_counting_listener();
             let proxy = format!("http://127.0.0.1:{proxy_port}");
             run_isolated(
                 "gossip_ssrf_tests::shared_client_ignores_env_proxy",

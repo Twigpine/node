@@ -93,7 +93,9 @@ Optional:
 - `TWIGPINE_HEARTBEAT_INTERVAL_HOURS=20` — how often to post heartbeats (must be < 24)
 - `TWIGPINE_RECONCILIATION_SWEEP=true` — enable the hourly durability sweep that re-pins/backstops missing objects (default `true`; disabled when no IPFS/Pinata backend is configured). Public pin repair runs against any configured backend. Encrypted recovery repair requires local IPFS (`TWIGPINE_IPFS_API`); Pinata-only nodes reconcile public pins only. Set `=false` to disable.
 
-Outbound requests to URLs other people choose (peer announce and ping, bootstrap, webhook delivery, and the sync worker's git fetch of a peer) resolve each hostname and connect only when every resolved address is public. A peer or webhook hostname that resolves to a loopback, private, link-local or cloud-metadata address is refused and logged once at `warn`. The node ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` for that traffic. `TWIGPINE_IPFS_API` is unaffected: it is your own endpoint and keeps working on a private or loopback hostname.
+Outbound requests to URLs other people choose (peer announce and ping, bootstrap, webhook delivery, and the sync worker's git fetch of a peer) resolve each hostname and connect only when every resolved address is public. A peer or webhook hostname that resolves to a loopback, private, link-local, cloud-metadata or other IANA special-purpose address is refused and logged once at `warn`, and an IP-literal peer URL is classified the same way at fetch time. The node ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` for that traffic. `TWIGPINE_IPFS_API` is unaffected: it is your own endpoint and keeps working on a private or loopback hostname.
+
+The sync worker writes the same hardening into each peer mirror's own git config, so a later lazy fetch of a promisor mirror (for example a read of an object the peer withheld) stays pinned to the last checked addresses with proxy, redirect, credential and bundle channels off. If the peer legitimately moves to new addresses, that lazy fetch fails until the next sync refresh writes a fresh pin.
 
 ## 5. Verify
 

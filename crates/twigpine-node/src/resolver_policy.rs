@@ -4,8 +4,8 @@
 //! The resolver runs one lookup per new connection and keeps no cache, so a
 //! name that answered public earlier and private now is refused now. An answer
 //! is accepted only when it holds 1 to 32 distinct addresses and every one
-//! passes `is_public_ip`; otherwise the whole answer is refused, never
-//! filtered or truncated.
+//! passes `mirror_upstream_ip_permitted`; otherwise the whole answer is
+//! refused, never filtered or truncated.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -17,7 +17,7 @@ use std::time::Duration;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tracing::warn;
 
-use crate::api::peers::is_public_ip;
+use crate::api::peers::mirror_upstream_ip_permitted;
 
 const LOOKUP_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_ANSWERS: usize = 32;
@@ -67,7 +67,7 @@ fn check_answers(answers: &[IpAddr], max: usize) -> Result<Vec<IpAddr>, Denial> 
     if distinct.len() > max {
         return Err(Denial::TooMany);
     }
-    if !distinct.iter().all(|a| is_public_ip(*a)) {
+    if !distinct.iter().all(|a| mirror_upstream_ip_permitted(*a)) {
         return Err(Denial::NonPublic);
     }
     Ok(distinct)
@@ -179,6 +179,16 @@ mod tests {
             "2002:7f00:1::",
             "0.0.0.0",
             "::",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "192.0.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+            "ff02::1",
+            "2001:db8::1",
         ] {
             assert_eq!(
                 check_answers(&[ip(s)], 32),
