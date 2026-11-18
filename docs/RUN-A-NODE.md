@@ -299,7 +299,7 @@ short lifetimes reissued often are safer than one long-lived grant.
 
 **"insufficient $GITLAWB balance"** — fund the operator wallet with at least 10,000 $GITLAWB.
 
-**Node refuses to start with "strict-mode operator check failed"** — either `twigpine node register` first, or unset `TWIGPINE_OPERATOR_STRICT_MODE`.
+**Node refuses to start with "strict-mode operator check failed"** — either `twigpine node register` first, or set `TWIGPINE_OPERATOR_STRICT_MODE=false`. Unsetting it is not enough if the setting is also present under its old name, `GITLAWB_OPERATOR_STRICT_MODE`.
 
 **Node refuses to start with "TWIGPINE_DB_MAX_CONNECTIONS (20) must be at least max_concurrent_git_pushes (32) + 8 headroom"**: raise `TWIGPINE_DB_MAX_CONNECTIONS` to at least the push cap plus 8 (40 with the default cap of 32; 48 is the shipped default and the recommended value), or lower `TWIGPINE_MAX_CONCURRENT_GIT_PUSHES`. This bites a node upgraded in place that still sets the old pool size of 20. The check is deliberate: each concurrent push pins one pooled connection for its whole receive-pack, so a pool that does not clear the push cap lets a burst of slow pushes starve every other database path.
 

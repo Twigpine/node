@@ -92,7 +92,10 @@ WORKDIR /data
 # names would silently beat an existing deployment's GITLAWB_PORT or
 # GITLAWB_KEY. Under the old names, GITLAWB_* replaces them and TWIGPINE_*
 # outranks them. They move to the new names when the old ones are dropped.
-ENV GITLAWB_REPOS_DIR=/data/repos \
+# TWIGPINE_CONTAINER_IMAGE tells the node these six came from the image, so it
+# does not list them as old names the operator still uses.
+ENV TWIGPINE_CONTAINER_IMAGE=1 \
+    GITLAWB_REPOS_DIR=/data/repos \
     GITLAWB_KEY=/data/keys/identity.pem \
     GITLAWB_P2P_KEY=/data/keys/p2p.key \
     GITLAWB_HOST=0.0.0.0 \

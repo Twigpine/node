@@ -792,7 +792,12 @@ mod tests {
     /// to real AWS S3, and a probe that passed there would say nothing about
     /// Tigris.
     fn probe_env() -> Option<String> {
-        if std::env::var("TWIGPINE_TIGRIS_PROBE").ok().as_deref() != Some("1") {
+        // Read under either name: a test never runs the startup step that
+        // carries a setting's old name over, and a probe that silently skips
+        // looks exactly like one that passed.
+        let setting =
+            |rest: &str| twigpine_core::legacy_env::read(rest).and_then(|v| v.into_string().ok());
+        if setting("TIGRIS_PROBE").as_deref() != Some("1") {
             return None;
         }
         for name in [
@@ -805,8 +810,8 @@ mod tests {
                 return None;
             }
         }
-        match std::env::var("TWIGPINE_TIGRIS_BUCKET") {
-            Ok(b) if !b.is_empty() => Some(b),
+        match setting("TIGRIS_BUCKET") {
+            Some(b) => Some(b),
             _ => {
                 eprintln!(
                     "tigris conditional-write probe: TWIGPINE_TIGRIS_BUCKET is unset, skipping"

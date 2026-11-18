@@ -43,10 +43,26 @@ pub const IMAGE_DEFAULTS: [(&str, &str); 6] = [
     ("P2P_PORT", "7546"),
 ];
 
-fn is_image_default(rest: &str, value: &OsStr) -> bool {
-    IMAGE_DEFAULTS
+/// Set by the container image, and only by it, to say the old-name defaults
+/// above are present. Without it a `GITLAWB_PORT=7545` is something a person
+/// configured, and a disagreement with `TWIGPINE_PORT` is reported.
+pub const IMAGE_MARKER: &str = "TWIGPINE_CONTAINER_IMAGE";
+
+fn is_image_default(in_image: bool, rest: &str, value: &OsStr) -> bool {
+    in_image
+        && IMAGE_DEFAULTS
+            .iter()
+            .any(|(name, default)| *name == rest && value == OsStr::new(default))
+}
+
+/// A setting under either name, current name first, an empty value counting as
+/// unset. For code that runs without [`adopt`]: tests that read a setting
+/// directly rather than through a binary's `main`.
+pub fn read(rest: &str) -> Option<OsString> {
+    [PREFIX, LEGACY_PREFIX]
         .iter()
-        .any(|(name, default)| *name == rest && value == OsStr::new(default))
+        .filter_map(|prefix| std::env::var_os(format!("{prefix}{rest}")))
+        .find(|value| !value.is_empty())
 }
 
 /// What [`adopt`] found. Names only, never values: settings include keys.
@@ -96,6 +112,7 @@ where
 
     let mut sets: Vec<(String, OsString)> = Vec::new();
     let mut report = Report::default();
+    let in_image = get(IMAGE_MARKER).is_some_and(|v| !v.is_empty());
 
     for (name, value) in &vars {
         if let Some(rest) = suffix(name, LEGACY_PREFIX) {
@@ -103,18 +120,20 @@ where
             match get(&new_name).filter(|v| !v.is_empty()) {
                 None => {
                     sets.push((new_name.clone(), value.clone()));
-                    if !is_image_default(rest, value) {
+                    if !is_image_default(in_image, rest, value) {
                         report.legacy_only.push(new_name);
                     }
                 }
                 Some(new_value) if new_value != value.as_os_str() => {
                     sets.push((name.clone(), new_value.to_os_string()));
-                    if !is_image_default(rest, value) {
+                    if !is_image_default(in_image, rest, value) {
                         report.conflicts.push(new_name);
                     }
                 }
                 Some(_) => {}
             }
+        } else if name == IMAGE_MARKER {
+            // The marker is not a setting; it has no old name to fill in.
         } else if let Some(rest) = suffix(name, PREFIX) {
             if !value.is_empty() && get(&format!("{LEGACY_PREFIX}{rest}")).is_none() {
                 sets.push((format!("{LEGACY_PREFIX}{rest}"), value.clone()));
@@ -254,12 +273,28 @@ mod tests {
             .iter()
             .map(|(k, v)| (format!("GITLAWB_{k}"), v.to_string()))
             .collect();
-        let pairs: Vec<(&str, &str)> = image
+        let mut pairs: Vec<(&str, &str)> = image
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+
+        // Outside the image the same values are a person's configuration:
+        // reported, and a disagreement with the new name is a conflict.
+        let (_, r) = plan(env(&pairs));
+        assert_eq!(r.legacy_only.len(), 6, "{r:?}");
+        let mut host = pairs.clone();
+        host.push(("TWIGPINE_PORT", "8000"));
+        let (_, r) = plan(env(&host));
+        assert_eq!(r.conflicts, vec!["TWIGPINE_PORT"]);
+
+        // Inside the image, marked as such, they are adopted quietly.
+        pairs.push((IMAGE_MARKER, "1"));
         let (s, r) = plan(env(&pairs));
         assert_eq!(s.len(), 6, "every default still reaches the new name");
+        assert!(
+            s.iter().all(|(name, _)| name.starts_with(PREFIX)),
+            "the marker itself is not mirrored: {s:?}"
+        );
         assert!(r.is_empty(), "{r:?}");
 
         // The operator overrides one with the new name: used, not a conflict.

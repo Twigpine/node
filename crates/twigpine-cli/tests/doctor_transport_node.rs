@@ -125,7 +125,13 @@ fn doctor_with(env_node: Option<&str>, node_flag: Option<&str>, extra_env: &[(&s
     // The setting's name from before the rename is read too, so a developer
     // shell that still exports it must not leak into the run.
     for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("GITLAWB_") {
+        // Upper-cased first: Windows treats names as case-insensitive, and the
+        // binary reads `Gitlawb_Node` as this setting there.
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GITLAWB_")
+        {
             cmd.env_remove(name);
         }
     }
