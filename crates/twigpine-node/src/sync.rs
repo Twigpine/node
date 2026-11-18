@@ -151,6 +151,34 @@ pub fn start(
     });
 }
 
+/// Build the sync worker's HTTP client.
+///
+/// Peer URLs are attacker-influenceable, so the client follows no redirects
+/// (a 3xx to a loopback or private address must not be followed), ignores
+/// proxy environment variables (a proxy would resolve the peer's name itself,
+/// past the address check), and connects only to addresses the resolver policy
+/// has checked. Each call is bounded at 30 seconds so a stalled peer cannot
+/// hang the worker.
+///
+/// Panics rather than falling back to `reqwest::Client::new()`: the default
+/// builder follows redirects and honors proxies, which would silently
+/// reintroduce the SSRF vector this builder closes.
+fn build_sync_http_client() -> reqwest::Client {
+    build_sync_http_client_with(crate::resolver_policy::ResolverPolicy::production())
+}
+
+fn build_sync_http_client_with(
+    resolver: crate::resolver_policy::ResolverPolicy,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(Arc::new(resolver))
+        .build()
+        .expect("failed to build sync HTTP client")
+}
+
 async fn run(
     db: Arc<Db>,
     config: Arc<Config>,
@@ -158,19 +186,7 @@ async fn run(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
-    // Bound each peer HTTP call (withheld-paths lookup + replica registration)
-    // so a stalled peer cannot hang the worker.
-    // No redirects: peer URLs are attacker-influenceable, so a 3xx to a
-    // loopback/private address must not be followed (SSRF guard, matching the
-    // shared http_client and announce-time validation).
-    // Panic rather than fall back to reqwest::Client::new(): the default
-    // builder follows redirects, which would silently reintroduce the SSRF
-    // vector Policy::none() is here to close.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("failed to build no-redirect sync HTTP client");
+    let client = build_sync_http_client();
     info!("sync worker started (auto_sync=true)");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
@@ -3144,5 +3160,81 @@ mod tests {
             "failed",
             "deterministic prune refusal must fail the row, not defer forever"
         );
+    }
+
+    /// A resolver whose lookup answers `127.0.0.1` for every name, plus a
+    /// counter of how many lookups it served.
+    fn loopback_resolver() -> (
+        crate::resolver_policy::ResolverPolicy,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let policy = crate::resolver_policy::ResolverPolicy::new(
+            move |_host| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(vec!["127.0.0.1".parse().unwrap()]) })
+            },
+            Duration::from_secs(5),
+            32,
+        );
+        (policy, calls)
+    }
+
+    /// Bind a loopback listener and count the connections it accepts.
+    async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = accepted.clone();
+        tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (port, accepted)
+    }
+
+    #[tokio::test]
+    async fn sync_client_refuses_a_name_that_resolves_to_loopback_in_fetch_withheld() {
+        let (resolver, calls) = loopback_resolver();
+        let client = build_sync_http_client_with(resolver);
+        let (port, accepted) = counting_listener().await;
+        let origin = format!("http://rebind.invalid:{port}");
+        assert!(
+            crate::api::peers::is_public_http_url(&origin),
+            "the witness URL must pass the string gate so only resolution can refuse it"
+        );
+
+        let out = fetch_withheld(&client, &origin, "owner", "repo").await;
+
+        assert!(out.is_none());
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_client_refuses_a_name_that_resolves_to_loopback_in_register_replica() {
+        let (resolver, calls) = loopback_resolver();
+        let client = build_sync_http_client_with(resolver);
+        let (port, accepted) = counting_listener().await;
+        let origin = format!("http://rebind.invalid:{port}");
+        assert!(
+            crate::api::peers::is_public_http_url(&origin),
+            "the witness URL must pass the string gate so only resolution can refuse it"
+        );
+
+        register_replica_with_origin(
+            &client,
+            &Keypair::generate(),
+            Some("https://mirror.example"),
+            &origin,
+            "owner",
+            "repo",
+        )
+        .await;
+
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
