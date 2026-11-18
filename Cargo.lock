@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-twigpine"
-version = "0.7.1"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3927,7 +3927,7 @@ dependencies = [
 
 [[package]]
 name = "icaptcha-client"
-version = "0.4.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "mockito",
@@ -7402,7 +7402,7 @@ dependencies = [
 
 [[package]]
 name = "twigpine-attest"
-version = "0.7.1"
+version = "0.8.1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -7419,7 +7419,7 @@ dependencies = [
 
 [[package]]
 name = "twigpine-cli"
-version = "0.7.1"
+version = "0.8.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -7448,7 +7448,7 @@ dependencies = [
 
 [[package]]
 name = "twigpine-core"
-version = "0.7.1"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7476,7 +7476,7 @@ dependencies = [
 
 [[package]]
 name = "twigpine-node"
-version = "0.7.1"
+version = "0.8.1"
 dependencies = [
  "alloy",
  "anyhow",
