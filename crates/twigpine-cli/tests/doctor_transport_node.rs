@@ -233,7 +233,7 @@ fn unset_env_with_flag_equal_to_transport_default_still_warns_not_set() {
 }
 
 /// The bug this check exists to prevent, one level down: something answering 200
-/// on the transport port is not proof a gitlawb node is there. Reporting it as a
+/// on the transport port is not proof a Twigpine node is there. Reporting it as a
 /// healthy transport is the same false green doctor already shipped once.
 #[test]
 fn a_non_gitlawb_200_is_not_a_healthy_transport() {
@@ -267,7 +267,7 @@ fn a_non_gitlawb_200_is_not_a_healthy_transport() {
     // Positive assertion: only the identity check can produce this text, so the
     // test cannot pass by the probe quietly failing instead.
     assert!(
-        line.contains("not a gitlawb node"),
+        line.contains("not a Twigpine node"),
         "a non-gitlawb 200 must be called out, not reported reachable, got: {line}"
     );
 }
@@ -585,7 +585,7 @@ fn an_empty_or_malformed_did_is_not_a_healthy_transport() {
             .divergence_line()
             .unwrap_or_else(|| panic!("no row for {body}:\n{}", r.stdout));
         assert!(
-            line.contains("not a gitlawb node"),
+            line.contains("not a Twigpine node"),
             "{body} must not read as healthy, got: {line}"
         );
     }

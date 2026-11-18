@@ -257,6 +257,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_url_under_the_new_scheme() {
+        assert_eq!(
+            parse_gitlawb_url("twigpine://did:key:z6Mk1234/myrepo"),
+            Some(("did:key:z6Mk1234".to_string(), "myrepo".to_string()))
+        );
+    }
+
+    #[test]
     fn parse_simple_gitlawb_url() {
         let result = parse_gitlawb_url("gitlawb://did:key:z6Mk1234/myrepo");
         assert_eq!(

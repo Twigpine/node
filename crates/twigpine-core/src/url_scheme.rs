@@ -11,10 +11,9 @@
 //!   The two spellings name the same repository, so a delegation chain may mix
 //!   them and still attenuate.
 //!
-//! Writers still produce the old scheme. They switch in a later release, once
-//! the readers here have shipped: remote URLs when users have a helper that
-//! reads both, UCAN resources once every node on the network does. See
-//! `docs/LEGACY-NAMES.md`.
+//! Writers still produce the old scheme. Remote URLs switch in a later release;
+//! UCAN resources keep it, because the node a user pushes to checks them and
+//! may be one we do not run. See `docs/LEGACY-NAMES.md`.
 
 /// The scheme, without `://`.
 pub const SCHEME: &str = "twigpine";

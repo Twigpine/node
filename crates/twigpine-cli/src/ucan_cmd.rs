@@ -993,6 +993,20 @@ async fn cmd_verify(token: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_resource_typed_with_the_new_scheme_is_issued_under_the_old_one() {
+        // UCAN resources keep the old spelling: the node hosting a repository
+        // checks it, and that node may not read the new one yet.
+        assert_eq!(
+            super::canonical_resource("twigpine://repos/did:key:z6MkA/r.git"),
+            "gitlawb://repos/did:key:z6MkA/r"
+        );
+        assert_eq!(
+            super::canonical_resource("gitlawb://repos/did:key:z6MkA/r"),
+            "gitlawb://repos/did:key:z6MkA/r"
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
     use twigpine_core::identity::Keypair;

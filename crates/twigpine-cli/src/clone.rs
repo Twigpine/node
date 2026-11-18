@@ -2226,6 +2226,12 @@ mod tests {
         let (url2, o2, n2) = parse_repo("did:key:zAbc/myrepo").unwrap();
         assert_eq!(url2, "gitlawb://did:key:zAbc/myrepo");
         assert_eq!((o2.as_str(), n2.as_str()), ("did:key:zAbc", "myrepo"));
+
+        // The new scheme is read; the remote is still written under the old
+        // one until writers switch (docs/LEGACY-NAMES.md).
+        let (url3, o3, n3) = parse_repo("twigpine://did:key:zAbc/myrepo").unwrap();
+        assert_eq!(url3, "gitlawb://did:key:zAbc/myrepo");
+        assert_eq!((o3.as_str(), n3.as_str()), ("did:key:zAbc", "myrepo"));
     }
 
     #[test]

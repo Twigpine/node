@@ -196,6 +196,7 @@ fn manifest_blob_json(oid: &str, cid: &str) -> serde_json::Value {
 /// are the tags the `twigpine` recovery query filters on.
 fn build_manifest_tags_header(manifest: &EncryptedManifest<'_>) -> String {
     [
+        // Written under the old name until writers switch: see docs/LEGACY-NAMES.md.
         "App-Name:gitlawb".to_string(),
         "Schema:gitlawb/encrypted-manifest/v1".to_string(),
         format!("Repo:{}", sanitize_tag(manifest.repo)),
@@ -214,6 +215,7 @@ pub fn arweave_url(tx_id: &str) -> String {
 /// Format: comma-separated "name:value" pairs.
 fn build_tags_header(anchor: &RefAnchor) -> String {
     [
+        // Written under the old name until writers switch: see docs/LEGACY-NAMES.md.
         "App-Name:gitlawb".to_string(),
         "Schema:gitlawb/ref-update/v1".to_string(),
         format!("Repo:{}", sanitize_tag(&anchor.repo)),

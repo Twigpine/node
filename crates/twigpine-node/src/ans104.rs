@@ -999,7 +999,6 @@ mod tests {
 
     fn sample_tags() -> Vec<(&'static [u8], &'static [u8])> {
         vec![
-            // Written under the old name until the writers switch: see docs/LEGACY-NAMES.md.
             (b"App-Name", b"gitlawb"),
             (b"Schema", b"gitlawb/ref-update/v1"),
         ]

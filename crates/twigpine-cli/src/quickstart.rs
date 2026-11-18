@@ -216,7 +216,7 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             println!("  ✓  Repository created");
             println!();
             println!("══════════════════════════════════════════════════════════════════════");
-            println!("  You're set up on gitlawb.");
+            println!("  You're set up on Twigpine.");
             println!();
             println!("  Your DID:   {did}");
             println!("  Node:       {}", args.node);

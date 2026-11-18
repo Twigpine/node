@@ -10,6 +10,6 @@ packages/gl-linux-arm64/git-remote-gitlawb
 packages/gl-linux-x64/gl
 packages/gl-linux-x64/git-remote-gitlawb
 
-# Wrapper bin placeholders are overwritten by postinstall.
-packages/gl/bin/gl
-packages/gl/bin/git-remote-gitlawb
+# The wrapper's bin/ placeholders are committed: npm links commands before the
+# install step runs and skips any whose file is missing. install.js overwrites
+# them with the real programs.

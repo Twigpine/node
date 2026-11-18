@@ -708,12 +708,14 @@ fn ledger_key(identity: &SignatureIdentity) -> String {
     let mut hasher = Sha256::new();
     match unique_nonce(identity) {
         Some(nonce) => {
+            // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
             hasher.update(b"gitlawb/sig-nonce\x00");
             hasher.update(identity.key_fingerprint.as_bytes());
             hasher.update(b"\x00");
             hasher.update(nonce.as_bytes());
         }
         None => {
+            // Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
             hasher.update(b"gitlawb/sig-string\x00");
             hasher.update(identity.signing_string_hash.as_bytes());
         }

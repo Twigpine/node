@@ -1,0 +1,8 @@
+#!/bin/sh
+# Placeholder. npm links each command before the install step runs, and skips
+# a command whose file is missing, so this file has to exist in the package.
+# The install step (install.js) replaces it with the real program.
+echo "@gitlawb/gl: the install step did not run, so this command is not set up." >&2
+echo "Reinstall with scripts allowed:  npm install -g @gitlawb/gl --allow-scripts=@gitlawb/gl" >&2
+echo "or install without npm:          curl -fsSL https://twigpine.com/install.sh | sh" >&2
+exit 1

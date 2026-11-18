@@ -11,6 +11,7 @@ use crate::rate_limit::RateLimiter;
 /// HKDF salt for [`AppState::derive_scan_token_key`]. A constant, not a secret: HKDF's
 /// salt is a domain qualifier, and the confidentiality of the derived key rests entirely
 /// on the node's private seed being the input keying material.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const SCAN_TOKEN_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/ipfs-scan-token";
 
 /// HKDF `info` for [`AppState::derive_scan_token_key`]: the domain separation AND the
@@ -25,6 +26,7 @@ const SCAN_TOKEN_KEY_INFO: &[u8] = b"gitlawb/ipfs-scan-token/v1";
 /// HKDF salt for [`AppState::derive_webhook_secret_key`]. A constant, not a
 /// secret: the confidentiality of the derived key rests on the node's private
 /// seed being the input keying material, exactly as for the scan-token key.
+// Kept from before the rename on purpose: see docs/LEGACY-NAMES.md.
 const WEBHOOK_SECRET_KEY_SALT: &[u8] = b"gitlawb/hkdf-salt/webhook-secret";
 
 /// HKDF `info` for [`AppState::derive_webhook_secret_key`]: the domain

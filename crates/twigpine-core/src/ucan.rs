@@ -413,7 +413,8 @@ impl Ucan {
     /// exactly that capability (see `is_attenuated_by`).
     pub fn can(&self, resource: &str, action: &str) -> bool {
         self.payload.att.iter().any(|cap| {
-            let resource_ok = cap.with == resource || cap.with == "*";
+            let resource_ok =
+                crate::url_scheme::same_resource(&cap.with, resource) || cap.with == "*";
             let action_ok = cap.can == action || cap.can == "*" || cap.can == caps::REPO_ADMIN;
             resource_ok && action_ok
         })
@@ -1262,9 +1263,6 @@ mod push_scope_tests {
         );
     }
 
-    /// The chain walk, at every depth: a wildcard anywhere denies; concrete
-    /// everywhere grants. The grandparent case is the one a single-level check
-    /// misses, because the immediate proof already names the repo.
     #[test]
     fn a_chain_mixing_the_two_resource_spellings_verifies_and_grants() {
         let owner = Keypair::generate();
@@ -1296,17 +1294,27 @@ mod push_scope_tests {
         // The spelling is all that may differ: another repository is still
         // not covered.
         let other = format!("twigpine://repos/{owner_s}/other");
-        assert!(Ucan::delegate(
+        let stray = Ucan::delegate(
             &a,
             node.did(),
             vec![Capability::new(&other, caps::GIT_PUSH)],
             Some(hour()),
             &proof,
         )
-        .map(|u| u.verify_chain().is_err())
-        .unwrap_or(true));
+        .unwrap();
+        assert!(stray.verify_chain().is_err());
+        assert!(!stray.chain_grants_push_to(&owner_s, "other"));
+        assert!(!leaf.chain_grants_push_to(&owner_s, "other"));
+
+        // `Ucan::can` follows the same rule.
+        assert!(leaf.can(&old, caps::GIT_PUSH));
+        assert!(leaf.can(&new, caps::GIT_PUSH));
+        assert!(!leaf.can(&other, caps::GIT_PUSH));
     }
 
+    /// The chain walk, at every depth: a wildcard anywhere denies; concrete
+    /// everywhere grants. The grandparent case is the one a single-level check
+    /// misses, because the immediate proof already names the repo.
     #[test]
     fn chain_grants_push_only_when_every_link_names_the_repo() {
         let owner = Keypair::generate();

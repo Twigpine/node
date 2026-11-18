@@ -504,7 +504,7 @@ async fn probe_transport(url: &str) -> TransportVerdict {
             if body.truncated || body.read_failed {
                 return TransportVerdict {
                     usable: false,
-                    detail: "response too large or incomplete for a gitlawb node".to_string(),
+                    detail: "response too large or incomplete for a Twigpine node".to_string(),
                 };
             }
             let info = serde_json::from_slice::<serde_json::Value>(&body.bytes).unwrap_or_default();
@@ -519,7 +519,7 @@ async fn probe_transport(url: &str) -> TransportVerdict {
             } else {
                 TransportVerdict {
                     usable: false,
-                    detail: "something is listening but it is not a gitlawb node".to_string(),
+                    detail: "something is listening but it is not a Twigpine node".to_string(),
                 }
             }
         }
@@ -598,7 +598,6 @@ fn is_loopback_url(value: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Check if a binary name exists anywhere on PATH.
 /// The git helper row. Git runs `git-remote-gitlawb` for `gitlawb://` remotes,
 /// which is what every remote created so far uses, so without it clone and push
 /// fail now: a failure. `git-remote-twigpine` runs `twigpine://` remotes, which
@@ -620,6 +619,7 @@ fn helper_check(has_old_name: bool, has_new_name: bool) -> Check {
     }
 }
 
+/// Check if a binary name exists anywhere on PATH.
 fn which_in_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| {

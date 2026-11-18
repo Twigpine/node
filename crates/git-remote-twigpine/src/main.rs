@@ -1,11 +1,13 @@
-//! git-remote-twigpine — git remote helper for gitlawb:// URLs
+//! git-remote-twigpine — git remote helper for twigpine:// URLs
 //!
-//! Git calls this binary when it encounters a remote URL with the "gitlawb://" scheme.
-//! It implements the git remote helper protocol, translating gitlawb:// URLs into
-//! HTTP smart-protocol requests against a twigpine-node.
+//! Git calls this binary when it encounters a remote URL with the "twigpine://"
+//! scheme, and runs it as `git-remote-gitlawb` for the "gitlawb://" spelling
+//! from before the rename. It implements the git remote helper protocol,
+//! translating those URLs into HTTP smart-protocol requests against a
+//! twigpine-node.
 //!
 //! # URL format
-//!   gitlawb://did:key:z6Mk.../repo-name
+//!   twigpine://did:key:z6Mk.../repo-name   (or gitlawb://...)
 //!
 //! # v0.1 resolution
 //!   DID → http://127.0.0.1:7545  (hardcoded; v0.2 will use DHT)
@@ -207,11 +209,12 @@ fn help_text() -> String {
     format!(
         "{}\n\
          \n\
-         Git remote helper for gitlawb:// URLs. Git invokes this automatically\n\
-         when it encounters a gitlawb:// remote; you normally do not run it directly.\n\
+         Git remote helper for twigpine:// URLs, and for gitlawb:// from before the\n\
+         rename. Git invokes it automatically for such a remote; you normally do not\n\
+         run it directly.\n\
          \n\
          USAGE:\n\
-         \x20   git clone gitlawb://did:key:z6Mk.../<repo>\n\
+         \x20   git clone twigpine://did:key:z6Mk.../<repo>\n\
          \n\
          ENVIRONMENT:\n\
          \x20   TWIGPINE_NODE   Node base URL (default: {DEFAULT_LOCAL_NODE})\n\
@@ -780,7 +783,7 @@ fn build_pack_post_request(
 /// Returns `(did_string, short_owner, repo_name)`.
 fn parse_gitlawb_url(url: &str) -> Result<(String, String, String)> {
     let without_scheme = twigpine_core::url_scheme::strip_scheme(url)
-        .ok_or_else(|| anyhow::anyhow!("not a twigpine:// URL: {url}"))?;
+        .ok_or_else(|| anyhow::anyhow!("not a twigpine:// or gitlawb:// URL: {url}"))?;
 
     // without_scheme = "did:key:z6Mk.../repo-name"
     let (did_string, repo_name) = without_scheme
