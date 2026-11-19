@@ -348,7 +348,7 @@ pub async fn delete_marker_bounded(
 /// serving) or a live push's admission permits, lease, and write lock.
 /// `kill_on_drop(true)` makes the timeout real for these plumbing commands
 /// (no helper processes to reparent, unlike receive-pack's pack-objects).
-async fn run_git_bounded(
+pub(crate) async fn run_git_bounded(
     git_bin: &str,
     repo_path: &Path,
     args: &[&str],
