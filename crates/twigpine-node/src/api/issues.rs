@@ -63,7 +63,7 @@ pub async fn create_issue(
 
     let guard = state
         .repo_store
-        .acquire_write_without_hold_deadline(&record.owner_did, &record.name)
+        .acquire_write(&record.owner_did, &record.name)
         .await
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
 
@@ -425,7 +425,7 @@ pub async fn close_issue(
     // 503. Calling .to_string() first destroys that and reports both as a 500.
     let guard = state
         .repo_store
-        .acquire_write_without_hold_deadline(&record.owner_did, &record.name)
+        .acquire_write(&record.owner_did, &record.name)
         .await
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
     let disk_path = guard.path().to_path_buf();
@@ -1605,13 +1605,13 @@ mod lock_pool_shed_tests {
         server.abort();
     }
 
-    /// #282: issue writes never consult the hold deadline, so create takes its
-    /// guard without one (`acquire_write_without_hold_deadline`). Under a
-    /// zero-length operator timeout the create still publishes and keeps its
-    /// ref; a stamped deadline would only roll the finished write back at
-    /// release and 5xx the caller.
+    /// #282: issue writes keep the lock-hold deadline. `create_issue` is
+    /// reachable by any signed DID on a public repo, and its git is one small
+    /// ref write, so the stamped deadline is what bounds its refresh and
+    /// publish. Under a zero-length operator timeout the create must refuse,
+    /// and no issue ref may be left on disk.
     #[sqlx::test]
-    async fn create_issue_without_hold_deadline_publishes(pool: PgPool) {
+    async fn create_issue_keeps_the_lock_hold_deadline(pool: PgPool) {
         use crate::git::repo_store::tests as rs_tests;
 
         let mock = rs_tests::S3Mock::start().await;
@@ -1643,13 +1643,14 @@ mod lock_pool_shed_tests {
             }),
         )
         .await;
-        let (status, Json(issue)) = res.expect("a create with no hold deadline must publish");
-        assert_eq!(status, StatusCode::CREATED);
         assert!(
-            git_issues::get_issue(&live, &issue.id)
-                .expect("get_issue")
-                .is_some(),
-            "the issue ref must survive on disk, not be rolled back"
+            res.is_err(),
+            "a stamped-and-expired hold deadline must refuse the create"
+        );
+        let issues = git_issues::list_issues(&live).expect("list issues");
+        assert!(
+            issues.is_empty(),
+            "no issue ref may be left on disk after the refused create, got {issues:?}"
         );
 
         mock.shutdown();

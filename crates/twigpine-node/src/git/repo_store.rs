@@ -513,9 +513,11 @@ impl RepoStore {
     }
 
     /// For writers whose under-lock work never consults the hold deadline
-    /// (merge, issue create/close). Stamping one would only turn a slow but
-    /// completed write into a refused publish and a rollback at release, while
-    /// their unbounded git already holds the lock past it.
+    /// (merge). Stamping one would only turn a slow but completed merge into a
+    /// refused publish and a rollback at release, while its unbounded git
+    /// already holds the lock past it. Issue writes keep the deadline: their
+    /// git is one ref write, so the deadline is what bounds their refresh and
+    /// publish.
     pub async fn acquire_write_without_hold_deadline(
         &self,
         owner_did: &str,
@@ -9525,8 +9527,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// #282: merge and issue writes never consult the hold deadline, so their
-    /// guards carry none (`acquire_write_without_hold_deadline`). Under a
+    /// #282: merge never consults the hold deadline, so its guard carries
+    /// none (`acquire_write_without_hold_deadline`). Under a
     /// zero-length operator timeout such a guard still refreshes and
     /// publishes on each phase's own bound, while the same store's
     /// `acquire_write` stamps the already-expired deadline and dies at the
