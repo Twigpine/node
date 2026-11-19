@@ -2578,7 +2578,14 @@ impl RepoWriteGuard {
                         // ever dispatched — a definite non-publication, safe to
                         // compensate. A bound that expires after dispatch is the
                         // genuinely unknowable case.
-                        outcome = if hold_spent {
+                        // Also a timeout that landed inside the hold: the
+                        // deadline ran out while the archive was still being
+                        // prepared and nothing was dispatched, which is the
+                        // same landed-tree, no-PUT state as the pre-skip.
+                        let hold_expired_pre_dispatch =
+                            self.lock_hold_deadline.is_some_and(|d| Instant::now() >= d)
+                                && !self.publish_stage.get().may_have_published();
+                        outcome = if hold_spent || hold_expired_pre_dispatch {
                             warn!(
                                 repo = %self.repo_name,
                                 "lock-hold deadline expired before the release upload; no PUT \
