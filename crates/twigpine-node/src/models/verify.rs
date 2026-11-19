@@ -50,7 +50,9 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
         .await?
         .ok_or_else(|| AppError::NotFound("repo gone".into()))?;
     let rules = state.db.list_visibility_rules(&record.id).await?;
-    if !record.is_public || !rules.is_empty() {
+    // A mirror row (slash-form id) has a vacuous publicity pair, so it can
+    // never prove full publicity here either.
+    if !record.is_public || !rules.is_empty() || record.id.contains('/') {
         return reject_release(state, release_id, "repository is no longer fully public").await;
     }
 

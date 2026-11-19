@@ -156,7 +156,9 @@ pub async fn claim_release(
             // a withdrawn parent cannot launder references.
             let (precord, prules) =
                 crate::api::authorize_repo_read(state, powner, pname, Some(caller), "/").await?;
-            if !precord.is_public || !prules.is_empty() {
+            // A mirror parent row fails closed the same way: its publicity
+            // pair is vacuous.
+            if !precord.is_public || !prules.is_empty() || precord.id.contains('/') {
                 return Err(bad_request(
                     "declared parent's repo is no longer fully public",
                 ));

@@ -145,6 +145,63 @@ async fn open_session_owner_created(pool: sqlx::PgPool) {
     node.shutdown().await;
 }
 
+/// A mirror row with no canonical twin carries a vacuous publicity pair:
+/// `is_public` is hardcoded true and rules never sync, so neither check may
+/// admit it for publishing. Slash-form ids mark mirror rows (issue #244).
+#[sqlx::test]
+async fn mirror_repo_without_twin_cannot_publish(pool: sqlx::PgPool) {
+    let node = spawn_node(pool.clone()).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO repos
+             (id, name, owner_did, description, is_public, default_branch,
+              created_at, updated_at, disk_path)
+         VALUES ($1,'model',$2,'mirrored from peer',true,'main',$3,$3,'/tmp/mirror-model')",
+    )
+    .bind(format!("{owner_did}/model"))
+    .bind(&owner_did)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("mirror row seeds");
+
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &sessions_path(&owner_did, "model"),
+        b"{}".to_vec(),
+        &owner,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 400);
+
+    let body = serde_json::to_vec(&json!({"commit": "0".repeat(40), "branch": "main"})).unwrap();
+    let signed = sign_request(&owner, "POST", &claims_path(&owner_did, "model"), &body);
+    let resp = client
+        .post(format!(
+            "{}{}",
+            node.base_url,
+            claims_path(&owner_did, "model")
+        ))
+        .header("content-digest", &signed.content_digest)
+        .header("signature-input", &signed.signature_input)
+        .header("signature", &signed.signature)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 400);
+
+    node.shutdown().await;
+}
+
 /// A signed caller who is not the repo owner gets the owner gate's 403.
 #[sqlx::test]
 async fn open_session_non_owner_forbidden(pool: sqlx::PgPool) {

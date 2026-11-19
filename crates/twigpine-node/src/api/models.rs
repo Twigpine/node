@@ -40,7 +40,11 @@ fn hosting_enabled(state: &AppState) -> Result<()> {
 /// a public one carrying any path-scoped visibility rule, refuses with a
 /// clear 4xx rather than partially publishing.
 fn require_fully_public(record: &RepoRecord, rules: &[VisibilityRule]) -> Result<()> {
-    if !record.is_public || !rules.is_empty() {
+    // A mirror row (slash-form id) carries a vacuous publicity pair: its
+    // is_public is hardcoded true and rules never sync, so passing this
+    // check on one means nothing. Mirrors are replication-managed, not
+    // publishable; refuse them the same way as a gated canonical repo.
+    if !record.is_public || !rules.is_empty() || record.id.contains('/') {
         return Err(AppError::BadRequest(
             "model hosting requires a fully public repository".into(),
         ));
