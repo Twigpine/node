@@ -1721,6 +1721,7 @@ async fn gossip_task(
                     client.as_ref(),
                     &mut failed_once,
                     peers,
+                    crate::api::peers::mirror_upstream_ip_permitted,
                 )
                 .await;
             }
@@ -2004,18 +2005,40 @@ fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
     Ok(kp)
 }
 
+// reqwest dials an IP-literal host without calling the resolver, so the
+// resolver policy never sees it. Classify literals here; hostnames pass on to
+// the policy. An unparseable URL is refused too.
+fn peer_url_literal_permitted(http_url: &str, permit: fn(std::net::IpAddr) -> bool) -> bool {
+    let Ok(parsed) = url::Url::parse(http_url) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => permit(std::net::IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => permit(std::net::IpAddr::V6(v6)),
+        Some(url::Host::Domain(_)) => true,
+        None => false,
+    }
+}
+
 async fn gossip_ping_round(
     db: &Db,
     client: &reqwest::Client,
     failed_once: &mut HashSet<String>,
     peers: Vec<db::PeerRecord>,
+    permit: fn(std::net::IpAddr) -> bool,
 ) {
     {
         let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
         failed_once.retain(|did| current_dids.contains(did.as_str()));
     }
     for peer in peers {
-        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        // A refused URL counts as a failed probe, like a connection error.
+        let ok = if peer_url_literal_permitted(&peer.http_url, permit) {
+            ping_peer_readiness(client, &peer.http_url).await
+        } else {
+            warn!(did = %peer.did, "peer url refused by address policy; not pinging");
+            false
+        };
         match peer_ping_db_update(failed_once, &peer.did, ok) {
             Some(reachable) => {
                 if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
@@ -2124,7 +2147,7 @@ mod rate_limit_env_tests {
 #[cfg(test)]
 mod gossip_ssrf_tests {
     use super::{
-        gossip_ping_round, peer_ping_db_update, ping_peer_readiness,
+        gossip_ping_round, peer_ping_db_update, peer_url_literal_permitted, ping_peer_readiness,
         ping_peer_readiness_with_timeout,
     };
     use axum::{http::StatusCode, routing::get, Router};
@@ -2140,6 +2163,11 @@ mod gossip_ssrf_tests {
     // fails ping_peer_readiness_does_not_follow_redirect.
     fn production_http_client() -> reqwest::Client {
         super::build_http_client().expect("failed to build production http client")
+    }
+
+    // Lets tests that use a loopback mock exercise the round itself.
+    fn permit_all(_: std::net::IpAddr) -> bool {
+        true
     }
 
     #[test]
@@ -2198,6 +2226,7 @@ mod gossip_ssrf_tests {
             &production_http_client(),
             &mut failed_once,
             state.db.list_peers().await.unwrap(),
+            permit_all,
         )
         .await;
         assert!(
@@ -2226,6 +2255,7 @@ mod gossip_ssrf_tests {
             &production_http_client(),
             &mut failed_once,
             state.db.list_peers().await.unwrap(),
+            permit_all,
         )
         .await;
         assert!(
@@ -2611,6 +2641,7 @@ mod gossip_ssrf_tests {
                 &client,
                 &mut failed_once,
                 state.db.list_peers().await.unwrap(),
+                crate::api::peers::mirror_upstream_ip_permitted,
             )
             .await;
         }
@@ -2626,6 +2657,78 @@ mod gossip_ssrf_tests {
             .find(|p| p.did == did)
             .unwrap();
         assert!(!peer.last_ping_ok, "a refused peer must end up unreachable");
+    }
+
+    // A pre-gate row can hold an IP literal, which reqwest dials without the
+    // resolver. The round must refuse it before any request is sent.
+    #[sqlx::test]
+    async fn gossip_ping_round_never_dials_a_refused_ip_literal(pool: PgPool) {
+        let (port, accepted) = counting_listener().await;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let did = "did:key:z6MkGossipLiteralRefused";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, TRUE, $3)",
+        )
+        .bind(did)
+        .bind(format!("http://127.0.0.1:{port}"))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut failed_once = HashSet::new();
+        for _ in 0..2 {
+            gossip_ping_round(
+                state.db.as_ref(),
+                &production_http_client(),
+                &mut failed_once,
+                state.db.list_peers().await.unwrap(),
+                crate::api::peers::mirror_upstream_ip_permitted,
+            )
+            .await;
+        }
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        let peer = state
+            .db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .unwrap();
+        assert!(
+            !peer.last_ping_ok,
+            "a refused literal must end up unreachable"
+        );
+    }
+
+    #[test]
+    fn peer_url_literal_classifier_refuses_non_public_literals() {
+        let permit = crate::api::peers::mirror_upstream_ip_permitted;
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://10.0.0.1",
+            "http://203.0.113.10",
+            "http://[::1]:8080",
+            "http://[fd00::1]",
+            "http://[::ffff:127.0.0.1]",
+            "not a url",
+        ] {
+            assert!(
+                !peer_url_literal_permitted(url, permit),
+                "{url} must be refused"
+            );
+        }
+        for url in [
+            "http://8.8.8.8",
+            "http://[2606:4700::1111]",
+            "https://peer.example.com",
+        ] {
+            assert!(peer_url_literal_permitted(url, permit), "{url} must pass");
+        }
     }
 }
 
