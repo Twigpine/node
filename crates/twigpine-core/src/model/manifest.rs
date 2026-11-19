@@ -218,7 +218,9 @@ pub fn detect_format(first_bytes: &[u8], path: &str) -> FileFormat {
     }
     if matches!(
         ext,
-        "json" | "txt" | "md" | "py" | "jinja" | "model" | "yaml" | "yml"
+        // `tokenizer.model` is deliberately absent: it is a sentencepiece
+        // protobuf, so it falls through to `other` like the binaries.
+        "json" | "txt" | "md" | "py" | "jinja" | "yaml" | "yml"
     ) {
         return FileFormat::Text;
     }
@@ -353,7 +355,8 @@ mod tests {
             FileFormat::Other
         );
         assert_eq!(detect_format(b"{\"a\":1}", "config.json"), FileFormat::Text);
-        assert_eq!(detect_format(b"", "tokenizer.model"), FileFormat::Text);
+        // Sentencepiece models are protobufs, not text.
+        assert_eq!(detect_format(b"", "tokenizer.model"), FileFormat::Other);
         assert_eq!(
             detect_format(b"\x00\x01\x02", "blob.weird"),
             FileFormat::Other

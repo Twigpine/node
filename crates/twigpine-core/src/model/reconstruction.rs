@@ -199,18 +199,19 @@ fn idx_insert(map: &mut HashMap<String, (String, u32)>, k: String, v: (String, u
     map.entry(k).or_insert(v);
 }
 
-/// Seal a staged run of new chunks into one block and append its term and
-/// block-table entry.
-fn seal_staged(
-    staged: &mut Vec<crate::model::chunking::Chunk>,
+/// Seal the accumulating block of new chunks: patch its id into the terms
+/// written while it was still open, then append the block-table entry and
+/// queue the bytes for upload.
+fn seal_pending(
+    pending: &mut Vec<crate::model::chunking::Chunk>,
     terms: &mut Vec<Term>,
     block_entries: &mut Vec<BlockEntry>,
     new_blocks: &mut Vec<Block>,
 ) {
-    if staged.is_empty() {
+    if pending.is_empty() {
         return;
     }
-    let chunks = std::mem::take(staged);
+    let chunks = std::mem::take(pending);
     let mut data = Vec::with_capacity(chunks.iter().map(|c| c.len).sum::<usize>());
     for c in &chunks {
         data.extend_from_slice(&c.data);
@@ -220,12 +221,13 @@ fn seal_staged(
         chunks,
         data,
     };
-    terms.push(Term {
-        block: block.sha256.clone(),
-        chunk_start: 0,
-        chunk_end: block.chunks.len() as u32,
-        length: block.data.len() as u64,
-    });
+    // Terms for new chunks were written with an empty placeholder id
+    // because the block hash is not known until it seals.
+    for term in terms.iter_mut() {
+        if term.block.is_empty() {
+            term.block = block.sha256.clone();
+        }
+    }
     block_entries.push(BlockEntry {
         sha256: block.sha256.clone(),
         size: block.data.len() as u64,
@@ -263,10 +265,12 @@ pub fn pack_file<R: Read>(
     let mut terms: Vec<Term> = Vec::new();
     let mut new_blocks: Vec<Block> = Vec::new();
     let mut block_entries: Vec<BlockEntry> = Vec::new();
-    // Chunks not found in `dedup`, staged until the staging run seals into a
-    // block (at the target size, on a reused-chunk boundary, or at EOF).
-    let mut staged: Vec<crate::model::chunking::Chunk> = Vec::new();
-    let mut staged_bytes: usize = 0;
+    // Chunks not found in `dedup` accumulate into one pending block that
+    // seals only at the target size or EOF. Sealing on every reused-chunk
+    // boundary would scatter a fine-tune's edits into one tiny block each,
+    // multiplying the object and pin count blocks exist to keep low.
+    let mut pending: Vec<crate::model::chunking::Chunk> = Vec::new();
+    let mut pending_bytes: usize = 0;
     let mut file_size: u64 = 0;
 
     for chunk in chunk_reader(reader) {
@@ -274,7 +278,6 @@ pub fn pack_file<R: Read>(
         file_hasher.update(&chunk.data);
         file_size += chunk.len as u64;
         if let Some((block_sha, idx)) = dedup.by_chunk.get(&chunk.sha256) {
-            seal_staged(&mut staged, &mut terms, &mut block_entries, &mut new_blocks);
             // Extend the previous term when it already reads the chunk before
             // this one in the same block: a shared run stays a single term.
             match terms.last_mut() {
@@ -290,14 +293,31 @@ pub fn pack_file<R: Read>(
                 }),
             }
         } else {
-            staged_bytes += chunk.len;
-            staged.push(chunk);
-            if staged_bytes >= BLOCK_TARGET {
-                seal_staged(&mut staged, &mut terms, &mut block_entries, &mut new_blocks);
+            // The term indexes into the pending block at the position the
+            // chunk will hold once the block seals; the id is patched then.
+            let idx = pending.len() as u32;
+            let len = chunk.len as u64;
+            pending_bytes += chunk.len;
+            pending.push(chunk);
+            match terms.last_mut() {
+                Some(t) if t.block.is_empty() => {
+                    t.chunk_end = idx + 1;
+                    t.length += len;
+                }
+                _ => terms.push(Term {
+                    block: String::new(),
+                    chunk_start: idx,
+                    chunk_end: idx + 1,
+                    length: len,
+                }),
+            }
+            if pending_bytes >= BLOCK_TARGET {
+                seal_pending(&mut pending, &mut terms, &mut block_entries, &mut new_blocks);
+                pending_bytes = 0;
             }
         }
     }
-    seal_staged(&mut staged, &mut terms, &mut block_entries, &mut new_blocks);
+    seal_pending(&mut pending, &mut terms, &mut block_entries, &mut new_blocks);
 
     let file = FileEntry {
         path: path.to_string(),
@@ -558,6 +578,53 @@ mod tests {
             packed.new_blocks.len() <= 1,
             "changed chunks should seal into at most one new block"
         );
+
+        let store: HashMap<String, Vec<u8>> = base_packed
+            .new_blocks
+            .iter()
+            .chain(packed.new_blocks.iter())
+            .map(|b| (b.sha256.clone(), b.data.clone()))
+            .collect();
+        let mut out = Vec::new();
+        rebuild_file(
+            &packed.file,
+            &rec,
+            &mut |id| Ok(store.get(id).cloned().expect("block")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, tuned);
+    }
+
+    #[test]
+    fn scattered_edits_share_one_new_block() {
+        // A fine-tune whose edits are spread across the file: every run of
+        // changed chunks lands in the same pending block, so the object and
+        // pin count does not grow with the number of edited regions.
+        let base = gen_bytes(20 * 1024 * 1024, 41);
+        let (base_rec, base_packed) = pack("model.safetensors", &base);
+        let region = (base.len() - 200_000) / 50;
+        let mut tuned = base.clone();
+        for i in 0..50 {
+            let at = 50_000 + i * region;
+            for b in tuned.iter_mut().skip(at).take(4_096) {
+                *b = b.wrapping_add(7);
+            }
+        }
+
+        let dedup = DedupIndex::from_reconstructions(&[&base_rec]);
+        let packed = pack_file("tuned.safetensors", Cursor::new(tuned.clone()), &dedup).unwrap();
+        assert_eq!(
+            packed.new_blocks.len(),
+            1,
+            "scattered edits must seal into one new block, not one per run"
+        );
+
+        let mut rec = Reconstruction::new();
+        rec.blocks.extend(base_rec.blocks.iter().cloned());
+        rec.blocks.extend(packed.block_entries.clone());
+        rec.files.push(packed.file.clone());
+        rec.validate().unwrap();
 
         let store: HashMap<String, Vec<u8>> = base_packed
             .new_blocks
