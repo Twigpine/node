@@ -19706,11 +19706,20 @@ exit 0
                 "the deadline-cut push never returned within 20s"
             );
         };
+        // The group must already be gone when the push returns: the poll
+        // loop above only samples before each poll, so a release that landed
+        // inside the final poll would otherwise be hidden by the SIGKILL below.
+        let group_alive_at_return = pid_alive(desc);
         // Clean up regardless so a failure leaves no orphan behind.
         // SAFETY: kill(2) takes integers only.
         unsafe {
             libc::kill(desc, libc::SIGKILL);
         }
+        assert!(
+            !group_alive_at_return,
+            "the receive-pack group must be gone when the deadline-cut push returns; \
+             the write lock was released while the descendant was still alive"
+        );
         assert!(
             result.is_err(),
             "a push cut by its lock-hold deadline must fail, not report success"

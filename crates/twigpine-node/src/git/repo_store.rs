@@ -2199,6 +2199,13 @@ impl RepoWriteGuard {
         }
     }
 
+    /// Absolute deadline for a caller's own under-lock work: `own` from now,
+    /// never past the lock-hold deadline, or `None` once that has passed.
+    /// A guard with no lock-hold deadline keeps `own`.
+    pub(crate) fn hold_deadline(&self, own: Duration) -> Option<Instant> {
+        Instant::now().checked_add(self.hold_bounded(own)?)
+    }
+
     /// Backend pid of the session holding the lock. Test-only observable for the
     /// must-not-over-close check: if `release` closed the session instead of
     /// returning it, consecutive writes would report different pids.
@@ -2501,10 +2508,16 @@ impl RepoWriteGuard {
                 // with the lock held and a lock-pool slot pinned, so bounding
                 // each attempt separately would double the worst-case occupancy.
                 // The bound also composes with the lock-hold deadline: a guard
-                // whose deadline has passed starts nothing, classified through
-                // `resolve_unfinished_publish` as definite non-publication at
-                // stage Idle. The skip is explicit because `timeout(0)` would
-                // still poll the publish once.
+                // whose deadline has passed starts nothing. The skip is
+                // explicit because `timeout(0)` would still poll the publish
+                // once. The write has already landed on the live tree, so the
+                // skip is classified `UploadUnknowable` rather than as a
+                // definite refusal: that routes it to a no-attempt quarantine
+                // marker the read path resolves outside the lock, instead of
+                // the recursive `remove_dir_all` a definite refusal runs here,
+                // which would hold this lock-pool session past the deadline
+                // that caused the skip.
+                let hold_spent = self.hold_bounded(self.lock_held_transfer_timeout).is_none();
                 let published = match self.hold_bounded(self.lock_held_transfer_timeout) {
                     None => None,
                     Some(bound) => {
@@ -2565,7 +2578,17 @@ impl RepoWriteGuard {
                         // ever dispatched — a definite non-publication, safe to
                         // compensate. A bound that expires after dispatch is the
                         // genuinely unknowable case.
-                        outcome = self.resolve_unfinished_publish(&tigris).await;
+                        outcome = if hold_spent {
+                            warn!(
+                                repo = %self.repo_name,
+                                "lock-hold deadline expired before the release upload; no PUT \
+                                 was dispatched, quarantining the landed tree instead of \
+                                 deleting it under the lock"
+                            );
+                            ReleaseOutcome::UploadUnknowable
+                        } else {
+                            self.resolve_unfinished_publish(&tigris).await
+                        };
                     }
                 }
             }
@@ -9416,7 +9439,7 @@ pub(crate) mod tests {
         repo_name: &str,
         lock_key: i64,
         lock_hold_deadline: Instant,
-    ) -> (ReleaseOutcome, usize) {
+    ) -> (ReleaseOutcome, usize, TreeAfterRelease) {
         use axum::response::IntoResponse;
 
         let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9443,6 +9466,7 @@ pub(crate) mod tests {
         let local_path = validated_repo_disk_path(dir.path(), "did:key:z6MkHoldExpired", repo_name)
             .expect("test path");
         seed_bare_repo(&local_path);
+        let tree_path = local_path.clone();
         let guard = RepoWriteGuard {
             owner_slug: "did_key_z6MkHoldExpired".to_string(),
             repo_name: repo_name.to_string(),
@@ -9470,14 +9494,33 @@ pub(crate) mod tests {
         let outcome = guard.release(true).await;
         let put_count = puts.load(std::sync::atomic::Ordering::SeqCst);
         server.abort();
-        (outcome, put_count)
+        let tree = TreeAfterRelease {
+            on_disk: tree_path.exists(),
+            quarantined_without_attempt: matches!(
+                read_quarantine(&tree_path),
+                Some(Quarantine::Marker(ref m)) if m.attempt.is_none()
+            ),
+        };
+        (outcome, put_count, tree)
+    }
+
+    /// What `release` left at the live path, read before the fixture's temp
+    /// dir is dropped.
+    struct TreeAfterRelease {
+        on_disk: bool,
+        quarantined_without_attempt: bool,
     }
 
     /// #282: every phase under the lock consumes the guard's one lock-hold
     /// deadline. A guard whose deadline has already passed must not START a
-    /// publish the bound cannot finish: the `None` (timed out) arm routes
-    /// through `resolve_unfinished_publish`, where stage `Idle` reads as a
-    /// definite non-publication (`UploadFailed`), and no PUT is dispatched.
+    /// publish the bound cannot finish, and no PUT is dispatched.
+    ///
+    /// The write itself already landed on the live tree (`success == true`), so
+    /// the skip must not run the under-lock `remove_dir_all` that a definite
+    /// refusal runs: that recursive delete would hold the lock-pool session
+    /// past the very deadline that caused the skip. The outcome is
+    /// `UploadUnknowable`, which leaves the tree on disk behind a no-attempt
+    /// quarantine marker; the read path resolves that marker outside the lock.
     ///
     /// Load-bearing on the clamp: the repo is seeded and the mock accepts
     /// every PUT, so without the `hold_bounded` deadline the publish would
@@ -9486,7 +9529,7 @@ pub(crate) mod tests {
     #[sqlx::test]
     async fn release_after_lock_hold_deadline_starts_no_publish(pool: sqlx::PgPool) {
         // Already past: the publish's budget must clamp to zero.
-        let (outcome, puts) = release_with_lock_hold_deadline(
+        let (outcome, puts, tree) = release_with_lock_hold_deadline(
             &pool,
             "expired-hold",
             995_777,
@@ -9495,12 +9538,22 @@ pub(crate) mod tests {
         .await;
         assert_eq!(
             outcome,
-            ReleaseOutcome::UploadFailed,
-            "an expired lock-hold deadline makes the publish a definite non-publication, got {outcome:?}"
+            ReleaseOutcome::UploadUnknowable,
+            "an expired lock-hold deadline after a landed write is quarantined, not \
+             deleted under the lock, got {outcome:?}"
         );
         assert_eq!(
             puts, 0,
             "no PUT may be dispatched once the lock-hold deadline has passed"
+        );
+        assert!(
+            tree.on_disk,
+            "the landed tree must not be removed inside release"
+        );
+        assert!(
+            tree.quarantined_without_attempt,
+            "the tree must sit behind a no-attempt quarantine marker so a read \
+             resolves it outside the lock"
         );
     }
 
@@ -9509,7 +9562,7 @@ pub(crate) mod tests {
     /// would make the expired case pass for the wrong reason.
     #[sqlx::test]
     async fn release_before_lock_hold_deadline_publishes(pool: sqlx::PgPool) {
-        let (outcome, puts) = release_with_lock_hold_deadline(
+        let (outcome, puts, _tree) = release_with_lock_hold_deadline(
             &pool,
             "live-hold",
             995_778,

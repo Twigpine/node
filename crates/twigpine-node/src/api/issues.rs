@@ -67,9 +67,23 @@ pub async fn create_issue(
         .await
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
 
-    let create_result = git_issues::create_issue(guard.path(), &issue_id, &json_str);
-
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    // The guard's lock-hold deadline funds the ref write: an expired one
+    // refuses before the ref is touched, and the write itself runs through
+    // the bounded runner so a hung git child cannot outlive the hold.
+    let Some(write_deadline) = guard.hold_deadline(git_timeout) else {
+        let _ = guard.release(false).await;
+        tracing::warn!(repo = %repo, "lock-hold deadline expired before the issue write; refusing");
+        return Err(AppError::RepoUnavailable);
+    };
+    let create_result = git_issues::create_issue_bounded(
+        &state.git_bin,
+        guard.path(),
+        &issue_id,
+        &json_str,
+        write_deadline,
+    );
+
     let deadline = std::time::Instant::now() + git_timeout;
     let git_bin = state.git_bin.clone();
     let issue_id_for_comp = issue_id.clone();
@@ -491,6 +505,19 @@ pub async fn close_issue(
         .as_deref()
         .and_then(|id| git_issues::get_issue(&disk_path, id).ok().flatten());
 
+    // An expired lock-hold deadline refuses before the ref is touched. The
+    // close's own git children are not clamped to it (there is no bounded
+    // close), so this bounds when the write may START, not how long it runs.
+    if guard
+        .hold_deadline(std::time::Duration::from_secs(
+            state.config.git_service_timeout_secs,
+        ))
+        .is_none()
+    {
+        let _ = guard.release(false).await;
+        tracing::warn!(repo = %repo, "lock-hold deadline expired before the issue close; refusing");
+        return Err(AppError::RepoUnavailable);
+    }
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
@@ -1654,6 +1681,112 @@ mod lock_pool_shed_tests {
         );
 
         mock.shutdown();
+    }
+
+    /// Fixture for the pre-mutation hold-deadline tests: a repo store with NO
+    /// object store, so acquisition has no refresh that could refuse an
+    /// expired deadline. The only thing left to refuse the write is the
+    /// handler's own check of the guard's deadline.
+    async fn nostore_zero_hold_state(
+        pool: &PgPool,
+        owner: &str,
+        repo_name: &str,
+    ) -> (AppState, std::path::PathBuf, tempfile::TempDir) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let mut seeded = seed_repo(owner, repo_name);
+        let live = crate::git::repo_store::validated_repo_disk_path(disk.path(), owner, repo_name)
+            .expect("repo path");
+        seeded.disk_path = live.to_string_lossy().to_string();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(pool, 2, std::time::Duration::from_secs(1)),
+        )
+        .with_lock_hold_timeout(std::time::Duration::ZERO);
+        (state, live.to_path_buf(), disk)
+    }
+
+    /// #282: a guard whose hold deadline expired before the handler's ref write
+    /// refuses the create instead of writing under a lock it no longer has the
+    /// budget to hold. No object store, so only the handler's own check can
+    /// refuse; the issue ref must not exist afterwards.
+    #[sqlx::test]
+    async fn create_issue_refuses_when_the_hold_deadline_expired_before_the_write(pool: PgPool) {
+        let owner = "did:key:zISSUEPRECHECKCREATEAAAAAAAAAAAAAAAAA";
+        let repo_name = "precheck-create";
+        let (state, live, _disk) = nostore_zero_hold_state(&pool, owner, repo_name).await;
+
+        let res = create_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string())),
+            Json(CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        let err = res.expect_err("an expired hold deadline must refuse the create");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the refusal is the retryable 503 the refresh path uses"
+        );
+        let issues = git_issues::list_issues(&live).expect("list issues");
+        assert!(
+            issues.is_empty(),
+            "no issue ref may be written once the hold deadline expired, got {issues:?}"
+        );
+    }
+
+    /// Same refusal on the close path: the seeded issue must stay open.
+    #[sqlx::test]
+    async fn close_issue_refuses_when_the_hold_deadline_expired_before_the_write(pool: PgPool) {
+        let owner = "did:key:zISSUEPRECHECKCLOSEAAAAAAAAAAAAAAAAAA";
+        let repo_name = "precheck-close";
+        let (state, live, _disk) = nostore_zero_hold_state(&pool, owner, repo_name).await;
+        let full_id = "abc12345-0000-0000-0000-000000000000";
+        let open_json = serde_json::to_string(&IssueRecord {
+            id: full_id.to_string(),
+            title: "seeded".to_string(),
+            body: Some(String::new()),
+            author: Some(owner.to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "open".to_string(),
+            signed_payload: None,
+        })
+        .expect("serialize seeded issue");
+        git_issues::create_issue(&live, full_id, &open_json).expect("seed issue");
+
+        let res = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                repo_name.to_string(),
+                full_id.to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+            crate::auth::LedgerTicket::already_spent(),
+        )
+        .await;
+        let err = res.expect_err("an expired hold deadline must refuse the close");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the refusal is the retryable 503 the refresh path uses"
+        );
+        assert_eq!(
+            git_issues::get_issue(&live, full_id)
+                .expect("read the ref")
+                .as_deref(),
+            Some(open_json.as_str()),
+            "the issue must still be open: the close may not write past the deadline"
+        );
     }
 
     /// The compensating rewrite after a refused publish must land on the ref the

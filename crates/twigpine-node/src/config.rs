@@ -472,9 +472,10 @@ pub struct Config {
     /// than publishing late. Does NOT bound the acquire-side wait for the
     /// lock (`git_acquire_timeout_secs`), the post-git outcome bookkeeping on
     /// the main pool, the ~2-4s the detached reaper holds the session while
-    /// the process group dies, or a caller's synchronous under-lock work that
-    /// never consults the deadline (the merge/issue write paths still run
-    /// unbounded git under their guards). Must be positive and at most
+    /// the process group dies, or merge writes, which take their guards
+    /// without this deadline and run unbounded git under them. Issue writes
+    /// keep the deadline: an expired one refuses the write before the ref is
+    /// touched, and a create's git is clamped to it. Must be positive and at most
     /// `git_service_timeout_secs` (a hold bound above the git timeout can
     /// never bind before it). Unset (the default) the effective bound is
     /// `git_service_timeout_secs` itself (600s shipped), so every push keeps
