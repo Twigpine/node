@@ -343,6 +343,36 @@ pub struct BlockSlice {
     pub len: u64,
 }
 
+/// Byte offset of each chunk inside a block, as a prefix sum over the
+/// chunk table: `offsets[i]` is where chunk `i`'s bytes begin.
+fn chunk_offsets(block: &BlockEntry) -> Vec<u64> {
+    block
+        .chunks
+        .iter()
+        .scan(0u64, |off, c| {
+            let start = *off;
+            *off += c.len;
+            Some(start)
+        })
+        .collect()
+}
+
+/// Byte range inside a block covering the chunks a term names.
+fn term_span(block: &BlockEntry, term: &Term) -> Result<(u64, u64), ModelError> {
+    let start = term.chunk_start as usize;
+    let end = term.chunk_end as usize;
+    if start >= end || end > block.chunks.len() {
+        return Err(ModelError::Invalid(format!(
+            "term chunk range {start}..{end} outside block {} with {} chunks",
+            term.block,
+            block.chunks.len()
+        )));
+    }
+    let offsets = chunk_offsets(block);
+    let len: u64 = block.chunks[start..end].iter().map(|c| c.len).sum();
+    Ok((offsets[start], len))
+}
+
 pub fn map_file_range(
     file: &FileEntry,
     rec: &Reconstruction,
@@ -367,24 +397,17 @@ pub fn map_file_range(
             cursor = term_end;
             continue;
         }
-        // Byte offset of each chunk inside the block, as a prefix sum.
-        let mut block_off = 0u64;
-        for (i, chunk) in block.chunks.iter().enumerate() {
-            block_off += chunk.len;
-            if i < term.chunk_start as usize {
-                continue;
-            }
-            if i >= term.chunk_end as usize {
-                break;
-            }
+        let offsets = chunk_offsets(block);
+        for i in term.chunk_start as usize..term.chunk_end as usize {
+            let chunk = &block.chunks[i];
             // This chunk covers file bytes [chunk_lo, chunk_hi).
-            let chunk_hi = cursor + chunk.len;
             let chunk_lo = cursor;
+            let chunk_hi = cursor + chunk.len;
             cursor = chunk_hi;
             let s = start.max(chunk_lo);
             let e = end_exclusive.min(chunk_hi);
             if s < e {
-                let off = block_off - chunk.len + (s - chunk_lo);
+                let off = offsets[i] + (s - chunk_lo);
                 match out.last_mut() {
                     // Adjacent slices in the same block merge into one read.
                     Some(slice) if slice.block == term.block && slice.offset + slice.len == off => {
@@ -405,12 +428,15 @@ pub fn map_file_range(
 }
 
 /// Rebuild a file's bytes from its terms, verifying every chunk's hash and
-/// the whole-file digest. `fetch` returns a block's bytes by id (a
-/// BlockStore range read or a cache hit on the caller's side).
+/// the whole-file digest. `fetch` is a range read returning exactly `len`
+/// bytes starting at `offset` inside the named block (a BlockStore range
+/// read or a cache hit on the caller's side). The block id itself is not
+/// re-verified here: blocks are hash-verified when stored, and the chunk
+/// hashes cover the bytes this file actually uses.
 pub fn rebuild_file<W: Write>(
     file: &FileEntry,
     rec: &Reconstruction,
-    fetch: &mut dyn FnMut(&str) -> std::io::Result<Vec<u8>>,
+    fetch: &mut dyn FnMut(&str, u64, u64) -> std::io::Result<Vec<u8>>,
     out: &mut W,
 ) -> Result<u64, ModelError> {
     use sha2::Digest;
@@ -421,34 +447,28 @@ pub fn rebuild_file<W: Write>(
         let block = blocks
             .get(term.block.as_str())
             .ok_or_else(|| ModelError::Invalid(format!("unknown block {}", term.block)))?;
-        let bytes = fetch(&term.block)?;
-        if sha256_hex(&bytes) != term.block {
-            return Err(ModelError::HashMismatch(format!(
-                "block {} content does not hash to its id",
-                term.block
+        let (offset, span_len) = term_span(block, term)?;
+        let bytes = fetch(&term.block, offset, span_len)?;
+        if bytes.len() as u64 != span_len {
+            return Err(ModelError::Invalid(format!(
+                "range read on block {} returned {} of {span_len} bytes",
+                term.block,
+                bytes.len()
             )));
         }
-        let mut off = 0usize;
-        for (i, chunk) in block.chunks.iter().enumerate() {
-            let next = off + chunk.len as usize;
-            if i >= term.chunk_start as usize && i < term.chunk_end as usize {
-                let data = bytes.get(off..next).ok_or_else(|| {
-                    ModelError::Invalid(format!(
-                        "block {} shorter than its chunk table",
-                        term.block
-                    ))
-                })?;
-                if sha256_hex(data) != chunk.sha256 {
-                    return Err(ModelError::HashMismatch(format!(
-                        "chunk {} in block {}",
-                        chunk.sha256, term.block
-                    )));
-                }
-                out.write_all(data)?;
-                file_hasher.update(data);
-                written += chunk.len;
+        let mut rel = 0usize;
+        for chunk in &block.chunks[term.chunk_start as usize..term.chunk_end as usize] {
+            let data = &bytes[rel..rel + chunk.len as usize];
+            if sha256_hex(data) != chunk.sha256 {
+                return Err(ModelError::HashMismatch(format!(
+                    "chunk {} in block {}",
+                    chunk.sha256, term.block
+                )));
             }
-            off = next;
+            out.write_all(data)?;
+            file_hasher.update(data);
+            written += chunk.len;
+            rel += chunk.len as usize;
         }
     }
     if written != file.size {
@@ -508,7 +528,10 @@ mod tests {
         let n = rebuild_file(
             &packed.file,
             &rec,
-            &mut |id| Ok(store.get(id).cloned().expect("block")),
+            &mut |id, off, len| {
+                let block = store.get(id).expect("block");
+                Ok(block[off as usize..(off + len) as usize].to_vec())
+            },
             &mut out,
         )
         .unwrap();
@@ -589,7 +612,10 @@ mod tests {
         rebuild_file(
             &packed.file,
             &rec,
-            &mut |id| Ok(store.get(id).cloned().expect("block")),
+            &mut |id, off, len| {
+                let block = store.get(id).expect("block");
+                Ok(block[off as usize..(off + len) as usize].to_vec())
+            },
             &mut out,
         )
         .unwrap();
@@ -636,7 +662,10 @@ mod tests {
         rebuild_file(
             &packed.file,
             &rec,
-            &mut |id| Ok(store.get(id).cloned().expect("block")),
+            &mut |id, off, len| {
+                let block = store.get(id).expect("block");
+                Ok(block[off as usize..(off + len) as usize].to_vec())
+            },
             &mut out,
         )
         .unwrap();
@@ -708,8 +737,56 @@ mod tests {
         let bytes = gen_bytes(300_000, 31);
         let (rec, packed) = pack("f", &bytes);
         let mut out = Vec::new();
-        let err =
-            rebuild_file(&packed.file, &rec, &mut |_id| Ok(vec![0u8; 16]), &mut out).unwrap_err();
+        let err = rebuild_file(
+            &packed.file,
+            &rec,
+            &mut |_id, _off, len| Ok(vec![0u8; len as usize]),
+            &mut out,
+        )
+        .unwrap_err();
         assert!(matches!(err, ModelError::HashMismatch(_)));
+    }
+
+    #[test]
+    fn rebuild_fetches_only_the_bytes_the_file_needs() {
+        // Terms can revisit one block or name a middle chunk range: the
+        // fetcher must serve each term's span, never whole blocks, so the
+        // bytes read equal the file size rather than a multiple of it.
+        let base = gen_bytes(4 * 1024 * 1024, 53);
+        let (base_rec, base_packed) = pack("base.safetensors", &base);
+        let mut tuned = base.clone();
+        for b in tuned.iter_mut().skip(1024 * 1024).take(64 * 1024) {
+            *b = b.wrapping_add(3);
+        }
+
+        let dedup = DedupIndex::from_reconstructions(&[&base_rec]);
+        let packed = pack_file("tuned.safetensors", Cursor::new(tuned.clone()), &dedup).unwrap();
+        let mut rec = Reconstruction::new();
+        rec.blocks.extend(base_rec.blocks.iter().cloned());
+        rec.blocks.extend(packed.block_entries.clone());
+        rec.files.push(packed.file.clone());
+        rec.validate().unwrap();
+
+        let store: HashMap<String, Vec<u8>> = base_packed
+            .new_blocks
+            .iter()
+            .chain(packed.new_blocks.iter())
+            .map(|b| (b.sha256.clone(), b.data.clone()))
+            .collect();
+        let mut fetched = 0u64;
+        let mut out = Vec::new();
+        rebuild_file(
+            &packed.file,
+            &rec,
+            &mut |id, off, len| {
+                fetched += len;
+                let block = store.get(id).expect("block");
+                Ok(block[off as usize..(off + len) as usize].to_vec())
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, tuned);
+        assert_eq!(fetched, packed.file.size);
     }
 }
