@@ -2,7 +2,7 @@
 //! the check-then-act tail (other-verifying probe, quota reservation, release
 //! insert) runs inside one transaction under the claim advisory lock.
 
-use twigpine_core::model::manifest::Manifest;
+use twigpine_core::model::manifest::{Manifest, StorageKind};
 
 use crate::db::model_queries::ClaimPersist;
 use crate::db::RepoRecord;
@@ -93,7 +93,7 @@ pub(crate) async fn read_verified_manifest(
         .ok_or_else(|| bad_request("commit carries no .twigpine/model-release.sig"))?;
     let sig_text =
         String::from_utf8(sig_text).map_err(|_| bad_request("model-release.sig is not utf-8"))?;
-    let did: twigpine_core::did::Did = owner_did
+    let did: twigpine_core::did::Did = crate::db::canonical_did(owner_did)
         .parse()
         .map_err(|_| bad_request("repo owner DID does not resolve"))?;
     let manifest = twigpine_core::model::manifest::verify(&manifest_bytes, &sig_text, &did)
@@ -120,9 +120,50 @@ pub async fn claim_release(
     }
     let (manifest_bytes, manifest) =
         read_verified_manifest(&state.git_bin, &disk_path, commit, &record.owner_did).await?;
+    let expected_repo = format!(
+        "{}/{}",
+        crate::db::canonical_did(&record.owner_did),
+        record.name
+    );
+    if manifest.repo != expected_repo {
+        return Err(bad_request("manifest names a different repository"));
+    }
+    if manifest.reconstruction.is_none()
+        && manifest
+            .files
+            .iter()
+            .any(|f| matches!(f.storage, StorageKind::Chunked))
+    {
+        return Err(bad_request(
+            "chunked files declared but the manifest has no reconstruction object",
+        ));
+    }
     let m_sha = twigpine_core::cid::sha256_hex(&manifest_bytes);
     let rec_sha = manifest.reconstruction.as_ref().map(|r| r.sha256.clone());
     let blocks = super::referenced_blocks(state, &manifest).await?;
+
+    // Resolve the declared parent before the transaction: the repo lookup
+    // uses its own pool connection and must not sit behind the global
+    // advisory lock, where pool pressure would stall every claim.
+    let parent = match &manifest.parent {
+        None => None,
+        Some(parent) => {
+            let (powner, pname) = parent
+                .repo
+                .split_once('/')
+                .ok_or_else(|| bad_request("declared parent repo is not owner/name"))?;
+            // A parent only confers blocks while its repo is fully public:
+            // a withdrawn parent cannot launder references.
+            let (precord, prules) =
+                crate::api::authorize_repo_read(state, powner, pname, Some(caller), "/").await?;
+            if !precord.is_public || !prules.is_empty() {
+                return Err(bad_request(
+                    "declared parent's repo is no longer fully public",
+                ));
+            }
+            Some((precord.id, parent.commit.clone()))
+        }
+    };
 
     let mut tx = db.model_begin().await?;
     db.model_tx_advisory_lock(&mut tx, CLAIM_LOCK_KEY).await?;
@@ -155,7 +196,7 @@ pub async fn claim_release(
         if let Some(missing) = blocks.iter().find(|b| !present.contains(b.as_str())) {
             return Err(bad_request(format!(
                 "manifest references block {} which is not stored on this node",
-                &missing[..16]
+                missing.get(..16).unwrap_or(missing)
             )));
         }
     }
@@ -172,24 +213,11 @@ pub async fn claim_release(
         .await?
         .into_iter()
         .collect();
-    let parent_blocks: std::collections::HashSet<String> = match &manifest.parent {
+    let parent_blocks: std::collections::HashSet<String> = match &parent {
         None => std::collections::HashSet::new(),
-        Some(parent) => {
-            let (powner, pname) = parent
-                .repo
-                .split_once('/')
-                .ok_or_else(|| bad_request("declared parent repo is not owner/name"))?;
-            // A parent only confers blocks while its repo is fully public:
-            // a withdrawn parent cannot launder references.
-            let (precord, prules) =
-                crate::api::authorize_repo_read(state, powner, pname, Some(caller), "/").await?;
-            if !precord.is_public || !prules.is_empty() {
-                return Err(bad_request(
-                    "declared parent's repo is no longer fully public",
-                ));
-            }
+        Some((prepo_id, pcommit)) => {
             let rows = db
-                .model_tx_release_blocks_at_commit(&mut tx, &precord.id, &parent.commit)
+                .model_tx_release_blocks_at_commit(&mut tx, prepo_id, pcommit)
                 .await?;
             if rows.is_empty() {
                 return Err(bad_request(
@@ -207,7 +235,7 @@ pub async fn claim_release(
             return Err(bad_request(format!(
                 "block {} is not reachable through an open session, a prior \
                  release, or the declared parent",
-                &b[..16]
+                b.get(..16).unwrap_or(b)
             )));
         }
     }
@@ -234,16 +262,6 @@ pub async fn claim_release(
         )));
     }
 
-    // Node-wide quota in the same transaction: claimed bytes plus open
-    // session bytes.
-    let node_cap = state.config.model_node_quota_bytes as i64;
-    let node_total = db.model_tx_node_used(&mut tx).await?;
-    if node_total > node_cap {
-        return Err(AppError::TooManyRequests(format!(
-            "node model storage cap ({node_cap} bytes) would be exceeded"
-        )));
-    }
-
     let persist = ClaimPersist {
         signature: material.signature.clone(),
         signature_input: material.signature_input.clone(),
@@ -266,12 +284,29 @@ pub async fn claim_release(
     let release_id = row.id;
 
     // Claimed blocks leave the caller's open sessions' charge: the
-    // release now carries them, so session bytes stop double-counting.
+    // release now carries them. This must precede the node-cap check or
+    // the just-claimed bytes count twice (once under quota, once under
+    // the sessions they still appear linked to).
     db.model_tx_link_release_blocks(&mut tx, release_id, caller, &blocks)
         .await?;
-    db.model_tx_recount_open_session_bytes(&mut tx, caller)
-        .await?;
+
+    // Node-wide quota in the same transaction: claimed bytes plus open
+    // session bytes.
+    let node_cap = state.config.model_node_quota_bytes as i64;
+    let node_total = db.model_tx_node_used(&mut tx).await?;
+    if node_total > node_cap {
+        return Err(AppError::TooManyRequests(format!(
+            "node model storage cap ({node_cap} bytes) would be exceeded"
+        )));
+    }
 
     tx.commit().await?;
+
+    // Pin the commit under the hidden release ref now: between claim and
+    // publish a force-push plus gc could drop the commit the verifier
+    // needs. Best-effort; the publish path writes it again.
+    if let Err(e) = super::verify::write_release_ref(&state.git_bin, &disk_path, commit).await {
+        tracing::warn!(%commit, "release ref write at claim failed: {e}");
+    }
     Ok(row)
 }

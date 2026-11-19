@@ -38,7 +38,10 @@ pub async fn read_range(
     use futures::StreamExt;
     let id = crate::blockstore::BlockId::parse(sha)
         .map_err(|e| crate::blockstore::BlockStoreError::Backend(e.to_string()))?;
-    let mut stream = store.get_range(&id, start, start + len).await?;
+    let end = start
+        .checked_add(len)
+        .ok_or(crate::blockstore::BlockStoreError::OutOfRange)?;
+    let mut stream = store.get_range(&id, start, end).await?;
     let mut out = Vec::with_capacity(len.min(1 << 22) as usize);
     while let Some(chunk) = stream.next().await {
         out.extend_from_slice(&chunk?);

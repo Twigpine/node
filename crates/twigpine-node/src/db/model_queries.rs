@@ -25,6 +25,11 @@ pub struct ModelSession {
 
 type SessionTuple = (String, String, String, String, i64, String);
 
+/// Global advisory key serializing block-byte admission across sessions
+/// (see `model_admit_bytes`). Distinct from `CLAIM_LOCK_KEY` in
+/// `crate::models`, which serializes claim admission.
+const MODEL_ADMIT_LOCK: i64 = 0x6D6F64656C61646D; // "modeladm"
+
 const SESSION_COLS: &str = "id, owner_did, repo_id, expires_at, bytes_received, state";
 
 impl From<SessionTuple> for ModelSession {
@@ -149,6 +154,16 @@ impl Db {
         session_cap: i64,
         node_cap: i64,
     ) -> Result<Option<ModelSession>> {
+        // Serialize admissions process-wide: the per-owner and node-wide cap
+        // terms read other sessions' bytes_received, and two concurrent PUTs
+        // on different sessions would otherwise admit against the same stale
+        // sums. The critical section is one UPDATE, so the global key costs
+        // nothing next to the upload itself.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(MODEL_ADMIT_LOCK)
+            .execute(&mut *tx)
+            .await?;
         let row = sqlx::query_as::<_, SessionTuple>(&format!(
             "UPDATE model_upload_sessions s
              SET bytes_received = s.bytes_received + $1,
@@ -174,8 +189,9 @@ impl Db {
         .bind(ts_now())
         .bind(session_cap)
         .bind(node_cap)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(row.map(Into::into))
     }
 
@@ -254,6 +270,19 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(Into::into))
+    }
+
+    /// Ids of `verifying` releases stuck past `stale_secs`: the worker
+    /// retries them forever today, so the sweep rejects them to un-wedge
+    /// the publisher's one-verifying slot.
+    pub async fn model_stale_verifying(&self, stale_secs: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM model_releases
+             WHERE state = 'verifying' AND created_at < $1",
+        )
+        .bind(ts_from_now(-stale_secs))
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// The reconstruction object sha a release was claimed with, if any.
@@ -354,9 +383,10 @@ impl Db {
         Ok(sqlx::query_scalar(
             "SELECT sb.block_sha256 FROM model_session_blocks sb
              JOIN model_upload_sessions s ON s.id = sb.session_id
-             WHERE s.owner_did = $1 AND s.state = 'open'",
+             WHERE s.owner_did = $1 AND s.state = 'open' AND s.expires_at > $2",
         )
         .bind(owner_did)
+        .bind(ts_now())
         .fetch_all(&mut **tx)
         .await?)
     }
@@ -532,11 +562,27 @@ impl Db {
         .bind(shas)
         .execute(&mut **tx)
         .await?;
+        // The release now carries these blocks, so the sessions stop being
+        // charged for exactly the bytes that moved. Subtracting the moved
+        // set (rather than recounting links) preserves bytes admitted but
+        // not yet recorded by a PUT still in flight.
         sqlx::query(
-            "DELETE FROM model_session_blocks sb
-             USING model_upload_sessions s
-             WHERE s.id = sb.session_id AND s.owner_did = $1
-               AND s.state = 'open' AND sb.block_sha256 = ANY($2)",
+            "WITH moved AS (
+                   DELETE FROM model_session_blocks sb
+                   USING model_upload_sessions s
+                   WHERE s.id = sb.session_id AND s.owner_did = $1
+                     AND s.state = 'open' AND sb.block_sha256 = ANY($2)
+                   RETURNING sb.session_id, sb.block_sha256
+                 ), per_session AS (
+                   SELECT m.session_id, COALESCE(SUM(b.size), 0)::bigint AS bytes
+                   FROM moved m
+                   JOIN model_blocks b ON b.sha256 = m.block_sha256
+                   GROUP BY m.session_id
+                 )
+                 UPDATE model_upload_sessions s
+                 SET bytes_received = GREATEST(s.bytes_received - ps.bytes, 0)
+                 FROM per_session ps
+                 WHERE ps.session_id = s.id",
         )
         .bind(publisher_did)
         .bind(shas)
@@ -545,29 +591,12 @@ impl Db {
         Ok(())
     }
 
-    pub async fn model_tx_recount_open_session_bytes(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        owner_did: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE model_upload_sessions s
-             SET bytes_received = COALESCE((
-                   SELECT SUM(b.size) FROM model_session_blocks sb
-                   JOIN model_blocks b ON b.sha256 = sb.block_sha256
-                   WHERE sb.session_id = s.id), 0)
-             WHERE s.owner_did = $1 AND s.state = 'open'",
-        )
-        .bind(owner_did)
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
-    }
-
     // ── verification ───────────────────────────────────────────────────────
 
-    pub async fn model_mark_published(&self, release_id: i64) -> Result<()> {
-        sqlx::query(
+    /// `false` when the release left `verifying` first (the stale-verify
+    /// sweep rejected it mid-run); the caller then unwinds what it wrote.
+    pub async fn model_mark_published(&self, release_id: i64) -> Result<bool> {
+        let done = sqlx::query(
             "UPDATE model_releases
              SET state = 'published', published_at = $2
              WHERE id = $1 AND state = 'verifying'",
@@ -575,14 +604,23 @@ impl Db {
         .bind(release_id)
         .bind(ts_now())
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        Ok(done > 0)
     }
 
     /// Reject: mark the release, drop its refs, and refund the publisher the
     /// bytes no other live release still references.
     pub async fn model_reject_release(&self, release_id: i64, reason: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        // The refund's "no other live release references this block" test
+        // and a concurrent claim's "not already claimed" test must agree;
+        // the claim lock makes them serialize. Same order as claim_release
+        // (advisory first, then rows), so no deadlock is introduced.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::models::CLAIM_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
         let released: Option<(String,)> = sqlx::query_as(
             "UPDATE model_releases
              SET state = 'rejected', failure_reason = $2
@@ -719,6 +757,19 @@ impl Db {
         tx: &mut Transaction<'_, Postgres>,
         sha: &str,
     ) -> Result<bool> {
+        // Lock the block row first. READ COMMITTED snapshots are taken per
+        // statement, so folding the liveness subqueries into the locking
+        // SELECT would evaluate them against the pre-lock snapshot and miss
+        // a link committed while this statement waited.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM model_blocks WHERE sha256 = $1 FOR UPDATE)",
+        )
+        .bind(sha)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !exists {
+            return Ok(true);
+        }
         Ok(sqlx::query_scalar::<_, bool>(
             "SELECT NOT EXISTS (
                    SELECT 1 FROM model_release_blocks rb
@@ -728,14 +779,11 @@ impl Db {
              AND NOT EXISTS (
                    SELECT 1 FROM model_session_blocks sb
                    JOIN model_upload_sessions s ON s.id = sb.session_id
-                   WHERE sb.block_sha256 = $1 AND s.state = 'open')
-             FROM model_blocks b
-             WHERE b.sha256 = $1 FOR UPDATE",
+                   WHERE sb.block_sha256 = $1 AND s.state = 'open')",
         )
         .bind(sha)
-        .fetch_optional(&mut **tx)
-        .await?
-        .unwrap_or(false))
+        .fetch_one(&mut **tx)
+        .await?)
     }
 
     pub async fn model_tx_delete_block_row(
@@ -871,6 +919,42 @@ mod tests {
         assert!(db.model_tx_block_still_dead(&mut tx, &sha).await.unwrap());
         db.model_tx_delete_block_row(&mut tx, &sha).await.unwrap();
         tx.commit().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn session_blocks_ignore_expired_sessions(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        let s = db
+            .model_open_session("did:owner", "r1", 3600)
+            .await
+            .unwrap();
+        let sha = "c".repeat(64);
+        db.model_record_block(&s.id, &sha, 100, 100).await.unwrap();
+
+        let mut tx = db.model_begin().await.unwrap();
+        assert_eq!(
+            db.model_tx_session_blocks(&mut tx, "did:owner")
+                .await
+                .unwrap(),
+            vec![sha.clone()]
+        );
+        tx.rollback().await.unwrap();
+
+        // Past the wall-clock TTL the row still says 'open' until the sweep
+        // runs, yet the claim-side reachability set must already be empty.
+        sqlx::query("UPDATE model_upload_sessions SET expires_at = $1 WHERE id = $2")
+            .bind("2000-01-01T00:00:00+00:00")
+            .bind(&s.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = db.model_begin().await.unwrap();
+        assert!(db
+            .model_tx_session_blocks(&mut tx, "did:owner")
+            .await
+            .unwrap()
+            .is_empty());
+        tx.rollback().await.unwrap();
     }
 
     #[sqlx::test]

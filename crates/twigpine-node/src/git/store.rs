@@ -5,7 +5,7 @@ use std::process::Command;
 /// internal bookkeeping, and `refs/gitlawb/releases/*` pins published model
 /// releases so gc never prunes them. One shared list keeps the
 /// repo-config writers in lockstep.
-const HIDDEN_REFS: &[(&str, &str)] = &[
+pub(crate) const HIDDEN_REFS: &[(&str, &str)] = &[
     ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
     ("transfer.hideRefs", "refs/gitlawb/requests/"),
     ("uploadpack.hideRefs", "refs/gitlawb/releases/"),

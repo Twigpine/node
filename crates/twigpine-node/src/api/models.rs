@@ -204,20 +204,30 @@ pub async fn put_model_block(
             BlockStoreError::Unknown => AppError::Conflict(
                 "the write's outcome is unknown; check the object before retrying".into(),
             ),
+            BlockStoreError::Body(e) => {
+                AppError::BadRequest(format!("block body could not be read: {e}"))
+            }
             other => AppError::Internal(anyhow::anyhow!("block store write failed: {other}")),
         });
     }
     // Stored and AlreadyPresent both leave the bytes stored.
 
     // Past this point the object exists; a bookkeeping failure must refund
-    // the admission or the session's charge leaks until it expires.
+    // the admission or the session's charge leaks until it expires, and
+    // must delete the store object or the sweep can never find it (its
+    // candidate list is model_blocks rows).
     let size = match store.size(&block_id).await {
-        Ok(s) => s.unwrap_or(declared),
-        Err(e) => {
+        Ok(Some(s)) => s,
+        r => {
             let _ = db.model_refund_bytes(&session.id, declared as i64).await;
-            return Err(AppError::Internal(anyhow::anyhow!(
-                "block size lookup failed: {e}"
-            )));
+            let _ = store.delete(&block_id).await;
+            return Err(match r {
+                Ok(None) => AppError::Internal(anyhow::anyhow!(
+                    "block {sha} absent immediately after write"
+                )),
+                Err(e) => AppError::Internal(anyhow::anyhow!("block size lookup failed: {e}")),
+                Ok(Some(_)) => unreachable!(),
+            });
         }
     };
     let duplicate = match db
@@ -227,6 +237,7 @@ pub async fn put_model_block(
         Ok(d) => d,
         Err(e) => {
             let _ = db.model_refund_bytes(&session.id, declared as i64).await;
+            let _ = store.delete(&block_id).await;
             return Err(e.into());
         }
     };

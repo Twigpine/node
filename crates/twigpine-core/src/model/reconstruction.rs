@@ -99,6 +99,21 @@ impl Reconstruction {
     /// Structural sanity: terms index real blocks, chunk ranges are ordered,
     /// and each file's terms sum to its declared size.
     pub fn validate(&self) -> Result<(), ModelError> {
+        for block in &self.blocks {
+            let sum: u64 = block
+                .chunks
+                .iter()
+                .try_fold(0u64, |acc, c| acc.checked_add(c.len))
+                .ok_or_else(|| {
+                    ModelError::Invalid(format!("block {} chunk lengths overflow", block.sha256))
+                })?;
+            if sum != block.size {
+                return Err(ModelError::Invalid(format!(
+                    "block {} chunks sum to {sum} but the entry declares {}",
+                    block.sha256, block.size
+                )));
+            }
+        }
         let blocks: HashMap<&str, &BlockEntry> =
             self.blocks.iter().map(|b| (b.sha256.as_str(), b)).collect();
         for file in &self.files {
@@ -128,15 +143,19 @@ impl Reconstruction {
                 }
                 let span: u64 = block.chunks[term.chunk_start as usize..term.chunk_end as usize]
                     .iter()
-                    .map(|c| c.len)
-                    .sum();
+                    .try_fold(0u64, |acc, c| acc.checked_add(c.len))
+                    .ok_or_else(|| {
+                        ModelError::Invalid(format!("{}: term lengths overflow", file.path))
+                    })?;
                 if span != term.length {
                     return Err(ModelError::Invalid(format!(
                         "{}: term length {span} != declared {}",
                         file.path, term.length
                     )));
                 }
-                total += term.length;
+                total = total.checked_add(term.length).ok_or_else(|| {
+                    ModelError::Invalid(format!("{}: file size overflow", file.path))
+                })?;
             }
             if total != file.size {
                 return Err(ModelError::Invalid(format!(
@@ -162,7 +181,7 @@ impl Default for Reconstruction {
 /// Chunk-sha lookup over prior reconstruction objects, the dedup surface:
 /// a chunk whose hash a prior release already stored can be referenced by
 /// term instead of re-uploaded.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct DedupIndex {
     /// chunk sha256 -> (block sha256, chunk index inside that block)
     by_chunk: HashMap<String, (String, u32)>,
@@ -203,14 +222,14 @@ impl DedupIndex {
 /// Seal the accumulating block of new chunks: patch its id into the terms
 /// written while it was still open, then append the block-table entry and
 /// queue the bytes for upload.
-fn seal_pending(
+fn seal_pending<F: FnMut(Block) -> std::io::Result<()>>(
     pending: &mut Vec<crate::model::chunking::Chunk>,
     terms: &mut [Term],
     block_entries: &mut Vec<BlockEntry>,
-    new_blocks: &mut Vec<Block>,
-) {
+    on_block: &mut F,
+) -> std::io::Result<()> {
     if pending.is_empty() {
-        return;
+        return Ok(());
     }
     let chunks = std::mem::take(pending);
     let mut data = Vec::with_capacity(chunks.iter().map(|c| c.len).sum::<usize>());
@@ -241,7 +260,7 @@ fn seal_pending(
             })
             .collect(),
     });
-    new_blocks.push(block);
+    on_block(block)
 }
 
 /// What `pack_file` produced: the file's entry, the new blocks to store and
@@ -254,16 +273,38 @@ pub struct PackedFile {
 
 /// Chunk and pack one file, reusing terms for chunks a prior reconstruction
 /// already holds (`dedup`). `path` is the repo-relative path recorded in the
-/// entry.
+/// entry. Every sealed block is held in the result; publishers of large
+/// files should prefer `pack_file_with`, which keeps memory bounded by a
+/// block instead of the file.
 pub fn pack_file<R: Read>(
     path: &str,
     reader: R,
     dedup: &DedupIndex,
 ) -> std::io::Result<PackedFile> {
+    let mut new_blocks: Vec<Block> = Vec::new();
+    let (file, block_entries) = pack_file_with(path, reader, dedup, |b| {
+        new_blocks.push(b);
+        Ok(())
+    })?;
+    Ok(PackedFile {
+        file,
+        new_blocks,
+        block_entries,
+    })
+}
+
+/// `pack_file` with each sealed block handed to `on_block` as it finishes:
+/// the caller can upload and drop it while the file is still packing, so a
+/// file of any size packs in block-sized memory.
+pub fn pack_file_with<R: Read, F: FnMut(Block) -> std::io::Result<()>>(
+    path: &str,
+    reader: R,
+    dedup: &DedupIndex,
+    mut on_block: F,
+) -> std::io::Result<(FileEntry, Vec<BlockEntry>)> {
     let mut file_hasher = sha2::Sha256::new();
 
     let mut terms: Vec<Term> = Vec::new();
-    let mut new_blocks: Vec<Block> = Vec::new();
     let mut block_entries: Vec<BlockEntry> = Vec::new();
     // Chunks not found in `dedup` accumulate into one pending block that
     // seals only at the target size or EOF. Sealing on every reused-chunk
@@ -312,22 +353,12 @@ pub fn pack_file<R: Read>(
                 }),
             }
             if pending_bytes >= BLOCK_TARGET {
-                seal_pending(
-                    &mut pending,
-                    &mut terms,
-                    &mut block_entries,
-                    &mut new_blocks,
-                );
+                seal_pending(&mut pending, &mut terms, &mut block_entries, &mut on_block)?;
                 pending_bytes = 0;
             }
         }
     }
-    seal_pending(
-        &mut pending,
-        &mut terms,
-        &mut block_entries,
-        &mut new_blocks,
-    );
+    seal_pending(&mut pending, &mut terms, &mut block_entries, &mut on_block)?;
 
     let file = FileEntry {
         path: path.to_string(),
@@ -335,11 +366,7 @@ pub fn pack_file<R: Read>(
         sha256: hex::encode(file_hasher.finalize()),
         terms,
     };
-    Ok(PackedFile {
-        file,
-        new_blocks,
-        block_entries,
-    })
+    Ok((file, block_entries))
 }
 
 /// Byte-range mapping: which slices of which blocks serve file bytes

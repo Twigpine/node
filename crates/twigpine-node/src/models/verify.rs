@@ -73,38 +73,90 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
         return reject_release(state, release_id, "manifest digest changed since claim").await;
     }
 
-    let Some(rec_ref) = &manifest.reconstruction else {
-        return reject_release(state, release_id, "manifest has no reconstruction object").await;
-    };
-    let store = state
-        .block_store
-        .clone()
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("block store gone")))?;
-    let rec_bytes = match super::read_block(&store, &rec_ref.sha256, rec_ref.size).await {
-        Ok(b) => b,
-        Err(e) => {
-            return reject_release(
-                state,
-                release_id,
-                &format!("reconstruction object unreadable: {e}"),
-            )
-            .await;
+    let rec = match &manifest.reconstruction {
+        Some(rec_ref) => {
+            let store = state
+                .block_store
+                .clone()
+                .ok_or_else(|| AppError::Internal(anyhow::anyhow!("block store gone")))?;
+            let rec_bytes = match super::read_block(&store, &rec_ref.sha256, rec_ref.size).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return reject_release(
+                        state,
+                        release_id,
+                        &format!("reconstruction object unreadable: {e}"),
+                    )
+                    .await;
+                }
+            };
+            match Reconstruction::parse(&rec_bytes) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    return reject_release(
+                        state,
+                        release_id,
+                        &format!("reconstruction object invalid: {e}"),
+                    )
+                    .await;
+                }
+            }
         }
+        None => None,
     };
-    let rec = match Reconstruction::parse(&rec_bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            return reject_release(
-                state,
-                release_id,
-                &format!("reconstruction object invalid: {e}"),
-            )
-            .await;
-        }
-    };
+    // An all-Git release legitimately carries no reconstruction object; a
+    // manifest naming chunked files without one is self-contradictory.
+    if rec.is_none()
+        && manifest
+            .files
+            .iter()
+            .any(|f| matches!(f.storage, StorageKind::Chunked))
+    {
+        return reject_release(
+            state,
+            release_id,
+            "chunked files declared but the manifest has no reconstruction object",
+        )
+        .await;
+    }
 
-    let rec_by_path: std::collections::HashMap<&str, _> =
-        rec.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    // Commit ⊆ manifest: a committed file the manifest does not name as
+    // git-stored slipped past the publish scan; refuse it rather than
+    // release bytes the manifest never described.
+    let tree = crate::git::store::run_git_bounded(
+        &state.git_bin,
+        &disk_path,
+        &["ls-tree", "-r", "--name-only", &release.commit_sha],
+        b"",
+        std::time::Duration::from_secs(30),
+        "git ls-tree",
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    let manifest_git_paths: std::collections::HashSet<&str> = manifest
+        .files
+        .iter()
+        .filter(|f| f.storage == StorageKind::Git)
+        .map(|f| f.path.as_str())
+        .collect();
+    for path in String::from_utf8_lossy(&tree.stdout)
+        .lines()
+        .filter(|p| !p.starts_with(".twigpine/"))
+    {
+        if !manifest_git_paths.contains(path) {
+            return reject_release(
+                state,
+                release_id,
+                &format!("{path} is committed but not in the manifest"),
+            )
+            .await;
+        }
+    }
+
+    let rec_by_path: std::collections::HashMap<&str, _> = rec
+        .as_ref()
+        .map(|r| r.files.iter().map(|f| (f.path.as_str(), f)).collect())
+        .unwrap_or_default();
     for file in &manifest.files {
         match file.storage {
             StorageKind::Chunked => {
@@ -128,8 +180,9 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                 // would force block_on, which has no reactor under the S3
                 // backend. Blocks were hash-verified at write, so the
                 // whole-file digest is the check that matters here.
+                let rec = rec.as_ref().expect("entry implies rec");
                 let slices = match twigpine_core::model::reconstruction::map_file_range(
-                    entry, &rec, 0, file.size,
+                    entry, rec, 0, file.size,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -147,19 +200,25 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                 };
                 // Ordered prefetch: `buffered` preserves order while
                 // overlapping the store's per-slice round trips.
+                let store = state
+                    .block_store
+                    .clone()
+                    .ok_or_else(|| AppError::Internal(anyhow::anyhow!("block store gone")))?;
                 let jobs = slices
                     .iter()
                     .map(|s| (s.block.clone(), s.offset, s.len))
                     .collect::<Vec<_>>();
-                let fetched =
+                // Ordered prefetch: `buffered` preserves order while
+                // overlapping the store's per-slice round trips. Consume
+                // as slices land: collecting first would hold the whole
+                // rebuilt file in memory.
+                let mut fetched =
                     futures::stream::iter(jobs.into_iter().map(|(block, offset, len)| {
                         let store = store.clone();
                         async move { super::read_range(&store, &block, offset, len).await }
                     }))
-                    .buffered(4)
-                    .collect::<Vec<_>>()
-                    .await;
-                for bytes in fetched {
+                    .buffered(4);
+                while let Some(bytes) = fetched.next().await {
                     let bytes = match bytes {
                         Ok(b) => b,
                         Err(e) => {
@@ -246,17 +305,74 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
     // Publish: hidden ref first, then the state flip, so a crash leaves a
     // verifying row the worker retries rather than a dangling ref.
     write_release_ref(&state.git_bin, &disk_path, &release.commit_sha).await?;
-    state.db.model_mark_published(release_id).await?;
+    if !state.db.model_mark_published(release_id).await? {
+        // The stale-verify sweep rejected the row while this pass ran:
+        // drop the ref just written so it does not advertise a rejected
+        // commit.
+        let ref_name = format!("refs/gitlawb/releases/{}", release.commit_sha);
+        let _ = crate::git::store::run_git_bounded(
+            &state.git_bin,
+            &disk_path,
+            &["update-ref", "-d", &ref_name],
+            b"",
+            std::time::Duration::from_secs(30),
+            "git update-ref",
+        )
+        .await;
+    }
     Ok(())
 }
 
 /// `refs/gitlawb/releases/<commit>` -> the release commit itself: reachable,
 /// so `gc` never prunes it, and hidden under the gitlawb ref namespace.
+/// Idempotently add the release-ref hideRefs config: repos created before
+/// the namespace existed only get it via the push-path prereq, which is
+/// warn-and-proceed, so a failed write there would leave release commits
+/// advertised to every clone.
+async fn ensure_release_refs_hidden(
+    git_bin: &str,
+    disk_path: &std::path::Path,
+) -> Result<(), AppError> {
+    for &(key, value) in crate::git::store::HIDDEN_REFS
+        .iter()
+        .filter(|(_, v)| v.contains("releases/"))
+    {
+        let have = crate::git::store::run_git_bounded(
+            git_bin,
+            disk_path,
+            &["config", "--get-all", key],
+            b"",
+            std::time::Duration::from_secs(30),
+            "git config --get-all",
+        )
+        .await
+        .map_err(AppError::Internal)?;
+        if String::from_utf8_lossy(&have.stdout)
+            .lines()
+            .any(|l| l.trim() == value)
+        {
+            continue;
+        }
+        crate::git::store::run_git_bounded(
+            git_bin,
+            disk_path,
+            &["config", "--add", key, value],
+            b"",
+            std::time::Duration::from_secs(30),
+            "git config --add",
+        )
+        .await
+        .map_err(AppError::Internal)?;
+    }
+    Ok(())
+}
+
 pub async fn write_release_ref(
     git_bin: &str,
     disk_path: &std::path::Path,
     commit: &str,
 ) -> Result<(), AppError> {
+    ensure_release_refs_hidden(git_bin, disk_path).await?;
     let out = crate::git::store::run_git_bounded(
         git_bin,
         disk_path,

@@ -8,6 +8,10 @@
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// A release still `verifying` this many seconds after claim is treated as
+/// wedged: the worker died mid-verify or hit a persistent internal error.
+const STALE_VERIFY_SECS: i64 = 6 * 3600;
+
 #[derive(Debug, Default)]
 pub struct SweepStats {
     pub sessions_expired: u64,
@@ -25,6 +29,13 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepStats, AppError> {
     let expired = db.model_expire_sessions().await?;
     stats.sessions_expired = expired.len() as u64;
     db.model_drop_sessions_blocks(&expired).await?;
+
+    // A `verifying` row that outlived its window wedges the publisher's
+    // one-verifying slot; reject it (which also frees the reservation).
+    for id in db.model_stale_verifying(STALE_VERIFY_SECS).await? {
+        db.model_reject_release(id, "verification timed out")
+            .await?;
+    }
 
     // Re-mark liveness both ways: blocks that lost every live reference get
     // an unreferenced_since stamp; blocks that regained one clear theirs.

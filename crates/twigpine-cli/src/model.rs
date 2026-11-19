@@ -22,7 +22,9 @@ use twigpine_core::model::manifest::{
     self, detect_format, Manifest, ManifestFile, ParentRef, ReconstructionRef, StorageKind,
     MANIFEST_SCHEMA_V1,
 };
-use twigpine_core::model::reconstruction::{pack_file, BlockEntry, DedupIndex, Reconstruction};
+use twigpine_core::model::reconstruction::{
+    pack_file_with, BlockEntry, DedupIndex, Reconstruction,
+};
 
 use crate::http::{json_or_denial, read_body_capped_bytes, read_json, NodeClient};
 use crate::identity::load_keypair_from_dir;
@@ -270,6 +272,39 @@ fn tracked_paths(root: &Path) -> Result<HashSet<String>> {
 
 /// Paths listed inside the managed .gitignore block (empty when there is no
 /// block): previously published chunked files.
+/// One repo-relative path as a gitignore pattern line: pattern
+/// metacharacters and a trailing space are backslash-escaped.
+fn escape_gitignore_path(p: &str) -> String {
+    let mut out = String::new();
+    let mut chars = p.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '\\' | '!' | '#' | '[' | ']') {
+            out.push('\\');
+        }
+        if c == ' ' && chars.peek().is_none() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn unescape_gitignore_path(line: &str) -> String {
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in line.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn managed_block_paths(gitignore: &str) -> Vec<String> {
     let mut inside = false;
     let mut out = Vec::new();
@@ -283,7 +318,7 @@ fn managed_block_paths(gitignore: &str) -> Vec<String> {
             break;
         }
         if inside && !t.is_empty() {
-            out.push(t.to_string());
+            out.push(unescape_gitignore_path(t));
         }
     }
     out
@@ -376,7 +411,7 @@ fn upsert_managed_block(existing: &str, paths: &[String]) -> String {
             out.push(String::new());
         }
         out.push(GITIGNORE_BEGIN.to_string());
-        out.extend(paths.iter().cloned());
+        out.extend(paths.iter().map(|p| escape_gitignore_path(p)));
         out.push(GITIGNORE_END.to_string());
     }
     let mut s = out.join("\n");
@@ -440,7 +475,18 @@ fn read_head(path: &Path, n: u64) -> Result<Vec<u8>> {
 /// Bytes of the staged index blob for `path`: exactly what the release
 /// commit will store, filters and symlink handling included.
 fn staged_blob(root: &Path, path: &str) -> Result<Vec<u8>> {
-    Ok(git(root, &["show", &format!(":{path}")])?.stdout)
+    // Resolve the blob sha through the index rather than `:{path}` revspec
+    // syntax: a path that opens with magic characters is parsed as revspec
+    // there, not as a filename.
+    let out = git(root, &["ls-files", "-s", "-z", "--", path])?;
+    let stdout = String::from_utf8(out.stdout).context("ls-files output was not utf-8")?;
+    // `<mode> <sha> <stage>\t<path>`: the sha is the second blank field.
+    let sha = stdout
+        .split(' ')
+        .nth(1)
+        .filter(|s| !s.is_empty())
+        .with_context(|| format!("{path} is not staged in the index"))?;
+    Ok(git(root, &["cat-file", "blob", sha])?.stdout)
 }
 
 /// Fetch a prior release's reconstruction object for dedup. A 404 means the
@@ -664,33 +710,55 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     let mut rec = Reconstruction::new();
     let mut files: Vec<ManifestFile> = Vec::new();
     for path in &scan.chunked_files {
-        let file = std::fs::File::open(root.join(path)).with_context(|| format!("open {path}"))?;
-        let packed = pack_file(path, file, &dedup)?;
-        // Make this file's fresh chunks visible to the next file's dedup.
-        dedup.add_block_entries(&packed.block_entries);
-        let head = read_head(&root.join(path), 64)?;
-        files.push(ManifestFile {
-            path: path.clone(),
-            size: packed.file.size,
-            sha256: packed.file.sha256.clone(),
-            format: detect_format(&head, path),
-            storage: StorageKind::Chunked,
+        // Pack on a blocking thread and upload each block as it seals: a
+        // bounded channel keeps resident memory to a couple of blocks
+        // rather than the whole file. The dedup index moves to the thread
+        // through an Arc and comes back when it finishes.
+        let shared_dedup = std::sync::Arc::new(std::mem::take(&mut dedup));
+        let task_dedup = shared_dedup.clone();
+        let (block_tx, mut block_rx) =
+            tokio::sync::mpsc::channel::<twigpine_core::model::chunking::Block>(2);
+        let pack_path = path.clone();
+        let pack_root = root.clone();
+        let pack_task = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(pack_root.join(&pack_path))
+                .map_err(|e| std::io::Error::new(e.kind(), format!("open {pack_path}: {e}")))?;
+            pack_file_with(&pack_path, file, &task_dedup, move |block| {
+                block_tx
+                    .blocking_send(block)
+                    .map_err(|_| std::io::Error::other("block upload channel closed"))
+            })
         });
-        rec.files.push(packed.file);
-        for e in packed.block_entries {
-            all_entries.insert(e.sha256.clone(), e.clone());
-            rec.blocks.push(e);
-        }
-        for b in packed.new_blocks {
-            let sha = b.sha256;
+        while let Some(block) = block_rx.recv().await {
+            let sha = block.sha256;
             if uploaded.contains(&sha) {
                 continue;
             }
-            upload_block(&client, &base, &session_id, &sha, b.data).await?;
+            upload_block(&client, &base, &session_id, &sha, block.data).await?;
             state.uploaded.push(sha.clone());
             uploaded.insert(sha.clone());
             save_state(&state_path, &state)?;
             println!("uploaded block {}", &sha[..16]);
+        }
+        let (file_entry, block_entries) = pack_task
+            .await
+            .context("pack task failed")?
+            .with_context(|| format!("pack {path}"))?;
+        dedup = std::sync::Arc::try_unwrap(shared_dedup).unwrap_or_else(|a| (*a).clone());
+        // Make this file's fresh chunks visible to the next file's dedup.
+        dedup.add_block_entries(&block_entries);
+        let head = read_head(&root.join(path), 64)?;
+        files.push(ManifestFile {
+            path: path.clone(),
+            size: file_entry.size,
+            sha256: file_entry.sha256.clone(),
+            format: detect_format(&head, path),
+            storage: StorageKind::Chunked,
+        });
+        rec.files.push(file_entry);
+        for e in block_entries {
+            all_entries.insert(e.sha256.clone(), e.clone());
+            rec.blocks.push(e);
         }
     }
     // Terms into earlier blocks need those entries in this object: a reader
@@ -733,12 +801,42 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         println!("uploaded reconstruction object");
     }
 
-    // 7. Managed .gitignore block, then stage the publishable set.
+    // 7. Managed .gitignore block, then stage exactly the publishable set
+    //    through a NUL pathspec: a bare `git add -A` would sweep in work the
+    //    scan never saw (files created or un-ignored during the upload, or
+    //    index changes staged for something else).
     let new_gitignore = upsert_managed_block(&existing_gitignore, &scan.chunked_files);
     if new_gitignore != existing_gitignore {
         std::fs::write(&gitignore_path, &new_gitignore)?;
     }
-    git(&root, &["add", "-A"])?;
+    let pathspec_path = git_dir.join("twigpine-model-pathspec");
+    {
+        let mut spec = Vec::new();
+        for p in &scan.git_files {
+            spec.extend_from_slice(p.as_bytes());
+            spec.push(0);
+        }
+        for p in [
+            ".gitignore",
+            ".twigpine/model-release.json",
+            ".twigpine/model-release.sig",
+        ] {
+            spec.extend_from_slice(p.as_bytes());
+            spec.push(0);
+        }
+        std::fs::write(&pathspec_path, spec)?;
+    }
+    let staged = git(
+        &root,
+        &[
+            "add",
+            "-A",
+            "--pathspec-file-nul",
+            &format!("--pathspec-from-file={}", pathspec_path.display()),
+        ],
+    );
+    let _ = std::fs::remove_file(&pathspec_path);
+    staged?;
 
     // 8. Hash the git-stored files from the index (the exact bytes the
     //    commit stores), then write and stage the manifest.
@@ -849,7 +947,23 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     let release_path = format!("{base}/models/releases/{commit}");
     let deadline = Instant::now() + POLL_BUDGET;
     loop {
-        let resp = client.get_signed(&release_path).await?;
+        // One transport hiccup should not abort the publish; the signed
+        // status read is idempotent, so retry it a few times.
+        let resp = 'poll: {
+            let mut last = None;
+            for _ in 0..3 {
+                match client.get_signed(&release_path).await {
+                    Ok(r) => break 'poll r,
+                    Err(e) => {
+                        last = Some(e);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+            return Err(last
+                .expect("three attempts ran")
+                .context("release status request failed"));
+        };
         let v: Value = read_json(resp, "release status").await?;
         match v["state"].as_str() {
             Some("published") => {

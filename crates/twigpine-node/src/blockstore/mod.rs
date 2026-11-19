@@ -95,6 +95,10 @@ pub enum BlockStoreError {
     /// unknown.
     #[error("the write's outcome is unknown; check size() before retrying")]
     Unknown,
+    /// The body stream itself failed (client abort, truncated upload): a
+    /// caller fault, distinct from a store-side `Io`.
+    #[error("body stream error: {0}")]
+    Body(io::Error),
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
     #[error("backend error: {0}")]
