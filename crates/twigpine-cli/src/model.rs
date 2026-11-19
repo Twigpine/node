@@ -87,6 +87,8 @@ pub async fn run(cmd: ModelCmd) -> Result<()> {
 // ── git helpers ─────────────────────────────────────────────────────────────
 
 fn git(root: &Path, args: &[&str]) -> Result<Output> {
+    // allow-unbounded-git: short-lived CLI process; there is no request
+    // permit to hold or client disconnect to outlive.
     let out = std::process::Command::new("git")
         .args(args)
         .current_dir(root)
@@ -141,6 +143,8 @@ fn release_commits(root: &Path) -> Vec<String> {
 }
 
 fn repo_root() -> Result<PathBuf> {
+    // allow-unbounded-git: short-lived CLI process; there is no request
+    // permit to hold or client disconnect to outlive.
     let out = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -564,6 +568,8 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     let branch = match &args.branch {
         Some(b) => b.clone(),
         None => {
+            // allow-unbounded-git: short-lived CLI process; there is no
+            // request permit to hold or client disconnect to outlive.
             let out = std::process::Command::new("git")
                 .args(["symbolic-ref", "--short", "-q", "HEAD"])
                 .current_dir(&root)
@@ -916,6 +922,8 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         .next()
         .context("no HEAD commit")?;
 
+    // allow-unbounded-git: short-lived CLI process; there is no request
+    // permit to hold or client disconnect to outlive.
     let push = std::process::Command::new("git")
         .args(["push", &remote_name, &format!("HEAD:{branch}")])
         .current_dir(&root)
