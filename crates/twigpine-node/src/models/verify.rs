@@ -6,7 +6,7 @@
 use sha2::Digest;
 use std::io::Write;
 use twigpine_core::model::manifest::{detect_format, StorageKind};
-use twigpine_core::model::reconstruction::{rebuild_file, Reconstruction};
+use twigpine_core::model::reconstruction::Reconstruction;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -15,7 +15,6 @@ use crate::state::AppState;
 struct VerifySink {
     hasher: sha2::Sha256,
     head: Vec<u8>,
-    digest: Option<String>,
 }
 
 impl Write for VerifySink {
@@ -122,38 +121,15 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                     )
                     .await;
                 }
-                // The rebuild runs on the blocking pool: `rebuild_file` is a
-                // sync walker over a range-fetch callback, and the store is
-                // async. block_on inside spawn_blocking is honest — the
-                // fetch itself is chunk-sized and bounded.
-                let store2 = store.clone();
-                let rec2 = rec.clone();
-                let path = file.path.clone();
-                let declared = file.format;
-                let built = tokio::task::spawn_blocking(move || {
-                    let mut sink = VerifySink {
-                        hasher: sha2::Sha256::new(),
-                        head: Vec::new(),
-                        digest: None,
-                    };
-                    let mut fetch = |block: &str, off: u64, len: u64| -> std::io::Result<Vec<u8>> {
-                        let store3 = store2.clone();
-                        let block = block.to_string();
-                        futures::executor::block_on(async move {
-                            super::read_range(&store3, &block, off, len).await
-                        })
-                        .map_err(|e| std::io::Error::other(e.to_string()))
-                    };
-                    rebuild_file(&entry, &rec2, &mut fetch, &mut sink)?;
-                    sink.digest = Some(hex::encode(sink.hasher.clone().finalize()));
-                    Ok::<_, twigpine_core::model::reconstruction::ModelError>((
-                        sink, path, declared,
-                    ))
-                })
-                .await;
-                let (sink, path, declared) = match built {
-                    Ok(Ok(v)) => v,
-                    Ok(Err(e)) => {
+                // Rebuild by ordered range reads, fully async: a sync walker
+                // would force block_on, which has no reactor under the S3
+                // backend. Blocks were hash-verified at write, so the
+                // whole-file digest is the check that matters here.
+                let slices = match twigpine_core::model::reconstruction::map_file_range(
+                    &entry, &rec, 0, file.size,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
                         return reject_release(
                             state,
                             release_id,
@@ -161,27 +137,51 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                         )
                         .await;
                     }
-                    Err(e) => return Err(AppError::Internal(e.into())),
                 };
-                if sink.digest.as_deref() != Some(file.sha256.as_str()) {
+                let mut sink = VerifySink {
+                    hasher: sha2::Sha256::new(),
+                    head: Vec::new(),
+                };
+                for slice in &slices {
+                    let bytes = match super::read_range(
+                        &store,
+                        &slice.block,
+                        slice.offset,
+                        slice.len,
+                    )
+                    .await
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return reject_release(
+                                state,
+                                release_id,
+                                &format!("{}: rebuild failed: {e}", file.path),
+                            )
+                            .await;
+                        }
+                    };
+                    if sink.write_all(&bytes).is_err() {
+                        return Err(AppError::Internal(anyhow::anyhow!("verify sink write")));
+                    }
+                }
+                let digest = hex::encode(sink.hasher.finalize());
+                if digest != file.sha256 {
                     return reject_release(
                         state,
                         release_id,
-                        &format!(
-                            "{}: rebuilt bytes hash to {}",
-                            path,
-                            sink.digest.unwrap_or_default()
-                        ),
+                        &format!("{}: rebuilt bytes hash to {digest}", file.path),
                     )
                     .await;
                 }
-                let detected = detect_format(&sink.head, &path);
-                if detected != declared {
+                let detected = detect_format(&sink.head, &file.path);
+                if detected != file.format {
                     return reject_release(
                         state,
                         release_id,
                         &format!(
-                            "{path}: declared format {declared:?} but bytes detect as {detected:?}"
+                            "{}: declared format {:?} but bytes detect as {:?}",
+                            file.path, file.format, detected
                         ),
                     )
                     .await;
