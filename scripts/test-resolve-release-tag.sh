@@ -605,6 +605,23 @@ job=npm-publish
             npm publish "npm/packages/$pkg" --provenance --access public --tag "$dist_tag"
           done
 
+job=npm-publish-cli
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+job=npm-publish-cli
+      - name: Resolve release tag
+        id: rel
+        env:
+          DISPATCH_TAG: ${{ inputs.npm_backfill_tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
+
 job=homebrew-bump
       - name: Check out workflow scripts
         if: ${{ steps.guard.outputs.enabled == 'true' }}
@@ -892,6 +909,7 @@ docker=release
 docker-manifest=release
 release-binaries=release
 npm-publish=release
+npm-publish-cli=npm-publish
 homebrew-bump=release
 web-sync=release
 EOF

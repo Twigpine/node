@@ -124,6 +124,21 @@ jobs:
       - name: Test release tag resolver
         run: scripts/test-resolve-release-tag.sh
 
+  npm-packaging:
+    name: npm packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # The @twigpine/cli build, launchers and publish order, against fake
+      # release archives and a fake registry. Nothing is published.
+      - name: Test the npm package build, launchers and publish script
+        run: bash scripts/npm/test-npm-packages.sh
+
   installer:
     name: installer checksum enforcement
     runs-on: ubuntu-latest

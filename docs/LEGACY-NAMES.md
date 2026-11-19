@@ -52,13 +52,16 @@ Readers accept both spellings today, through `twigpine_core::url_scheme`.
 | `X-Gitlawb-*` headers | `twigpine-core/src/legacy_headers.rs` |
 | `gl`, `git-remote-gitlawb`, `gitlawb-node` command names | Installers, Homebrew formula, Docker image, npm package. `git-remote-gitlawb` stays as long as `gitlawb://` remotes exist. |
 
+## Being retired
+
+- The npm package `@gitlawb/gl`, replaced by `@twigpine/cli`: published once more as a bridge, then deprecated (`docs/NPM_PACKAGING.md`). The CLI points users of the old package at the new one.
+
 ## Not decided yet
 
 - `gitlawb_*` metric names, with the infra change and whatever dashboards read them.
 - The default database URL `postgresql://localhost/gitlawb` in `twigpine-node/src/config.rs`, and the database and user names in `docker-compose.yml`: existing databases carry these names.
 - `infra/`, the macOS app and `bootstrap-peers.json`, which still set the old
   setting names and work through the fallback.
-- The npm package name `@gitlawb/gl`, replaced by `@twigpine/cli` in its own change.
 
 ## Not ours
 
