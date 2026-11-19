@@ -109,6 +109,20 @@ impl S3BlockStore {
             .build())
     }
 
+    /// Upload the bytes accumulated in `part_buf` as the next part.
+    async fn flush_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_buf: &mut Vec<u8>,
+        parts: &mut Vec<CompletedPart>,
+    ) -> Result<(), BlockStoreError> {
+        let staged = std::mem::take(part_buf);
+        let number = (parts.len() + 1) as i32;
+        parts.push(self.upload_one_part(key, upload_id, number, staged).await?);
+        Ok(())
+    }
+
     async fn abort(&self, key: &str, upload_id: &str) {
         if let Err(e) = self
             .s3
@@ -190,12 +204,8 @@ impl BlockStore for S3BlockStore {
                 hasher.update(&chunk);
                 part_buf.extend_from_slice(&chunk);
                 if part_buf.len() >= PART_SIZE {
-                    let staged = std::mem::take(&mut part_buf);
-                    let number = (parts.len() + 1) as i32;
-                    parts.push(
-                        self.upload_one_part(&key, &upload_id, number, staged)
-                            .await?,
-                    );
+                    self.flush_part(&key, &upload_id, &mut part_buf, &mut parts)
+                        .await?;
                 }
             }
             Ok(())
@@ -211,14 +221,12 @@ impl BlockStore for S3BlockStore {
             return Err(BlockStoreError::DigestMismatch);
         }
         if !part_buf.is_empty() {
-            let staged = std::mem::take(&mut part_buf);
-            let number = (parts.len() + 1) as i32;
-            match self.upload_one_part(&key, &upload_id, number, staged).await {
-                Ok(part) => parts.push(part),
-                Err(e) => {
-                    self.abort(&key, &upload_id).await;
-                    return Err(e);
-                }
+            if let Err(e) = self
+                .flush_part(&key, &upload_id, &mut part_buf, &mut parts)
+                .await
+            {
+                self.abort(&key, &upload_id).await;
+                return Err(e);
             }
         }
         if parts.is_empty() {

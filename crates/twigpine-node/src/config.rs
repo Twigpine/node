@@ -1405,7 +1405,6 @@ mod tests {
         assert_eq!(config.model_node_quota_bytes, 1 << 40);
         assert_eq!(config.model_unclaimed_ttl_secs, 86_400);
         assert_eq!(config.model_session_ttl_secs, 43_200);
-        // An unset session cap falls back to the per-identity quota.
         assert_eq!(config.model_max_session_bytes, None);
         assert_eq!(
             config.effective_model_max_session_bytes(),

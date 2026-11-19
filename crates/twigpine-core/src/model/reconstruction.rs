@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use thiserror::Error;
 
 use super::chunking::{chunk_reader, Block, BLOCK_TARGET};
@@ -185,18 +186,12 @@ impl DedupIndex {
             for (i, chunk) in block.chunks.iter().enumerate() {
                 // First writer wins: two priors carrying the same chunk are
                 // interchangeable, so keep the earliest.
-                idx_insert(
-                    &mut self.by_chunk,
-                    chunk.sha256.clone(),
-                    (block.sha256.clone(), i as u32),
-                );
+                self.by_chunk
+                    .entry(chunk.sha256.clone())
+                    .or_insert((block.sha256.clone(), i as u32));
             }
         }
     }
-}
-
-fn idx_insert(map: &mut HashMap<String, (String, u32)>, k: String, v: (String, u32)) {
-    map.entry(k).or_insert(v);
 }
 
 /// Seal the accumulating block of new chunks: patch its id into the terms
@@ -260,7 +255,6 @@ pub fn pack_file<R: Read>(
     dedup: &DedupIndex,
 ) -> std::io::Result<PackedFile> {
     let mut file_hasher = sha2::Sha256::new();
-    use sha2::Digest;
 
     let mut terms: Vec<Term> = Vec::new();
     let mut new_blocks: Vec<Block> = Vec::new();
@@ -455,7 +449,6 @@ pub fn rebuild_file<W: Write>(
     fetch: &mut BlockRangeFetch<'_>,
     out: &mut W,
 ) -> Result<u64, ModelError> {
-    use sha2::Digest;
     let blocks = rec.block_index();
     let mut file_hasher = sha2::Sha256::new();
     let mut written = 0u64;
@@ -506,20 +499,8 @@ pub fn rebuild_file<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::gen_bytes;
     use std::io::Cursor;
-
-    fn gen_bytes(n: usize, seed: u64) -> Vec<u8> {
-        let mut v = Vec::with_capacity(n);
-        let mut x = seed;
-        while v.len() < n {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            v.extend_from_slice(&x.to_le_bytes());
-        }
-        v.truncate(n);
-        v
-    }
 
     fn pack(path: &str, bytes: &[u8]) -> (Reconstruction, PackedFile) {
         let dedup = DedupIndex::new();
@@ -740,7 +721,6 @@ mod tests {
         let served: u64 = slices.iter().map(|s| s.len).sum();
         assert_eq!(served, want - 10);
         assert_eq!(slices[0].offset, prefix + 10);
-        // And the served bytes equal the file bytes.
         let mut got = Vec::new();
         for s in &slices {
             got.extend_from_slice(&block_data[s.offset as usize..(s.offset + s.len) as usize]);

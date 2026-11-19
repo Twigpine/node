@@ -13,9 +13,6 @@
 //! manifest's field is still checked for equality so a manifest naming one
 //! publisher cannot pass for another.
 
-use std::fmt;
-use std::str::FromStr;
-
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -62,19 +59,6 @@ pub enum FileFormat {
     Pickle,
     Text,
     Other,
-}
-
-impl fmt::Display for FileFormat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            FileFormat::Safetensors => "safetensors",
-            FileFormat::Gguf => "gguf",
-            FileFormat::Pickle => "pickle",
-            FileFormat::Text => "text",
-            FileFormat::Other => "other",
-        };
-        f.write_str(s)
-    }
 }
 
 /// Where a manifest-listed file's bytes live. Files under the chunking
@@ -172,9 +156,9 @@ pub fn verify(
             found: manifest.publisher_did,
         });
     }
-    let publisher =
-        Did::from_str(&manifest.publisher_did).map_err(|e| ManifestError::Did(e.to_string()))?;
-    let key = publisher
+    // The named publisher was just proven equal to the caller-supplied DID,
+    // so the key comes from that DID rather than a second parse of the field.
+    let key = expected_did
         .to_verifying_key()
         .map_err(|e| ManifestError::Did(e.to_string()))?;
 
@@ -389,12 +373,11 @@ mod tests {
         );
         let bytes = std::fs::read(format!("{dir}/manifest.json")).unwrap();
         let sig = std::fs::read_to_string(format!("{dir}/manifest.sig")).unwrap();
-        let did = Did::from_str(
-            std::fs::read_to_string(format!("{dir}/publisher.did"))
-                .unwrap()
-                .trim(),
-        )
-        .unwrap();
+        let did: Did = std::fs::read_to_string(format!("{dir}/publisher.did"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let parsed = verify(&bytes, &sig, &did).unwrap();
         assert_eq!(parsed.repo, "alice/llm");
         // And the frozen signature rejects tampering.
