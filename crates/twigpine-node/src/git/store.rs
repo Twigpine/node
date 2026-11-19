@@ -91,10 +91,14 @@ pub fn init_bare(path: &Path) -> Result<()> {
     // Hide the internal marker namespace from clone/fetch
     // advertisement. `refs/gitlawb/requests/*` carries request UUIDs
     // and would otherwise leak per-push metadata to every client and
-    // grow advertisement cost with push count.
+    // grow advertisement cost with push count. `refs/gitlawb/releases/*`
+    // pins published model releases so gc never prunes them; it is
+    // likewise not for clients.
     for (key, value) in [
         ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
         ("transfer.hideRefs", "refs/gitlawb/requests/"),
+        ("uploadpack.hideRefs", "refs/gitlawb/releases/"),
+        ("transfer.hideRefs", "refs/gitlawb/releases/"),
     ] {
         // allow-unbounded-git: same init-time local `git config` as above.
         let out = Command::new("git")
@@ -129,6 +133,8 @@ pub fn ensure_marker_hidden_checked(repo_path: &Path) -> Result<()> {
     for (key, value) in [
         ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
         ("transfer.hideRefs", "refs/gitlawb/requests/"),
+        ("uploadpack.hideRefs", "refs/gitlawb/releases/"),
+        ("transfer.hideRefs", "refs/gitlawb/releases/"),
     ] {
         // allow-unbounded-git: reached only through the #[allow(dead_code)]
         // ensure_marker_hidden wrapper; the push path runs this config through
@@ -215,6 +221,8 @@ pub async fn verify_recovery_prereqs_bounded(
     for (key, value) in [
         ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
         ("transfer.hideRefs", "refs/gitlawb/requests/"),
+        ("uploadpack.hideRefs", "refs/gitlawb/releases/"),
+        ("transfer.hideRefs", "refs/gitlawb/releases/"),
     ] {
         let current = run_git(git_bin, repo_path, &["config", "--get-all", key], timeout).await?;
         let already = String::from_utf8_lossy(&current.stdout)
