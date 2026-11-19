@@ -9,6 +9,7 @@ pub mod api;
 mod arweave;
 mod arweave_v2;
 pub mod auth;
+pub mod blockstore;
 mod bootstrap;
 mod cert;
 pub mod config;
@@ -402,6 +403,20 @@ pub async fn run() -> Result<()> {
         None
     };
 
+    // Content-addressed model block storage. Built only when model hosting is
+    // enabled; a misconfigured backend is fatal (fail closed, like purge-spam's
+    // object store), because falling back to local disk would silently move a
+    // deployment's blocks somewhere they were never meant to live.
+    let block_store = crate::blockstore::build(&config)
+        .await
+        .context("model block storage failed to initialize")?;
+    if let Some(ref store) = block_store {
+        info!(
+            backend = store.backend_name(),
+            "model block storage enabled"
+        );
+    }
+
     // Advisory-lock connections come from their own pool: a write guard pins one
     // for its whole lifetime, and sharing the application pool would let a push
     // burst starve ordinary request handlers.
@@ -621,6 +636,7 @@ pub async fn run() -> Result<()> {
             200_000,
         ),
         git_bin: "git".to_string(),
+        block_store,
     };
 
     // One-time re-encryption of any webhook HMAC secrets still resting as
