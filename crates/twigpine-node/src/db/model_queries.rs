@@ -862,12 +862,11 @@ mod tests {
             .unwrap()
             .is_none());
         tx.commit().await.unwrap();
-        let row: Option<i64> = sqlx::query_scalar(
-            "SELECT bytes_used FROM model_quota_usage WHERE did = 'did:owner'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
+        let row: Option<i64> =
+            sqlx::query_scalar("SELECT bytes_used FROM model_quota_usage WHERE did = 'did:owner'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
         assert!(row.is_none());
         // Within cap inserts, over-cap update refuses, within-cap update adds.
         let mut tx = db.model_begin().await.unwrap();
