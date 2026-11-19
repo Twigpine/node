@@ -304,6 +304,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn range_edge_contract_matches_the_trait() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        crate::blockstore::parity::get_range_edge_contract(&s).await;
+    }
+
+    #[tokio::test]
     async fn concurrent_puts_leave_one_object() {
         let dir = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(store(&dir));

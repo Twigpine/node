@@ -279,8 +279,18 @@ impl BlockStore for S3BlockStore {
         start: u64,
         end_exclusive: u64,
     ) -> Result<BoxStream<'static, io::Result<Bytes>>, BlockStoreError> {
-        if start >= end_exclusive {
+        // Bounds come from a HEAD, not from the GET's range answer: S3
+        // clamps an over-long end to the object size instead of failing,
+        // which would silently return fewer bytes than fs does.
+        let size = match self.size(id).await? {
+            Some(size) => size,
+            None => return Err(BlockStoreError::NotFound),
+        };
+        if start > end_exclusive || end_exclusive > size {
             return Err(BlockStoreError::OutOfRange);
+        }
+        if start == end_exclusive {
+            return Ok(futures::stream::empty().boxed());
         }
         let out = self
             .s3
@@ -596,6 +606,13 @@ mod tests {
 
         s.delete(&id).await.unwrap();
         assert_eq!(s.size(&id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn range_edge_contract_matches_the_trait() {
+        let (url, _st) = spawn_mock(false).await;
+        let s = store(&url);
+        crate::blockstore::parity::get_range_edge_contract(&s).await;
     }
 
     #[tokio::test]

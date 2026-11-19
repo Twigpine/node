@@ -114,8 +114,11 @@ pub trait BlockStore: Send + Sync {
         max_len: u64,
     ) -> Result<PutOutcome, BlockStoreError>;
 
-    /// Stream bytes `[start, end_exclusive)` of the stored object. A range
-    /// past the end fails with `OutOfRange`; a missing object with `NotFound`.
+    /// Stream bytes `[start, end_exclusive)` of the stored object. An empty
+    /// range (`start == end_exclusive`) succeeds with an empty stream;
+    /// `start > end_exclusive` or an `end_exclusive` past the object size
+    /// fails with `OutOfRange`; a missing object fails with `NotFound`.
+    /// Backends must honor this contract identically.
     async fn get_range(
         &self,
         id: &BlockId,
@@ -148,4 +151,83 @@ pub async fn build(config: &crate::config::Config) -> anyhow::Result<Option<Arc<
     }
     let store = fs::FsBlockStore::new(config.blockstore_dir.clone())?;
     Ok(Some(Arc::new(store)))
+}
+
+/// Assertions both backends must satisfy on `get_range` edges, run from each
+/// backend's own test module against a live store so the trait contract
+/// cannot drift between them.
+#[cfg(test)]
+pub(crate) mod parity {
+    use super::*;
+    use futures::StreamExt;
+    use sha2::{Digest, Sha256};
+
+    pub(crate) async fn get_range_edge_contract(store: &dyn BlockStore) {
+        let body: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let id = BlockId::parse(&hex::encode(Sha256::digest(&body))).unwrap();
+        let put_body = futures::stream::iter(vec![Ok(Bytes::from(body.clone()))]).boxed();
+        store.put_verified(&id, put_body, u64::MAX).await.unwrap();
+        let size = body.len() as u64;
+
+        async fn collect(mut s: BoxStream<'static, io::Result<Bytes>>) -> Vec<u8> {
+            let mut out = Vec::new();
+            while let Some(c) = s.next().await {
+                out.extend_from_slice(&c.unwrap());
+            }
+            out
+        }
+
+        // Empty ranges are in bounds: at offset 0 and at the end.
+        assert!(collect(store.get_range(&id, 0, 0).await.unwrap())
+            .await
+            .is_empty());
+        assert!(collect(store.get_range(&id, size, size).await.unwrap())
+            .await
+            .is_empty());
+        // The whole object is the largest legal range.
+        assert_eq!(
+            collect(store.get_range(&id, 0, size).await.unwrap()).await,
+            body
+        );
+        // One byte past the end is out of bounds, from any start.
+        assert!(matches!(
+            store
+                .get_range(&id, 0, size + 1)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            BlockStoreError::OutOfRange
+        ));
+        assert!(matches!(
+            store
+                .get_range(&id, 10, size + 1)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            BlockStoreError::OutOfRange
+        ));
+        // A reversed range is out of bounds.
+        assert!(matches!(
+            store.get_range(&id, 20, 10).await.map(|_| ()).unwrap_err(),
+            BlockStoreError::OutOfRange
+        ));
+        // A missing object is NotFound, even for an empty range.
+        let missing = BlockId::parse(&"0".repeat(64)).unwrap();
+        assert!(matches!(
+            store
+                .get_range(&missing, 0, 1)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            BlockStoreError::NotFound
+        ));
+        assert!(matches!(
+            store
+                .get_range(&missing, 0, 0)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            BlockStoreError::NotFound
+        ));
+    }
 }
