@@ -3023,6 +3023,10 @@ pub async fn git_receive_pack(
     let Some(git_timeout) =
         crate::git::repo_store::hold_bounded(lock_hold_deadline, git_service_timeout)
     else {
+        // Free the lock and its pool slot before the refusal's DB round trip:
+        // the refusal does not need the lock, and every other pre-git refusal
+        // runs with none held.
+        let _ = guard.release(false).await;
         if let Err(e) = state
             .db
             .refuse_receive_pack_before_git(
@@ -3188,6 +3192,22 @@ pub async fn git_receive_pack(
     // instead of spawning a receive-pack that is killed on the first poll.
     let Some(run_bound) = crate::git::repo_store::hold_bounded(lock_hold_deadline, git_timeout)
     else {
+        // No git child exists yet, so the admission bundle has nothing to
+        // reap: drop it, reclaim the guard and release it before the refusal's
+        // DB round trip, so the lock and its pool slot do not outlive the
+        // deadline. `release(false)` classifies the tree itself (receive-pack
+        // never ran on it), so this future's settlement copy is disarmed
+        // rather than left to quarantine an untouched tree on drop.
+        drop(admission);
+        let reclaimed = guard
+            .lock()
+            .expect("repo write-lock mutex poisoned")
+            .take()
+            .expect("the write lock is only taken here, and only once");
+        let _ = reclaimed.release(false).await;
+        if let Some(settlement) = settlement.as_mut() {
+            settlement.disarm();
+        }
         if let Err(e) = state
             .db
             .refuse_receive_pack_before_git(
@@ -19555,8 +19575,11 @@ exit 0
         let descfile = tmp.path().join("desc.pid");
         let body = format!(
             "#!/bin/sh\n\
+             case \"$1\" in receive-pack)\n\
              sh -c 'trap \"\" TERM; echo $$ > \"{}\"; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done' &\n\
-             wait\n",
+             wait; exit 0 ;;\n\
+             esac\n\
+             exec git \"$@\"\n",
             descfile.display()
         );
         let git_bin = write_fake_git(tmp.path(), &body);
@@ -19713,6 +19736,134 @@ exit 0
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    /// #282, the shed that lands after the tree was handed out. When the
+    /// pre-git phases (recovery prereqs, marker) spend the whole lock-hold
+    /// deadline, the handler sheds just before receive-pack would start. By
+    /// then `guard.path()` has declared the tree handed out and the settlement
+    /// token sits in this future, so a bare return would drop it at stage
+    /// `Idle` and quarantine a tree git never ran on, and would hold the lock
+    /// across the refusal's DB call. The shed must release the guard and
+    /// disarm the settlement first.
+    ///
+    /// A real (mock) object store is configured so the stage starts `Idle`;
+    /// with no backend it starts `NoBackend` and settlement never quarantines.
+    ///
+    /// MUTATION (RED): drop the teardown (release and disarm) from the second
+    /// shed and the quarantine-marker assertion fails.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_deadline_shed_after_path_handout_releases_and_does_not_quarantine(
+        pool: sqlx::PgPool,
+    ) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6shedtwo";
+        let name = "shed2";
+        let mock = crate::git::repo_store::tests::S3Mock::start().await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sentinel = tmp.path().join("receive-pack-ran");
+        // Every pre-git child (prereq `config`, marker `hash-object` and
+        // `update-ref`) hangs past the hold deadline and is cut by it; only
+        // `receive-pack` would leave the sentinel behind.
+        let git_bin = write_fake_git(
+            tmp.path(),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in receive-pack) : > \"{}\"; exit 0 ;; esac\nexec sleep 30\n",
+                sentinel.display()
+            ),
+        );
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+            crate::git::repo_store::tests::mock_tigris(&mock),
+        )
+        .with_lock_hold_timeout(std::time::Duration::from_secs(2));
+        let mut cfg = (*state.config).clone();
+        cfg.git_service_timeout_secs = 600;
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6shedtwo-shed2", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        // The tree must exist so the pre-git children actually spawn in it.
+        let bare = crate::git::repo_store::validated_repo_disk_path(
+            repos_dir.path(),
+            &rec.owner_did,
+            name,
+        )
+        .expect("test repo path");
+        crate::git::store::init_bare(&bare).expect("a bare repo on disk");
+        let quarantine = p3_quarantine_marker(repos_dir.path(), &rec.owner_did, name);
+
+        use crate::git::repo_store::advisory_lock_key;
+        let key = advisory_lock_key(&owner.replace([':', '/'], "_"), name);
+        let probe = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with((*pool.connect_options()).clone());
+
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(
+                "did:key:z6shedtwo".to_string(),
+            )),
+            None,
+            crate::rate_limit::PeerAddr(Some("203.0.113.83:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+
+        let status = match result {
+            Ok(r) => panic!("a deadline-shed push must fail, got {}", r.status()),
+            Err(e) => axum::response::IntoResponse::into_response(e).status(),
+        };
+        assert_eq!(
+            status,
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            "the pre-git deadline shed answers as a git timeout"
+        );
+        assert!(
+            !sentinel.exists(),
+            "receive-pack must never start once the hold deadline is spent"
+        );
+        assert!(
+            !quarantine.exists(),
+            "a shed before receive-pack must not quarantine a tree git never ran on"
+        );
+        let free_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !write_lock_is_takeable(&probe, key).await {
+            assert!(
+                std::time::Instant::now() < free_deadline,
+                "the write lock must be free once the shed returns"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT state, last_error FROM receive_pack_requests")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                crate::db::request_state::REJECTED_AT_GIT.to_string(),
+                Some("write-lock hold deadline expired before git".to_string()),
+            )],
+            "the shed must terminalize its request as a pre-git refusal"
+        );
+        mock.shutdown();
     }
 }
 

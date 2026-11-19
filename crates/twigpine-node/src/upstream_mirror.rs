@@ -290,6 +290,12 @@ fn reject_sensitive_local_config(git_bin: &str, repo_path: &Path, deadline: Inst
 /// only the external pack transfer it documents.
 const PREFLIGHT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Own bound for the under-lock stale-target recheck in
+/// [`Worker::fetch_target`]: one indexed row read, so a short bound is
+/// generous. It is clamped to the guard's lock-hold deadline like every
+/// other phase under the write lock (#282).
+const STALE_RECHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn run_fetch(
     git_bin: &str,
     repo_path: &Path,
@@ -392,7 +398,31 @@ impl Worker {
         // are held. Every future transition path must take these same locks
         // before changing authority, so no other node can commit a transition
         // between this check and the fetch.
-        let current = match self.db.get_repo_mirror_state(&target.repo_id).await {
+        //
+        // The recheck runs under the write lock, so it consumes the guard's
+        // lock-hold deadline like every later phase: an expired deadline
+        // starts no query, and a slow read cannot pin the lock and its
+        // lock-pool session past the deadline (#282).
+        let Some(recheck_bound) =
+            crate::git::repo_store::hold_bounded(guard.lock_hold_deadline(), STALE_RECHECK_TIMEOUT)
+        else {
+            let _ = guard.release(false).await;
+            anyhow::bail!(
+                "upstream mirror fetch: the lock-hold deadline expired before the stale-target recheck"
+            );
+        };
+        let recheck = tokio::time::timeout(
+            recheck_bound,
+            self.db.get_repo_mirror_state(&target.repo_id),
+        )
+        .await;
+        let Ok(recheck) = recheck else {
+            let _ = guard.release(false).await;
+            anyhow::bail!(
+                "upstream mirror fetch: the stale-target recheck did not finish inside the lock-hold budget"
+            );
+        };
+        let current = match recheck {
             Ok(Some(current)) => current,
             Ok(None) => {
                 let _ = guard.release(false).await;
@@ -1072,5 +1102,65 @@ esac
              fetch timeout, took {elapsed:?}"
         );
         assert!(worker.repo_write_leases.is_empty());
+    }
+
+    /// #282: the stale-target recheck runs under the write lock, so it
+    /// consumes the guard's lock-hold deadline too. With a zero hold bound
+    /// the deadline has passed by the time the recheck would run: the
+    /// recheck must refuse, release the lock, and spawn no git child.
+    /// Load-bearing on the recheck's `hold_bounded` check: without it the
+    /// recheck runs and `run_fetch` bails with its own expired-deadline
+    /// message instead, so the message assertion below fails.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn stale_recheck_respects_the_guard_lock_hold_deadline(pool: sqlx::PgPool) {
+        let bootstrap = tempfile::tempdir().unwrap();
+        let git = bootstrap.path().join("fake-git");
+        let git_marker = bootstrap.path().join("git-invoked");
+        std::fs::write(
+            &git,
+            format!("#!/bin/sh\n: > \"{}\"\nexit 1\n", git_marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&git, permissions).unwrap();
+        }
+
+        let (mut worker, db, _repos) = test_worker(pool, git, 1).await;
+        worker.repo_store = worker.repo_store.with_lock_hold_timeout(Duration::ZERO);
+        let target = add_inbound_mirror(
+            &worker,
+            &db,
+            "00000000-0000-0000-0000-000000000004",
+            "expiredrecheck",
+            "https://8.8.8.8/org/expired.git",
+        )
+        .await;
+        let (owner_did, name) = (target.owner_did.clone(), target.name.clone());
+
+        let error = worker.fetch_target(target).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "upstream mirror fetch: the lock-hold deadline expired before the stale-target recheck"
+        );
+        assert!(
+            !git_marker.exists(),
+            "no git child may run once the lock-hold deadline has expired"
+        );
+        assert!(worker.repo_write_leases.is_empty());
+
+        // The refusal released the advisory write lock: a fresh acquire on
+        // the same store takes it at once instead of waiting it out.
+        let reacquired = tokio::time::timeout(
+            Duration::from_secs(5),
+            worker.repo_store.acquire_write(&owner_did, &name),
+        )
+        .await
+        .expect("the write lock must be free after the recheck refused")
+        .expect("acquire after the refused recheck");
+        let _ = reacquired.release(false).await;
     }
 }

@@ -9375,16 +9375,19 @@ pub(crate) mod tests {
         mock.shutdown();
     }
 
-    /// #282: every phase under the lock consumes the guard's one lock-hold
-    /// deadline. A guard whose deadline has already passed must not START a
-    /// publish the bound cannot finish: the `None` (timed out) arm routes
-    /// through `resolve_unfinished_publish`, where stage `Idle` reads as a
-    /// definite non-publication (`UploadFailed`), and no PUT is dispatched.
+    /// Release a hand-built guard over a SEEDED bare repo against a mock store
+    /// that answers 200 to everything, with the given lock-hold deadline.
+    /// Returns the outcome and how many PUTs reached the mock.
     ///
-    /// Load-bearing on the clamp: without the `hold_bounded` deadline the
-    /// publish would run against the mock and the counter below would move.
-    #[sqlx::test]
-    async fn release_after_lock_hold_deadline_starts_no_publish(pool: sqlx::PgPool) {
+    /// The repo is seeded so archive preparation succeeds: without it a
+    /// publish that wrongly started would still fail before any PUT and read
+    /// as `UploadFailed`, which is the outcome the expired case asserts.
+    async fn release_with_lock_hold_deadline(
+        pool: &sqlx::PgPool,
+        repo_name: &str,
+        lock_key: i64,
+        lock_hold_deadline: Instant,
+    ) -> (ReleaseOutcome, usize) {
         use axum::response::IntoResponse;
 
         let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9408,24 +9411,21 @@ pub(crate) mod tests {
         });
 
         let dir = tempfile::TempDir::new().unwrap();
+        let local_path = validated_repo_disk_path(dir.path(), "did:key:z6MkHoldExpired", repo_name)
+            .expect("test path");
+        seed_bare_repo(&local_path);
         let guard = RepoWriteGuard {
             owner_slug: "did_key_z6MkHoldExpired".to_string(),
-            repo_name: "expired-hold".to_string(),
-            local_path: validated_repo_disk_path(
-                dir.path(),
-                "did:key:z6MkHoldExpired",
-                "expired-hold",
-            )
-            .expect("test path"),
-            lock_key: 995_777,
+            repo_name: repo_name.to_string(),
+            local_path,
+            lock_key,
             conn: Some(pool.acquire().await.unwrap()),
             tigris: Some(TigrisClient::for_testing_with_endpoint(
                 "test-bucket",
                 &endpoint,
             )),
             lock_held_transfer_timeout: Duration::from_secs(300),
-            // Already past: the publish's budget must clamp to zero.
-            lock_hold_deadline: Instant::now() - Duration::from_secs(1),
+            lock_hold_deadline,
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
@@ -9439,17 +9439,63 @@ pub(crate) mod tests {
         };
 
         let outcome = guard.release(true).await;
+        let put_count = puts.load(std::sync::atomic::Ordering::SeqCst);
+        server.abort();
+        (outcome, put_count)
+    }
+
+    /// #282: every phase under the lock consumes the guard's one lock-hold
+    /// deadline. A guard whose deadline has already passed must not START a
+    /// publish the bound cannot finish: the `None` (timed out) arm routes
+    /// through `resolve_unfinished_publish`, where stage `Idle` reads as a
+    /// definite non-publication (`UploadFailed`), and no PUT is dispatched.
+    ///
+    /// Load-bearing on the clamp: the repo is seeded and the mock accepts
+    /// every PUT, so without the `hold_bounded` deadline the publish would
+    /// succeed (`Released`) and the counter would move. The sibling test
+    /// below proves that same fixture does publish when the deadline is live.
+    #[sqlx::test]
+    async fn release_after_lock_hold_deadline_starts_no_publish(pool: sqlx::PgPool) {
+        // Already past: the publish's budget must clamp to zero.
+        let (outcome, puts) = release_with_lock_hold_deadline(
+            &pool,
+            "expired-hold",
+            995_777,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await;
         assert_eq!(
             outcome,
             ReleaseOutcome::UploadFailed,
             "an expired lock-hold deadline makes the publish a definite non-publication, got {outcome:?}"
         );
         assert_eq!(
-            puts.load(std::sync::atomic::Ordering::SeqCst),
-            0,
+            puts, 0,
             "no PUT may be dispatched once the lock-hold deadline has passed"
         );
-        server.abort();
+    }
+
+    /// Control for the test above: the same fixture with a live lock-hold
+    /// deadline publishes. Without it, a fixture that could never publish
+    /// would make the expired case pass for the wrong reason.
+    #[sqlx::test]
+    async fn release_before_lock_hold_deadline_publishes(pool: sqlx::PgPool) {
+        let (outcome, puts) = release_with_lock_hold_deadline(
+            &pool,
+            "live-hold",
+            995_778,
+            Instant::now() + Duration::from_secs(300),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ReleaseOutcome::Released,
+            "a live lock-hold deadline lets the publish run to completion, got {outcome:?}"
+        );
+        assert!(
+            puts > 0,
+            "the publish must reach the store while the lock-hold deadline is live"
+        );
     }
 
     /// #282: the unlock is also a phase under the deadline. A release entered
