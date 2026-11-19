@@ -1,13 +1,11 @@
 //! Model-hosting queries. Timestamps follow the repo convention: rfc3339
 //! text in TEXT columns, written and compared through the helpers here.
 
-#[cfg(any(test, feature = "test-harness"))]
-use sqlx::PgPool;
 use sqlx::{Postgres, Transaction};
 
 use super::{Db, Result};
 
-fn ts_now() -> String {
+pub(crate) fn ts_now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
@@ -258,6 +256,19 @@ impl Db {
         Ok(row.map(Into::into))
     }
 
+    /// The reconstruction object sha a release was claimed with, if any.
+    /// The reconstruction GET serves by this stored ref: the manifest it
+    /// names is immutable under the pinned commit and was verified at claim.
+    pub async fn model_reconstruction_sha(&self, id: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT reconstruction_sha256 FROM model_releases WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
     pub async fn model_release_by_id(&self, id: i64) -> Result<Option<ModelRelease>> {
         let row = sqlx::query_as::<_, ReleaseTuple>(&format!(
             "SELECT {RELEASE_COLS} FROM model_releases WHERE id = $1"
@@ -499,31 +510,36 @@ impl Db {
         Ok(row.into())
     }
 
-    /// Link `sha` to the release and drop it from the publisher's open
-    /// sessions, so the same bytes stop counting twice node-wide.
-    pub async fn model_tx_link_release_block(
+    /// Link `shas` to the release and drop them from the publisher's open
+    /// sessions, so the same bytes stop counting twice node-wide. Batched:
+    /// this runs inside the claim's advisory lock, so a manifest naming
+    /// thousands of blocks must not pay two round trips per block.
+    pub async fn model_tx_link_release_blocks(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         release_id: i64,
         publisher_did: &str,
-        sha: &str,
+        shas: &[String],
     ) -> Result<()> {
+        if shas.is_empty() {
+            return Ok(());
+        }
         sqlx::query(
             "INSERT INTO model_release_blocks (release_id, block_sha256)
-             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+             SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING",
         )
         .bind(release_id)
-        .bind(sha)
+        .bind(shas)
         .execute(&mut **tx)
         .await?;
         sqlx::query(
             "DELETE FROM model_session_blocks sb
              USING model_upload_sessions s
              WHERE s.id = sb.session_id AND s.owner_did = $1
-               AND s.state = 'open' AND sb.block_sha256 = $2",
+               AND s.state = 'open' AND sb.block_sha256 = ANY($2)",
         )
         .bind(publisher_did)
-        .bind(sha)
+        .bind(shas)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -637,9 +653,9 @@ impl Db {
         .await?)
     }
 
-    pub async fn model_drop_session_blocks(&self, session_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM model_session_blocks WHERE session_id = $1")
-            .bind(session_id)
+    pub async fn model_drop_sessions_blocks(&self, session_ids: &[String]) -> Result<()> {
+        sqlx::query("DELETE FROM model_session_blocks WHERE session_id = ANY($1)")
+            .bind(session_ids)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -735,12 +751,6 @@ impl Db {
     }
 }
 
-/// The PgPool behind a `Db`, for test fixtures that seed rows directly.
-#[cfg(any(test, feature = "test-harness"))]
-pub fn test_pool(db: &Db) -> &PgPool {
-    db.pool()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,17 +772,14 @@ mod tests {
     #[sqlx::test]
     async fn admit_bytes_enforces_session_cap_and_slides_expiry(pool: sqlx::PgPool) {
         let db = migrated(pool.clone()).await;
-        let s = db
-            .model_open_session("did:owner", "r1", 3600)
-            .await
-            .unwrap();
+        let s = db.model_open_session("did:owner", "r1", 60).await.unwrap();
         let first = db
             .model_admit_bytes(&s.id, 100, 3600, 1000, 10_000)
             .await
             .unwrap()
             .expect("first admission");
         assert_eq!(first.bytes_received, 100);
-        assert!(first.expires_at >= s.expires_at);
+        assert!(first.expires_at > s.expires_at);
         // Over the per-identity session cap: refused.
         assert!(db
             .model_admit_bytes(&s.id, 950, 3600, 1000, 10_000)
@@ -795,11 +802,21 @@ mod tests {
             .await
             .unwrap();
         let sha = "a".repeat(64);
+        // First PUT: admit the block's bytes, then record the link.
+        db.model_admit_bytes(&s.id, 100, 3600, 1000, 10_000)
+            .await
+            .unwrap()
+            .expect("first admission");
         assert!(!db.model_record_block(&s.id, &sha, 100, 100).await.unwrap());
-        // Same block again: duplicate, admission refunded.
+        // Same block again: the second admission is charged then refunded
+        // when the record sees the existing link.
+        db.model_admit_bytes(&s.id, 100, 3600, 1000, 10_000)
+            .await
+            .unwrap()
+            .expect("second admission");
         assert!(db.model_record_block(&s.id, &sha, 100, 100).await.unwrap());
         let s2 = db.model_load_session(&s.id).await.unwrap().unwrap();
-        assert_eq!(s2.bytes_received, 0);
+        assert_eq!(s2.bytes_received, 100);
     }
 
     #[sqlx::test]
@@ -834,7 +851,9 @@ mod tests {
             db.model_expire_sessions().await.unwrap(),
             vec![s.id.clone()]
         );
-        db.model_drop_session_blocks(&s.id).await.unwrap();
+        db.model_drop_sessions_blocks(std::slice::from_ref(&s.id))
+            .await
+            .unwrap();
 
         // The block is now unreferenced: marked, then deletable past grace.
         assert_eq!(db.model_remark_liveness().await.unwrap(), 1);

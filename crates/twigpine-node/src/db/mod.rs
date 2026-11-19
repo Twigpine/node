@@ -524,13 +524,13 @@ pub struct MarkerCleanup {
     pub dead_letter: bool,
 }
 
+pub mod model_queries;
+
 /// The lifecycle states of a row in `pending_ref_transitions`. Persisted as a
 /// TEXT column with one of these string values; the constants are the canonical
 /// spellings, and tests + the recovery drain all use them so a typo on one
 /// side or the other cannot silently mismatch the other.
 #[allow(dead_code)] // constants are used by tests + the next-slice handler
-pub mod model_queries;
-
 pub mod pending_state {
     #[allow(dead_code)]
     pub const PREPARED: &str = "prepared";

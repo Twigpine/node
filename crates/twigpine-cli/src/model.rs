@@ -8,7 +8,6 @@
 //! and polls until the node's verification publishes it.
 
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -431,14 +430,6 @@ fn parse_parent(spec: &str) -> Result<((String, String), String)> {
     Ok(((owner.to_string(), name.to_string()), commit.to_string()))
 }
 
-/// The detached signature file contents: base64-std over the domain-tagged
-/// manifest bytes, same as `manifest::sign` but through the CLI Keypair
-/// (which signs but does not expose its SigningKey).
-fn sign_manifest_bytes(kp: &twigpine_core::identity::Keypair, manifest_bytes: &[u8]) -> String {
-    let sig = kp.sign(&manifest::signing_input(manifest_bytes));
-    B64.encode(sig.to_bytes())
-}
-
 fn read_head(path: &Path, n: u64) -> Result<Vec<u8>> {
     let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut buf = Vec::new();
@@ -594,8 +585,9 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     //    declared parent's when given.
     let mut priors: Vec<Reconstruction> = Vec::new();
     let mut parent_ref: Option<ParentRef> = None;
-    for commit in release_commits(&root) {
-        if let Some(rec) = fetch_reconstruction(&client, &owner, &name, &commit).await? {
+    let prior_commits = release_commits(&root);
+    for commit in &prior_commits {
+        if let Some(rec) = fetch_reconstruction(&client, &owner, &name, commit).await? {
             priors.push(rec);
         }
     }
@@ -632,66 +624,9 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         }
     }
 
-    // 4. Pack every chunked file; shared chunks become terms into prior
-    //    blocks, the rest seal into new blocks to upload.
-    let mut rec = Reconstruction::new();
-    let mut new_blocks = Vec::new();
-    let mut new_block_shas: HashSet<String> = HashSet::new();
-    let mut files: Vec<ManifestFile> = Vec::new();
-    for path in &scan.chunked_files {
-        let file = std::fs::File::open(root.join(path)).with_context(|| format!("open {path}"))?;
-        let packed = pack_file(path, file, &dedup)?;
-        let head = read_head(&root.join(path), 64)?;
-        files.push(ManifestFile {
-            path: path.clone(),
-            size: packed.file.size,
-            sha256: packed.file.sha256.clone(),
-            format: detect_format(&head, path),
-            storage: StorageKind::Chunked,
-        });
-        rec.files.push(packed.file);
-        for e in packed.block_entries {
-            all_entries.insert(e.sha256.clone(), e.clone());
-            rec.blocks.push(e);
-        }
-        for b in packed.new_blocks {
-            if new_block_shas.insert(b.sha256.clone()) {
-                new_blocks.push(b);
-            }
-        }
-        // Make this file's fresh chunks visible to the next file's dedup.
-        dedup.add(&rec);
-    }
-    // Terms into earlier blocks need those entries in this object: a reader
-    // resolves term.block against rec.blocks only.
-    let needed: HashSet<String> = rec
-        .files
-        .iter()
-        .flat_map(|f| f.terms.iter().map(|t| t.block.clone()))
-        .collect();
-    for sha in needed {
-        if rec.blocks.iter().any(|b| b.sha256 == sha) {
-            continue;
-        }
-        let entry = all_entries
-            .get(&sha)
-            .with_context(|| format!("term references unknown block {sha}"))?;
-        rec.blocks.push(entry.clone());
-    }
-    // A release with no chunked files has no chunked bytes to reconstruct:
-    // no reconstruction object, no reconstruction block.
-    let rec_bytes = if scan.chunked_files.is_empty() {
-        Vec::new()
-    } else {
-        rec.validate()
-            .map_err(|e| anyhow::anyhow!("reconstruction object invalid: {e}"))?;
-        rec.to_bytes()
-            .map_err(|e| anyhow::anyhow!("reconstruction serialize failed: {e}"))?
-    };
-    let rec_sha = sha256_hex(&rec_bytes);
-
-    // 5. Open (or resume) the upload session and send the new blocks, then
-    //    the reconstruction object as one more block.
+    // 4. Open (or resume) the upload session before packing, so each new
+    //    block streams out as it seals instead of buffering the whole
+    //    model in memory.
     let state_path = git_dir.join(STATE_FILE_NAME);
     let mut state = load_state(&state_path);
     if !state.session_id.is_empty() {
@@ -709,9 +644,7 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         }
     }
     if state.session_id.is_empty() {
-        let body = serde_json::to_vec(&json!({
-            "parent_release": parent_ref.as_ref().map(|p| p.commit.clone()),
-        }))?;
+        let body = serde_json::to_vec(&json!({}))?;
         let resp = client
             .post(&format!("{base}/models/sessions"), &body)
             .await?;
@@ -726,33 +659,88 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     let mut uploaded: HashSet<String> = state.uploaded.iter().cloned().collect();
     let session_id = state.session_id.clone();
 
-    let total = new_blocks.len() + usize::from(!rec_bytes.is_empty());
-    for (i, block) in new_blocks.into_iter().enumerate() {
-        let sha = block.sha256;
-        if uploaded.contains(&sha) {
+    // 5. Pack every chunked file; shared chunks become terms into prior
+    //    blocks, the rest seal into new blocks uploaded as they seal.
+    let mut rec = Reconstruction::new();
+    let mut files: Vec<ManifestFile> = Vec::new();
+    for path in &scan.chunked_files {
+        let file = std::fs::File::open(root.join(path)).with_context(|| format!("open {path}"))?;
+        let packed = pack_file(path, file, &dedup)?;
+        // Make this file's fresh chunks visible to the next file's dedup.
+        dedup.add_block_entries(&packed.block_entries);
+        let head = read_head(&root.join(path), 64)?;
+        files.push(ManifestFile {
+            path: path.clone(),
+            size: packed.file.size,
+            sha256: packed.file.sha256.clone(),
+            format: detect_format(&head, path),
+            storage: StorageKind::Chunked,
+        });
+        rec.files.push(packed.file);
+        for e in packed.block_entries {
+            all_entries.insert(e.sha256.clone(), e.clone());
+            rec.blocks.push(e);
+        }
+        for b in packed.new_blocks {
+            let sha = b.sha256;
+            if uploaded.contains(&sha) {
+                continue;
+            }
+            upload_block(&client, &base, &session_id, &sha, b.data).await?;
+            state.uploaded.push(sha.clone());
+            uploaded.insert(sha.clone());
+            save_state(&state_path, &state)?;
+            println!("uploaded block {}", &sha[..16]);
+        }
+    }
+    // Terms into earlier blocks need those entries in this object: a reader
+    // resolves term.block against rec.blocks only.
+    let needed: HashSet<String> = rec
+        .files
+        .iter()
+        .flat_map(|f| f.terms.iter().map(|t| t.block.clone()))
+        .collect();
+    let mut present: HashSet<String> = rec.blocks.iter().map(|b| b.sha256.clone()).collect();
+    for sha in needed {
+        if present.contains(&sha) {
             continue;
         }
-        upload_block(&client, &base, &session_id, &sha, block.data).await?;
-        state.uploaded.push(sha.clone());
-        uploaded.insert(sha);
-        save_state(&state_path, &state)?;
-        println!("uploaded block {}/{total}", i + 1);
+        let entry = all_entries
+            .get(&sha)
+            .with_context(|| format!("term references unknown block {sha}"))?;
+        present.insert(entry.sha256.clone());
+        rec.blocks.push(entry.clone());
     }
-    if !rec_bytes.is_empty() && !uploaded.contains(&rec_sha) {
-        upload_block(&client, &base, &session_id, &rec_sha, rec_bytes.clone()).await?;
+    // A release with no chunked files has no chunked bytes to reconstruct:
+    // no reconstruction object, no reconstruction block.
+    let rec_bytes = if scan.chunked_files.is_empty() {
+        Vec::new()
+    } else {
+        rec.validate()
+            .map_err(|e| anyhow::anyhow!("reconstruction object invalid: {e}"))?;
+        rec.to_bytes()
+            .map_err(|e| anyhow::anyhow!("reconstruction serialize failed: {e}"))?
+    };
+    let rec_sha = sha256_hex(&rec_bytes);
+
+    // 6. The reconstruction object goes up as one more content block.
+    let has_rec = !rec_bytes.is_empty();
+    let rec_size = rec_bytes.len() as u64;
+    if has_rec && !uploaded.contains(&rec_sha) {
+        upload_block(&client, &base, &session_id, &rec_sha, rec_bytes).await?;
         state.uploaded.push(rec_sha.clone());
         save_state(&state_path, &state)?;
-        println!("uploaded reconstruction object ({total}/{total})");
+        println!("uploaded reconstruction object");
     }
 
-    // 6. Managed .gitignore block, then stage the publishable set.
+    // 7. Managed .gitignore block, then stage the publishable set.
     let new_gitignore = upsert_managed_block(&existing_gitignore, &scan.chunked_files);
     if new_gitignore != existing_gitignore {
         std::fs::write(&gitignore_path, &new_gitignore)?;
     }
     git(&root, &["add", "-A"])?;
 
-    // 7. Hash the git-stored files from the index (the exact bytes the
+    // 8. Hash the git-stored files from the index (the exact bytes the
     //    commit stores), then write and stage the manifest.
     for path in &scan.git_files {
         let bytes = staged_blob(&root, path)?;
@@ -773,12 +761,12 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         license: args.license.clone(),
         parent: parent_ref,
         files,
-        reconstruction: if rec_bytes.is_empty() {
+        reconstruction: if !has_rec {
             None
         } else {
             Some(ReconstructionRef {
                 sha256: rec_sha,
-                size: rec_bytes.len() as u64,
+                size: rec_size,
             })
         },
     };
@@ -790,14 +778,27 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     std::fs::write(twigpine_dir.join("model-release.json"), &manifest_bytes)?;
     std::fs::write(
         twigpine_dir.join("model-release.sig"),
-        format!("{}\n", sign_manifest_bytes(&kp, &manifest_bytes)),
+        format!(
+            "{}\n",
+            manifest::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&kp.to_seed()),
+                &manifest_bytes,
+            )
+        ),
     )?;
-    git(&root, &["add", "-A"])?;
+    git(
+        &root,
+        &[
+            "add",
+            ".twigpine/model-release.json",
+            ".twigpine/model-release.sig",
+        ],
+    )?;
 
-    // 8. Commit when the index differs, push, and claim HEAD.
+    // 9. Commit when the index differs, push, and claim HEAD.
     let has_changes = git(&root, &["diff", "--cached", "--quiet"]).is_err();
     if has_changes {
-        let n = release_commits(&root).len() + 1;
+        let n = prior_commits.len() + 1;
         git(&root, &["commit", "-m", &format!("model release {n}")])?;
     } else {
         // Nothing staged: a re-publish of identical content lands here, and
@@ -844,7 +845,7 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     let release_id = claim["release_id"].as_i64().unwrap_or_default();
     println!("release {release_id} claimed; verifying");
 
-    // 9. Poll until the verification worker settles the release.
+    // 10. Poll until the verification worker settles the release.
     let release_path = format!("{base}/models/releases/{commit}");
     let deadline = Instant::now() + POLL_BUDGET;
     loop {
@@ -886,22 +887,25 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    const T: u64 = 1024; // test threshold
+    const THR: u64 = 1024;
 
     #[test]
     fn classify_by_threshold_tracking_and_ignore() {
         // Below threshold: tracked or unignored-untracked are git files.
-        assert_eq!(classify(T - 1, true, false, false, T), Class::Git);
-        assert_eq!(classify(T - 1, false, false, false, T), Class::Git);
-        assert_eq!(classify(T - 1, false, true, false, T), Class::Ignored);
-        assert_eq!(classify(T - 1, false, true, true, T), Class::Ignored);
+        assert_eq!(classify(THR - 1, true, false, false, THR), Class::Git);
+        assert_eq!(classify(THR - 1, false, false, false, THR), Class::Git);
+        assert_eq!(classify(THR - 1, false, true, false, THR), Class::Ignored);
+        assert_eq!(classify(THR - 1, false, true, true, THR), Class::Ignored);
         // At/above threshold: tracked refuses; untracked chunks unless
         // ignored outside the managed block.
-        assert_eq!(classify(T, true, false, false, T), Class::LargeTracked);
-        assert_eq!(classify(T + 1, true, true, false, T), Class::LargeTracked);
-        assert_eq!(classify(T, false, false, false, T), Class::Chunked);
-        assert_eq!(classify(T, false, true, true, T), Class::Chunked);
-        assert_eq!(classify(T, false, true, false, T), Class::Ignored);
+        assert_eq!(classify(THR, true, false, false, THR), Class::LargeTracked);
+        assert_eq!(
+            classify(THR + 1, true, true, false, THR),
+            Class::LargeTracked
+        );
+        assert_eq!(classify(THR, false, false, false, THR), Class::Chunked);
+        assert_eq!(classify(THR, false, true, true, THR), Class::Chunked);
+        assert_eq!(classify(THR, false, true, false, THR), Class::Ignored);
     }
 
     #[test]
@@ -1034,32 +1038,6 @@ mod tests {
             v["reconstruction"]["sha256"].as_str(),
             Some(rec_sha.as_str())
         );
-    }
-
-    #[test]
-    fn cli_signature_matches_manifest_sign() {
-        // The two paths sign the same domain-tagged bytes with the same key:
-        // manifest::sign takes a raw SigningKey, the CLI signs through Keypair.
-        let seed = [9u8; 32];
-        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let kp = twigpine_core::identity::Keypair::from_seed(&seed).unwrap();
-        let m = Manifest {
-            schema: MANIFEST_SCHEMA_V1.to_string(),
-            repo: "alice/m".to_string(),
-            publisher_did: kp.did().to_string(),
-            license: "mit".to_string(),
-            parent: None,
-            files: vec![],
-            reconstruction: Some(ReconstructionRef {
-                sha256: "a".repeat(64),
-                size: 1,
-            }),
-        };
-        let bytes = m.to_bytes().unwrap();
-        let sig = sign_manifest_bytes(&kp, &bytes);
-        assert_eq!(sig, manifest::sign(&signing, &bytes));
-        let parsed = manifest::verify(&bytes, &sig, &kp.did()).unwrap();
-        assert_eq!(parsed.repo, "alice/m");
     }
 
     #[test]

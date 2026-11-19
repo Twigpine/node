@@ -24,9 +24,7 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepStats, AppError> {
     // session no longer confers liveness.
     let expired = db.model_expire_sessions().await?;
     stats.sessions_expired = expired.len() as u64;
-    for sid in &expired {
-        db.model_drop_session_blocks(sid).await?;
-    }
+    db.model_drop_sessions_blocks(&expired).await?;
 
     // Re-mark liveness both ways: blocks that lost every live reference get
     // an unreferenced_since stamp; blocks that regained one clear theirs.

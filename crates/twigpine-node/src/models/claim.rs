@@ -26,7 +26,6 @@ fn bad_request(msg: impl Into<String>) -> AppError {
     AppError::BadRequest(msg.into())
 }
 
-/// Read `commit:path` bytes from the repo on disk, bounded.
 pub(crate) async fn git_show(
     git_bin: &str,
     disk_path: &std::path::Path,
@@ -60,7 +59,6 @@ pub(crate) async fn git_show(
     }
 }
 
-/// Whether commit `sha` resolves in the repo.
 pub async fn commit_exists(
     git_bin: &str,
     disk_path: &std::path::Path,
@@ -117,13 +115,12 @@ pub async fn claim_release(
     let db = &state.db;
     let disk_path = std::path::PathBuf::from(&record.disk_path);
 
-    // The pushed commit must exist and carry the signed manifest.
     if !commit_exists(&state.git_bin, &disk_path, commit).await? {
         return Err(bad_request("commit not found in this repository"));
     }
     let (manifest_bytes, manifest) =
         read_verified_manifest(&state.git_bin, &disk_path, commit, &record.owner_did).await?;
-    let m_sha = super::manifest_sha256(&manifest_bytes);
+    let m_sha = twigpine_core::cid::sha256_hex(&manifest_bytes);
     let rec_sha = manifest.reconstruction.as_ref().map(|r| r.sha256.clone());
     let blocks = super::referenced_blocks(state, &manifest).await?;
 
@@ -150,8 +147,12 @@ pub async fn claim_release(
     // Lock the referenced block rows so a racing sweep cannot delete one
     // mid-claim, and require each to exist.
     if !blocks.is_empty() {
-        let present = db.model_tx_lock_present_blocks(&mut tx, &blocks).await?;
-        if let Some(missing) = blocks.iter().find(|b| !present.contains(b)) {
+        let present: std::collections::HashSet<String> = db
+            .model_tx_lock_present_blocks(&mut tx, &blocks)
+            .await?
+            .into_iter()
+            .collect();
+        if let Some(missing) = blocks.iter().find(|b| !present.contains(b.as_str())) {
             return Err(bad_request(format!(
                 "manifest references block {} which is not stored on this node",
                 &missing[..16]
@@ -161,12 +162,18 @@ pub async fn claim_release(
 
     // Authorization: every referenced block must arrive through the caller's
     // open session, a live release of the caller's, or the declared parent.
-    let caller_session_blocks = db.model_tx_session_blocks(&mut tx, caller).await?;
-    let caller_release_blocks = db
+    let caller_session_blocks: std::collections::HashSet<String> = db
+        .model_tx_session_blocks(&mut tx, caller)
+        .await?
+        .into_iter()
+        .collect();
+    let caller_release_blocks: std::collections::HashSet<String> = db
         .model_tx_publisher_release_blocks(&mut tx, caller)
-        .await?;
-    let parent_blocks: Vec<String> = match &manifest.parent {
-        None => Vec::new(),
+        .await?
+        .into_iter()
+        .collect();
+    let parent_blocks: std::collections::HashSet<String> = match &manifest.parent {
+        None => std::collections::HashSet::new(),
         Some(parent) => {
             let (powner, pname) = parent
                 .repo
@@ -189,7 +196,7 @@ pub async fn claim_release(
                     "declared parent is not a published release on this node",
                 ));
             }
-            rows
+            rows.into_iter().collect()
         }
     };
     for b in &blocks {
@@ -258,12 +265,10 @@ pub async fn claim_release(
         .await?;
     let release_id = row.id;
 
-    for b in &blocks {
-        // Claimed blocks leave the caller's open sessions' charge: the
-        // release now carries them, so session bytes stop double-counting.
-        db.model_tx_link_release_block(&mut tx, release_id, caller, b)
-            .await?;
-    }
+    // Claimed blocks leave the caller's open sessions' charge: the
+    // release now carries them, so session bytes stop double-counting.
+    db.model_tx_link_release_blocks(&mut tx, release_id, caller, &blocks)
+        .await?;
     db.model_tx_recount_open_session_bytes(&mut tx, caller)
         .await?;
 

@@ -1055,7 +1055,9 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             gate: GateClass::OwnerGate,
             handler: "models::claim_model_release",
             // A well-formed claim body; the owner twin passes the owner gate and
-            // fails the commit lookup (400), which is still a Not403 twin.
+            // fails the commit lookup (the seeded placeholder disk_path makes
+            // it a 500 today, a real on-disk repo would make it 400), which is
+            // still a Not403 twin.
             body: Some(r#"{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branch":"main"}"#),
             needs: NO_ENTITY,
             reach: Reach::None,

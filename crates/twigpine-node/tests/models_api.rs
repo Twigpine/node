@@ -9,19 +9,13 @@
 mod support;
 
 use serde_json::{json, Value};
-use sha2::Digest;
+use support::bounded_client;
 use support::signing::signed_request;
 
+use twigpine_core::cid::sha256_hex;
 use twigpine_core::http_sig::sign_request;
 use twigpine_core::identity::Keypair;
 use twigpine_node::test_harness::{spawn_node, TestNode};
-
-fn bounded_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("client builds")
-}
 
 fn sessions_path(owner: &str, repo: &str) -> String {
     format!("/api/v1/repos/{owner}/{repo}/models/sessions")
@@ -330,7 +324,7 @@ async fn put_block_without_session_header_unauthorized(pool: sqlx::PgPool) {
     let client = bounded_client();
     let owner_did = Keypair::generate().did().to_string();
     node.seed_repo(&owner_did, "model", true).await;
-    let sha = hex::encode(sha2::Sha256::digest(b"block"));
+    let sha = sha256_hex(b"block");
 
     let resp = put_block(
         &client,
@@ -356,7 +350,7 @@ async fn put_block_bogus_session_not_found(pool: sqlx::PgPool) {
     let owner_did = Keypair::generate().did().to_string();
     node.seed_repo(&owner_did, "model", true).await;
     let body = b"block".to_vec();
-    let sha = hex::encode(sha2::Sha256::digest(&body));
+    let sha = sha256_hex(&body);
 
     let resp = put_block(
         &client,
@@ -384,7 +378,7 @@ async fn put_block_session_for_other_repo_not_found(pool: sqlx::PgPool) {
     node.seed_repo(&owner_did, "model-b", true).await;
     let session_id = seed_open_session(&node, &repo_a, &owner_did).await;
     let body = b"block".to_vec();
-    let sha = hex::encode(sha2::Sha256::digest(&body));
+    let sha = sha256_hex(&body);
 
     let resp = put_block(
         &client,
@@ -410,21 +404,16 @@ async fn put_block_expired_session_not_found(pool: sqlx::PgPool) {
     let owner_did = Keypair::generate().did().to_string();
     let repo_id = node.seed_repo(&owner_did, "model", true).await;
     let session_id = "e".repeat(64);
-    sqlx::query(
-        "INSERT INTO model_upload_sessions
-             (id, owner_did, repo_id, created_at, expires_at, bytes_received, state)
-         VALUES ($1,$2,$3,$4,$5,0,'open')",
-    )
-    .bind(&session_id)
-    .bind(&owner_did)
-    .bind(&repo_id)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
-    .execute(&pool)
-    .await
-    .expect("seed expired session");
+    node.seed_model_session(&repo_id, &session_id, &owner_did)
+        .await;
+    sqlx::query("UPDATE model_upload_sessions SET expires_at = $1 WHERE id = $2")
+        .bind((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("backdate session expiry");
     let body = b"block".to_vec();
-    let sha = hex::encode(sha2::Sha256::digest(&body));
+    let sha = sha256_hex(&body);
 
     let resp = put_block(
         &client,
@@ -441,10 +430,6 @@ async fn put_block_expired_session_not_found(pool: sqlx::PgPool) {
     node.shutdown().await;
 }
 
-/// Happy path: a block whose body hashes to the id in the path is stored,
-/// reported with the session's running byte count and `duplicate:false`;
-/// resending it reports `duplicate:true`; a body that does not match the
-/// named id is refused with 400.
 #[sqlx::test]
 async fn put_block_happy_path_duplicate_and_digest_mismatch(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
@@ -454,7 +439,7 @@ async fn put_block_happy_path_duplicate_and_digest_mismatch(pool: sqlx::PgPool) 
     let session_id = seed_open_session(&node, &repo_id, &owner_did).await;
 
     let body = b"the quick brown fox".to_vec();
-    let sha = hex::encode(sha2::Sha256::digest(&body));
+    let sha = sha256_hex(&body);
     let resp = put_block(
         &client,
         &node.base_url,
@@ -725,6 +710,75 @@ async fn release_get_published_unknown_and_private(pool: sqlx::PgPool) {
     .await
     .expect("request sends");
     assert_eq!(resp.status().as_u16(), 404);
+
+    node.shutdown().await;
+}
+
+/// The reconstruction GET and the claims POST hide a repo that is not fully
+/// public: every caller class gets the same 404, none reach the store or the
+/// commit lookup. The deny sweep cannot drive the hostile-only legs for the
+/// reconstruction route, so they live here.
+#[sqlx::test]
+async fn reconstruction_and_claims_deny_on_private_repo(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let stranger = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    node.seed_repo(&owner_did, "model", false).await;
+    let commit = "c".repeat(40);
+    let rec_path = format!(
+        "{}/reconstruction",
+        release_path(&owner_did, "model", &commit)
+    );
+
+    for (label, req) in [
+        (
+            "anon GET reconstruction",
+            client.get(format!("{}{}", node.base_url, rec_path)),
+        ),
+        (
+            "stranger GET reconstruction",
+            signed_request(
+                &client,
+                reqwest::Method::GET,
+                &node.base_url,
+                &rec_path,
+                Vec::new(),
+                &stranger,
+            ),
+        ),
+        (
+            "owner GET reconstruction",
+            signed_request(
+                &client,
+                reqwest::Method::GET,
+                &node.base_url,
+                &rec_path,
+                Vec::new(),
+                &owner,
+            ),
+        ),
+        (
+            "stranger POST claims",
+            signed_request(
+                &client,
+                reqwest::Method::POST,
+                &node.base_url,
+                &claims_path(&owner_did, "model"),
+                serde_json::to_vec(&serde_json::json!({
+                    "commit": commit,
+                    "branch": "main",
+                }))
+                .expect("claim body"),
+                &stranger,
+            )
+            .header("content-type", "application/json"),
+        ),
+    ] {
+        let resp = req.send().await.expect("request sends");
+        assert_eq!(resp.status().as_u16(), 404, "{label}");
+    }
 
     node.shutdown().await;
 }

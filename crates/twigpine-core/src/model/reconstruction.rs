@@ -182,7 +182,13 @@ impl DedupIndex {
     }
 
     pub fn add(&mut self, rec: &Reconstruction) {
-        for block in &rec.blocks {
+        self.add_block_entries(&rec.blocks);
+    }
+
+    /// Index only `entries`: callers packing several files can add each
+    /// file's fresh block table instead of re-scanning every prior entry.
+    pub fn add_block_entries(&mut self, entries: &[BlockEntry]) {
+        for block in entries {
             for (i, chunk) in block.chunks.iter().enumerate() {
                 // First writer wins: two priors carrying the same chunk are
                 // interchangeable, so keep the earliest.

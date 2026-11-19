@@ -3,6 +3,7 @@
 //! then mark the release published (and pin the hidden ref). Rejection frees
 //! the quota reservation and drops the block refs.
 
+use futures::StreamExt;
 use sha2::Digest;
 use std::io::Write;
 use twigpine_core::model::manifest::{detect_format, StorageKind};
@@ -34,7 +35,7 @@ impl Write for VerifySink {
 /// Verify one release end to end. Idempotent: a release no longer in
 /// `verifying` returns immediately.
 pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), AppError> {
-    let Some(release) = super::release_by_id(&state.db, release_id).await? else {
+    let Some(release) = state.db.model_release_by_id(release_id).await? else {
         return Ok(());
     };
     if release.state != "verifying" {
@@ -68,7 +69,7 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                 .await;
         }
     };
-    if super::manifest_sha256(&manifest_bytes) != release.manifest_sha256 {
+    if twigpine_core::cid::sha256_hex(&manifest_bytes) != release.manifest_sha256 {
         return reject_release(state, release_id, "manifest digest changed since claim").await;
     }
 
@@ -102,10 +103,12 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
         }
     };
 
+    let rec_by_path: std::collections::HashMap<&str, _> =
+        rec.files.iter().map(|f| (f.path.as_str(), f)).collect();
     for file in &manifest.files {
         match file.storage {
             StorageKind::Chunked => {
-                let Some(entry) = rec.files.iter().find(|f| f.path == file.path).cloned() else {
+                let Some(&entry) = rec_by_path.get(file.path.as_str()) else {
                     return reject_release(
                         state,
                         release_id,
@@ -126,7 +129,7 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                 // backend. Blocks were hash-verified at write, so the
                 // whole-file digest is the check that matters here.
                 let slices = match twigpine_core::model::reconstruction::map_file_range(
-                    &entry, &rec, 0, file.size,
+                    entry, &rec, 0, file.size,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -142,15 +145,22 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                     hasher: sha2::Sha256::new(),
                     head: Vec::new(),
                 };
-                for slice in &slices {
-                    let bytes = match super::read_range(
-                        &store,
-                        &slice.block,
-                        slice.offset,
-                        slice.len,
-                    )
-                    .await
-                    {
+                // Ordered prefetch: `buffered` preserves order while
+                // overlapping the store's per-slice round trips.
+                let jobs = slices
+                    .iter()
+                    .map(|s| (s.block.clone(), s.offset, s.len))
+                    .collect::<Vec<_>>();
+                let fetched =
+                    futures::stream::iter(jobs.into_iter().map(|(block, offset, len)| {
+                        let store = store.clone();
+                        async move { super::read_range(&store, &block, offset, len).await }
+                    }))
+                    .buffered(4)
+                    .collect::<Vec<_>>()
+                    .await;
+                for bytes in fetched {
+                    let bytes = match bytes {
                         Ok(b) => b,
                         Err(e) => {
                             return reject_release(
@@ -197,7 +207,7 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                 .await
                 {
                     Ok(Some(bytes)) => {
-                        let got = hex::encode(sha2::Sha256::digest(&bytes));
+                        let got = twigpine_core::cid::sha256_hex(&bytes);
                         if got != file.sha256 || bytes.len() as u64 != file.size {
                             return reject_release(
                                 state,

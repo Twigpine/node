@@ -48,14 +48,6 @@ fn require_fully_public(record: &RepoRecord, rules: &[VisibilityRule]) -> Result
     Ok(())
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct OpenSessionBody {
-    /// Optional commit sha of the declared parent release. Informational at
-    /// open time; the claim re-anchors the parent through the manifest.
-    #[serde(default)]
-    pub parent_release: Option<String>,
-}
-
 /// POST `/api/v1/repos/{owner}/{repo}/models/sessions` — open an upload
 /// session. Owner-only (a session writes bytes the owner is billed for) on a
 /// fully public repo.
@@ -63,20 +55,17 @@ pub async fn open_model_session(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
     Extension(auth): Extension<AuthenticatedDid>,
-    _body: Option<Json<OpenSessionBody>>,
+    _body: Option<Json<serde_json::Value>>,
 ) -> Result<impl IntoResponse> {
     hosting_enabled(&state)?;
     let caller = &auth.0;
     let (record, rules) = authorize_repo_read(&state, &owner, &name, Some(caller), "/").await?;
     require_repo_owner(&record, caller)?;
     require_fully_public(&record, &rules)?;
-    let session = models::open_session(
-        &state.db,
-        caller,
-        &record.id,
-        state.config.model_session_ttl_secs,
-    )
-    .await?;
+    let session = state
+        .db
+        .model_open_session(caller, &record.id, state.config.model_session_ttl_secs)
+        .await?;
     Ok((
         axum::http::StatusCode::CREATED,
         Json(json!({
@@ -97,7 +86,9 @@ pub async fn get_model_session(
     let caller = &auth.0;
     let (record, _rules) = authorize_repo_read(&state, &owner, &name, Some(caller), "/").await?;
     require_repo_owner(&record, caller)?;
-    let session = models::load_session(&state.db, &id)
+    let session = state
+        .db
+        .model_load_session(&id)
         .await?
         .filter(|s| s.repo_id == record.id)
         .ok_or_else(|| AppError::NotFound("model upload session not found".into()))?;
@@ -130,8 +121,8 @@ pub async fn put_model_block(
             "a model block PUT requires the session header".into(),
         ));
     };
-    let pool = &state.db;
-    let Some(session) = models::load_session(pool, &session_id).await? else {
+    let db = &state.db;
+    let Some(session) = db.model_load_session(&session_id).await? else {
         return Err(AppError::NotFound("model upload session not found".into()));
     };
     // authorize_repo_read 404s a repo the session owner can no longer read;
@@ -168,19 +159,20 @@ pub async fn put_model_block(
     // node-wide quota, and it slides the session expiry in the same write.
     let session_cap = state.config.effective_model_max_session_bytes() as i64;
     let node_cap = state.config.model_node_quota_bytes as i64;
-    let Some(_) = models::admit_bytes(
-        pool,
-        &session.id,
-        declared as i64,
-        state.config.model_session_ttl_secs,
-        session_cap,
-        node_cap,
-    )
-    .await?
+    let Some(_) = db
+        .model_admit_bytes(
+            &session.id,
+            declared as i64,
+            state.config.model_session_ttl_secs,
+            session_cap,
+            node_cap,
+        )
+        .await?
     else {
         // Not admitted: re-check whether the session died (404 hides the
         // session) or a cap refused (named quota).
-        let session = models::load_session(pool, &session_id)
+        let session = db
+            .model_load_session(&session_id)
             .await?
             .filter(|s| s.state == "open" && s.expires_at > models::ts_now());
         return match session {
@@ -197,49 +189,48 @@ pub async fn put_model_block(
         .into_body()
         .into_data_stream()
         .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
-    let outcome = store
+    if let Err(e) = store
         .put_verified(&block_id, Box::pin(stream), models::MAX_BLOCK_BYTES)
-        .await;
-    let outcome = match outcome {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = models::refund_bytes(pool, &session.id, declared as i64).await;
-            return Err(match e {
-                BlockStoreError::DigestMismatch => {
-                    AppError::BadRequest(format!("block body does not hash to the named id {sha}"))
-                }
-                BlockStoreError::TooLarge(cap) => {
-                    AppError::BadRequest(format!("block exceeds the {cap}-byte limit"))
-                }
-                BlockStoreError::Unknown => AppError::Conflict(
-                    "the write's outcome is unknown; check the object before retrying".into(),
-                ),
-                other => AppError::Internal(anyhow::anyhow!("block store write failed: {other}")),
-            });
-        }
-    };
-    let _ = outcome; // Stored and AlreadyPresent both leave the bytes stored.
+        .await
+    {
+        let _ = db.model_refund_bytes(&session.id, declared as i64).await;
+        return Err(match e {
+            BlockStoreError::DigestMismatch => {
+                AppError::BadRequest(format!("block body does not hash to the named id {sha}"))
+            }
+            BlockStoreError::TooLarge(cap) => {
+                AppError::BadRequest(format!("block exceeds the {cap}-byte limit"))
+            }
+            BlockStoreError::Unknown => AppError::Conflict(
+                "the write's outcome is unknown; check the object before retrying".into(),
+            ),
+            other => AppError::Internal(anyhow::anyhow!("block store write failed: {other}")),
+        });
+    }
+    // Stored and AlreadyPresent both leave the bytes stored.
 
     // Past this point the object exists; a bookkeeping failure must refund
     // the admission or the session's charge leaks until it expires.
     let size = match store.size(&block_id).await {
         Ok(s) => s.unwrap_or(declared),
         Err(e) => {
-            let _ = models::refund_bytes(pool, &session.id, declared as i64).await;
+            let _ = db.model_refund_bytes(&session.id, declared as i64).await;
             return Err(AppError::Internal(anyhow::anyhow!(
                 "block size lookup failed: {e}"
             )));
         }
     };
-    let duplicate = match models::record_block(pool, &session.id, &sha, size, declared as i64).await
+    let duplicate = match db
+        .model_record_block(&session.id, &sha, size, declared as i64)
+        .await
     {
         Ok(d) => d,
         Err(e) => {
-            let _ = models::refund_bytes(pool, &session.id, declared as i64).await;
-            return Err(e);
+            let _ = db.model_refund_bytes(&session.id, declared as i64).await;
+            return Err(e.into());
         }
     };
-    let fresh = models::load_session(pool, &session.id).await?;
+    let fresh = db.model_load_session(&session.id).await?;
     Ok(Json(json!({
         "received": fresh.as_ref().map(|s| s.bytes_received).unwrap_or(0),
         "duplicate": duplicate,
@@ -327,7 +318,9 @@ pub async fn get_model_release(
     let caller = auth.map(|Extension(AuthenticatedDid(d))| d);
     let (record, _rules) =
         authorize_repo_read(&state, &owner, &name, caller.as_deref(), "/").await?;
-    let release = models::release_by_commit(&state.db, &record.id, &commit)
+    let release = state
+        .db
+        .model_release_by_commit(&record.id, &commit)
         .await?
         .ok_or_else(|| AppError::NotFound("model release not found".into()))?;
     Ok(Json(release_view(&release)))
@@ -350,25 +343,30 @@ pub async fn get_model_reconstruction(
     if !record.is_public || !rules.is_empty() {
         return Err(AppError::NotFound("model release not found".into()));
     }
-    let release = models::release_by_commit(&state.db, &record.id, &commit)
+    let release = state
+        .db
+        .model_release_by_commit(&record.id, &commit)
         .await?
         .filter(|r| r.state == "published")
         .ok_or_else(|| AppError::NotFound("model release not found".into()))?;
-    let (manifest_bytes, manifest) = models::claim::read_verified_manifest(
-        &state.git_bin,
-        &std::path::PathBuf::from(&record.disk_path),
-        &release.commit_sha,
-        &record.owner_did,
-    )
-    .await?;
-    let _ = manifest_bytes;
-    let Some(rec_ref) = &manifest.reconstruction else {
+    // The stored reconstruction ref was bound when the release verified;
+    // re-reading and re-verifying the manifest per GET is wasted work.
+    let Some(sha) = state.db.model_reconstruction_sha(release.id).await? else {
         return Err(AppError::NotFound(
             "release has no reconstruction object".into(),
         ));
     };
     let store = state.block_store.clone().expect("checked above");
-    let bytes = models::read_block(&store, &rec_ref.sha256, rec_ref.size)
+    let size = store
+        .size(
+            &BlockId::parse(&sha)
+                .map_err(|_| AppError::NotFound("reconstruction object not stored".into()))?,
+        )
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| AppError::NotFound("reconstruction object not stored".into()))?;
+    let bytes = models::read_block(&store, &sha, size)
         .await
         .map_err(|_| AppError::NotFound("reconstruction object not stored".into()))?;
     Ok((
