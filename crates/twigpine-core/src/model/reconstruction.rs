@@ -204,7 +204,7 @@ fn idx_insert(map: &mut HashMap<String, (String, u32)>, k: String, v: (String, u
 /// queue the bytes for upload.
 fn seal_pending(
     pending: &mut Vec<crate::model::chunking::Chunk>,
-    terms: &mut Vec<Term>,
+    terms: &mut [Term],
     block_entries: &mut Vec<BlockEntry>,
     new_blocks: &mut Vec<Block>,
 ) {
@@ -408,8 +408,10 @@ pub fn map_file_range(
             continue;
         }
         let offsets = chunk_offsets(block);
-        for i in term.chunk_start as usize..term.chunk_end as usize {
-            let chunk = &block.chunks[i];
+        for (i, chunk) in block.chunks[term.chunk_start as usize..term.chunk_end as usize]
+            .iter()
+            .enumerate()
+        {
             // This chunk covers file bytes [chunk_lo, chunk_hi).
             let chunk_lo = cursor;
             let chunk_hi = cursor + chunk.len;
@@ -417,7 +419,7 @@ pub fn map_file_range(
             let s = start.max(chunk_lo);
             let e = end_exclusive.min(chunk_hi);
             if s < e {
-                let off = offsets[i] + (s - chunk_lo);
+                let off = offsets[term.chunk_start as usize + i] + (s - chunk_lo);
                 match out.last_mut() {
                     // Adjacent slices in the same block merge into one read.
                     Some(slice) if slice.block == term.block && slice.offset + slice.len == off => {
@@ -437,6 +439,10 @@ pub fn map_file_range(
     Ok(out)
 }
 
+/// A range read over a stored block: `fetch(block_id, offset, len)` returns
+/// exactly `len` bytes starting at `offset`.
+pub type BlockRangeFetch<'a> = dyn FnMut(&str, u64, u64) -> std::io::Result<Vec<u8>> + 'a;
+
 /// Rebuild a file's bytes from its terms, verifying every chunk's hash and
 /// the whole-file digest. `fetch` is a range read returning exactly `len`
 /// bytes starting at `offset` inside the named block (a BlockStore range
@@ -446,7 +452,7 @@ pub fn map_file_range(
 pub fn rebuild_file<W: Write>(
     file: &FileEntry,
     rec: &Reconstruction,
-    fetch: &mut dyn FnMut(&str, u64, u64) -> std::io::Result<Vec<u8>>,
+    fetch: &mut BlockRangeFetch<'_>,
     out: &mut W,
 ) -> Result<u64, ModelError> {
     use sha2::Digest;
