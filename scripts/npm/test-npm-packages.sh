@@ -156,6 +156,22 @@ if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-nowin" --out-dir "
   ok "a rebuild without Windows removes the earlier Windows payload"
 else bad "a rebuild without Windows removes the earlier Windows payload"; fi
 
+# A checksum-valid archive missing a program: the build fails and leaves no
+# extracted archive behind in the temporary directory.
+cp -R "$ART" "$W/art-noprog"
+pkg="twigpine-node-$VERSION-x86_64-unknown-linux-musl"
+rm -rf "$W/stage-noprog" && mkdir -p "$W/stage-noprog/$pkg"
+fake_program "$W/stage-noprog/$pkg/twigpine" twigpine
+COPYFILE_DISABLE=1 tar -czf "$W/art-noprog/$pkg.tar.gz" -C "$W/stage-noprog" "$pkg"
+(cd "$W/art-noprog" && printf '%s  %s\n' "$(sha "$pkg.tar.gz")" "$pkg.tar.gz" > "$pkg.tar.gz.sha256")
+mkdir -p "$W/tmp-noprog"
+if TMPDIR="$W/tmp-noprog" node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-noprog" \
+  --out-dir "$W/npm-noprog" > "$W/out" 2>&1; then
+  bad "a payload missing a program fails the build and cleans up"
+elif grep -q "does not contain git-remote-twigpine" "$W/out" && [ -z "$(ls -A "$W/tmp-noprog")" ]; then
+  ok "a payload missing a program fails the build and cleans up"
+else bad "a payload missing a program fails the build and cleans up"; fi
+
 # Called through a symlinked path (macOS temp and checkout paths often are).
 ln -s "$ROOT" "$W/linked-root"
 if node "$W/linked-root/scripts/npm/build-platform-packages.mjs" --version "$VERSION" \
@@ -192,10 +208,18 @@ check "the program's exit status comes through" test "$status" = 7
 out="$(printf 'capabilities\n\n' | FAKE_STDIN=1 node "$INSTALL/bin/git-remote-twigpine.js" origin twigpine://did:key:z/r 2>&1)"
 check "the helper gets git's stdin and answers on stdout" \
   test "$out" = "$(printf 'git-remote-twigpine origin twigpine://did:key:z/r\ncapabilities')"
-# Through `sh -c ...; echo $?`, so the signal is observed as a status and the
-# test's own shell does not report a killed job.
-status="$(sh -c 'FAKE_SIGNAL=TERM node "$1" > /dev/null 2>&1; echo $?' _ "$INSTALL/bin/twigpine.js" 2>/dev/null)"
-check "a program killed by a signal ends the launcher the same way" test "$status" = 143
+# How the launcher ended, as Node's spawnSync reports it ("status signal"),
+# when the program kills itself with $1: a signal and an exit status of
+# 128 + n look the same to a shell, not to a parent process. No core files.
+launcher_end() {
+  (ulimit -c 0 2>/dev/null || true
+   FAKE_SIGNAL="$1" node -e 'const r = require("child_process").spawnSync(process.execPath, [process.argv[1]], { stdio: "ignore" }); console.log(`${r.status} ${r.signal}`);' "$INSTALL/bin/twigpine.js")
+}
+check "a program killed by a signal ends the launcher by that signal" test "$(launcher_end TERM)" = "null SIGTERM"
+check "a program that crashes (SIGSEGV) ends the launcher by SIGSEGV" test "$(launcher_end SEGV)" = "null SIGSEGV"
+check "a program that exits with 143 ends the launcher with 143, not a signal" \
+  test "$(FAKE_EXIT=143 node -e 'const r = require("child_process").spawnSync(process.execPath, [process.argv[1]], { stdio: "ignore" }); console.log(`${r.status} ${r.signal}`);' "$INSTALL/bin/twigpine.js")" = "143 null"
+# Through `sh -c ...; echo $?`, so the status is observed as a shell sees it.
 status="$(sh -c 'FAKE_SIGNAL=PIPE node "$1" > /dev/null 2>&1; echo $?' _ "$INSTALL/bin/twigpine.js" 2>/dev/null)"
 check "a program killed by SIGPIPE ends the launcher with 141, as a shell expects" test "$status" = 141
 

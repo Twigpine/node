@@ -33,10 +33,22 @@ const FORWARDED = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 // outright (or throws, for SIGHUP).
 const FORWARD_TO_PROGRAM = process.platform !== 'win32';
 
-// Signals the launcher can re-raise on itself to end the same way. Node
-// ignores SIGPIPE and turns SIGUSR1 into its debugger, so for any other
+// Signals the launcher can re-raise on itself to end the same way, including
+// a crashing program's, so a parent sees the crash and not an exit status.
+// Node ignores SIGPIPE and turns SIGUSR1 into its debugger, so for any other
 // signal the launcher exits with the shell's 128 + number instead.
-const RERAISED = new Set(['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT', 'SIGABRT', 'SIGKILL']);
+const RERAISED = new Set([
+  'SIGINT',
+  'SIGTERM',
+  'SIGHUP',
+  'SIGQUIT',
+  'SIGABRT',
+  'SIGKILL',
+  'SIGSEGV',
+  'SIGBUS',
+  'SIGILL',
+  'SIGFPE',
+]);
 
 // The npm name this wrapper was published under, read from its own manifest
 // so the name lives in one place.

@@ -66,9 +66,12 @@ export const MATRIX = [
 // The programs a payload carries. The daemon is not part of the npm package.
 const PROGRAMS = ['twigpine', 'git-remote-twigpine'];
 
+// Thrown, not process.exit(): the `finally` blocks that remove extracted
+// archives from the temporary directory still run on the way out.
+class BuildFailure extends Error {}
+
 function fail(message) {
-  console.error(`[build-platform-packages] ${message}`);
-  process.exit(1);
+  throw new BuildFailure(message);
 }
 
 function parseArgs(argv) {
@@ -326,5 +329,11 @@ function main() {
 // Run when executed, not when imported. Both sides through realpath: macOS
 // reaches temp and checkout paths through symlinks.
 if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])) {
-  main();
+  try {
+    main();
+  } catch (error) {
+    if (!(error instanceof BuildFailure)) throw error;
+    console.error(`[build-platform-packages] ${error.message}`);
+    process.exitCode = 1;
+  }
 }
