@@ -134,6 +134,10 @@ pub async fn put_model_block(
     // indistinguishable from a missing session. The owner always reads their
     // own repo, so the fully-public check is what stops bytes landing on a
     // repo that turned private or gained visibility rules mid-upload.
+    // mirror-rows-handled: sessions can only bind canonical repos (open
+    // refuses slash ids); the id check below already makes a mirror row a
+    // mismatch, and the explicit slash guard keeps the publicity pair from
+    // being trusted on one.
     let (record, rules) =
         authorize_repo_read(&state, &owner, &name, Some(&session.owner_did), "/").await?;
     if session.repo_id != record.id
@@ -141,6 +145,7 @@ pub async fn put_model_block(
         || session.expires_at <= models::ts_now()
         || !record.is_public
         || !rules.is_empty()
+        || record.id.contains('/')
     {
         return Err(AppError::NotFound("model upload session not found".into()));
     }
@@ -353,9 +358,12 @@ pub async fn get_model_reconstruction(
 ) -> Result<impl IntoResponse> {
     hosting_enabled(&state)?;
     let caller = auth.map(|Extension(AuthenticatedDid(d))| d);
+    // mirror-rows-handled: a mirror row (slash-form id) can never carry a
+    // claimed release, and its publicity pair is vacuous, so it takes the
+    // same 404 as a private repo.
     let (record, rules) =
         authorize_repo_read(&state, &owner, &name, caller.as_deref(), "/").await?;
-    if !record.is_public || !rules.is_empty() {
+    if !record.is_public || !rules.is_empty() || record.id.contains('/') {
         return Err(AppError::NotFound("model release not found".into()));
     }
     let release = state

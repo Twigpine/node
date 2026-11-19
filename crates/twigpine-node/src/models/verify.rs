@@ -49,6 +49,8 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
         .get_repo_by_id(&release.repo_id)
         .await?
         .ok_or_else(|| AppError::NotFound("repo gone".into()))?;
+    // mirror-rows-handled: a slash-form id fails closed in the condition
+    // below; the vacuous pair never admits a mirror for publishing.
     let rules = state.db.list_visibility_rules(&record.id).await?;
     // A mirror row (slash-form id) has a vacuous publicity pair, so it can
     // never prove full publicity here either.
