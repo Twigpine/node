@@ -3012,7 +3012,9 @@ pub async fn git_receive_pack(
     // rather than carried as a duration that silently ages: a slow push is
     // cut at the deadline, so it cannot pin its lock-pool slot for the sum
     // of every per-phase bound (#282).
-    let lock_hold_deadline = guard.lock_hold_deadline();
+    let lock_hold_deadline = guard
+        .lock_hold_deadline()
+        .expect("acquire_write stamps a lock-hold deadline");
     let git_service_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     // `timeout(0, drive_git_child)` would still spawn git on its first poll,
     // so an expired deadline sheds here rather than racing inside the bound.

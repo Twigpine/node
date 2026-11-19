@@ -63,7 +63,7 @@ pub async fn create_issue(
 
     let guard = state
         .repo_store
-        .acquire_write(&record.owner_did, &record.name)
+        .acquire_write_without_hold_deadline(&record.owner_did, &record.name)
         .await
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
 
@@ -425,7 +425,7 @@ pub async fn close_issue(
     // 503. Calling .to_string() first destroys that and reports both as a 500.
     let guard = state
         .repo_store
-        .acquire_write(&record.owner_did, &record.name)
+        .acquire_write_without_hold_deadline(&record.owner_did, &record.name)
         .await
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
     let disk_path = guard.path().to_path_buf();
@@ -1603,6 +1603,56 @@ mod lock_pool_shed_tests {
         );
 
         server.abort();
+    }
+
+    /// #282: issue writes never consult the hold deadline, so create takes its
+    /// guard without one (`acquire_write_without_hold_deadline`). Under a
+    /// zero-length operator timeout the create still publishes and keeps its
+    /// ref; a stamped deadline would only roll the finished write back at
+    /// release and 5xx the caller.
+    #[sqlx::test]
+    async fn create_issue_without_hold_deadline_publishes(pool: PgPool) {
+        use crate::git::repo_store::tests as rs_tests;
+
+        let mock = rs_tests::S3Mock::start().await;
+        let owner = "did:key:zISSUENOHOLDAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "nohold-create";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let mut seeded = seed_repo(owner, repo_name);
+        let live = crate::git::repo_store::validated_repo_disk_path(disk.path(), owner, repo_name)
+            .expect("repo path");
+        seeded.disk_path = live.to_string_lossy().to_string();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+            rs_tests::mock_tigris(&mock),
+        )
+        .with_lock_hold_timeout(std::time::Duration::ZERO);
+
+        let res = create_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string())),
+            Json(CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        let (status, Json(issue)) = res.expect("a create with no hold deadline must publish");
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            git_issues::get_issue(&live, &issue.id)
+                .expect("get_issue")
+                .is_some(),
+            "the issue ref must survive on disk, not be rolled back"
+        );
+
+        mock.shutdown();
     }
 
     /// The compensating rewrite after a refused publish must land on the ref the

@@ -403,9 +403,12 @@ impl Worker {
         // lock-hold deadline like every later phase: an expired deadline
         // starts no query, and a slow read cannot pin the lock and its
         // lock-pool session past the deadline (#282).
-        let Some(recheck_bound) =
-            crate::git::repo_store::hold_bounded(guard.lock_hold_deadline(), STALE_RECHECK_TIMEOUT)
-        else {
+        let Some(recheck_bound) = crate::git::repo_store::hold_bounded(
+            guard
+                .lock_hold_deadline()
+                .expect("acquire_write stamps a lock-hold deadline"),
+            STALE_RECHECK_TIMEOUT,
+        ) else {
             let _ = guard.release(false).await;
             anyhow::bail!(
                 "upstream mirror fetch: the lock-hold deadline expired before the stale-target recheck"
@@ -455,7 +458,9 @@ impl Worker {
         // slow push (#282). `run_fetch` clamps each phase's own bound
         // against this deadline internally.
         let fetch_timeout = Duration::from_secs(self.config.upstream_mirror_fetch_timeout_secs);
-        let lock_hold_deadline = guard.lock_hold_deadline();
+        let lock_hold_deadline = guard
+            .lock_hold_deadline()
+            .expect("acquire_write stamps a lock-hold deadline");
         let fetch = tokio::task::spawn_blocking(move || {
             run_fetch(
                 &git_bin,

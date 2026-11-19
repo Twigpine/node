@@ -508,6 +508,28 @@ impl RepoStore {
     /// and drop the legacy one a release later; that's optional given the
     /// accepted-window path.
     pub async fn acquire_write(&self, owner_did: &str, repo_name: &str) -> Result<RepoWriteGuard> {
+        self.acquire_write_inner(owner_did, repo_name, Some(self.lock_hold_timeout))
+            .await
+    }
+
+    /// For writers whose under-lock work never consults the hold deadline
+    /// (merge, issue create/close). Stamping one would only turn a slow but
+    /// completed write into a refused publish and a rollback at release, while
+    /// their unbounded git already holds the lock past it.
+    pub async fn acquire_write_without_hold_deadline(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<RepoWriteGuard> {
+        self.acquire_write_inner(owner_did, repo_name, None).await
+    }
+
+    async fn acquire_write_inner(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        hold_timeout: Option<Duration>,
+    ) -> Result<RepoWriteGuard> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
@@ -666,7 +688,7 @@ impl RepoStore {
             conn: Some(lock_conn),
             tigris: self.tigris.clone(),
             lock_held_transfer_timeout: self.lock_held_transfer_timeout,
-            lock_hold_deadline: Instant::now() + self.lock_hold_timeout,
+            lock_hold_deadline: hold_timeout.map(|t| Instant::now() + t),
             // Overwritten by the refresh below with the generation actually
             // observed under the lock. Only reachable unset when no backend is
             // configured, in which case `release` publishes nothing at all.
@@ -2100,8 +2122,9 @@ pub struct RepoWriteGuard {
     /// lock is held consumes `min(its own bound, the deadline's remaining
     /// budget)` through `hold_bounded`, so one deadline covers refresh, the
     /// caller's under-lock work, and release rather than letting each spend a
-    /// full budget of its own.
-    lock_hold_deadline: Instant,
+    /// full budget of its own. `None` carries no deadline: every phase keeps
+    /// its own bound, exactly as before the deadline existed.
+    lock_hold_deadline: Option<Instant>,
     /// The generation of the stored archive as observed by the HEAD inside
     /// `acquire_write`, under the lock. `release` publishes fenced on it, so a
     /// PUT abandoned by an earlier writer's timeout cannot land on top of a
@@ -2160,14 +2183,18 @@ impl RepoWriteGuard {
     /// guard in shared state (the receive-pack reaper bundle) can clamp every
     /// under-lock phase against the same instant instead of a duration that
     /// silently ages.
-    pub(crate) fn lock_hold_deadline(&self) -> Instant {
+    pub(crate) fn lock_hold_deadline(&self) -> Option<Instant> {
         self.lock_hold_deadline
     }
 
     /// `own` clamped to what this guard's lock-hold deadline still funds; see
-    /// the module-level `hold_bounded` for the rule a `None` carries.
+    /// the module-level `hold_bounded` for the rule a `None` carries. A guard
+    /// with no deadline keeps each phase's own bound.
     fn hold_bounded(&self, own: Duration) -> Option<Duration> {
-        hold_bounded(self.lock_hold_deadline, own)
+        match self.lock_hold_deadline {
+            Some(d) => hold_bounded(d, own),
+            None => Some(own),
+        }
     }
 
     /// Backend pid of the session holding the lock. Test-only observable for the
@@ -4214,7 +4241,7 @@ pub(crate) mod tests {
             conn: Some(pool.acquire().await.expect("conn")),
             tigris: None,
             lock_held_transfer_timeout: Duration::from_secs(300),
-            lock_hold_deadline: Instant::now() + Duration::from_secs(600),
+            lock_hold_deadline: Some(Instant::now() + Duration::from_secs(600)),
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
@@ -4585,7 +4612,7 @@ pub(crate) mod tests {
             conn: Some(lock_pool.acquire().await.unwrap()),
             tigris: None,
             lock_held_transfer_timeout: Duration::from_secs(300),
-            lock_hold_deadline: Instant::now() + Duration::from_secs(600),
+            lock_hold_deadline: Some(Instant::now() + Duration::from_secs(600)),
             // No backend, so nothing is ever published and the fence is unread.
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
@@ -9425,7 +9452,7 @@ pub(crate) mod tests {
                 &endpoint,
             )),
             lock_held_transfer_timeout: Duration::from_secs(300),
-            lock_hold_deadline,
+            lock_hold_deadline: Some(lock_hold_deadline),
             publish_fence: UploadPrecondition::Unconditional,
             refresh_swap_authority: None,
             publish_stage: Arc::new(PublishStageCell::new()),
@@ -9496,6 +9523,53 @@ pub(crate) mod tests {
             puts > 0,
             "the publish must reach the store while the lock-hold deadline is live"
         );
+    }
+
+    /// #282: merge and issue writes never consult the hold deadline, so their
+    /// guards carry none (`acquire_write_without_hold_deadline`). Under a
+    /// zero-length operator timeout such a guard still refreshes and
+    /// publishes on each phase's own bound, while the same store's
+    /// `acquire_write` stamps the already-expired deadline and dies at the
+    /// under-lock refresh. The release-side refusal a stamped deadline would
+    /// deal a completed write is pinned by
+    /// `release_after_lock_hold_deadline_starts_no_publish`.
+    #[sqlx::test]
+    async fn write_without_hold_deadline_publishes_after_the_hold_expires(pool: PgPool) {
+        let mock = S3Mock::start().await;
+        let opts = (*pool.connect_options()).clone();
+        let repos = TempDir::new().unwrap();
+        let store = fenced_store(&mock, &opts, repos.path())
+            .await
+            .with_lock_hold_timeout(Duration::ZERO);
+        let owner = "did:key:z6MkNoHoldDeadline";
+
+        let guard = store
+            .acquire_write_without_hold_deadline(owner, "repo")
+            .await
+            .expect("acquire");
+        let _ = guard.path();
+        seed_bare_repo(&guard.local_path);
+        let outcome = guard.release(true).await;
+        assert_eq!(
+            outcome,
+            ReleaseOutcome::Released,
+            "a guard carrying no hold deadline must publish, got {outcome:?}"
+        );
+        assert!(
+            !mock.put_attempts().is_empty(),
+            "the publish must reach the store"
+        );
+
+        // Control: on the same store a guard that DOES stamp the zero
+        // deadline cannot even start its under-lock refresh, which is exactly
+        // why these writers take no deadline at all.
+        let refused = store.acquire_write(owner, "repo").await;
+        assert!(
+            refused.is_err(),
+            "a stamped-and-expired hold deadline must refuse the write"
+        );
+
+        mock.shutdown();
     }
 
     /// #282: the unlock is also a phase under the deadline. A release entered
