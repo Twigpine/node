@@ -158,6 +158,33 @@ fn old_command_name_notice() {
     }
 }
 
+/// The npm package was `@gitlawb/gl` and is `@twigpine/cli` now. A program
+/// installed by the old package says so once per run, on a terminal only:
+/// npm hides install-script output, and `npm update -g @gitlawb/gl` cannot
+/// move anyone to a package with another name.
+fn old_npm_package_notice() {
+    use std::io::IsTerminal;
+    let from_old_package = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .is_ok_and(|exe| installed_by_old_npm_package(&exe));
+    if from_old_package && std::io::stderr().is_terminal() {
+        eprintln!(
+            "note: on npm, @gitlawb/gl is now @twigpine/cli. To keep getting updates:\n\
+             \x20 npm uninstall -g @gitlawb/gl && npm install -g @twigpine/cli"
+        );
+    }
+}
+
+/// Whether `exe` lives inside an `@gitlawb/gl` npm install.
+fn installed_by_old_npm_package(exe: &std::path::Path) -> bool {
+    let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    parts.windows(3).any(|w| {
+        w[0] == std::ffi::OsStr::new("node_modules")
+            && w[1] == std::ffi::OsStr::new("@gitlawb")
+            && w[2] == std::ffi::OsStr::new("gl")
+    })
+}
+
 fn main() -> Result<()> {
     // Before the runtime starts its threads, and before anything reads a
     // setting: accept the names settings had before the rename.
@@ -176,6 +203,7 @@ async fn run() -> Result<()> {
         .init();
 
     old_command_name_notice();
+    old_npm_package_notice();
 
     let cli = Cli::parse();
     match cli.command {
@@ -208,5 +236,29 @@ async fn run() -> Result<()> {
         Commands::Bounty(args) => bounty::run(args).await,
         Commands::Ucan(args) => ucan_cmd::run(args).await,
         Commands::Whoami(args) => whoami::run(args).await,
+    }
+}
+
+#[cfg(test)]
+mod npm_package_notice_tests {
+    use super::installed_by_old_npm_package;
+    use std::path::Path;
+
+    #[test]
+    fn only_an_install_under_the_old_package_name() {
+        assert!(installed_by_old_npm_package(Path::new(
+            "/usr/local/lib/node_modules/@gitlawb/gl/bin/gl"
+        )));
+        assert!(installed_by_old_npm_package(Path::new(
+            "/home/a/.npm-global/lib/node_modules/@gitlawb/gl/bin/twigpine"
+        )));
+        for other in [
+            "/usr/local/lib/node_modules/@twigpine/cli/node_modules/@twigpine/cli-linux-x64/twigpine",
+            "/home/a/.local/bin/twigpine",
+            "/opt/gitlawb/gl/bin/gl",
+            "/usr/local/lib/node_modules/@gitlawb/glx/bin/gl",
+        ] {
+            assert!(!installed_by_old_npm_package(Path::new(other)), "{other}");
+        }
     }
 }

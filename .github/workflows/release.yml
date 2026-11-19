@@ -801,6 +801,113 @@ jobs:
             npm publish "npm/packages/$pkg" --provenance --access public --tag "$dist_tag"
           done
 
+  npm-publish-cli:
+    # @twigpine/cli: one package, a wrapper plus a platform version per target,
+    # no install script (docs/NPM_PACKAGING.md). Its own environment so its
+    # trusted publisher and approval are separate from the rest of the release.
+    # The @gitlawb/gl job above stays for one more release, as the bridge that
+    # points existing installs at this package, and is then removed.
+    name: Publish @twigpine/cli to npm
+    needs: [release-please, release-binaries]
+    if: >-
+      ${{ !cancelled() && (
+        (needs.release-please.outputs.release_created == 'true' && needs.release-binaries.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.npm_backfill_tag != '')
+      ) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC) + provenance
+    environment: npm-publish
+    steps:
+      # The packaging scripts and launchers come from this workflow's commit;
+      # only the programs come from the release. A backfill of a release cut
+      # before this job existed therefore still gets today's launchers.
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: rel
+        env:
+          DISPATCH_TAG: ${{ inputs.npm_backfill_tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
+
+      - name: Set up Node 24 + OIDC-capable npm
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24"
+      - name: Ensure npm supports trusted publishing
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.19.1
+          installed="$(npm --version)"
+          echo "npm installed: $installed"
+          if [ "$installed" != "11.19.1" ]; then
+            echo "::error::npm is not the pinned 11.19.1 (got: $installed)"
+            exit 1
+          fi
+
+      - name: Fetch release archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          ASSETS: ${{ steps.rel.outputs.assets }}
+        run: |
+          set -euo pipefail
+          mkdir -p _art
+          windows="twigpine-node-${VERSION}-x86_64-pc-windows-msvc.zip"
+          for archive in \
+            "twigpine-node-${VERSION}-aarch64-apple-darwin.tar.gz" \
+            "twigpine-node-${VERSION}-x86_64-apple-darwin.tar.gz" \
+            "twigpine-node-${VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+            "twigpine-node-${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            "$windows"; do
+            for file in "$archive" "$archive.sha256"; do
+              # By the asset id the resolver captured and uploader-checked, not
+              # by name: release assets are mutable, an id is not.
+              want="$(printf '%s' "$file" | base64 -w0)"
+              asset_id="$(printf '%s\n' "$ASSETS" | awk -v n="$want" '$1 == n {print $2; exit}')"
+              if [ -z "$asset_id" ]; then
+                # Windows is built best-effort (release-binaries); without it
+                # the package is published for the other platforms.
+                if [ "$archive" = "$windows" ]; then
+                  echo "::warning::release $TAG has no $file; publishing without Windows"
+                  rm -f "_art/$windows" "_art/$windows.sha256"
+                  continue 2
+                fi
+                echo "::error::release $TAG has no asset $file captured at resolve time"
+                exit 1
+              fi
+              gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+                -H 'Accept: application/octet-stream' > "_art/$file"
+            done
+          done
+
+      - name: Build packages
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/npm/build-platform-packages.mjs \
+            --version "$VERSION" --artifacts-dir _art --out-dir _npm \
+            --allow-missing win32-x64
+
+      - name: Publish @twigpine/cli
+        env:
+          # No token: npm exchanges this job's GitHub OIDC identity with the
+          # registry (trusted publishing).
+          TWIGPINE_NPM_PUBLISH_FLAGS: --provenance
+        run: |
+          set -euo pipefail
+          scripts/npm/publish-packages.sh _npm
+
   homebrew-bump:
     name: Bump Homebrew tap
     needs: [release-please, release-binaries]

@@ -1,37 +1,34 @@
 # npm distribution for the Twigpine CLI
 
-This directory packages the `gl` and `git-remote-gitlawb` binaries as the
-[`@gitlawb/gl`](https://www.npmjs.com/package/@gitlawb/gl) npm package.
-
-It uses the **optionalDependencies platform-package** pattern (the same one
-esbuild/swc/turbo use): the wrapper `@gitlawb/gl` declares four per-platform
-packages as `optionalDependencies`, each gated by `os`/`cpu`. npm installs only
-the one matching the host, and the wrapper's `postinstall` (`install.js`) copies
-the binary out of it into `bin/`. No binaries are downloaded at install time.
+Two packages are built from this directory. The full description, publishing
+rules and one-time setup are in [`docs/NPM_PACKAGING.md`](../docs/NPM_PACKAGING.md).
 
 ```text
-packages/
-  gl/                  @gitlawb/gl            wrapper (postinstall, bin shims)
-  gl-darwin-arm64/     @gitlawb/gl-darwin-arm64   aarch64-apple-darwin
-  gl-darwin-x64/       @gitlawb/gl-darwin-x64     x86_64-apple-darwin
-  gl-linux-arm64/      @gitlawb/gl-linux-arm64    aarch64-unknown-linux-musl
-  gl-linux-x64/        @gitlawb/gl-linux-x64      x86_64-unknown-linux-musl
+cli/                   @twigpine/cli   the package: launchers + manifest; the
+                                       release job adds one payload per platform
+packages/              @gitlawb/gl     the old package, published once more as a
+                                       bridge to @twigpine/cli, then removed
 ```
 
-## Publishing
+## `@twigpine/cli`
 
-Publishing is **automated** by `.github/workflows/release.yml` (the `npm-publish`
-job) on every release-please release. That job:
+One package, the layout Zero and esbuild use: a wrapper whose launchers run the
+program from a per-platform payload, published as versions of the same
+package (`X.Y.Z-<platform>-<arch>`) and pinned through `npm:` aliases. No
+install script. macOS and Linux (arm64, x64) and Windows (x64, also used on
+Windows on ARM).
 
-1. Downloads the four unix release tarballs from the `Twigpine/node` GitHub release.
-2. Lays `gl` + `git-remote-gitlawb` into each platform package.
-3. Rewrites every `package.json` `version` (and the wrapper's
-   `optionalDependencies` pins) to the release version.
-4. Publishes the four platform packages first, then the wrapper, with
-   `npm publish --provenance --access public`.
+`scripts/npm/build-platform-packages.mjs` builds the payloads and wrapper from
+the release archives, `scripts/npm/publish-packages.sh` publishes them, and
+`scripts/npm/test-npm-packages.sh` tests both and the launchers. The
+`npm-publish-cli` job in `.github/workflows/release.yml` runs them on every
+release. The `version` in `cli/package.json` is a placeholder; the release
+version comes from the tag.
 
-The committed `version` fields here are placeholders; the workflow is the single
-source of truth and always uses the release tag. There is no manual publish step.
+## `@gitlawb/gl` (being retired)
 
-Windows is intentionally not published to npm — the wrapper points Windows users
-at the curl/PowerShell installer instead.
+A wrapper whose `postinstall` (`packages/gl/install.js`) copied the programs
+out of four `@gitlawb/gl-<platform>` packages. npm links commands before
+`postinstall` runs, so `packages/gl/bin/` holds placeholders for npm to link,
+which `install.js` overwrites. The `npm-publish` job publishes it for one more
+release, after which it is deprecated and this directory and that job go.
