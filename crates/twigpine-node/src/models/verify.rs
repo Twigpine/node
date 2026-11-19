@@ -286,11 +286,15 @@ pub async fn reject_release(
 }
 
 /// Poll for `verifying` releases and verify them in order. Spawned once per
-/// node when model hosting is enabled.
+/// node when model hosting is enabled; exits on node shutdown.
 pub async fn run_verify_worker(state: AppState) {
+    let mut shutdown_rx = state.subscribe_shutdown();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = shutdown_rx.changed() => return,
+        }
         let ids = match state.db.model_verifying_ids(4).await {
             Ok(v) => v,
             Err(e) => {

@@ -68,11 +68,16 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepStats, AppError> {
     Ok(stats)
 }
 
-/// Periodic sweep; spawned once when model hosting is enabled.
+/// Periodic sweep; spawned once when model hosting is enabled and exits on
+/// node shutdown.
 pub async fn run_sweep_worker(state: AppState) {
+    let mut shutdown_rx = state.subscribe_shutdown();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = shutdown_rx.changed() => return,
+        }
         if let Err(e) = sweep_once(&state).await {
             tracing::warn!("model sweep failed: {e}");
         }
