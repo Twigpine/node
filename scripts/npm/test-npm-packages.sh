@@ -204,10 +204,13 @@ launcher=$!
 for _ in $(seq 1 50); do [ -s "$W/child.pid" ] && break; sleep 0.1; done
 child="$(cat "$W/child.pid" 2>/dev/null || true)"
 kill -TERM "$launcher" 2>/dev/null || true
-wait "$launcher" 2>/dev/null || true
+# Poll before waiting: the launcher outlives the program, so waiting first
+# would also pass when nothing was forwarded and the program simply ran out
+# its sleep.
 gone=no
 for _ in $(seq 1 30); do kill -0 "$child" 2>/dev/null || { gone=yes; break; }; sleep 0.1; done
 [ "$gone" = yes ] || kill -KILL "$child" 2>/dev/null || true
+wait "$launcher" 2>/dev/null || true
 check "a signal sent to the launcher alone reaches the program" test -n "$child" -a "$gone" = yes
 
 rm -rf "$PAYLOAD"
