@@ -220,12 +220,25 @@ pub async fn put_model_block(
     };
     let _ = outcome; // Stored and AlreadyPresent both leave the bytes stored.
 
-    let size = store
-        .size(&block_id)
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("block size lookup failed: {e}")))?
-        .unwrap_or(declared);
-    let duplicate = models::record_block(pool, &session.id, &sha, size, declared as i64).await?;
+    // Past this point the object exists; a bookkeeping failure must refund
+    // the admission or the session's charge leaks until it expires.
+    let size = match store.size(&block_id).await {
+        Ok(s) => s.unwrap_or(declared),
+        Err(e) => {
+            let _ = models::refund_bytes(pool, &session.id, declared as i64).await;
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "block size lookup failed: {e}"
+            )));
+        }
+    };
+    let duplicate = match models::record_block(pool, &session.id, &sha, size, declared as i64).await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = models::refund_bytes(pool, &session.id, declared as i64).await;
+            return Err(e);
+        }
+    };
     let fresh = models::load_session(pool, &session.id).await?;
     Ok(Json(json!({
         "received": fresh.as_ref().map(|s| s.bytes_received).unwrap_or(0),
