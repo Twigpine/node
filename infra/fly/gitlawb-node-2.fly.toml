@@ -1,6 +1,6 @@
-# fly.toml app configuration file generated for gitlawb-node-2 on 2026-07-22T09:47:18+08:00
+# fly.toml app configuration file generated for gitlawb-node-2 on 2026-11-18T16:59:01+08:00
 #
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
 #
 
 app = 'gitlawb-node-2'
@@ -10,12 +10,17 @@ primary_region = 'sjc'
   dockerfile = '../../Dockerfile'
 
 [env]
+  # 0.8.1: keep the libp2p key on the volume (new PeerId once, then stable)
+  TWIGPINE_P2P_KEY = '/data/keys/p2p.key'
+  # 0.8.1 pools sized for this node's Postgres (max_connections 100)
+  TWIGPINE_DB_MAX_CONNECTIONS = '30'
+  TWIGPINE_DB_LOCK_POOL_MAX_CONNECTIONS = '24'
+  TWIGPINE_MAX_CONCURRENT_GIT_PUSHES = '16'
   GITLAWB_AUTO_SYNC = 'true'
   GITLAWB_BOOTSTRAP_PEERS = 'https://node.gitlawb.com,https://node3.gitlawb.com'
   GITLAWB_HOST = '0.0.0.0'
   GITLAWB_KEY = '/data/keys/identity.pem'
   GITLAWB_MAX_PACK_BYTES = '524288000'
-  GITLAWB_P2P_KEY = '/data/keys/p2p.key'
   GITLAWB_P2P_PORT = '7546'
   GITLAWB_PORT = '7545'
   GITLAWB_PUBLIC_URL = 'https://node2.gitlawb.com'
