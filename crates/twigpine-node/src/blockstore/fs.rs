@@ -45,6 +45,20 @@ impl FsBlockStore {
     }
 }
 
+/// Fsync a directory so a name created inside it survives a crash: after
+/// `Stored`, a link that only exists in the page cache is a lost write.
+#[cfg(unix)]
+async fn fsync_dir(dir: &Path) -> io::Result<()> {
+    tokio::fs::File::open(dir).await?.sync_all().await
+}
+
+/// Directory fsync is a unix durability primitive; elsewhere the link is
+/// the best guarantee available.
+#[cfg(not(unix))]
+async fn fsync_dir(_: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 #[async_trait]
 impl BlockStore for FsBlockStore {
     async fn put_verified(
@@ -98,16 +112,30 @@ impl BlockStore for FsBlockStore {
         }
         drop(file);
 
-        if let Some(parent) = dest.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                Self::cleanup(&tmp).await;
-                return Err(e.into());
+        let dir = dest.parent().expect("content path has two levels");
+        let fresh_dirs = !dir.exists();
+        if let Err(e) = tokio::fs::create_dir_all(dir).await {
+            Self::cleanup(&tmp).await;
+            return Err(e.into());
+        }
+        if fresh_dirs {
+            // The new <aa>/<bb> levels are themselves names in a parent
+            // directory; persist each level's entry.
+            for ancestor in [dir.parent().unwrap_or(&self.root), self.root.as_path()] {
+                if let Err(e) = fsync_dir(ancestor).await {
+                    Self::cleanup(&tmp).await;
+                    return Err(e.into());
+                }
             }
         }
         // A hard link refuses to replace an existing object, which is what
         // makes a same-content race benign rather than a torn write.
         match tokio::fs::hard_link(&tmp, &dest).await {
             Ok(()) => {
+                if let Err(e) = fsync_dir(dir).await {
+                    Self::cleanup(&tmp).await;
+                    return Err(e.into());
+                }
                 Self::cleanup(&tmp).await;
                 Ok(PutOutcome::Stored)
             }
