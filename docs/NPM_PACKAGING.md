@@ -124,6 +124,10 @@ Done once, by a maintainer, in this order:
 3. Add the trusted publisher with publish permission: on npmjs.com under the
    package's settings, or
    `npm trust github @twigpine/cli --file release.yml --repo Twigpine/node --env npm-publish --allow-publish`.
+   Do this step last, at most two days before the release that first
+   publishes `@twigpine/cli`: npm expires a new trusted publisher that has
+   not completed a publish within two days, and an expired one can only be
+   deleted and created again (which starts a new two days).
 
 Until then the `npm-publish-cli` job fails on its own; the rest of the release
 is unaffected. The `npm-publish` job publishing `@gitlawb/gl` needs that
