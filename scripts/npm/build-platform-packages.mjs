@@ -21,9 +21,11 @@
 // platform is required except those named in --allow-missing: the release
 // builds Windows best-effort, so CI passes --allow-missing win32-x64. A
 // platform left out is left out of the wrapper too, its aliases and its `os`
-// list, so npm on that platform refuses the install with a clear error
-// instead of installing commands with no program. --only narrows the set for
-// tests the same way.
+// and `cpu` lists, so npm on that platform refuses the install with a clear
+// error instead of installing commands with no program. Only a whole system,
+// or a selection that is still every pairing of its systems and
+// architectures, can be described that way; anything else is refused.
+// --only narrows the set for tests the same way.
 //
 // Usage:
 //   node scripts/npm/build-platform-packages.mjs --version X.Y.Z \
@@ -214,9 +216,7 @@ function buildPlatformPackage(entry, source, version, artifactsDir, outDir) {
       version: platformVersion(version, entry),
       description: `Twigpine programs for ${entry.platform}-${entry.arch} (installed by ${source.name}@${version})`,
       os: [entry.platform],
-      // Windows on ARM has no build of its own and runs the x64 one under
-      // emulation; npm installs a payload only when its cpu list matches.
-      cpu: entry.platform === 'win32' && entry.arch === 'x64' ? ['x64', 'arm64'] : [entry.arch],
+      cpu: cpusFor(entry),
       license: source.license,
       repository: source.repository,
       // Yarn's Plug'n'Play keeps packages in zip files unless told otherwise,
@@ -229,6 +229,34 @@ function buildPlatformPackage(entry, source, version, artifactsDir, outDir) {
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
+}
+
+// Windows on ARM has no build of its own and runs the x64 one under
+// emulation; npm installs a payload only when its cpu list matches.
+function cpusFor(entry) {
+  return entry.platform === 'win32' && entry.arch === 'x64' ? ['x64', 'arm64'] : [entry.arch];
+}
+
+// The systems and architectures the wrapper may install on. npm checks `os`
+// and `cpu` separately, so the wrapper would also install on every pairing of
+// the two lists; each pairing needs a payload, or the commands would install
+// with no program behind them. Full builds and builds that leave a whole
+// system out (Windows, best-effort) pass; leaving out one architecture of a
+// system that keeps another does not.
+function installTargets(entries) {
+  const platforms = new Set(entries.map((entry) => entry.platform));
+  const cpus = new Set(entries.flatMap(cpusFor));
+  for (const platform of platforms) {
+    for (const cpu of cpus) {
+      if (!entries.some((entry) => entry.platform === platform && cpusFor(entry).includes(cpu))) {
+        fail(
+          `no ${platform}-${cpu} payload, but the wrapper would install there: ` +
+            `build every architecture of ${platform}, or leave ${platform} out entirely`,
+        );
+      }
+    }
+  }
+  return { platforms, cpus };
 }
 
 function buildWrapper(source, version, outDir, entries) {
@@ -254,8 +282,9 @@ function buildWrapper(source, version, outDir, entries) {
   pkg.version = version;
   pkg.optionalDependencies = optionalDependencies(source.name, version, entries);
   // Install only where a payload was published.
-  const platforms = new Set(entries.map((entry) => entry.platform));
+  const { platforms, cpus } = installTargets(entries);
   pkg.os = (pkg.os || []).filter((platform) => platforms.has(platform));
+  pkg.cpu = (pkg.cpu || []).filter((cpu) => cpus.has(cpu));
   writeFileSync(join(wrapperDir, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
   return wrapperDir;
 }
@@ -278,6 +307,8 @@ function main() {
     return true;
   });
   if (selected.length === 0) fail('no platforms to build');
+  // Before anything is written: a selection the wrapper cannot describe fails here.
+  installTargets(selected);
   // A payload left from an earlier build into the same directory must not be
   // published beside a wrapper that no longer names it.
   for (const entry of MATRIX) {

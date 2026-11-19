@@ -42,7 +42,9 @@ and without a fallback downloader.
 - The release builds Windows best-effort. A release without the Windows
   archive is published without Windows: the wrapper then leaves `win32` out
   of its aliases and its `os`, so npm on Windows refuses the install instead
-  of installing commands with no program.
+  of installing commands with no program. Only a whole system can be left out:
+  npm checks `os` and `cpu` separately, so the build refuses a selection that
+  drops one architecture of a system while keeping another.
 - The wrapper holds the launchers in `npm/cli/bin/` and a manifest with no
   scripts and no dependencies, only the exact-version `optionalDependencies`.
   `scripts/npm/build-platform-packages.mjs` writes both from the release

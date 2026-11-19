@@ -100,7 +100,7 @@ check "the Windows payload carries .exe programs" \
 check "the Windows payload also installs on Windows on ARM" \
   test "$(field "$OUT/platforms/cli-win32-x64/package.json" cpu)" = '["x64","arm64"]'
 check "payloads ask Yarn not to keep them zipped" test "$(field "$LP" preferUnplugged)" = true
-check "the wrapper installs on every published platform" test "$(field "$WP" os)" = '["darwin","linux","win32"]'
+check "the wrapper installs on every published platform" test "$(field "$WP" os) $(field "$WP" cpu)" = '["darwin","linux","win32"] ["x64","arm64"]'
 packed="$(cd "$OUT/wrapper" && npm pack --dry-run --json 2>/dev/null | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d)[0].files.map(f=>f.path).sort().join(" ")))')"
 check "the wrapper tarball carries the launchers and both licence files" test "$packed" = \
   "LICENSE-APACHE LICENSE-MIT README.md bin/git-remote-twigpine.js bin/gl.js bin/launch.js bin/twigpine.js package.json"
@@ -131,6 +131,22 @@ if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-nowin" --out-dir "
   && ! grep -q win32 <<< "$(field "$W/npm-nowin/wrapper/package.json" optionalDependencies)"; then
   ok "a release without Windows is packaged without it, and the wrapper says so"
 else bad "a release without Windows is packaged without it, and the wrapper says so"; fi
+
+# One architecture of a system left out while another stays: npm checks os and
+# cpu separately, so such a wrapper would install where it has no program.
+cp -R "$ART" "$W/art-noarm"
+rm "$W/art-noarm/twigpine-node-$VERSION-aarch64-apple-darwin.tar.gz"*
+if node "$BUILD" --version "$VERSION" --artifacts-dir "$W/art-noarm" --out-dir "$W/npm-noarm" \
+  --allow-missing darwin-arm64 > "$W/out" 2>&1; then
+  bad "refuses to leave out one architecture of a system that keeps another"
+elif grep -q "no darwin-arm64 payload" "$W/out" && [ ! -e "$W/npm-noarm/wrapper" ]; then
+  ok "refuses to leave out one architecture of a system that keeps another"
+else bad "refuses to leave out one architecture of a system that keeps another"; fi
+if node "$BUILD" --version "$VERSION" --artifacts-dir "$ART" --out-dir "$W/npm-only" \
+  --only linux-x64 > "$W/out" 2>&1 \
+  && [ "$(field "$W/npm-only/wrapper/package.json" os) $(field "$W/npm-only/wrapper/package.json" cpu)" = '["linux"] ["x64"]' ]; then
+  ok "a one-platform build limits the wrapper to that system and architecture"
+else bad "a one-platform build limits the wrapper to that system and architecture"; fi
 
 # Rebuilt into a directory that held a full build: the old Windows payload goes.
 cp -R "$OUT" "$W/npm-rebuild"
