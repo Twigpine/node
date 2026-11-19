@@ -136,12 +136,16 @@ pub async fn put_model_block(
     };
     // authorize_repo_read 404s a repo the session owner can no longer read;
     // the session-to-repo binding check below keeps foreign-session PUTs
-    // indistinguishable from a missing session.
-    let (record, _rules) =
+    // indistinguishable from a missing session. The owner always reads their
+    // own repo, so the fully-public check is what stops bytes landing on a
+    // repo that turned private or gained visibility rules mid-upload.
+    let (record, rules) =
         authorize_repo_read(&state, &owner, &name, Some(&session.owner_did), "/").await?;
     if session.repo_id != record.id
         || session.state != "open"
         || session.expires_at <= models::ts_now()
+        || !record.is_public
+        || !rules.is_empty()
     {
         return Err(AppError::NotFound("model upload session not found".into()));
     }
