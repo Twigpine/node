@@ -10,6 +10,7 @@
 //! recomputed by the node on receipt.
 
 pub mod chunking;
+pub mod manifest;
 pub mod reconstruction;
 
 /// The schema tag carried by the reconstruction object defined here. Unknown
