@@ -1,0 +1,730 @@
+//! HTTP-level coverage for the U5/U6/U7 model-hosting routes: the signed
+//! session open and session status, the unsigned bearer block PUT, the signed
+//! release claim (including its request-digest replay), and the read-gated
+//! release status. The deny sweep already proves the hostile statuses; these
+//! tests drive the happy paths and the handler-specific 4xxes the sweep rows
+//! cannot express. Requires `--features test-harness`.
+
+#[allow(dead_code)]
+mod support;
+
+use serde_json::{json, Value};
+use sha2::Digest;
+use support::signing::signed_request;
+
+use twigpine_core::http_sig::sign_request;
+use twigpine_core::identity::Keypair;
+use twigpine_node::test_harness::{spawn_node, TestNode};
+
+fn bounded_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("client builds")
+}
+
+fn sessions_path(owner: &str, repo: &str) -> String {
+    format!("/api/v1/repos/{owner}/{repo}/models/sessions")
+}
+
+fn claims_path(owner: &str, repo: &str) -> String {
+    format!("/api/v1/repos/{owner}/{repo}/models/claims")
+}
+
+fn release_path(owner: &str, repo: &str, commit: &str) -> String {
+    format!("/api/v1/repos/{owner}/{repo}/models/releases/{commit}")
+}
+
+fn blocks_path(owner: &str, repo: &str, sha: &str) -> String {
+    format!("/api/v1/repos/{owner}/{repo}/models/blocks/{sha}")
+}
+
+fn put_block(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    session: Option<&str>,
+    body: Vec<u8>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.put(format!("{base_url}{path}")).body(body);
+    if let Some(s) = session {
+        req = req.header("x-twigpine-model-session", s);
+    }
+    req
+}
+
+/// An owner keypair plus the raw SigningKey the manifest format signs with;
+/// both derive from one seed so the keypair's DID anchors the manifest.
+fn owner_with_signing(seed: u8) -> (Keypair, ed25519_dalek::SigningKey) {
+    let seed_bytes = [seed; 32];
+    (
+        Keypair::from_seed(&seed_bytes).expect("keypair"),
+        ed25519_dalek::SigningKey::from_bytes(&seed_bytes),
+    )
+}
+
+/// Build a git repo on disk containing one commit with a valid signed release
+/// manifest, returning the commit sha. The claim route's `git cat-file` /
+/// `git show` calls run against `repos.disk_path`, so the row must point here.
+fn make_release_repo(dir: &std::path::Path, manifest: &[u8], sig: &str) -> String {
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    run(&["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(dir.join(".twigpine")).expect("mkdir .twigpine");
+    std::fs::write(dir.join(".twigpine/model-release.json"), manifest).expect("write manifest");
+    std::fs::write(dir.join(".twigpine/model-release.sig"), sig).expect("write sig");
+    run(&["add", "-A"]);
+    run(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "-m",
+        "model release 1",
+    ]);
+    run(&["rev-parse", "HEAD"])
+}
+
+/// Point the seeded repo row at an on-disk git directory (seed_repo writes a
+/// placeholder disk_path the claim route cannot read).
+async fn set_disk_path(pool: &sqlx::PgPool, repo_id: &str, dir: &std::path::Path) {
+    sqlx::query("UPDATE repos SET disk_path = $1 WHERE id = $2")
+        .bind(dir.to_str().expect("utf-8 temp path"))
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("update disk_path");
+}
+
+async fn seed_open_session(node: &TestNode, repo_id: &str, owner_did: &str) -> String {
+    let session_id = "s".repeat(64);
+    node.seed_model_session(repo_id, &session_id, owner_did)
+        .await;
+    session_id
+}
+
+// ── POST /models/sessions ────────────────────────────────────────────────────
+
+/// The owner opening a session on a fully public repo gets 201 and a
+/// 64-hex session id plus an expiry.
+#[sqlx::test]
+async fn open_session_owner_created(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    node.seed_repo(&owner_did, "model", true).await;
+
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &sessions_path(&owner_did, "model"),
+        b"{}".to_vec(),
+        &owner,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 201);
+    let v: Value = resp.json().await.expect("session body");
+    assert_eq!(
+        v["session_id"].as_str().map(str::len),
+        Some(64),
+        "session id is a 256-bit hex bearer"
+    );
+    assert!(v["expires_at"].as_str().is_some());
+
+    node.shutdown().await;
+}
+
+/// A signed caller who is not the repo owner gets the owner gate's 403.
+#[sqlx::test]
+async fn open_session_non_owner_forbidden(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let stranger = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    node.seed_repo(&owner_did, "model", true).await;
+
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &sessions_path(&owner_did, "model"),
+        b"{}".to_vec(),
+        &stranger,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 403);
+
+    node.shutdown().await;
+}
+
+/// An unsigned request is stopped by the signature layer before any repo
+/// lookup: 401.
+#[sqlx::test]
+async fn open_session_anon_unauthorized(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner_did = Keypair::generate().did().to_string();
+    node.seed_repo(&owner_did, "model", true).await;
+
+    let resp = client
+        .post(format!(
+            "{}{}",
+            node.base_url,
+            sessions_path(&owner_did, "model")
+        ))
+        .body(b"{}".to_vec())
+        .send()
+        .await
+        .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 401);
+
+    node.shutdown().await;
+}
+
+/// A private repo answers the read gate's existence-hiding 404 to a signed
+/// non-reader, before the owner gate can fire.
+#[sqlx::test]
+async fn open_session_private_repo_hidden(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let stranger = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    node.seed_repo(&owner_did, "model", false).await;
+
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &sessions_path(&owner_did, "model"),
+        b"{}".to_vec(),
+        &stranger,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 404);
+
+    node.shutdown().await;
+}
+
+/// A public repo carrying a path-scoped visibility rule is not "fully
+/// public", so the session open refuses it with a named 400 rather than
+/// partially publishing.
+#[sqlx::test]
+async fn open_session_repo_with_visibility_rule_rejected(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    node.withhold_path(&repo_id, "sub/**", &[], &owner_did)
+        .await;
+
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &sessions_path(&owner_did, "model"),
+        b"{}".to_vec(),
+        &owner,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("fully public"),
+        "denial should name the fully-public requirement, got: {body}"
+    );
+
+    node.shutdown().await;
+}
+
+// ── GET /models/sessions/{id} ────────────────────────────────────────────────
+
+/// The owner reads back an open session's state and byte counter.
+#[sqlx::test]
+async fn get_session_owner_reads_open(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let session_id = seed_open_session(&node, &repo_id, &owner_did).await;
+
+    let resp = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &format!("{}/{}", sessions_path(&owner_did, "model"), session_id),
+        Vec::new(),
+        &owner,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: Value = resp.json().await.expect("session body");
+    assert_eq!(v["session_id"].as_str(), Some(session_id.as_str()));
+    assert_eq!(v["state"].as_str(), Some("open"));
+
+    node.shutdown().await;
+}
+
+/// A signed stranger reaches the owner gate on the session read: 403.
+#[sqlx::test]
+async fn get_session_non_owner_forbidden(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let stranger = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let session_id = seed_open_session(&node, &repo_id, &owner_did).await;
+
+    let resp = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &format!("{}/{}", sessions_path(&owner_did, "model"), session_id),
+        Vec::new(),
+        &stranger,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 403);
+
+    node.shutdown().await;
+}
+
+// ── PUT /models/blocks/{sha256} ──────────────────────────────────────────────
+
+/// The unsigned PUT without the session header gets 401: the bearer
+/// credential is absent, not invalid.
+#[sqlx::test]
+async fn put_block_without_session_header_unauthorized(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner_did = Keypair::generate().did().to_string();
+    node.seed_repo(&owner_did, "model", true).await;
+    let sha = hex::encode(sha2::Sha256::digest(b"block"));
+
+    let resp = put_block(
+        &client,
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        None,
+        b"block".to_vec(),
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 401);
+
+    node.shutdown().await;
+}
+
+/// A session id that was never issued answers the same 404 as an expired or
+/// foreign one: a bearer guess learns nothing about which part failed.
+#[sqlx::test]
+async fn put_block_bogus_session_not_found(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner_did = Keypair::generate().did().to_string();
+    node.seed_repo(&owner_did, "model", true).await;
+    let body = b"block".to_vec();
+    let sha = hex::encode(sha2::Sha256::digest(&body));
+
+    let resp = put_block(
+        &client,
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&"f".repeat(64)),
+        body,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 404);
+
+    node.shutdown().await;
+}
+
+/// A session bound to repo A does not upload into repo B: the
+/// session-to-repo binding check answers 404.
+#[sqlx::test]
+async fn put_block_session_for_other_repo_not_found(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner_did = Keypair::generate().did().to_string();
+    let repo_a = node.seed_repo(&owner_did, "model-a", true).await;
+    node.seed_repo(&owner_did, "model-b", true).await;
+    let session_id = seed_open_session(&node, &repo_a, &owner_did).await;
+    let body = b"block".to_vec();
+    let sha = hex::encode(sha2::Sha256::digest(&body));
+
+    let resp = put_block(
+        &client,
+        &node.base_url,
+        &blocks_path(&owner_did, "model-b", &sha),
+        Some(&session_id),
+        body,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 404);
+
+    node.shutdown().await;
+}
+
+/// An open session whose expiry already passed answers 404; the PUT never
+/// reaches the block store.
+#[sqlx::test]
+async fn put_block_expired_session_not_found(pool: sqlx::PgPool) {
+    let node = spawn_node(pool.clone()).await;
+    let client = bounded_client();
+    let owner_did = Keypair::generate().did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let session_id = "e".repeat(64);
+    sqlx::query(
+        "INSERT INTO model_upload_sessions
+             (id, owner_did, repo_id, created_at, expires_at, bytes_received, state)
+         VALUES ($1,$2,$3,$4,$5,0,'open')",
+    )
+    .bind(&session_id)
+    .bind(&owner_did)
+    .bind(&repo_id)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("seed expired session");
+    let body = b"block".to_vec();
+    let sha = hex::encode(sha2::Sha256::digest(&body));
+
+    let resp = put_block(
+        &client,
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session_id),
+        body,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 404);
+
+    node.shutdown().await;
+}
+
+/// Happy path: a block whose body hashes to the id in the path is stored,
+/// reported with the session's running byte count and `duplicate:false`;
+/// resending it reports `duplicate:true`; a body that does not match the
+/// named id is refused with 400.
+#[sqlx::test]
+async fn put_block_happy_path_duplicate_and_digest_mismatch(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner_did = Keypair::generate().did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let session_id = seed_open_session(&node, &repo_id, &owner_did).await;
+
+    let body = b"the quick brown fox".to_vec();
+    let sha = hex::encode(sha2::Sha256::digest(&body));
+    let resp = put_block(
+        &client,
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session_id),
+        body.clone(),
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: Value = resp.json().await.expect("block response");
+    assert_eq!(v["duplicate"].as_bool(), Some(false));
+    assert!(
+        v["received"].as_i64().unwrap_or(0) >= body.len() as i64,
+        "bytes_received should include this block: {v}"
+    );
+
+    let resp = put_block(
+        &client,
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session_id),
+        body.clone(),
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: Value = resp.json().await.expect("dup response");
+    assert_eq!(v["duplicate"].as_bool(), Some(true));
+
+    let wrong_sha = "0".repeat(64);
+    let resp = put_block(
+        &client,
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &wrong_sha),
+        Some(&session_id),
+        body,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 400, "digest mismatch is a 400");
+
+    node.shutdown().await;
+}
+
+// ── POST /models/claims ──────────────────────────────────────────────────────
+
+/// A claim against a pushed commit carrying a signed manifest inserts the
+/// release row; re-sending the identical signed request resolves to the same
+/// release_id through the persisted request digest.
+#[sqlx::test]
+async fn claim_accepts_signed_manifest_and_replays_idempotently(pool: sqlx::PgPool) {
+    let node = spawn_node(pool.clone()).await;
+    let client = bounded_client();
+    let (owner, signing) = owner_with_signing(7);
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+
+    let manifest = twigpine_core::model::manifest::Manifest {
+        schema: twigpine_core::model::manifest::MANIFEST_SCHEMA_V1.to_string(),
+        repo: format!("{owner_did}/model"),
+        publisher_did: owner_did.clone(),
+        license: "mit".to_string(),
+        parent: None,
+        files: vec![],
+        reconstruction: None,
+    };
+    let manifest_bytes = manifest.to_bytes().expect("manifest bytes");
+    let sig = twigpine_core::model::manifest::sign(&signing, &manifest_bytes);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let commit = make_release_repo(dir.path(), &manifest_bytes, &sig);
+    set_disk_path(&pool, &repo_id, dir.path()).await;
+
+    let path = claims_path(&owner_did, "model");
+    let body =
+        serde_json::to_vec(&json!({"commit": commit, "branch": "main"})).expect("claim body");
+    // Sign once, then send the identical request twice: the digest replay
+    // resolves the second to the original row.
+    let signed = sign_request(&owner, "POST", &path, &body);
+    let send = |client: &reqwest::Client| {
+        client
+            .post(format!("{}{}", node.base_url, path))
+            .header("content-digest", &signed.content_digest)
+            .header("signature-input", &signed.signature_input)
+            .header("signature", &signed.signature)
+            .header("content-type", "application/json")
+            .body(body.clone())
+    };
+
+    let resp = send(&client).send().await.expect("request sends");
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 200, "claim body: {text}");
+    let v: Value = serde_json::from_str(&text).expect("claim response");
+    let release_id = v["release_id"].as_i64().expect("release_id");
+    assert_eq!(v["commit"].as_str(), Some(commit.as_str()));
+    assert_eq!(v["state"].as_str(), Some("verifying"));
+
+    let resp = send(&client).send().await.expect("replay sends");
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: Value = resp.json().await.expect("replay response");
+    assert_eq!(
+        v["release_id"].as_i64(),
+        Some(release_id),
+        "a replayed claim must resolve to the original release row"
+    );
+
+    node.shutdown().await;
+}
+
+/// A claim naming a commit the repo does not hold is a 400, not a 404: the
+/// repo exists and is readable; the commit is the bad input.
+#[sqlx::test]
+async fn claim_missing_commit_is_bad_request(pool: sqlx::PgPool) {
+    let node = spawn_node(pool.clone()).await;
+    let client = bounded_client();
+    let (owner, signing) = owner_with_signing(8);
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+
+    // A real on-disk repo is needed for `git cat-file` to answer "missing"
+    // rather than the spawn failing on a nonexistent path.
+    let manifest = twigpine_core::model::manifest::Manifest {
+        schema: twigpine_core::model::manifest::MANIFEST_SCHEMA_V1.to_string(),
+        repo: format!("{owner_did}/model"),
+        publisher_did: owner_did.clone(),
+        license: "mit".to_string(),
+        parent: None,
+        files: vec![],
+        reconstruction: None,
+    };
+    let manifest_bytes = manifest.to_bytes().expect("manifest bytes");
+    let sig = twigpine_core::model::manifest::sign(&signing, &manifest_bytes);
+    let dir = tempfile::tempdir().expect("tempdir");
+    make_release_repo(dir.path(), &manifest_bytes, &sig);
+    set_disk_path(&pool, &repo_id, dir.path()).await;
+
+    let body = serde_json::to_vec(&json!({
+        "commit": "b".repeat(40),
+        "branch": "main",
+    }))
+    .expect("claim body");
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &claims_path(&owner_did, "model"),
+        body,
+        &owner,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap_or_default();
+    assert!(text.contains("commit not found"), "got: {text}");
+
+    node.shutdown().await;
+}
+
+/// The owner gate on claims: a signed stranger is 403, an unsigned request is
+/// 401 before the handler runs.
+#[sqlx::test]
+async fn claim_non_owner_forbidden_and_anon_unauthorized(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let stranger = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    node.seed_repo(&owner_did, "model", true).await;
+    let body = serde_json::to_vec(&json!({
+        "commit": "a".repeat(40),
+        "branch": "main",
+    }))
+    .expect("claim body");
+
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &claims_path(&owner_did, "model"),
+        body.clone(),
+        &stranger,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 403);
+
+    let resp = client
+        .post(format!(
+            "{}{}",
+            node.base_url,
+            claims_path(&owner_did, "model")
+        ))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 401);
+
+    node.shutdown().await;
+}
+
+// ── GET /models/releases/{sha} ───────────────────────────────────────────────
+
+/// A seeded published release reads back its fields; an unknown commit is a
+/// plain 404; a private repo's release is existence-hiding to a non-reader.
+#[sqlx::test]
+async fn release_get_published_unknown_and_private(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = bounded_client();
+    let owner = Keypair::generate();
+    let stranger = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let commit = "c".repeat(40);
+    node.seed_model_release(&repo_id, &commit, &owner_did).await;
+
+    let resp = client
+        .get(format!(
+            "{}{}",
+            node.base_url,
+            release_path(&owner_did, "model", &commit)
+        ))
+        .send()
+        .await
+        .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: Value = resp.json().await.expect("release body");
+    assert_eq!(v["commit"].as_str(), Some(commit.as_str()));
+    assert_eq!(v["state"].as_str(), Some("published"));
+    assert_eq!(v["branch"].as_str(), Some("main"));
+    assert!(v["release_id"].as_i64().is_some());
+    assert!(v["manifest_sha256"].as_str().is_some());
+
+    let resp = client
+        .get(format!(
+            "{}{}",
+            node.base_url,
+            release_path(&owner_did, "model", &"d".repeat(40))
+        ))
+        .send()
+        .await
+        .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 404, "unknown commit is a 404");
+
+    // Private repo: a signed stranger gets the existence-hiding 404.
+    let priv_repo = node.seed_repo(&owner_did, "model-priv", false).await;
+    node.seed_model_release(&priv_repo, &commit, &owner_did)
+        .await;
+    let resp = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &release_path(&owner_did, "model-priv", &commit),
+        Vec::new(),
+        &stranger,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 404);
+
+    node.shutdown().await;
+}

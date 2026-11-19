@@ -407,8 +407,9 @@ impl Db {
         if shas.is_empty() {
             return Ok(0);
         }
+        // SUM over bigint returns numeric; cast back so the i64 decode holds.
         Ok(sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT SUM(b.size) FROM model_blocks b
+            "SELECT SUM(b.size)::bigint FROM model_blocks b
              WHERE b.sha256 = ANY($1)
                AND NOT EXISTS (
                      SELECT 1 FROM model_release_blocks rb
@@ -450,10 +451,11 @@ impl Db {
 
     /// Node-wide used bytes: claimed quota plus every open session's bytes.
     pub async fn model_tx_node_used(&self, tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
+        // SUM over bigint returns numeric; cast back so the i64 decode holds.
         Ok(sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT COALESCE((SELECT SUM(bytes_used) FROM model_quota_usage), 0)
+            "SELECT (COALESCE((SELECT SUM(bytes_used) FROM model_quota_usage), 0)
                   + COALESCE((SELECT SUM(bytes_received) FROM model_upload_sessions
-                              WHERE state = 'open'), 0)",
+                              WHERE state = 'open'), 0))::bigint",
         )
         .fetch_one(&mut **tx)
         .await?
@@ -579,8 +581,9 @@ impl Db {
             tx.commit().await?;
             return Ok(());
         };
+        // SUM over bigint returns numeric; cast back so the i64 decode holds.
         let freed: i64 = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT COALESCE(SUM(b.size), 0) FROM model_blocks b
+            "SELECT COALESCE(SUM(b.size), 0)::bigint FROM model_blocks b
              JOIN model_release_blocks rb ON rb.block_sha256 = b.sha256
              WHERE rb.release_id = $1
                AND NOT EXISTS (
@@ -769,7 +772,7 @@ mod tests {
             .unwrap()
             .expect("first admission");
         assert_eq!(first.bytes_received, 100);
-        assert!(first.expires_at > s.expires_at || first.expires_at == s.expires_at);
+        assert!(first.expires_at >= s.expires_at);
         // Over the per-identity session cap: refused.
         assert!(db
             .model_admit_bytes(&s.id, 950, 3600, 1000, 10_000)
