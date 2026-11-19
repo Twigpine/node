@@ -312,12 +312,22 @@ pub fn pack_file<R: Read>(
                 }),
             }
             if pending_bytes >= BLOCK_TARGET {
-                seal_pending(&mut pending, &mut terms, &mut block_entries, &mut new_blocks);
+                seal_pending(
+                    &mut pending,
+                    &mut terms,
+                    &mut block_entries,
+                    &mut new_blocks,
+                );
                 pending_bytes = 0;
             }
         }
     }
-    seal_pending(&mut pending, &mut terms, &mut block_entries, &mut new_blocks);
+    seal_pending(
+        &mut pending,
+        &mut terms,
+        &mut block_entries,
+        &mut new_blocks,
+    );
 
     let file = FileEntry {
         path: path.to_string(),
