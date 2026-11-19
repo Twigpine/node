@@ -213,7 +213,7 @@ check "a signal sent to the launcher alone reaches the program" test -n "$child"
 rm -rf "$PAYLOAD"
 status=0
 node "$INSTALL/bin/twigpine.js" > "$W/out" 2>&1 || status=$?
-if [ "$status" = 1 ] && grep -q "npm install -g @twigpine/cli" "$W/out" && grep -q "install.sh" "$W/out"; then
+if [ "$status" = 1 ] && grep -q "npm install -g --include=optional @twigpine/cli" "$W/out" && grep -q "install.sh" "$W/out"; then
   ok "a missing payload says how to fix it"
 else bad "a missing payload says how to fix it"; fi
 

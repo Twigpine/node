@@ -62,9 +62,11 @@ and without a fallback downloader.
   well. A GUI git client started with a minimal PATH may not find it; the
   installers (`install.sh`, `install.ps1`, Homebrew) put the native helper on
   PATH instead.
-- There is no downloader. If the payload is missing (`--omit=optional`, a
-  release without that platform's build), the launcher says how to reinstall
-  or install without npm.
+- There is no downloader. If the payload is missing (installed with
+  `--omit=optional`, or a `node_modules` copied from another platform), the
+  launcher says how to reinstall or install without npm. On a platform the
+  release has no build for, npm refuses the install itself (the wrapper's
+  `os` and `cpu`).
 - `npx` needs the command named: `npx -p @twigpine/cli twigpine doctor`.
 
 ## Publishing rules
@@ -95,12 +97,30 @@ and without a fallback downloader.
 Done once, by a maintainer, in this order:
 
 1. In the GitHub repository settings, create the `npm-publish` environment,
-   limited to the `main` branch, with a required reviewer. First: GitHub
-   creates an environment a job names on first use, with no protection.
-2. Publish a placeholder `@twigpine/cli@0.0.0` by hand with
-   `npm publish --access public`; npm only lets a trusted publisher be set on
-   a package that exists. The placeholder is a manifest and a README, with no
-   `bin`, so it cannot install commands that do nothing.
+   with deployment branches limited to `main`. Do this first: GitHub creates
+   an environment a job names on first use, with no protection. Leave out a
+   required reviewer, as `release` does: merging the release PR is already
+   the human step, and a run waiting for approval holds the workflow's
+   `release` concurrency group, so release-please and the Docker images wait
+   behind it until someone approves or rejects.
+2. Publish a placeholder `@twigpine/cli@0.0.0` by hand: npm only lets a
+   trusted publisher be set on a package that exists. Publish it from an
+   empty directory holding only this `package.json` (and a README if you
+   like), **not** from `npm/cli/`, whose manifest has the launchers' `bin`
+   entries and would publish commands that do nothing, at a version that can
+   never be published again:
+
+   ```json
+   {
+     "name": "@twigpine/cli",
+     "version": "0.0.0",
+     "description": "Placeholder so the release workflow can be set up as this package's trusted publisher. Real releases are published from github.com/Twigpine/node.",
+     "repository": { "type": "git", "url": "git+https://github.com/Twigpine/node.git" },
+     "license": "MIT OR Apache-2.0"
+   }
+   ```
+
+   then `npm publish --access public`.
 3. Add the trusted publisher with publish permission: on npmjs.com under the
    package's settings, or
    `npm trust github @twigpine/cli --file release.yml --repo Twigpine/node --env npm-publish --allow-publish`.
@@ -127,8 +147,12 @@ To reach existing users:
   @gitlawb/gl` installs something and shows its deprecation message.
 - A CLI installed from `@gitlawb/gl` prints the two commands above on a
   terminal.
-- After that release, a maintainer deprecates every `@gitlawb/gl*` version
-  with a pointer to `@twigpine/cli`, the install line in the README and the
-  website moves to `@twigpine/cli`, and the `npm-publish` job and
-  `npm/packages/` are removed. The old versions stay on the registry: existing
-  installs resolve their platform packages through them.
+- After that release, in one change: the `npm-publish` job and
+  `npm/packages/` are removed, a maintainer deprecates every `@gitlawb/gl*`
+  version with a pointer to `@twigpine/cli`, and the install line in the
+  README and the website moves to `@twigpine/cli`. Keep removing the job and
+  deprecating together: `npm deprecate` marks only versions that exist, and
+  while the job is in `release.yml`, every release and every
+  `npm_backfill_tag` dispatch (which both jobs read) would publish a new
+  `@gitlawb/gl` version without the deprecation. The old versions stay on the
+  registry: existing installs resolve their platform packages through them.

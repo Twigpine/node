@@ -27,6 +27,12 @@ export const SUPPORTED = ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x6
 // already reaches both, as they share a process group.
 const FORWARDED = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 
+// On Windows the launcher only listens to these, so that it outlives the
+// program and passes its exit status through: the console already delivers
+// Ctrl-C and window close to the program, and there kill() can only end it
+// outright (or throws, for SIGHUP).
+const FORWARD_TO_PROGRAM = process.platform !== 'win32';
+
 // Signals the launcher can re-raise on itself to end the same way. Node
 // ignores SIGPIPE and turns SIGUSR1 into its debugger, so for any other
 // signal the launcher exits with the shell's 128 + number instead.
@@ -75,7 +81,7 @@ export function missingProgramMessage(command, packageName, platform = process.p
     `${command}: the Twigpine program for ${here} is not installed.`,
     `npm installs it as an optional dependency (${payloadName(packageName, platform, arch)}),`,
     'so reinstall without omitting optional dependencies, for example:',
-    `  npm install -g ${packageName}`,
+    `  npm install -g --include=optional ${packageName}`,
     'If this release has no build for your platform, install without npm:',
     platform === 'win32'
       ? '  irm https://twigpine.com/install.ps1 | iex'
@@ -111,7 +117,12 @@ export function run(program, argv0) {
   const child = spawn(binary, process.argv.slice(2), { stdio: 'inherit', argv0 });
   for (const name of FORWARDED) {
     process.on(name, () => {
-      if (child.exitCode === null && child.signalCode === null) child.kill(name);
+      if (!FORWARD_TO_PROGRAM || child.exitCode !== null || child.signalCode !== null) return;
+      try {
+        child.kill(name);
+      } catch {
+        // The program is already gone, or this signal cannot be sent here.
+      }
     });
   }
   child.on('error', (error) => {
