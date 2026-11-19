@@ -423,7 +423,9 @@ impl Db {
     }
 
     /// Atomic per-identity reservation; `None` when the cap would be
-    /// exceeded.
+    /// exceeded. The cap applies on BOTH branches: a `WHERE` inside `DO
+    /// UPDATE` alone would let a first-time DID insert any `delta`, since
+    /// that clause never guards the insert attempt.
     pub async fn model_tx_reserve_quota(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -432,7 +434,8 @@ impl Db {
         cap: i64,
     ) -> Result<Option<i64>> {
         Ok(sqlx::query_scalar::<_, i64>(
-            "INSERT INTO model_quota_usage (did, bytes_used) VALUES ($1, $2)
+            "INSERT INTO model_quota_usage (did, bytes_used)
+             SELECT $1, $2 WHERE $2 <= $3
              ON CONFLICT (did) DO UPDATE
                SET bytes_used = model_quota_usage.bytes_used + $2
                WHERE model_quota_usage.bytes_used + $2 <= $3
@@ -845,6 +848,46 @@ mod tests {
         let mut tx = db.model_begin().await.unwrap();
         assert!(db.model_tx_block_still_dead(&mut tx, &sha).await.unwrap());
         db.model_tx_delete_block_row(&mut tx, &sha).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn reserve_quota_caps_first_and_later_claims(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        // First claim over cap: refused, and no row may be left behind.
+        let mut tx = db.model_begin().await.unwrap();
+        assert!(db
+            .model_tx_reserve_quota(&mut tx, "did:owner", 2000, 1000)
+            .await
+            .unwrap()
+            .is_none());
+        tx.commit().await.unwrap();
+        let row: Option<i64> = sqlx::query_scalar(
+            "SELECT bytes_used FROM model_quota_usage WHERE did = 'did:owner'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(row.is_none());
+        // Within cap inserts, over-cap update refuses, within-cap update adds.
+        let mut tx = db.model_begin().await.unwrap();
+        assert_eq!(
+            db.model_tx_reserve_quota(&mut tx, "did:owner", 600, 1000)
+                .await
+                .unwrap(),
+            Some(600)
+        );
+        assert!(db
+            .model_tx_reserve_quota(&mut tx, "did:owner", 500, 1000)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.model_tx_reserve_quota(&mut tx, "did:owner", 400, 1000)
+                .await
+                .unwrap(),
+            Some(1000)
+        );
         tx.commit().await.unwrap();
     }
 
