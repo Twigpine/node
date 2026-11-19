@@ -16,6 +16,7 @@ mod ipfs_cmd;
 mod issue;
 mod mcp;
 mod mirror;
+mod model;
 mod name;
 mod node;
 mod node_stake;
@@ -140,6 +141,12 @@ enum Commands {
 
     /// Print your current identity (DID) and optional node info
     Whoami(whoami::WhoamiArgs),
+
+    /// Publish open-weight model releases
+    Model {
+        #[command(subcommand)]
+        cmd: model::ModelCmd,
+    },
 }
 
 /// The command was `gl` before the rename and still answers to it. Say so
@@ -236,6 +243,7 @@ async fn run() -> Result<()> {
         Commands::Bounty(args) => bounty::run(args).await,
         Commands::Ucan(args) => ucan_cmd::run(args).await,
         Commands::Whoami(args) => whoami::run(args).await,
+        Commands::Model { cmd } => model::run(cmd).await,
     }
 }
 
