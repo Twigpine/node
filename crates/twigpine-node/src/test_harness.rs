@@ -42,6 +42,12 @@ pub struct TestNode {
     pub base_url: String,
     /// The node's own DID (for building requests that reference it).
     pub node_did: String,
+    /// The AppState the router serves from, kept so a test can drive the
+    /// workers the spawned serve task does not run (the durability worker
+    /// is never part of `axum::serve`) and inspect config/state directly.
+    /// The clone shares every `Arc` inside, so calls through it act on the
+    /// same database, block store, and shutdown signal the node does.
+    state: AppState,
     shutdown_tx: watch::Sender<bool>,
     repos_dir: PathBuf,
     /// Seeding handle over the same pool the node serves from. Kept private so
@@ -161,6 +167,7 @@ fn build_state(
     pool: PgPool,
     repos_dir: PathBuf,
     block_store: Arc<dyn crate::blockstore::BlockStore>,
+    extra_config_args: &[&str],
 ) -> AppState {
     let keypair = Keypair::generate();
     let scan_token_key = crate::state::AppState::derive_scan_token_key(&keypair);
@@ -187,7 +194,9 @@ fn build_state(
     // are removed with it.
     let block_store: Option<Arc<dyn crate::blockstore::BlockStore>> = Some(block_store);
     AppState {
-        config: Arc::new(Config::parse_from(["twigpine-node"])),
+        config: Arc::new(Config::parse_from(
+            std::iter::once("twigpine-node").chain(extra_config_args.iter().copied()),
+        )),
         db,
         node_did,
         node_keypair: Arc::new(keypair),
@@ -256,7 +265,20 @@ pub async fn spawn_node(pool: PgPool) -> TestNode {
     std::fs::create_dir_all(&block_dir).expect("create temp block dir");
     let block_store: Arc<dyn crate::blockstore::BlockStore> =
         Arc::new(crate::blockstore::fs::FsBlockStore::new(block_dir).expect("fs block store"));
-    spawn_node_with_store(pool, repos_dir, block_store).await
+    spawn_node_inner(pool, repos_dir, block_store, &[]).await
+}
+
+/// [`spawn_node`] with extra clap args forwarded into `Config` (e.g.
+/// `["--irys-url", url, "--ipfs-api", url]` so the durability worker talks
+/// to a test's mock providers instead of the disabled defaults).
+pub async fn spawn_node_with_args(pool: PgPool, extra_config_args: &[&str]) -> TestNode {
+    let repos_dir = unique_repos_dir();
+    std::fs::create_dir_all(&repos_dir).expect("create temp repos dir");
+    let block_dir = repos_dir.join("model-blocks");
+    std::fs::create_dir_all(&block_dir).expect("create temp block dir");
+    let block_store: Arc<dyn crate::blockstore::BlockStore> =
+        Arc::new(crate::blockstore::fs::FsBlockStore::new(block_dir).expect("fs block store"));
+    spawn_node_inner(pool, repos_dir, block_store, extra_config_args).await
 }
 
 /// A [`crate::blockstore::BlockStore`] wrapper that fails the next `size()`
@@ -337,17 +359,32 @@ pub async fn spawn_node_with_store(
     repos_dir: PathBuf,
     block_store: Arc<dyn crate::blockstore::BlockStore>,
 ) -> TestNode {
+    spawn_node_inner(pool, repos_dir, block_store, &[]).await
+}
+
+async fn spawn_node_inner(
+    pool: PgPool,
+    repos_dir: PathBuf,
+    block_store: Arc<dyn crate::blockstore::BlockStore>,
+    extra_config_args: &[&str],
+) -> TestNode {
     let db = Arc::new(crate::db::Db::for_testing(pool.clone()));
     db.run_migrations()
         .await
         .expect("test schema migrations should apply");
 
-    let state = build_state(db.clone(), pool.clone(), repos_dir.clone(), block_store);
+    let state = build_state(
+        db.clone(),
+        pool.clone(),
+        repos_dir.clone(),
+        block_store,
+        extra_config_args,
+    );
     let node_did = state.node_did.to_string();
     let shutdown_tx = state.shutdown_tx.clone();
     let mut shutdown_rx = shutdown_tx.subscribe();
 
-    let router = crate::server::build_router(state);
+    let router = crate::server::build_router(state.clone());
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -368,6 +405,7 @@ pub async fn spawn_node_with_store(
     TestNode {
         base_url: format!("http://{addr}"),
         node_did,
+        state,
         shutdown_tx,
         repos_dir,
         db,
@@ -487,6 +525,114 @@ impl TestNode {
         .execute(self.db.pool())
         .await
         .expect("seed model release");
+    }
+
+    /// The `AppState` the spawned router serves from, so a test can drive
+    /// the node's own workers in-process (the durability worker is not part
+    /// of `axum::serve`; `twigpine_node::models::durability::durability_pass`
+    /// takes this state).
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
+
+    /// The on-disk path `RepoStore` maps `owner_did`/`name` to, the same
+    /// location [`Self::seed_bare_repo`] creates. `git show`-based release
+    /// reads resolve through the repo row's `disk_path`, so seed the row
+    /// with [`Self::set_repo_disk_path`] after writing objects here.
+    pub fn repo_git_dir(&self, owner_did: &str, name: &str) -> PathBuf {
+        let slug = owner_did.replace([':', '/'], "_");
+        self.repos_dir.join(&slug).join(format!("{name}.git"))
+    }
+
+    /// Repoint a repo row's `disk_path` (seeded as a `/tmp` placeholder) at a
+    /// real on-disk git directory, so `git show`-backed paths like the model
+    /// durability worker's manifest/sig reads resolve.
+    pub async fn set_repo_disk_path(&self, repo_id: &str, path: &std::path::Path) {
+        sqlx::query("UPDATE repos SET disk_path = $1 WHERE id = $2")
+            .bind(path.to_string_lossy().to_string())
+            .bind(repo_id)
+            .execute(self.db.pool())
+            .await
+            .expect("set repo disk_path");
+    }
+
+    /// Seed a published release row with its real pointer fields (unlike
+    /// [`Self::seed_model_release`], which fills every content column with
+    /// placeholders). Returns the release id for block linking and
+    /// durability enqueueing.
+    pub async fn seed_published_model_release(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+        publisher_did: &str,
+        manifest_sha256: &str,
+        reconstruction_sha256: Option<&str>,
+        claim_signature: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO model_releases
+                 (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
+                  reconstruction_sha256, claim_signature, claim_signature_input,
+                  claim_signing_string, claim_body, created_at)
+             VALUES ($1,$2,'main',$3,'published',$4,$5,$6,'input','signing',\
+                     decode('00','hex'),$7)
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(commit_sha)
+        .bind(publisher_did)
+        .bind(manifest_sha256)
+        .bind(reconstruction_sha256)
+        .bind(claim_signature)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(self.db.pool())
+        .await
+        .expect("seed published model release")
+    }
+
+    /// Write `bytes` into the node's block store under `sha256` (through the
+    /// store's own verified-put path, so a mismatching id fails the seed)
+    /// and record the `model_blocks` row the release-block foreign key needs.
+    pub async fn seed_model_block(&self, sha256: &str, bytes: &[u8]) {
+        let store = self
+            .state
+            .block_store
+            .as_ref()
+            .expect("test node has a block store")
+            .clone();
+        let id = crate::blockstore::BlockId::parse(sha256).expect("valid block sha");
+        let body = bytes.to_vec();
+        let stream = futures::stream::once(async move {
+            Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(body))
+        });
+        store
+            .put_verified(&id, Box::pin(stream), bytes.len() as u64)
+            .await
+            .expect("seed model block into store");
+        sqlx::query(
+            "INSERT INTO model_blocks (sha256, size, created_at) VALUES ($1,$2,$3)
+             ON CONFLICT (sha256) DO NOTHING",
+        )
+        .bind(sha256)
+        .bind(bytes.len() as i64)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(self.db.pool())
+        .await
+        .expect("seed model_blocks row");
+    }
+
+    /// Link a seeded block sha to a release (`model_release_blocks`), the
+    /// table the durability enqueue expands into pin jobs.
+    pub async fn link_release_block(&self, release_id: i64, block_sha256: &str) {
+        sqlx::query(
+            "INSERT INTO model_release_blocks (release_id, block_sha256) VALUES ($1,$2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(release_id)
+        .bind(block_sha256)
+        .execute(self.db.pool())
+        .await
+        .expect("link release block");
     }
 
     /// Seed an open model upload session row directly (see
