@@ -183,6 +183,15 @@ pub fn detect_format(first_bytes: &[u8], path: &str) -> FileFormat {
     if first_bytes.starts_with(b"GGUF") {
         return FileFormat::Gguf;
     }
+    // safetensors: an 8-byte little-endian header length followed by '{'.
+    // Checked before raw pickle: a header length such as 0x0380 starts with
+    // the bytes 0x80 0x03, which the pickle test below would claim.
+    if first_bytes.len() >= 9
+        && u64::from_le_bytes(first_bytes[..8].try_into().unwrap()) > 0
+        && first_bytes[8] == b'{'
+    {
+        return FileFormat::Safetensors;
+    }
     // Raw pickle: the protocol opcode 0x80 followed by the version byte.
     if first_bytes.len() >= 2 && first_bytes[0] == 0x80 && (2..=5).contains(&first_bytes[1]) {
         return FileFormat::Pickle;
@@ -192,13 +201,6 @@ pub fn detect_format(first_bytes: &[u8], path: &str) -> FileFormat {
     // Torch/HF checkpoints are zip archives containing pickled tensors.
     if first_bytes.starts_with(b"PK\x03\x04") && matches!(ext, "bin" | "pt" | "pth" | "ckpt") {
         return FileFormat::Pickle;
-    }
-    // safetensors: an 8-byte little-endian header length followed by '{'.
-    if first_bytes.len() >= 9
-        && u64::from_le_bytes(first_bytes[..8].try_into().unwrap()) > 0
-        && first_bytes[8] == b'{'
-    {
-        return FileFormat::Safetensors;
     }
     if matches!(
         ext,
@@ -327,6 +329,22 @@ mod tests {
         let mut st = 5u64.to_le_bytes().to_vec();
         st.extend_from_slice(b"{\"a\":0}");
         assert_eq!(detect_format(&st, "m.safetensors"), FileFormat::Safetensors);
+        // A header length whose low bytes read as a pickle prefix (0x0480
+        // and 0x0380 start 0x80 0x04 / 0x80 0x03) is still safetensors.
+        for len in [0x0480u64, 0x0380, 0x0280, 0x0580] {
+            let mut overlap = len.to_le_bytes().to_vec();
+            overlap.extend_from_slice(b"{\"a\":0}");
+            assert_eq!(
+                detect_format(&overlap, "m.safetensors"),
+                FileFormat::Safetensors,
+                "header length {len:#x}"
+            );
+        }
+        // A real pickle whose byte 8 is not '{' stays pickle.
+        assert_eq!(
+            detect_format(b"\x80\x04\x95\x00\x00\x00\x00\x00\x00", "x.bin"),
+            FileFormat::Pickle
+        );
         assert_eq!(detect_format(b"GGUF\x01rest", "m.gguf"), FileFormat::Gguf);
         assert_eq!(detect_format(b"\x80\x04x", "torch.bin"), FileFormat::Pickle);
         assert_eq!(

@@ -197,19 +197,22 @@ impl DedupIndex {
 /// Seal the accumulating block of new chunks: patch its id into the terms
 /// written while it was still open, then append the block-table entry and
 /// queue the bytes for upload.
-fn seal_pending(
+fn seal_pending<F: FnMut(Block) -> std::io::Result<()>>(
     pending: &mut Vec<crate::model::chunking::Chunk>,
     terms: &mut [Term],
     block_entries: &mut Vec<BlockEntry>,
-    new_blocks: &mut Vec<Block>,
-) {
+    on_block: &mut F,
+) -> std::io::Result<()> {
     if pending.is_empty() {
-        return;
+        return Ok(());
     }
-    let chunks = std::mem::take(pending);
+    let mut chunks = std::mem::take(pending);
     let mut data = Vec::with_capacity(chunks.iter().map(|c| c.len).sum::<usize>());
-    for c in &chunks {
+    for c in &mut chunks {
         data.extend_from_slice(&c.data);
+        // The bytes now live in `data`; keeping the chunk's copy would hold
+        // every sealed block twice. Chunk metadata (sha256, len) stays.
+        c.data = Vec::new();
     }
     let block = Block {
         sha256: sha256_hex(&data),
@@ -235,7 +238,7 @@ fn seal_pending(
             })
             .collect(),
     });
-    new_blocks.push(block);
+    on_block(block)
 }
 
 /// What `pack_file` produced: the file's entry, the new blocks to store and
@@ -248,16 +251,38 @@ pub struct PackedFile {
 
 /// Chunk and pack one file, reusing terms for chunks a prior reconstruction
 /// already holds (`dedup`). `path` is the repo-relative path recorded in the
-/// entry.
+/// entry. Every sealed block is held in the result; publishers of large
+/// files should prefer `pack_file_with`, which keeps memory bounded by a
+/// block instead of the file.
 pub fn pack_file<R: Read>(
     path: &str,
     reader: R,
     dedup: &DedupIndex,
 ) -> std::io::Result<PackedFile> {
+    let mut new_blocks: Vec<Block> = Vec::new();
+    let (file, block_entries) = pack_file_with(path, reader, dedup, |b| {
+        new_blocks.push(b);
+        Ok(())
+    })?;
+    Ok(PackedFile {
+        file,
+        new_blocks,
+        block_entries,
+    })
+}
+
+/// `pack_file` with each sealed block handed to `on_block` as it finishes:
+/// the caller can upload and drop it while the file is still packing, so a
+/// file of any size packs in block-sized memory.
+pub fn pack_file_with<R: Read, F: FnMut(Block) -> std::io::Result<()>>(
+    path: &str,
+    reader: R,
+    dedup: &DedupIndex,
+    mut on_block: F,
+) -> std::io::Result<(FileEntry, Vec<BlockEntry>)> {
     let mut file_hasher = sha2::Sha256::new();
 
     let mut terms: Vec<Term> = Vec::new();
-    let mut new_blocks: Vec<Block> = Vec::new();
     let mut block_entries: Vec<BlockEntry> = Vec::new();
     // Chunks not found in `dedup` accumulate into one pending block that
     // seals only at the target size or EOF. Sealing on every reused-chunk
@@ -306,22 +331,12 @@ pub fn pack_file<R: Read>(
                 }),
             }
             if pending_bytes >= BLOCK_TARGET {
-                seal_pending(
-                    &mut pending,
-                    &mut terms,
-                    &mut block_entries,
-                    &mut new_blocks,
-                );
+                seal_pending(&mut pending, &mut terms, &mut block_entries, &mut on_block)?;
                 pending_bytes = 0;
             }
         }
     }
-    seal_pending(
-        &mut pending,
-        &mut terms,
-        &mut block_entries,
-        &mut new_blocks,
-    );
+    seal_pending(&mut pending, &mut terms, &mut block_entries, &mut on_block)?;
 
     let file = FileEntry {
         path: path.to_string(),
@@ -329,11 +344,7 @@ pub fn pack_file<R: Read>(
         sha256: hex::encode(file_hasher.finalize()),
         terms,
     };
-    Ok(PackedFile {
-        file,
-        new_blocks,
-        block_entries,
-    })
+    Ok((file, block_entries))
 }
 
 /// Byte-range mapping: which slices of which blocks serve file bytes
@@ -509,6 +520,80 @@ mod tests {
         rec.files.push(packed.file.clone());
         rec.blocks.extend(packed.block_entries.clone());
         (rec, packed)
+    }
+
+    /// Deterministic non-repeating bytes that count what was consumed, so a
+    /// test can see how much of the input had been read when a block sealed.
+    struct CountingGen {
+        left: usize,
+        state: u64,
+        read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for CountingGen {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left);
+            for b in &mut buf[..n] {
+                self.state = self
+                    .state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (self.state >> 56) as u8;
+            }
+            self.left -= n;
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn pack_file_with_hands_over_each_block_while_reading() {
+        let total = BLOCK_TARGET + 8 * 1024 * 1024;
+        let read = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let reader = CountingGen {
+            left: total,
+            state: 1,
+            read: read.clone(),
+        };
+        let mut read_at_block: Vec<usize> = Vec::new();
+        let mut cleared = true;
+        let (file, entries) = pack_file_with("w.bin", reader, &DedupIndex::new(), |b| {
+            read_at_block.push(read.get());
+            cleared &= b.chunks.iter().all(|c| c.data.is_empty() && c.len > 0);
+            assert_eq!(b.data.len(), b.chunks.iter().map(|c| c.len).sum::<usize>());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(file.size, total as u64);
+        assert!(read_at_block.len() >= 2, "expected two sealed blocks");
+        // The first block reached the sink long before the input ended: the
+        // packer held about one block, not the file.
+        assert!(
+            read_at_block[0] <= BLOCK_TARGET + 4 * crate::model::chunking::CHUNK_MAX,
+            "first block sealed after {} bytes read",
+            read_at_block[0]
+        );
+        assert!(read_at_block[0] < total);
+        assert!(cleared, "a sealed block still carries per-chunk buffers");
+        assert_eq!(entries.len(), read_at_block.len());
+    }
+
+    #[test]
+    fn pack_file_with_propagates_a_sink_error() {
+        let read = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let reader = CountingGen {
+            left: BLOCK_TARGET + 1024 * 1024,
+            state: 2,
+            read: read.clone(),
+        };
+        let err = pack_file_with("w.bin", reader, &DedupIndex::new(), |_| {
+            Err(std::io::Error::other("sink full"))
+        })
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.to_string(), "sink full");
+        // The error stopped the read; the rest of the input was not consumed.
+        assert!(read.get() < BLOCK_TARGET + 1024 * 1024);
     }
 
     #[test]

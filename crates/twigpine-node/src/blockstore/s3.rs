@@ -16,7 +16,7 @@
 use std::io;
 
 use async_trait::async_trait;
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client as S3Client;
@@ -34,6 +34,22 @@ use super::{BlockId, BlockStore, BlockStoreError, PutOutcome};
 const PART_SIZE: usize = 16 * 1024 * 1024;
 
 const KEY_PREFIX: &str = "model-blocks/v1";
+
+/// Does a non-success `CompleteMultipartUpload` answer prove the object was
+/// not committed? A 4xx refusal does, except two answers a retried complete
+/// produces after an earlier attempt committed with its response lost: 404
+/// `NoSuchUpload` (the upload id is consumed by the commit) and 409
+/// (`OperationAborted`, a conflicting operation in flight). Those are
+/// ambiguous, so the caller reconciles with `size()`. Every non-4xx status
+/// is ambiguous too.
+fn complete_refusal_is_definite(status: u16, code: Option<&str>) -> bool {
+    match status {
+        404 if code == Some("NoSuchUpload") => false,
+        409 => false,
+        400..=499 => true,
+        _ => false,
+    }
+}
 
 pub struct S3BlockStore {
     s3: S3Client,
@@ -147,9 +163,9 @@ impl S3BlockStore {
     /// honest answer is `Unknown`. Same rule as `git::tigris`'s dispatch
     /// classifier, including the cautious fallback for the `#[non_exhaustive]`
     /// error enum.
-    fn classify_complete_failure<E>(err: &SdkError<E>) -> BlockStoreError {
+    fn classify_complete_failure<E: ProvideErrorMetadata>(err: &SdkError<E>) -> BlockStoreError {
         if let Some(status) = err.raw_response().map(|r| r.status().as_u16()) {
-            return if (400..500).contains(&status) {
+            return if complete_refusal_is_definite(status, ProvideErrorMetadata::code(err)) {
                 Self::backend(format!("complete refused with status {status}"))
             } else {
                 BlockStoreError::Unknown
@@ -175,8 +191,6 @@ impl BlockStore for S3BlockStore {
             return Ok(PutOutcome::AlreadyPresent);
         }
 
-        // A zero-length body cannot be a multipart upload, but it can be a
-        // valid (if useless) object under the empty-sha id.
         let upload = self
             .s3
             .create_multipart_upload()
@@ -202,10 +216,17 @@ impl BlockStore for S3BlockStore {
                     return Err(BlockStoreError::TooLarge(max_len));
                 }
                 hasher.update(&chunk);
-                part_buf.extend_from_slice(&chunk);
-                if part_buf.len() >= PART_SIZE {
-                    self.flush_part(&key, &upload_id, &mut part_buf, &mut parts)
-                        .await?;
+                // A stream item can be as large as a whole block: fill each
+                // part to PART_SIZE and flush, never copy the item in whole.
+                let mut rest: &[u8] = &chunk;
+                while !rest.is_empty() {
+                    let take = (PART_SIZE - part_buf.len()).min(rest.len());
+                    part_buf.extend_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                    if part_buf.len() >= PART_SIZE {
+                        self.flush_part(&key, &upload_id, &mut part_buf, &mut parts)
+                            .await?;
+                    }
                 }
             }
             Ok(())
@@ -215,6 +236,10 @@ impl BlockStore for S3BlockStore {
         if let Err(e) = result {
             self.abort(&key, &upload_id).await;
             return Err(e);
+        }
+        if len == 0 {
+            self.abort(&key, &upload_id).await;
+            return Err(BlockStoreError::EmptyBlock);
         }
         if hex::encode(hasher.finalize()) != id.as_str() {
             self.abort(&key, &upload_id).await;
@@ -229,26 +254,6 @@ impl BlockStore for S3BlockStore {
                 return Err(e);
             }
         }
-        if parts.is_empty() {
-            // len == 0 and the hash matched, meaning id is the empty-sha.
-            self.abort(&key, &upload_id).await;
-            self.s3
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .body(ByteStream::from_static(b""))
-                .send()
-                .await
-                .map_err(|e| {
-                    if e.raw_response().is_none() {
-                        BlockStoreError::Unknown
-                    } else {
-                        Self::backend(e)
-                    }
-                })?;
-            return Ok(PutOutcome::Stored);
-        }
-
         let completed = CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
@@ -377,6 +382,8 @@ mod tests {
         /// past the client's operation timeout, simulating a commit whose
         /// answer was lost.
         hang_on_complete: Mutex<bool>,
+        /// Largest single part body the mock has received.
+        max_part_len: Mutex<usize>,
     }
 
     async fn head_handler(
@@ -445,6 +452,10 @@ mod tests {
             q.get("partNumber").and_then(|p| p.parse::<i32>().ok()),
             q.get("uploadId"),
         ) {
+            {
+                let mut max = st.max_part_len.lock().unwrap();
+                *max = (*max).max(body.len());
+            }
             st.parts.lock().unwrap().insert((key, part), body.to_vec());
             return Response::builder()
                 .status(StatusCode::OK)
@@ -543,6 +554,8 @@ mod tests {
             .route("/{bucket}/{*key}", post(post_handler))
             .route("/{bucket}/{*key}", head(head_handler))
             .route("/{bucket}/{*key}", delete(delete_handler))
+            // Parts are PART_SIZE bytes; axum's 2 MiB default would refuse them.
+            .layer(axum::extract::DefaultBodyLimit::disable())
             .with_state(st.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -613,6 +626,82 @@ mod tests {
         let (url, _st) = spawn_mock(false).await;
         let s = store(&url);
         crate::blockstore::parity::get_range_edge_contract(&s).await;
+    }
+
+    #[tokio::test]
+    async fn empty_body_is_refused_and_leaves_nothing() {
+        let (url, st) = spawn_mock(false).await;
+        let s = store(&url);
+        crate::blockstore::parity::empty_body_contract(&s).await;
+        assert!(st.parts.lock().unwrap().is_empty());
+        assert!(st.map.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn complete_failure_classifier_table() {
+        // Definite refusals stay backend errors.
+        for (status, code) in [
+            (400, Some("InvalidPart")),
+            (400, Some("EntityTooSmall")),
+            (403, Some("AccessDenied")),
+            (404, Some("NoSuchBucket")),
+            (404, None),
+            (412, Some("PreconditionFailed")),
+        ] {
+            assert!(
+                complete_refusal_is_definite(status, code),
+                "{status} {code:?} should be definite"
+            );
+        }
+        // A retry after a lost-answer commit, a conflicting operation, and
+        // anything outside 4xx are ambiguous.
+        for (status, code) in [
+            (404, Some("NoSuchUpload")),
+            (409, Some("OperationAborted")),
+            (409, None),
+            (200, Some("InternalError")),
+            (500, None),
+            (502, None),
+            (503, Some("SlowDown")),
+        ] {
+            assert!(
+                !complete_refusal_is_definite(status, code),
+                "{status} {code:?} should be ambiguous"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_oversized_stream_item_is_split_into_bounded_parts() {
+        let (url, st) = spawn_mock(false).await;
+        let s = store(&url);
+        let body: Vec<u8> = (0..(PART_SIZE * 2 + 1234) as u32)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let id = id_of(&body);
+        // One item holding the whole body, then many small items.
+        assert_eq!(
+            s.put_verified(&id, stream(body.clone()), u64::MAX)
+                .await
+                .unwrap(),
+            PutOutcome::Stored
+        );
+        assert_eq!(s.size(&id).await.unwrap(), Some(body.len() as u64));
+        let got = collect(s.get_range(&id, 0, body.len() as u64).await.unwrap()).await;
+        assert_eq!(got, body, "split parts must reassemble in order");
+        s.delete(&id).await.unwrap();
+        let small: Vec<Vec<u8>> = body.chunks(100_000).map(|c| c.to_vec()).collect();
+        let stream_small =
+            futures::stream::iter(small.into_iter().map(|p| Ok(Bytes::from(p)))).boxed();
+        assert_eq!(
+            s.put_verified(&id, stream_small, u64::MAX).await.unwrap(),
+            PutOutcome::Stored
+        );
+        let got = collect(s.get_range(&id, 0, body.len() as u64).await.unwrap()).await;
+        assert_eq!(got, body);
+        // Parts are consumed by the commit; the mock recorded each upload.
+        let max_part = st.max_part_len.lock().unwrap();
+        assert!(*max_part <= PART_SIZE, "a part held {} bytes", *max_part);
     }
 
     #[tokio::test]

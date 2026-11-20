@@ -1175,6 +1175,14 @@ impl Config {
     /// validated.
     pub fn validate(&mut self) -> Result<(), String> {
         self.settle_default_key_paths()?;
+        if self.model_unclaimed_ttl_secs <= self.model_session_ttl_secs {
+            return Err(format!(
+                "TWIGPINE_MODEL_UNCLAIMED_TTL_SECS ({}) must exceed \
+                 TWIGPINE_MODEL_SESSION_TTL_SECS ({}) so an in-progress upload \
+                 is never swept under its publisher",
+                self.model_unclaimed_ttl_secs, self.model_session_ttl_secs
+            ));
+        }
         // Concurrent git writes pin the dedicated lock pool for their whole
         // duration (connection-affine advisory lock in acquire_write). The main
         // pool no longer carries that occupancy.
@@ -1442,6 +1450,32 @@ mod tests {
         assert_eq!(config.effective_model_max_session_bytes(), 2048);
         assert_eq!(config.blockstore_dir, PathBuf::from("/var/lib/node/blocks"));
         assert_eq!(config.blockstore_s3_bucket, "model-blocks");
+    }
+
+    #[test]
+    fn model_unclaimed_ttl_must_exceed_session_ttl() {
+        let parse = |unclaimed: &str, session: &str| {
+            let mut config = Config::parse_from([
+                "twigpine-node",
+                "--model-unclaimed-ttl-secs",
+                unclaimed,
+                "--model-session-ttl-secs",
+                session,
+            ]);
+            config.validate()
+        };
+        // Reversed and equal both let the sweep delete blocks under an open
+        // upload session.
+        let reversed = parse("30", "60").unwrap_err();
+        assert!(
+            reversed.contains("TWIGPINE_MODEL_UNCLAIMED_TTL_SECS"),
+            "{reversed}"
+        );
+        assert!(parse("60", "60").is_err());
+        assert!(parse("61", "60").is_ok());
+        // The shipped defaults satisfy the rule.
+        let mut defaults = Config::parse_from(["twigpine-node"]);
+        defaults.validate().unwrap();
     }
 
     #[test]

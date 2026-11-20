@@ -25,8 +25,42 @@ pub struct FsBlockStore {
 
 impl FsBlockStore {
     pub fn new(root: PathBuf) -> io::Result<Self> {
-        std::fs::create_dir_all(root.join("tmp"))?;
+        let tmp = root.join("tmp");
+        // Every directory this call creates, deepest first. Creating them
+        // adds an entry to each one's parent, and an entry that is not
+        // fsynced is lost on a crash together with every block under it.
+        let created: Vec<PathBuf> = tmp
+            .ancestors()
+            .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
+            .map(Path::to_path_buf)
+            .collect();
+        std::fs::create_dir_all(&tmp)?;
+        for dir in &created {
+            if let Some(parent) = dir.parent() {
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                fsync_dir_blocking(parent)?;
+            }
+        }
         Ok(Self { root })
+    }
+
+    /// Fsync `dir` and every directory above it up to the store root, so the
+    /// whole `<aa>/<bb>/<sha>` name chain is durable. Used wherever success
+    /// is reported for a name this call did not itself just publish: a
+    /// concurrent writer may have linked it and not yet synced.
+    async fn sync_chain(&self, dir: &Path) -> io::Result<()> {
+        fsync_dir(dir).await?;
+        self.sync_ancestors(dir).await
+    }
+
+    /// The directories above a leaf directory, up to and including the root.
+    async fn sync_ancestors(&self, dir: &Path) -> io::Result<()> {
+        fsync_dir(dir.parent().unwrap_or(&self.root)).await?;
+        fsync_dir(&self.root).await
     }
 
     fn content_path(&self, id: &BlockId) -> PathBuf {
@@ -49,8 +83,27 @@ impl FsBlockStore {
 /// `Stored`, a link that only exists in the page cache is a lost write.
 #[cfg(unix)]
 async fn fsync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    SYNCED.lock().unwrap().push(dir.to_path_buf());
     tokio::fs::File::open(dir).await?.sync_all().await
 }
+
+#[cfg(unix)]
+fn fsync_dir_blocking(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    SYNCED.lock().unwrap().push(dir.to_path_buf());
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir_blocking(_: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Every directory fsynced in this test process, so a test can assert which
+/// names a code path made durable.
+#[cfg(test)]
+static SYNCED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// Directory fsync is a unix durability primitive; elsewhere the link is
 /// the best guarantee available.
@@ -68,7 +121,11 @@ impl BlockStore for FsBlockStore {
         max_len: u64,
     ) -> Result<PutOutcome, BlockStoreError> {
         let dest = self.content_path(id);
+        let dir = dest.parent().expect("content path has two levels");
         if dest.exists() {
+            // The name may belong to a writer that linked it and has not
+            // fsynced yet: persist the chain before reporting it present.
+            self.sync_chain(dir).await?;
             return Ok(PutOutcome::AlreadyPresent);
         }
 
@@ -103,6 +160,11 @@ impl BlockStore for FsBlockStore {
             Self::cleanup(&tmp).await;
             return Err(BlockStoreError::DigestMismatch);
         }
+        if len == 0 {
+            drop(file);
+            Self::cleanup(&tmp).await;
+            return Err(BlockStoreError::EmptyBlock);
+        }
         // Flush before the link: a crash between link and write-back would
         // leave a truncated object under a valid id.
         if let Err(e) = file.sync_all().await {
@@ -112,21 +174,17 @@ impl BlockStore for FsBlockStore {
         }
         drop(file);
 
-        let dir = dest.parent().expect("content path has two levels");
-        let fresh_dirs = !dir.exists();
         if let Err(e) = tokio::fs::create_dir_all(dir).await {
             Self::cleanup(&tmp).await;
             return Err(e.into());
         }
-        if fresh_dirs {
-            // The new <aa>/<bb> levels are themselves names in a parent
-            // directory; persist each level's entry.
-            for ancestor in [dir.parent().unwrap_or(&self.root), self.root.as_path()] {
-                if let Err(e) = fsync_dir(ancestor).await {
-                    Self::cleanup(&tmp).await;
-                    return Err(e.into());
-                }
-            }
+        // The <aa>/<bb> levels are names in their parents. Persist them on
+        // every store, not only when this call created them: a concurrent
+        // writer may have created them and not yet synced, and the
+        // directory merely existing says nothing about being durable.
+        if let Err(e) = self.sync_ancestors(dir).await {
+            Self::cleanup(&tmp).await;
+            return Err(e.into());
         }
         // A hard link refuses to replace an existing object, which is what
         // makes a same-content race benign rather than a torn write.
@@ -141,6 +199,8 @@ impl BlockStore for FsBlockStore {
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 Self::cleanup(&tmp).await;
+                // The winner's link may precede its own directory sync.
+                self.sync_chain(dir).await?;
                 Ok(PutOutcome::AlreadyPresent)
             }
             Err(e) => {
@@ -308,6 +368,122 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(&dir);
         crate::blockstore::parity::get_range_edge_contract(&s).await;
+    }
+
+    #[tokio::test]
+    async fn empty_body_is_refused_and_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        crate::blockstore::parity::empty_body_contract(&s).await;
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("blocks/tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    /// Directories whose entry was fsynced under `root`, in call order.
+    fn synced_under(root: &Path) -> Vec<PathBuf> {
+        SYNCED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(root))
+            .cloned()
+            .collect()
+    }
+
+    fn forget_synced(root: &Path) {
+        SYNCED.lock().unwrap().retain(|p| !p.starts_with(root));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_root_persists_every_created_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("a");
+        let root = top.join("b").join("blocks");
+        FsBlockStore::new(root.clone()).unwrap();
+        let synced = synced_under(dir.path());
+        // Each directory created on the way down, and the pre-existing
+        // directory that now holds the first of them, has been fsynced.
+        for expected in [
+            dir.path(),
+            top.as_path(),
+            top.join("b").as_path(),
+            root.as_path(),
+        ] {
+            assert!(
+                synced.iter().any(|p| p == expected),
+                "{expected:?} not fsynced; got {synced:?}"
+            );
+        }
+    }
+
+    /// A destination that already exists may have been linked by a writer
+    /// that has not fsynced yet, so reporting it present must persist the
+    /// whole publication chain itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn already_present_persists_the_publication_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let body = b"duplicate".to_vec();
+        let id = id_of(&body);
+        s.put_verified(&id, stream(body.clone()), u64::MAX)
+            .await
+            .unwrap();
+        let leaf = s.content_path(&id).parent().unwrap().to_path_buf();
+        forget_synced(dir.path());
+        assert_eq!(
+            s.put_verified(&id, stream(body), u64::MAX).await.unwrap(),
+            PutOutcome::AlreadyPresent
+        );
+        let synced = synced_under(dir.path());
+        for expected in [leaf.as_path(), leaf.parent().unwrap(), s.root.as_path()] {
+            assert!(
+                synced.iter().any(|p| p == expected),
+                "{expected:?} not fsynced on AlreadyPresent; got {synced:?}"
+            );
+        }
+    }
+
+    /// A second block landing in a directory that already exists still
+    /// persists that directory's ancestors: existence is not durability.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_store_persists_the_ancestor_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let first = b"first".to_vec();
+        s.put_verified(&id_of(&first), stream(first.clone()), u64::MAX)
+            .await
+            .unwrap();
+        // Same aa/bb directory, different object: find a body whose id
+        // shares the first four hex characters.
+        let target = id_of(&first);
+        let prefix = &target.as_str()[..4];
+        let mut n = 0u64;
+        let sibling = loop {
+            let candidate = n.to_le_bytes().to_vec();
+            if id_of(&candidate).as_str().starts_with(prefix) && candidate != first {
+                break candidate;
+            }
+            n += 1;
+        };
+        forget_synced(dir.path());
+        s.put_verified(&id_of(&sibling), stream(sibling.clone()), u64::MAX)
+            .await
+            .unwrap();
+        let leaf = s.content_path(&target).parent().unwrap().to_path_buf();
+        let synced = synced_under(dir.path());
+        for expected in [leaf.as_path(), leaf.parent().unwrap(), s.root.as_path()] {
+            assert!(
+                synced.iter().any(|p| p == expected),
+                "{expected:?} not fsynced for a store into an existing dir; got {synced:?}"
+            );
+        }
     }
 
     #[tokio::test]

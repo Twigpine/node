@@ -82,6 +82,12 @@ pub enum BlockStoreError {
     /// stored.
     #[error("body exceeds the {0}-byte limit")]
     TooLarge(u64),
+    /// The body was empty. Model blocks are never empty (`model_blocks.size`
+    /// is checked `> 0` and the packer never seals an empty block), so both
+    /// backends refuse the empty id instead of storing a zero-byte object the
+    /// database could not record. Nothing was stored.
+    #[error("an empty body is not a valid block")]
+    EmptyBlock,
     /// The requested byte range is outside the stored object.
     #[error("requested range is outside the object")]
     OutOfRange,
@@ -106,7 +112,12 @@ pub trait BlockStore: Send + Sync {
     /// Stream `body` into the store under `id`, hashing as it goes. The body
     /// is never fully buffered. Fails with `TooLarge` the moment the body
     /// exceeds `max_len`, with `DigestMismatch` when the bytes do not hash to
-    /// `id`, and leaves no object or temporary state behind on any failure.
+    /// `id`, and with `EmptyBlock` for a zero-length body. After any of those
+    /// definite failures no object is stored and staged data is cleaned up on
+    /// a best-effort basis: a remote backend whose abort call fails leaves
+    /// orphaned staging state behind. `Unknown` is the exception to the
+    /// no-object guarantee: the write may have committed, so callers
+    /// reconcile with `size()` before retrying.
     async fn put_verified(
         &self,
         id: &BlockId,
@@ -161,6 +172,16 @@ pub(crate) mod parity {
     use super::*;
     use futures::StreamExt;
     use sha2::{Digest, Sha256};
+
+    /// A zero-length body is refused identically by every backend and leaves
+    /// no object under the empty-body id.
+    pub(crate) async fn empty_body_contract(store: &dyn BlockStore) {
+        let id = BlockId::parse(&hex::encode(Sha256::digest(b""))).unwrap();
+        let body = futures::stream::iter(Vec::<io::Result<Bytes>>::new()).boxed();
+        let err = store.put_verified(&id, body, u64::MAX).await.unwrap_err();
+        assert!(matches!(err, BlockStoreError::EmptyBlock), "got {err:?}");
+        assert_eq!(store.size(&id).await.unwrap(), None);
+    }
 
     pub(crate) async fn get_range_edge_contract(store: &dyn BlockStore) {
         let body: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();

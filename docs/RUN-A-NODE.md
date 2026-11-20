@@ -292,7 +292,7 @@ content-addressed blocks outside git.
 - `TWIGPINE_MODEL_HOSTING_ENABLED=false` - the master switch.
 - `TWIGPINE_MODEL_QUOTA_BYTES` - per-identity quota for claimed blocks (default 256 GiB).
 - `TWIGPINE_MODEL_NODE_QUOTA_BYTES` - total model bytes this node will hold (default 1 TiB).
-- `TWIGPINE_MODEL_UNCLAIMED_TTL_SECS` - grace period before unclaimed blocks are swept (default 86400).
+- `TWIGPINE_MODEL_UNCLAIMED_TTL_SECS` - grace period before unclaimed blocks are swept (default 86400). Must exceed the session TTL; the node refuses to start otherwise.
 - `TWIGPINE_MODEL_SESSION_TTL_SECS` - base upload-session lifetime, renewed by each accepted block (default 43200).
 - `TWIGPINE_MODEL_MAX_SESSION_BYTES` - optional cap on one identity's open sessions (defaults to the quota).
 - `TWIGPINE_BLOCKSTORE_DIR` - where blocks live on disk (default `./data/model-blocks`).
