@@ -304,8 +304,8 @@ pub async fn claim_model_release(
         )));
     };
     crate::api::status::require_body_bound_signature(&material, &body_bytes)?;
-    if body.commit.len() != 40 || !body.commit.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(AppError::BadRequest("commit must be a 40-hex sha".into()));
+    if !twigpine_core::cid::is_hex_oid(&body.commit) {
+        return Err(AppError::BadRequest("commit must be a hex sha".into()));
     }
     let material = models::claim::ClaimMaterial {
         request_digest: crate::api::status::request_digest(&material, &body_bytes),
