@@ -85,10 +85,15 @@ pub(crate) async fn read_verified_manifest(
     commit: &str,
     owner_did: &str,
 ) -> Result<(Vec<u8>, Manifest), AppError> {
-    let manifest_bytes = git_show(git_bin, disk_path, commit, ".twigpine/model-release.json")
-        .await?
-        .ok_or_else(|| bad_request("commit carries no .twigpine/model-release.json"))?;
-    let sig_text = git_show(git_bin, disk_path, commit, ".twigpine/model-release.sig")
+    let manifest_bytes = git_show(
+        git_bin,
+        disk_path,
+        commit,
+        crate::models::RELEASE_MANIFEST_PATH,
+    )
+    .await?
+    .ok_or_else(|| bad_request("commit carries no .twigpine/model-release.json"))?;
+    let sig_text = git_show(git_bin, disk_path, commit, crate::models::RELEASE_SIG_PATH)
         .await?
         .ok_or_else(|| bad_request("commit carries no .twigpine/model-release.sig"))?;
     let sig_text =

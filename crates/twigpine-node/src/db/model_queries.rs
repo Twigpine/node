@@ -833,22 +833,6 @@ impl Db {
         Ok(row.map(Into::into))
     }
 
-    /// The reconstruction object's sha for a release, when the manifest
-    /// declared one (all-git releases have none). `ModelRelease` does not
-    /// carry the column; the durability enqueue needs it directly.
-    pub async fn model_release_reconstruction_sha(
-        &self,
-        release_id: i64,
-    ) -> Result<Option<String>> {
-        Ok(
-            sqlx::query_scalar("SELECT reconstruction_sha256 FROM model_releases WHERE id = $1")
-                .bind(release_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .flatten(),
-        )
-    }
-
     /// Every block a release references, in stable order. The
     /// `pin_block` job material and (after the pins land) the block-CID
     /// map's key set.
@@ -871,13 +855,13 @@ impl Db {
     pub async fn model_durability_enqueue(
         &self,
         release_id: i64,
-        jobs: &[(String, String)],
+        jobs: &[(&str, &str)],
     ) -> Result<u64> {
         if jobs.is_empty() {
             return Ok(0);
         }
-        let kinds: Vec<&str> = jobs.iter().map(|(k, _)| k.as_str()).collect();
-        let keys: Vec<&str> = jobs.iter().map(|(_, o)| o.as_str()).collect();
+        let kinds: Vec<&str> = jobs.iter().map(|(k, _)| *k).collect();
+        let keys: Vec<&str> = jobs.iter().map(|(_, o)| *o).collect();
         let now = ts_now();
         let inserted = sqlx::query(
             "INSERT INTO model_durability_jobs
@@ -1000,6 +984,27 @@ impl Db {
         .rows_affected())
     }
 
+    /// (pending, failed) counts for a release's jobs matching `pred`
+    /// (`kind = $2` or `kind <> $2`), the job-gate inputs.
+    async fn model_durability_counts(
+        &self,
+        release_id: i64,
+        kind: &str,
+        pred: &str,
+    ) -> Result<(i64, i64)> {
+        let (pending, failed): (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FILTER (WHERE state = 'pending'),
+                    COUNT(*) FILTER (WHERE state = 'failed')
+             FROM model_durability_jobs
+             WHERE release_id = $1 AND kind {pred} $2",
+        ))
+        .bind(release_id)
+        .bind(kind)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((pending.unwrap_or(0), failed.unwrap_or(0)))
+    }
+
     /// (pending, failed) counts for a release's jobs of `kind`, the
     /// `pin_block_map` gate (`pin_block`) and the anchor gate.
     pub async fn model_durability_kind_counts(
@@ -1007,17 +1012,7 @@ impl Db {
         release_id: i64,
         kind: &str,
     ) -> Result<(i64, i64)> {
-        let (pending, failed): (Option<i64>, Option<i64>) = sqlx::query_as(
-            "SELECT COUNT(*) FILTER (WHERE state = 'pending'),
-                    COUNT(*) FILTER (WHERE state = 'failed')
-             FROM model_durability_jobs
-             WHERE release_id = $1 AND kind = $2",
-        )
-        .bind(release_id)
-        .bind(kind)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok((pending.unwrap_or(0), failed.unwrap_or(0)))
+        self.model_durability_counts(release_id, kind, "=").await
     }
 
     /// (pending, failed) counts for a release's jobs of every kind EXCEPT
@@ -1027,17 +1022,7 @@ impl Db {
         release_id: i64,
         kind: &str,
     ) -> Result<(i64, i64)> {
-        let (pending, failed): (Option<i64>, Option<i64>) = sqlx::query_as(
-            "SELECT COUNT(*) FILTER (WHERE state = 'pending'),
-                    COUNT(*) FILTER (WHERE state = 'failed')
-             FROM model_durability_jobs
-             WHERE release_id = $1 AND kind <> $2",
-        )
-        .bind(release_id)
-        .bind(kind)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok((pending.unwrap_or(0), failed.unwrap_or(0)))
+        self.model_durability_counts(release_id, kind, "<>").await
     }
 
     /// (object_key, provider_cid) pairs for done jobs of `kind`, keyed so

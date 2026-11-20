@@ -350,8 +350,6 @@ fn tracked_paths(root: &Path) -> Result<HashSet<String>> {
     Ok(out)
 }
 
-/// Paths listed inside the managed .gitignore block (empty when there is no
-/// block): previously published chunked files.
 /// One repo-relative path as a gitignore pattern line: pattern
 /// metacharacters and a trailing space are backslash-escaped.
 fn escape_gitignore_path(p: &str) -> String {
@@ -385,6 +383,8 @@ fn unescape_gitignore_path(line: &str) -> String {
     out
 }
 
+/// Paths listed inside the managed .gitignore block (empty when there is no
+/// block): previously published chunked files.
 fn managed_block_paths(gitignore: &str) -> Vec<String> {
     let mut inside = false;
     let mut out = Vec::new();
@@ -1269,8 +1269,8 @@ async fn discover_release_anchors(
 
 /// One anchor candidate through its trust gates: fetch the body, parse the
 /// anchor JSON, then fetch the manifest and verify it against the expected
-/// DID. Returns `Ok(Some(..))` only when the manifest verifies; every failure
-/// is a warning plus `Ok(None)` so the next candidate gets tried.
+/// DID. Returns `Some(..)` only when the manifest verifies; every failure is
+/// a warning plus `None` so the next candidate gets tried.
 async fn verify_candidate(
     net: &Net<'_>,
     tx_id: &str,
@@ -1457,8 +1457,8 @@ fn chunk_offsets(block: &BlockEntry) -> Vec<u64> {
 
 /// Rebuild one chunked file into `out_path` from its terms, streaming to
 /// disk. Per-chunk sha256s are verified as slices are consumed and the
-/// whole-file digest against the manifest at the end, so at most a handful
-/// of blocks are ever resident.
+/// whole-file digest is checked against the manifest at the end, so at most
+/// a handful of blocks are ever resident.
 async fn rebuild_chunked(
     source: &mut BlockSource<'_>,
     rec: &Reconstruction,
@@ -1664,10 +1664,10 @@ pub async fn fetch_model(args: &FetchArgs) -> Result<FetchReport> {
     }
 
     let out_dir = args.output.clone().unwrap_or_else(|| {
-        PathBuf::from(format!(
-            "{name}-{}",
-            &anchor.release_commit[..anchor.release_commit.len().min(8)]
-        ))
+        // `release_commit` is untrusted anchor text: truncate by chars so a
+        // multi-byte boundary cannot panic, like a raw byte slice would.
+        let short: String = anchor.release_commit.chars().take(8).collect();
+        PathBuf::from(format!("{name}-{short}"))
     });
     if out_dir.exists() {
         let non_empty = out_dir

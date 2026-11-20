@@ -113,7 +113,7 @@ enum Commands {
     /// Print your current identity (DID) and optional node info
     Whoami(whoami::WhoamiArgs),
 
-    /// Publish open-weight model releases
+    /// Publish and fetch open-weight model releases
     Model {
         #[command(subcommand)]
         cmd: model::ModelCmd,

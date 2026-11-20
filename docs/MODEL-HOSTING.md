@@ -10,9 +10,9 @@ Arweave and IPFS with no node in the loop.
 
 `twigpine model publish` runs inside a local clone and:
 
-1. Classifies files by the chunking threshold (10 MiB): smaller files stay
-   ordinary git blobs, larger ones are packed into content blocks (up to
-   128 MiB each) uploaded out of band under an upload session.
+1. Classifies files by the chunking threshold (10 MiB): files below it stay
+   ordinary git blobs, files at or above it are packed into content blocks
+   (up to 128 MiB each) uploaded out of band under an upload session.
 2. Commits `.twigpine/model-release.json` (the signed manifest) and
    `.twigpine/model-release.sig` (a detached Ed25519 signature over the exact
    manifest bytes), pushes, and posts a release claim to the node.
@@ -37,6 +37,8 @@ without it.
 | `TWIGPINE_MODEL_NODE_QUOTA_BYTES` | `1099511627776` (1 TiB) | Total model bytes the node will hold, open sessions included. |
 | `TWIGPINE_MODEL_SESSION_TTL_SECS` | `43200` | Base upload-session lifetime; each accepted block renews it. |
 | `TWIGPINE_MODEL_UNCLAIMED_TTL_SECS` | `86400` | Grace before blocks no release references are swept. Must exceed the session TTL. |
+| `TWIGPINE_HF_READ_RATE_LIMIT` | `600` | Per-IP request limit for the `/hf` read surface, per hour. |
+| `TWIGPINE_MODEL_DOWNLOAD_PERMITS` | `16` | Concurrent model downloads the resolve route will stream. |
 | `TWIGPINE_MODEL_MAX_SESSION_BYTES` | unset (uses the identity quota) | Optional cap on one identity's open sessions. |
 | `TWIGPINE_BLOCKSTORE_DIR` | `./data/model-blocks` | Where blocks live with the filesystem backend. |
 | `TWIGPINE_BLOCKSTORE_S3_BUCKET` | unset | Store blocks in S3 instead; reuses the `AWS_*` endpoint and credentials of the Tigris backend. |
@@ -70,13 +72,15 @@ confirmation before it claims.
 ### HF-compatible API
 
 A `huggingface_hub` client pointed at the node reads a published release like
-an HF repo. The repo id is `<owner_did>/<name>` (the owner segment carries
-the DID literally, colons and all):
+an HF repo. The repo id is `<owner>/<name>` where `<owner>` is the bare DID
+key: `huggingface_hub` validates `repo_id` client-side and rejects the
+colons in a full `did:key:` string, so pass the key without the `did:key:`
+prefix. The node normalizes it back to the full DID.
 
 ```python
 from huggingface_hub import snapshot_download
 # HF_ENDPOINT=https://<node>/hf
-snapshot_download(repo_id="did:key:z6Mk.../my-model")
+snapshot_download(repo_id="z6Mk.../my-model")
 ```
 
 Mounted routes: `GET /hf/api/models/{owner}/{repo}`,
@@ -85,9 +89,9 @@ Mounted routes: `GET /hf/api/models/{owner}/{repo}`,
 Anonymous reads work on fully public repos; HF bearer tokens carry no
 signature and read as anonymous.
 
-One size limit to know: huggingface_hub 2.x refuses plain downloads of a
-single file over 50 GiB, so `model publish` warns when a chunked file passes
-that line.
+One size limit to know: current `huggingface_hub` releases refuse plain
+downloads of a single file over 50 GiB, so `model publish` warns when a
+chunked file passes that line.
 
 ### Independent fetch (no node)
 
@@ -124,7 +128,7 @@ With a node running the feature and both providers configured:
    (`GET /api/v1/repos/{owner}/{repo}/models/releases/{commit}`).
 2. Confirm the durability jobs drained: the release's pin rows land on the
    configured IPFS tiers and one anchor tx posts to Irys.
-3. `HF_ENDPOINT=http://localhost:PORT/hf python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='<owner_did>/<name>')"`.
+3. `HF_ENDPOINT=http://localhost:PORT/hf python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='<owner_key>/<name>')"` (`<owner_key>` is the bare DID key, no `did:key:` prefix).
 4. Stop the node, then
    `twigpine model fetch <owner_did>/<name> --expect-did <did> --output /tmp/m`
    and diff the result against the original files.

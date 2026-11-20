@@ -29,6 +29,13 @@ pub const MAX_BLOCK_BYTES: u64 = 128 * 1024 * 1024;
 /// lock is what makes them safe under racing claims.
 pub(crate) const CLAIM_LOCK_KEY: i64 = 0x6D6F64656C636C61; // "modelcla"
 
+/// Paths inside a release commit: the signed manifest and its detached
+/// signature. One definition shared by the claim reader, the HF surface,
+/// and the durability jobs so a path change cannot split writers from
+/// readers.
+pub(crate) const RELEASE_MANIFEST_PATH: &str = ".twigpine/model-release.json";
+pub(crate) const RELEASE_SIG_PATH: &str = ".twigpine/model-release.sig";
+
 pub type ReleaseRow = ModelRelease;
 
 pub async fn read_range(

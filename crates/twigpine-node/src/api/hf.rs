@@ -42,7 +42,7 @@ use crate::state::AppState;
 
 /// Manifest and signature paths inside the release commit (the same paths
 /// `models::claim` reads at claim time).
-const MANIFEST_PATH: &str = ".twigpine/model-release.json";
+use crate::models::RELEASE_MANIFEST_PATH as MANIFEST_PATH;
 
 const X_REPO_COMMIT: HeaderName = HeaderName::from_static("x-repo-commit");
 const X_ERROR_CODE: HeaderName = HeaderName::from_static("x-error-code");
@@ -225,7 +225,9 @@ fn tree_entries(manifest: &Manifest, prefix: &str) -> Vec<serde_json::Value> {
             e["lfs"] = json!({
                 "oid": f.sha256,
                 "size": f.size,
-                "pointerSize": f.size,
+                // HF's pointerSize is the pointer file's byte size
+                // (a fixed ~130), not the object's.
+                "pointerSize": 130,
             });
         }
         if f.format == FileFormat::Pickle {
@@ -346,8 +348,9 @@ pub async fn hf_refs(
 }
 
 /// `HEAD|GET /hf/{owner}/{repo}/resolve/{rev}/{*path}`, byte-exact,
-/// resumable file bytes (KTD9). `X-Repo-Commit` is on every answer,
-/// including `EntryNotFound`, so a client can always pin what it read.
+/// resumable file bytes (KTD9). `X-Repo-Commit` rides every answer that
+/// resolved a release (200/206/304/416/`EntryNotFound`), so a client can
+/// always pin what it read.
 pub async fn hf_resolve(
     State(state): State<AppState>,
     Path((owner, name, rev, path)): Path<(String, String, String, String)>,

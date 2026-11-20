@@ -22,6 +22,7 @@
 use std::time::Duration;
 
 use crate::db::model_queries::DurabilityJob;
+use crate::db::RepoRecord;
 use crate::error::AppError;
 use crate::ipfs_pin::PolicyFence;
 use crate::models::claim::git_show;
@@ -43,8 +44,7 @@ const BACKFILL_BATCH: i64 = 64;
 /// enough that an empty drain is cheap.
 const TICK_SECS: u64 = 30;
 
-const MANIFEST_PATH: &str = ".twigpine/model-release.json";
-const SIG_PATH: &str = ".twigpine/model-release.sig";
+use crate::models::{RELEASE_MANIFEST_PATH as MANIFEST_PATH, RELEASE_SIG_PATH as SIG_PATH};
 
 /// Enqueue the full job set for one published release. Idempotent: the
 /// `(release, kind, object)` unique key makes a second call insert
@@ -57,25 +57,20 @@ pub async fn enqueue_for_release(state: &AppState, release_id: i64) -> Result<()
     if release.state != "published" {
         return Ok(());
     }
-    let mut jobs: Vec<(String, String)> = state
-        .db
-        .model_release_blocks(release_id)
-        .await?
-        .into_iter()
-        .map(|sha| (KIND_BLOCK.to_string(), sha))
+    let block_shas = state.db.model_release_blocks(release_id).await?;
+    let mut jobs: Vec<(&str, &str)> = block_shas
+        .iter()
+        .map(|sha| (KIND_BLOCK, sha.as_str()))
         .collect();
-    jobs.push((KIND_MANIFEST.to_string(), release.manifest_sha256.clone()));
-    if let Some(rec_sha) = state
-        .db
-        .model_release_reconstruction_sha(release_id)
-        .await?
-    {
-        jobs.push((KIND_RECONSTRUCTION.to_string(), rec_sha));
+    jobs.push((KIND_MANIFEST, release.manifest_sha256.as_str()));
+    let rec_sha = state.db.model_reconstruction_sha(release_id).await?;
+    if let Some(sha) = rec_sha.as_deref() {
+        jobs.push((KIND_RECONSTRUCTION, sha));
     }
     // Release-level jobs key on the commit: it scopes the row, nothing
     // resolves object bytes through it.
-    jobs.push((KIND_BLOCK_MAP.to_string(), release.commit_sha.clone()));
-    jobs.push((KIND_ANCHOR.to_string(), release.commit_sha));
+    jobs.push((KIND_BLOCK_MAP, release.commit_sha.as_str()));
+    jobs.push((KIND_ANCHOR, release.commit_sha.as_str()));
     state.db.model_durability_enqueue(release_id, &jobs).await?;
     Ok(())
 }
@@ -120,20 +115,15 @@ pub async fn run_durability_worker(state: AppState) {
 }
 
 /// Whether the repo a release belongs to may still be published outbound:
-/// fully public, no visibility rules, no mirror row, not quarantined. A
-/// `false` means every pending job for the release stops and the anchor
-/// must never post (KTD10: pins stop when publicity changes).
-async fn still_publishable(state: &AppState, repo_id: &str) -> Result<bool, AppError> {
-    let Some(record) = state.db.get_repo_by_id(repo_id).await? else {
-        return Ok(false);
-    };
-    if !record.is_public || record.id.contains('/') {
-        return Ok(false);
-    }
+/// fully public on the canonical predicate, and not quarantined. A `false`
+/// means every pending job for the release stops and the anchor must never
+/// post (KTD10: pins stop when publicity changes).
+async fn still_publishable(state: &AppState, record: &RepoRecord) -> Result<bool, AppError> {
     if state.db.is_repo_quarantined(&record.id).await? {
         return Ok(false);
     }
-    Ok(state.db.list_visibility_rules(&record.id).await?.is_empty())
+    let rules = state.db.list_visibility_rules(&record.id).await?;
+    Ok(crate::api::models::require_fully_public(record, &rules).is_ok())
 }
 
 /// Process one pending job. Errors are recorded (attempts bumped, failed
@@ -199,7 +189,14 @@ async fn process_job(state: &AppState, job: &DurabilityJob) -> Result<(), AppErr
         _ => {}
     }
 
-    if !still_publishable(state, &release.repo_id).await? {
+    let Some(record) = state.db.get_repo_by_id(&release.repo_id).await? else {
+        state
+            .db
+            .model_durability_mark_failed(job.id, "repo row is gone")
+            .await?;
+        return Ok(());
+    };
+    if !still_publishable(state, &record).await? {
         state
             .db
             .model_durability_fail_pending(job.release_id, "repository is no longer fully public")
@@ -212,7 +209,7 @@ async fn process_job(state: &AppState, job: &DurabilityJob) -> Result<(), AppErr
     // assuming the bump was publicity-shaped.
     let fence = PolicyFence::capture(&state.db, &release.repo_id).await;
 
-    let result = execute_job(state, &release, job, fence.as_ref()).await;
+    let result = execute_job(state, &release, job, fence.as_ref(), &record).await;
     match result {
         Ok(JobOutcome::Deferred) => Ok(()),
         Ok(JobOutcome::Done(cid)) => {
@@ -243,6 +240,15 @@ enum JobOutcome {
     Done(String),
 }
 
+/// The policy epoch is still good; a stale one defers the job so the
+/// publicity check re-runs before the provider call.
+async fn fence_current(fence: Option<&PolicyFence>) -> bool {
+    match fence {
+        Some(f) => f.is_current().await,
+        None => true,
+    }
+}
+
 /// Run the job's own work. `fence` is the captured policy epoch, checked
 /// right before each provider call.
 async fn execute_job(
@@ -250,6 +256,7 @@ async fn execute_job(
     release: &crate::models::ReleaseRow,
     job: &DurabilityJob,
     fence: Option<&PolicyFence>,
+    record: &RepoRecord,
 ) -> Result<JobOutcome, AppError> {
     match job.kind.as_str() {
         KIND_BLOCK | KIND_RECONSTRUCTION => {
@@ -275,7 +282,7 @@ async fn execute_job(
             pin_bytes(state, &job.object_key, &bytes, fence).await
         }
         KIND_MANIFEST => {
-            let bytes = git_bytes(state, release, MANIFEST_PATH).await?;
+            let bytes = git_bytes(&state.git_bin, record, release, MANIFEST_PATH).await?;
             pin_bytes(state, &job.object_key, &bytes, fence).await
         }
         KIND_BLOCK_MAP => {
@@ -291,7 +298,7 @@ async fn execute_job(
             // nothing else ever pins them. Pin each here and index it by
             // its manifest sha256, or a fetch without this node can rebuild
             // every chunked file and still miss config.json.
-            let manifest_bytes = git_bytes(state, release, MANIFEST_PATH).await?;
+            let manifest_bytes = git_bytes(&state.git_bin, record, release, MANIFEST_PATH).await?;
             let manifest = twigpine_core::model::manifest::Manifest::parse(&manifest_bytes)
                 .map_err(|e| AppError::Internal(anyhow::anyhow!("manifest parse: {e}")))?;
             let mut files = serde_json::Map::new();
@@ -300,7 +307,7 @@ async fn execute_job(
                 .iter()
                 .filter(|f| f.storage == twigpine_core::model::manifest::StorageKind::Git)
             {
-                let data = git_bytes(state, release, &file.path).await?;
+                let data = git_bytes(&state.git_bin, record, release, &file.path).await?;
                 match pin_bytes(state, &file.sha256, &data, fence).await? {
                     JobOutcome::Done(cid) => {
                         files.insert(file.sha256.clone(), serde_json::Value::String(cid));
@@ -318,7 +325,7 @@ async fn execute_job(
                 .map_err(|e| AppError::Internal(anyhow::anyhow!("block map serialize: {e}")))?;
             pin_bytes(state, &job.object_key, &bytes, fence).await
         }
-        KIND_ANCHOR => post_anchor(state, release, job, fence).await,
+        KIND_ANCHOR => post_anchor(state, release, job, fence, record).await,
         other => Err(AppError::Internal(anyhow::anyhow!(
             "unknown durability job kind {other}"
         ))),
@@ -329,17 +336,13 @@ async fn execute_job(
 /// object is a job error like a missing store block: retry until the
 /// attempt budget fails it.
 async fn git_bytes(
-    state: &AppState,
+    git_bin: &str,
+    record: &RepoRecord,
     release: &crate::models::ReleaseRow,
     path: &str,
 ) -> Result<Vec<u8>, AppError> {
-    let record = state
-        .db
-        .get_repo_by_id(&release.repo_id)
-        .await?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("repo row gone")))?;
     git_show(
-        &state.git_bin,
+        git_bin,
         std::path::Path::new(&record.disk_path),
         &release.commit_sha,
         path,
@@ -363,12 +366,10 @@ async fn pin_bytes(
     data: &[u8],
     fence: Option<&PolicyFence>,
 ) -> Result<JobOutcome, AppError> {
-    if let Some(f) = fence {
-        if !f.is_current().await {
-            return Ok(JobOutcome::Deferred);
-        }
+    if !fence_current(fence).await {
+        return Ok(JobOutcome::Deferred);
     }
-    let kubo = crate::ipfs_pin::pin_model_object(
+    let kubo = crate::ipfs_pin::pin_git_object(
         &state.config.ipfs_api,
         object_key,
         data,
@@ -376,6 +377,12 @@ async fn pin_bytes(
     )
     .await
     .map_err(AppError::Internal)?;
+    // Pinata is the off-node copy: check the epoch again between providers
+    // so a publicity flip mid-job cannot push content outbound that a flip
+    // one second earlier would have stopped entirely.
+    if !fence_current(fence).await {
+        return Ok(JobOutcome::Deferred);
+    }
     let pinata = crate::pinata::pin_model_object(
         &state.http_client,
         &state.config.pinata_upload_url,
@@ -407,6 +414,7 @@ async fn post_anchor(
     release: &crate::models::ReleaseRow,
     job: &DurabilityJob,
     fence: Option<&PolicyFence>,
+    record: &RepoRecord,
 ) -> Result<JobOutcome, AppError> {
     if state.config.irys_url.is_empty() {
         return Ok(JobOutcome::Done(String::new()));
@@ -421,11 +429,7 @@ async fn post_anchor(
         .model_durability_done_cid(job.release_id, KIND_BLOCK_MAP)
         .await?
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("block map pin has no provider CID")))?;
-    let (rec_sha, rec_cid) = match state
-        .db
-        .model_release_reconstruction_sha(job.release_id)
-        .await?
-    {
+    let (rec_sha, rec_cid) = match state.db.model_reconstruction_sha(job.release_id).await? {
         Some(sha) => {
             let cid = state
                 .db
@@ -438,18 +442,11 @@ async fn post_anchor(
         }
         None => (None, None),
     };
-    let signature = String::from_utf8(git_bytes(state, release, SIG_PATH).await?)
+    let signature = String::from_utf8(git_bytes(&state.git_bin, record, release, SIG_PATH).await?)
         .map_err(|_| AppError::Internal(anyhow::anyhow!("model-release.sig is not utf-8")))?;
-    let record = state
-        .db
-        .get_repo_by_id(&release.repo_id)
-        .await?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("repo row gone")))?;
 
-    if let Some(f) = fence {
-        if !f.is_current().await {
-            return Ok(JobOutcome::Deferred);
-        }
+    if !fence_current(fence).await {
+        return Ok(JobOutcome::Deferred);
     }
     let anchor = crate::arweave::ReleaseAnchor {
         repo: format!("{}/{}", record.owner_did, record.name),
