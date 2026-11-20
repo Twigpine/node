@@ -96,6 +96,16 @@ pub async fn create_issue(
             .await
             .into_result()
     } else {
+        // The bounded runner reports failure for a child it killed after
+        // `update-ref` had already committed, so an error does not prove the
+        // ref is absent. A refused create publishes nothing, so drop any such
+        // ref before the lock goes; left behind, a later writer would publish
+        // an issue whose id the client never received.
+        if let Err(e) =
+            git_issues::delete_issue_ref(&git_bin, guard.path(), &issue_id_for_comp, deadline)
+        {
+            tracing::warn!(repo = %repo, err = %e, "could not remove the issue ref after a failed create");
+        }
         guard.release(false).await.into_result()
     };
     release_result?;

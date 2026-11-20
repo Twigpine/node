@@ -4328,6 +4328,49 @@ mod tests {
         );
     }
 
+    /// #282: the create handler runs its ref write through the bounded runner,
+    /// which can report failure for a child it killed after `update-ref` had
+    /// already committed. The handler must not release the guard over a ref it
+    /// cannot rule out: it removes the ref first, so no unpublished issue
+    /// survives a refused create to be published by a later writer.
+    #[sqlx::test]
+    async fn create_issue_removes_a_ref_a_failed_bounded_write_may_have_committed(pool: PgPool) {
+        let owner = "did:key:zISSUEORPHANAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "orphan-create";
+        let mut state = test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let live = crate::git::repo_store::validated_repo_disk_path(disk.path(), owner, repo_name)
+            .expect("repo path");
+        let mut seeded = seed_repo(owner, repo_name);
+        seeded.disk_path = live.to_string_lossy().to_string();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, Duration::from_secs(1)),
+        );
+        let shim = git_shim::create("gl-orphan-git", git_shim::Behavior::FailAfterUpdateRef);
+        state.git_bin = shim.to_str().unwrap().to_string();
+
+        let res = crate::api::issues::create_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(AuthenticatedDid(owner.to_string())),
+            axum::extract::Path((owner.to_string(), repo_name.to_string())),
+            axum::Json(crate::api::issues::CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        assert!(res.is_err(), "a failed ref write must refuse the create");
+        let issues = crate::git::issues::list_issues(&live).expect("list issues");
+        assert!(
+            issues.is_empty(),
+            "no issue ref may survive a refused create, got {issues:?}"
+        );
+    }
+
     /// Adversarial-review D3-1: register binds the registered DID to the signer.
     /// A caller signed as A cannot register a different DID B (no spoofed
     /// registration or trust row under a victim DID). Rejected before any write.

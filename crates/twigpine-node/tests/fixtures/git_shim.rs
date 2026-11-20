@@ -55,5 +55,15 @@ fn main() -> std::io::Result<()> {
     if let Some(bytes) = input {
         child.stdin.take().unwrap().write_all(&bytes)?;
     }
-    std::process::exit(child.wait()?.code().unwrap_or(1));
+    let code = child.wait()?.code().unwrap_or(1);
+    // A ref write that commits and then reports failure, the state a runner
+    // that kills a child at its deadline cannot tell from a clean failure.
+    let committed_then_failed = mode == "fail-after-update-ref"
+        && args.first().is_some_and(|arg| arg == "update-ref")
+        && args.get(1).is_some_and(|arg| arg != "-d");
+    std::process::exit(if committed_then_failed && code == 0 {
+        1
+    } else {
+        code
+    });
 }

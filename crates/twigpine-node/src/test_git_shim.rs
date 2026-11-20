@@ -13,6 +13,7 @@ pub(super) enum Behavior<'a> {
     HangOid(&'a str),
     HangRepo(&'a str),
     LogTypes(&'a Path),
+    FailAfterUpdateRef,
 }
 
 #[allow(dead_code)]
@@ -69,6 +70,7 @@ pub(super) fn create(name: &str, behavior: Behavior<'_>) -> GitShim {
         Behavior::HangOid(oid) => format!("hang-oid\n{oid}"),
         Behavior::HangRepo(repo) => format!("hang-repo\n{repo}"),
         Behavior::LogTypes(path) => format!("log-types\n{}", path.display()),
+        Behavior::FailAfterUpdateRef => "fail-after-update-ref\n".to_owned(),
     };
     std::fs::write(directory.path().join("config"), config).expect("configure native Git fixture");
     GitShim {
