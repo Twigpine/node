@@ -4417,7 +4417,6 @@ mod tests {
         )
         .await;
         let elapsed = started.elapsed();
-        mock.shutdown();
 
         assert!(res.is_err(), "a failed ref write must refuse the create");
         assert!(
@@ -4434,6 +4433,16 @@ mod tests {
                 .exists(),
             "a tree whose orphan ref could not be removed must be quarantined"
         );
+        // The session went back with the drop: a second write on the same repo
+        // must get the advisory lock rather than shed as busy.
+        state
+            .repo_store
+            .acquire_write(owner, repo_name)
+            .await
+            .expect("the advisory lock must be free after the failed create")
+            .release(false)
+            .await;
+        mock.shutdown();
     }
 
     /// Adversarial-review D3-1: register binds the registered DID to the signer.

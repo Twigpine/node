@@ -84,19 +84,14 @@ pub async fn create_issue(
         write_deadline,
     );
 
+    let deadline = std::time::Instant::now() + git_timeout;
     let git_bin = state.git_bin.clone();
     let issue_id_for_comp = issue_id.clone();
 
     let release_result = if create_result.is_ok() {
-        // A fresh budget from now, clamped to what the hold still funds. An
-        // expired hold leaves no deadline, and the compensation is then only
-        // reachable after a definite publish refusal, where it is best-effort.
-        let comp_deadline = guard
-            .hold_deadline(git_timeout)
-            .unwrap_or_else(std::time::Instant::now);
         guard
             .release_compensating(true, move |path| {
-                git_issues::delete_issue_ref(&git_bin, path, &issue_id_for_comp, comp_deadline)
+                git_issues::delete_issue_ref(&git_bin, path, &issue_id_for_comp, deadline)
             })
             .await
             .into_result()
