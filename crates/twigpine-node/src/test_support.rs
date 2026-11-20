@@ -4435,13 +4435,12 @@ mod tests {
         );
         // The session went back with the drop: a second write on the same repo
         // must get the advisory lock rather than shed as busy.
-        state
+        let second = state
             .repo_store
             .acquire_write(owner, repo_name)
             .await
-            .expect("the advisory lock must be free after the failed create")
-            .release(false)
-            .await;
+            .expect("the advisory lock must be free after the failed create");
+        let _ = second.release(false).await;
         mock.shutdown();
     }
 
