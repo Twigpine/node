@@ -1267,6 +1267,18 @@ async fn discover_release_anchors(
     refs
 }
 
+/// Whether an untrusted id (anchor tx, provider CID) is safe to interpolate
+/// as one path segment of a gateway URL. Alnum plus the base32/base64url
+/// punctuation CIDs and tx ids actually use; `/`, `?`, `#`, and `..` would
+/// rewrite the request path on the gateway host.
+fn url_path_safe(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains("..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'='))
+}
+
 /// One anchor candidate through its trust gates: fetch the body, parse the
 /// anchor JSON, then fetch the manifest and verify it against the expected
 /// DID. Returns `Some(..)` only when the manifest verifies; every failure is
@@ -1279,6 +1291,10 @@ async fn verify_candidate(
     revision: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Option<(ReleaseAnchorBody, Manifest)> {
+    if !url_path_safe(tx_id) {
+        note_skip(warnings, "anchor tx id is not URL-safe".to_string());
+        return None;
+    }
     let mut skip = |why: String| {
         note_skip(warnings, format!("anchor {tx_id}: {why}"));
         None
@@ -1300,6 +1316,26 @@ async fn verify_candidate(
     };
     if anchor.schema != ANCHOR_SCHEMA {
         return skip(format!("unknown anchor schema {:?}", anchor.schema));
+    }
+    // release_commit is unsigned anchor text that lands in the default
+    // output directory name: require a real hex commit shape (40 for sha1
+    // repos, 64 for sha256 repos), never a path fragment.
+    let commit = &anchor.release_commit;
+    if !(commit.len() == 40 || commit.len() == 64)
+        || !commit
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return skip("release_commit is not a hex commit".to_string());
+    }
+    if !url_path_safe(&anchor.manifest_cid)
+        || !url_path_safe(&anchor.block_map_cid)
+        || anchor
+            .reconstruction_cid
+            .as_deref()
+            .is_some_and(|c| !url_path_safe(c))
+    {
+        return skip("anchor names a CID that is not URL-safe".to_string());
     }
     if anchor.repo != repo {
         return skip(format!(
@@ -1425,6 +1461,9 @@ impl BlockSource<'_> {
             .blocks
             .get(sha)
             .with_context(|| format!("block map has no CID for block {sha}"))?;
+        if !url_path_safe(cid) {
+            bail!("block {sha} maps to a CID that is not URL-safe");
+        }
         let bytes = get_capped(
             self.client,
             &format!("{}/ipfs/{cid}", self.ig),
@@ -1560,6 +1599,13 @@ pub async fn fetch_model(args: &FetchArgs) -> Result<FetchReport> {
         .split_once('/')
         .filter(|(o, n)| !o.is_empty() && !n.is_empty() && !n.contains('/'))
         .context("repo must be <owner>/<name>")?;
+    // Anchors tag the full DID; accept the bare DID key (the HF-safe form)
+    // by normalizing to did:key, matching the node's repo lookup.
+    let owner = if owner.starts_with("did:") {
+        owner.to_string()
+    } else {
+        format!("did:key:{owner}")
+    };
     let repo = format!("{owner}/{name}");
     let expect_did: Did = args
         .expect_did
@@ -1620,6 +1666,9 @@ pub async fn fetch_model(args: &FetchArgs) -> Result<FetchReport> {
                     rec_ref.sha256
                 )
             })?;
+            if !url_path_safe(rec_cid) {
+                bail!("reconstruction CID {rec_cid:?} is not URL-safe");
+            }
             let bytes = get_capped(
                 &client,
                 &format!("{ig}/ipfs/{rec_cid}"),
@@ -1707,6 +1756,9 @@ pub async fn fetch_model(args: &FetchArgs) -> Result<FetchReport> {
                             file.path, file.sha256
                         )
                     })?;
+                if !url_path_safe(cid) {
+                    bail!("{}: block map CID is not URL-safe", file.path);
+                }
                 let bytes = get_capped(
                     &client,
                     &format!("{ig}/ipfs/{cid}"),
@@ -1760,8 +1812,12 @@ pub async fn fetch_model(args: &FetchArgs) -> Result<FetchReport> {
 
 async fn cmd_fetch(args: FetchArgs) -> Result<()> {
     let report = fetch_model(&args).await?;
-    println!("fetched {} release {}", report.repo, report.release_commit);
-    println!("  anchor:   {}", report.anchor_tx);
+    println!(
+        "fetched {} release {}",
+        sanitize_node_msg(&report.repo),
+        sanitize_node_msg(&report.release_commit)
+    );
+    println!("  anchor:   {}", sanitize_node_msg(&report.anchor_tx));
     println!(
         "  verified: {} file(s), {} byte(s)",
         report.files, report.bytes

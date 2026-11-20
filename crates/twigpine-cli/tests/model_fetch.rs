@@ -19,7 +19,7 @@ use twigpine_core::model::reconstruction::{
     BlockEntry, ChunkMeta, FileEntry, Reconstruction, Term,
 };
 
-const COMMIT: &str = "aaaabbbbccccddddeeeeffff00001111";
+const COMMIT: &str = "aaaabbbbccccddddeeeeffff0000111122223333";
 const ANCHOR_SCHEMA: &str = "gitlawb/model-release-anchor/v1";
 const BLOCK_MAP_SCHEMA: &str = "gitlawb/model-block-map/v1";
 
@@ -431,4 +431,35 @@ async fn manifest_path_traversal_is_refused() {
         .unwrap_err();
     assert!(err.to_string().contains("relative path"));
     assert!(!out.path().join("escape.txt").exists());
+}
+
+#[tokio::test]
+async fn anchor_with_traversal_release_commit_is_skipped() {
+    let owner = Keypair::generate();
+    let release = build_release(&owner);
+    let rec_sha = sha256_hex(&release.rec_bytes);
+    // release_commit is unsigned anchor text that shapes the default output
+    // dir: a traversal-shaped value must be refused, not followed.
+    let mut hostile = anchor_json(&release, &release.did, &release.signing, &rec_sha);
+    hostile["release_commit"] = json!("a/../escape");
+    let good = anchor_json(&release, &release.did, &release.signing, &rec_sha);
+    let server = serve(
+        &[("tx-hostile", hostile), ("tx-good", good)],
+        &release.objects,
+    )
+    .await;
+
+    let out = TempDir::new().unwrap();
+    let report = fetch_model(&args(&server.url(), &release.did, &out))
+        .await
+        .unwrap();
+    assert_eq!(report.anchor_tx, "tx-good");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("tx-hostile") && w.contains("hex commit")),
+        "the malformed commit should be reported: {:?}",
+        report.warnings
+    );
 }

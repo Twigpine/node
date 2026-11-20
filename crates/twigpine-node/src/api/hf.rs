@@ -75,9 +75,16 @@ fn caller_did(auth: &Option<Extension<AuthenticatedDid>>) -> Option<&str> {
 /// egress guard sees it): model hosting serves only a fully public repo,
 /// and anything else answers the same bare 404 so release existence cannot
 /// be inferred through the model surface.
-fn require_fully_public_404(record: &RepoRecord, rules: &[VisibilityRule]) -> Result<(), AppError> {
+fn require_fully_public_404(
+    record: &RepoRecord,
+    rules: &[VisibilityRule],
+    owner: &str,
+    name: &str,
+) -> Result<(), AppError> {
     if require_fully_public(record, rules).is_err() {
-        return Err(AppError::RepoNotFound(record.id.clone()));
+        // The caller's spelling, byte-matching authorize_repo_read's
+        // missing-repo body: the internal id never leaves the node.
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
     }
     Ok(())
 }
@@ -94,7 +101,11 @@ async fn release_for_rev(
     rev: &str,
 ) -> Result<Option<ReleaseRow>, AppError> {
     let rev = rev.trim();
-    if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if rev.len() == 40
+        && rev
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() && (b'a'..=b'f').contains(&b))
+    {
         let rel = state
             .db
             .model_release_by_commit(&record.id, rev)
@@ -249,7 +260,7 @@ pub async fn hf_model_info(
     hosting_enabled(&state)?;
     let caller = caller_did(&auth);
     let (record, rules) = authorize_repo_read(&state, &owner, &name, caller, "/").await?;
-    require_fully_public_404(&record, &rules)?;
+    require_fully_public_404(&record, &rules, &owner, &name)?;
     let Some(release) = state.db.model_release_newest(&record.id).await? else {
         return Ok(hf_deny(StatusCode::NOT_FOUND, "RepoNotFound"));
     };
@@ -267,7 +278,7 @@ pub async fn hf_revision_info(
     hosting_enabled(&state)?;
     let caller = caller_did(&auth);
     let (record, rules) = authorize_repo_read(&state, &owner, &name, caller, "/").await?;
-    require_fully_public_404(&record, &rules)?;
+    require_fully_public_404(&record, &rules, &owner, &name)?;
     let Some(release) = release_for_rev(&state, &record, &rev).await? else {
         return revision_or_repo_not_found(&state, &record).await;
     };
@@ -285,7 +296,7 @@ pub async fn hf_tree(
     hosting_enabled(&state)?;
     let caller = caller_did(&auth);
     let (record, rules) = authorize_repo_read(&state, &owner, &name, caller, "/").await?;
-    require_fully_public_404(&record, &rules)?;
+    require_fully_public_404(&record, &rules, &owner, &name)?;
     tree_response(&state, &record, &rev, "").await
 }
 
@@ -300,7 +311,7 @@ pub async fn hf_tree_path(
     hosting_enabled(&state)?;
     let caller = caller_did(&auth);
     let (record, rules) = authorize_repo_read(&state, &owner, &name, caller, "/").await?;
-    require_fully_public_404(&record, &rules)?;
+    require_fully_public_404(&record, &rules, &owner, &name)?;
     let prefix = if path.ends_with('/') {
         path
     } else {
@@ -334,8 +345,11 @@ pub async fn hf_refs(
     hosting_enabled(&state)?;
     let caller = caller_did(&auth);
     let (record, rules) = authorize_repo_read(&state, &owner, &name, caller, "/").await?;
-    require_fully_public_404(&record, &rules)?;
-    let Some(release) = state.db.model_release_newest(&record.id).await? else {
+    require_fully_public_404(&record, &rules, &owner, &name)?;
+    // `main` names exactly the release `revision/main` resolves: newest on
+    // main, then the git default branch. Advertising any other release
+    // would promise a commit the revision route does not serve.
+    let Some(release) = release_for_rev(&state, &record, "main").await? else {
         return Ok(hf_deny(StatusCode::NOT_FOUND, "RepoNotFound"));
     };
     let branches = vec![json!({"name": "main", "targetCommit": release.commit_sha})];
@@ -361,7 +375,7 @@ pub async fn hf_resolve(
     hosting_enabled(&state)?;
     let caller = caller_did(&auth);
     let (record, rules) = authorize_repo_read(&state, &owner, &name, caller, "/").await?;
-    require_fully_public_404(&record, &rules)?;
+    require_fully_public_404(&record, &rules, &owner, &name)?;
     let Some(release) = release_for_rev(&state, &record, &rev).await? else {
         return revision_or_repo_not_found(&state, &record).await;
     };
@@ -390,7 +404,10 @@ pub async fn hf_resolve(
                 let t = t.trim();
                 // If-None-Match compares weakly: strip an optional `W/`.
                 let t = t.strip_prefix("W/").unwrap_or(t);
-                t.trim_matches('"') == file.sha256
+                t.strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .unwrap_or(t)
+                    == file.sha256
             });
         if hit {
             let mut resp = Response::new(Body::empty());
@@ -469,10 +486,13 @@ pub async fn hf_resolve(
         .clone()
         .ok_or_else(|| AppError::NotFound("model hosting not enabled".into()))?;
     // Bound concurrent model downloads: a stalled reader upstream must not
-    // starve every other consumer of the node.
-    let _permit = state
+    // starve every other consumer of the node. Owned so the permit can ride
+    // the response stream: a chunked body pulls blocks after this handler
+    // returns, long past a borrowed permit's drop.
+    let permit = state
         .model_download_semaphore
-        .acquire()
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|_| AppError::Internal(anyhow::anyhow!("download semaphore closed")))?;
 
@@ -535,7 +555,11 @@ pub async fn hf_resolve(
                 entry, &rec, want_start, want_end,
             )
             .map_err(|e| AppError::Internal(anyhow::anyhow!("range map: {e}")))?;
-            Body::from_stream(serve::slices_stream(store, slices))
+            let stream = serve::slices_stream(store, slices);
+            Body::from_stream(futures::StreamExt::map(stream, move |item| {
+                let _held = &permit;
+                item
+            }))
         }
     };
 

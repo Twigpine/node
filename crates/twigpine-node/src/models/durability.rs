@@ -1,9 +1,10 @@
 //! Durability outbox for published releases (KTD10, KTD13).
 //!
 //! Publishing a release enqueues one job per content object:
-//! `pin_block` for every block the release references, `pin_manifest` and
-//! `pin_reconstruction` for the git-resident objects, `pin_block_map` for
-//! the sha256-to-provider-CID map, and `anchor` for the Irys release root.
+//! `pin_block` for every block the release references, `pin_manifest` for
+//! the git-resident manifest, `pin_reconstruction` for the block-store
+//! reconstruction object, `pin_block_map` for the sha256-to-provider-CID
+//! map, and `anchor` for the Irys release root.
 //! Jobs are keyed `(release, kind, object)` so re-enqueueing is a no-op,
 //! and the startup backfill inserts missing sets atomically.
 //!
@@ -57,13 +58,16 @@ pub async fn enqueue_for_release(state: &AppState, release_id: i64) -> Result<()
     if release.state != "published" {
         return Ok(());
     }
+    let rec_sha = state.db.model_reconstruction_sha(release_id).await?;
     let block_shas = state.db.model_release_blocks(release_id).await?;
     let mut jobs: Vec<(&str, &str)> = block_shas
         .iter()
+        // The claim links the reconstruction object as a referenced block;
+        // its dedicated job pins it, so skip the duplicate pin_block row.
+        .filter(|sha| Some(sha.as_str()) != rec_sha.as_deref())
         .map(|sha| (KIND_BLOCK, sha.as_str()))
         .collect();
     jobs.push((KIND_MANIFEST, release.manifest_sha256.as_str()));
-    let rec_sha = state.db.model_reconstruction_sha(release_id).await?;
     if let Some(sha) = rec_sha.as_deref() {
         jobs.push((KIND_RECONSTRUCTION, sha));
     }
@@ -122,6 +126,9 @@ async fn still_publishable(state: &AppState, record: &RepoRecord) -> Result<bool
     if state.db.is_repo_quarantined(&record.id).await? {
         return Ok(false);
     }
+    // mirror-rows-handled: require_fully_public fails closed on slash-form
+    // (mirror) ids, whose publicity pair is vacuous, so a mirror row stops
+    // its own jobs the same way a private canonical repo does.
     let rules = state.db.list_visibility_rules(&record.id).await?;
     Ok(crate::api::models::require_fully_public(record, &rules).is_ok())
 }
@@ -245,7 +252,9 @@ enum JobOutcome {
 async fn fence_current(fence: Option<&PolicyFence>) -> bool {
     match fence {
         Some(f) => f.is_current().await,
-        None => true,
+        // `capture` yields None only when the epoch read failed; fail
+        // closed like `is_current` does on a read failure.
+        None => false,
     }
 }
 
