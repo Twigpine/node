@@ -227,8 +227,6 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                     hasher: sha2::Sha256::new(),
                     head: Vec::new(),
                 };
-                // Ordered prefetch: `buffered` preserves order while
-                // overlapping the store's per-slice round trips.
                 let store = state
                     .block_store
                     .clone()

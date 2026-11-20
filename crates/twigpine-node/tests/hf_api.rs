@@ -106,13 +106,16 @@ async fn seed_published_release(
     block_shas: &[String],
 ) -> i64 {
     let now = chrono::Utc::now().to_rfc3339();
+    // created_at predates published_at so a test can tell which timestamp
+    // the surface reports.
+    let created = "2000-01-01T00:00:00Z".to_string();
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO model_releases
              (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
               reconstruction_sha256, claim_signature, claim_signature_input,
               claim_signing_string, claim_body, created_at, published_at)
          VALUES ($1,$2,$3,$4,'published',$5,$6,'sig','input','signing',\
-                 decode('00','hex'),$7,$7)
+                 decode('00','hex'),$7,$8)
          RETURNING id",
     )
     .bind(repo_id)
@@ -121,6 +124,7 @@ async fn seed_published_release(
     .bind(publisher_did)
     .bind(manifest_sha)
     .bind(rec_sha)
+    .bind(&created)
     .bind(&now)
     .fetch_one(pool)
     .await
@@ -358,7 +362,13 @@ async fn model_info_revision_tree_and_refs(pool: sqlx::PgPool) {
     assert_eq!(resp.status().as_u16(), 200);
     let v: Value = resp.json().await.expect("model info json");
     assert_eq!(v["sha"].as_str(), Some(fx.commit.as_str()));
-    assert!(v["lastModified"].as_str().is_some());
+    let published_at: String =
+        sqlx::query_scalar("SELECT published_at FROM model_releases WHERE repo_id = $1")
+            .bind(&repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read published_at");
+    assert_eq!(v["lastModified"].as_str(), Some(published_at.as_str()));
     let sibs: Vec<&str> = v["siblings"]
         .as_array()
         .expect("siblings")
@@ -570,6 +580,15 @@ async fn pickle_entries_marked_unsafe(pool: sqlx::PgPool) {
         .expect("send");
     let entries: Vec<Value> = resp.json().await.unwrap();
     assert_eq!(entries[0]["unsafe"].as_bool(), Some(true));
+
+    // Model info marks the same file unsafe in siblings.
+    let resp = client
+        .get(format!("{}{}", node.base_url, info_path(&owner_did, "m")))
+        .send()
+        .await
+        .expect("send");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["siblings"][0]["unsafe"].as_bool(), Some(true));
 
     node.shutdown().await;
 }
@@ -911,6 +930,134 @@ async fn resolve_denies_after_repo_turns_private(pool: sqlx::PgPool) {
     ] {
         let resp = req.send().await.expect("send");
         assert_eq!(resp.status().as_u16(), 404, "{label}");
+    }
+
+    node.shutdown().await;
+}
+
+/// `/tree/{rev}/{path}` treats `path` as a directory prefix on a slash
+/// boundary: `sub` lists `sub/*` and must not leak a sibling-prefix
+/// `subdir/*` entry.
+#[sqlx::test]
+async fn tree_path_filters_on_slash_boundary(pool: sqlx::PgPool) {
+    let node = spawn_node(pool.clone()).await;
+    let client = bounded_client();
+    let (owner, signing) = owner_with_signing(23);
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "m", true).await;
+    seed_release(
+        &node,
+        &pool,
+        &owner_did,
+        &signing,
+        &repo_id,
+        "m",
+        &[
+            ("sub/a.txt", b"a".as_ref()),
+            ("sub/b.txt", b"b".as_ref()),
+            ("subdir/c.txt", b"c".as_ref()),
+        ],
+        &[],
+        "main",
+    )
+    .await;
+
+    for suffix in ["sub", "sub/"] {
+        let resp = client
+            .get(format!(
+                "{}{}/{}",
+                node.base_url,
+                tree_path(&owner_did, "m", "main"),
+                suffix
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status().as_u16(), 200, "{suffix}");
+        let entries: Vec<Value> = resp.json().await.expect("tree json");
+        let paths: Vec<&str> = entries.iter().filter_map(|e| e["path"].as_str()).collect();
+        assert_eq!(paths, ["sub/a.txt", "sub/b.txt"], "{suffix}");
+    }
+
+    // The unprefixed tree still lists every file.
+    let resp = client
+        .get(format!(
+            "{}{}",
+            node.base_url,
+            tree_path(&owner_did, "m", "main")
+        ))
+        .send()
+        .await
+        .expect("send");
+    let entries: Vec<Value> = resp.json().await.expect("tree json");
+    assert_eq!(entries.len(), 3);
+
+    node.shutdown().await;
+}
+
+/// Every HF route answers the same existence-hiding 404 for a repo that is
+/// private or carries visibility rules, anonymous or signed-stranger.
+#[sqlx::test]
+async fn all_routes_deny_private_and_ruled_repos(pool: sqlx::PgPool) {
+    let node = spawn_node(pool.clone()).await;
+    let client = bounded_client();
+    let (owner, _signing) = owner_with_signing(24);
+    let owner_did = owner.did().to_string();
+    let (stranger, _) = owner_with_signing(25);
+
+    node.seed_repo(&owner_did, "priv", false).await;
+    let ruled_id = node.seed_repo(&owner_did, "ruled", true).await;
+    sqlx::query(
+        "INSERT INTO visibility_rules
+             (id, repo_id, path_glob, mode, reader_dids, created_by, created_at)
+         VALUES ('r1', $1, '/withheld/**', 'b', '[]', $2, '2000-01-01T00:00:00Z')",
+    )
+    .bind(&ruled_id)
+    .bind(&owner_did)
+    .execute(&pool)
+    .await
+    .expect("seed rule");
+
+    for repo in ["priv", "ruled"] {
+        let routes = [
+            info_path(&owner_did, repo),
+            rev_path(&owner_did, repo, "main"),
+            tree_path(&owner_did, repo, "main"),
+            format!("{}/sub", tree_path(&owner_did, repo, "main")),
+            refs_path(&owner_did, repo),
+            resolve_path(&owner_did, repo, "main", "config.json"),
+        ];
+        for route in routes {
+            for (label, req) in [
+                ("anon", client.get(format!("{}{}", node.base_url, route))),
+                (
+                    "stranger",
+                    signed_request(
+                        &client,
+                        reqwest::Method::GET,
+                        &node.base_url,
+                        &route,
+                        Vec::new(),
+                        &stranger,
+                    ),
+                ),
+            ] {
+                let resp = req.send().await.expect("send");
+                assert_eq!(resp.status().as_u16(), 404, "{repo} {route} {label}");
+                // Denial must not echo whether a repo or release exists:
+                // the body is the same not-found shape a missing repo gets.
+                let body: Value = resp.json().await.expect("denial body");
+                let text = body.to_string();
+                assert!(
+                    text.contains("repo_not_found") || text.contains("not_found"),
+                    "{repo} {route} {label}: {body}"
+                );
+                assert!(
+                    !text.contains("private") && !text.contains("forbidden"),
+                    "{repo} {route} {label} leaked: {body}"
+                );
+            }
+        }
     }
 
     node.shutdown().await;

@@ -933,15 +933,11 @@ pub async fn run() -> Result<()> {
 
     // Model hosting workers (verify + sweep) only run while the operator
     // flag is on; the block store is the flag's live form.
-    let mut model_workers = Vec::new();
     if state.block_store.is_some() {
-        model_workers.push(tokio::spawn(models::verify::run_verify_worker(
-            state.clone(),
-        )));
-        model_workers.push(tokio::spawn(models::sweep::run_sweep_worker(state.clone())));
-        model_workers.push(tokio::spawn(models::durability::run_durability_worker(
-            state.clone(),
-        )));
+        let _model_verify_worker = tokio::spawn(models::verify::run_verify_worker(state.clone()));
+        let _model_sweep_worker = tokio::spawn(models::sweep::run_sweep_worker(state.clone()));
+        let _model_durability_worker =
+            tokio::spawn(models::durability::run_durability_worker(state.clone()));
     }
 
     // `into_make_service_with_connect_info` exposes the socket peer address as
