@@ -689,7 +689,7 @@ fn save_state(path: &Path, state: &PublishState) -> Result<()> {
 
 // ── misc ────────────────────────────────────────────────────────────────────
 
-/// `<owner>/<repo>@<40-hex commit>` -> ((owner, name), commit).
+/// `<owner>/<repo>@<hex commit>` -> ((owner, name), commit).
 fn parse_parent(spec: &str) -> Result<((String, String), String)> {
     let (repo, commit) = spec
         .rsplit_once('@')
@@ -700,8 +700,8 @@ fn parse_parent(spec: &str) -> Result<((String, String), String)> {
     if owner.is_empty() || name.is_empty() || name.contains('/') {
         bail!("parent must be <owner>/<repo>@<commit>");
     }
-    if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("parent commit must be a 40-hex sha");
+    if !twigpine_core::cid::is_hex_oid(commit) {
+        bail!("parent commit must be a hex sha");
     }
     Ok(((owner.to_string(), name.to_string()), commit.to_string()))
 }
@@ -1637,12 +1637,7 @@ async fn verify_candidate(
     // release_commit is unsigned anchor text that lands in the default
     // output directory name: require a real hex commit shape (40 for sha1
     // repos, 64 for sha256 repos), never a path fragment.
-    let commit = &anchor.release_commit;
-    if !(commit.len() == 40 || commit.len() == 64)
-        || !commit
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if !twigpine_core::cid::is_hex_oid(&anchor.release_commit) {
         return skip("release_commit is not a hex commit".to_string());
     }
     if !url_path_safe(&anchor.manifest_cid)

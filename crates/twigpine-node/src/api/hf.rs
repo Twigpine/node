@@ -91,21 +91,18 @@ fn require_fully_public_404(
 
 /// Resolve the HF revision to a published release row.
 ///
-/// A 40-hex rev is a commit pin. `main` resolves to the newest published
-/// release recorded on `main`, then on the repo's git default branch (a
-/// `master` default still serves HF `main`). Any other string is a branch
-/// name resolving to its newest published release.
+/// A hex rev is a commit pin (40 for sha1 repos, 64 for sha256). `main`
+/// resolves to the newest published release recorded on `main`, then on the
+/// repo's git default branch (a `master` default still serves HF `main`).
+/// Any other string is a branch name resolving to its newest published
+/// release.
 async fn release_for_rev(
     state: &AppState,
     record: &RepoRecord,
     rev: &str,
 ) -> Result<Option<ReleaseRow>, AppError> {
     let rev = rev.trim();
-    if rev.len() == 40
-        && rev
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() && (b'a'..=b'f').contains(&b))
-    {
+    if twigpine_core::cid::is_hex_oid(rev) {
         let rel = state
             .db
             .model_release_by_commit(&record.id, rev)
