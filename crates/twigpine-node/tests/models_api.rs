@@ -545,6 +545,96 @@ async fn put_block_happy_path_duplicate_and_digest_mismatch(pool: sqlx::PgPool) 
     node.shutdown().await;
 }
 
+/// A session bearer that declares a small Content-Length but streams a larger
+/// valid block must not get the larger block stored under the small charge.
+/// Both framing headers are sent so the body is read to EOF by chunked
+/// framing while the handler still sees the understated length.
+#[sqlx::test]
+async fn put_block_understated_content_length_is_not_stored_under_small_charge(pool: sqlx::PgPool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let node = spawn_node(pool).await;
+    let owner_did = Keypair::generate().did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let session_id = seed_open_session(&node, &repo_id, &owner_did).await;
+
+    let body = vec![b'x'; 4096];
+    let sha = sha256_hex(&body);
+    let addr = node.base_url.trim_start_matches("http://").to_string();
+    let mut sock = tokio::net::TcpStream::connect(&addr)
+        .await
+        .expect("connect");
+    let head = format!(
+        "PUT {} HTTP/1.1\r\nHost: {addr}\r\nx-twigpine-model-session: {session_id}\r\n\
+         Content-Length: 4\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        blocks_path(&owner_did, "model", &sha)
+    );
+    sock.write_all(head.as_bytes()).await.expect("write head");
+    sock.write_all(format!("{:x}\r\n", body.len()).as_bytes())
+        .await
+        .expect("write chunk size");
+    sock.write_all(&body).await.expect("write body");
+    sock.write_all(b"\r\n0\r\n\r\n").await.expect("write end");
+    let mut raw = Vec::new();
+    let _ = sock.read_to_end(&mut raw).await;
+    let raw = String::from_utf8_lossy(&raw).to_string();
+    let status_line = raw.lines().next().unwrap_or("").to_string();
+    eprintln!("raw response: {raw}");
+    assert!(
+        !status_line.contains(" 200 "),
+        "a block larger than its declared Content-Length must not be admitted: {status_line}"
+    );
+
+    node.shutdown().await;
+}
+
+/// An open session past its `expires_at` is dead on the status read too, so
+/// the CLI resume path (which abandons a 404) does not keep a lapsed session.
+#[sqlx::test]
+async fn get_session_expired_open_session_not_found(pool: sqlx::PgPool) {
+    let node = spawn_node(pool.clone()).await;
+    let client = bounded_client();
+    let kp = Keypair::generate();
+    let owner_did = kp.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let session_id = "f".repeat(64);
+    node.seed_model_session(&repo_id, &session_id, &owner_did)
+        .await;
+    let path = format!("{}/{session_id}", sessions_path(&owner_did, "model"));
+    let live = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &path,
+        Vec::new(),
+        &kp,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(live.status().as_u16(), 200, "a live session reads as open");
+    sqlx::query("UPDATE model_upload_sessions SET expires_at = $1 WHERE id = $2")
+        .bind((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("backdate session expiry");
+    let resp = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &path,
+        Vec::new(),
+        &kp,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 404, "a lapsed session is not found");
+
+    node.shutdown().await;
+}
+
 // ── POST /models/claims ──────────────────────────────────────────────────────
 
 /// A claim against a pushed commit carrying a signed manifest inserts the
