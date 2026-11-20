@@ -1005,7 +1005,7 @@ async fn all_routes_deny_private_and_ruled_repos(pool: sqlx::PgPool) {
     let owner_did = owner.did().to_string();
     let (stranger, _) = owner_with_signing(25);
 
-    node.seed_repo(&owner_did, "priv", false).await;
+    let priv_id = node.seed_repo(&owner_did, "priv", false).await;
     let ruled_id = node.seed_repo(&owner_did, "ruled", true).await;
     sqlx::query(
         "INSERT INTO visibility_rules
@@ -1018,7 +1018,7 @@ async fn all_routes_deny_private_and_ruled_repos(pool: sqlx::PgPool) {
     .await
     .expect("seed rule");
 
-    for repo in ["priv", "ruled"] {
+    for (repo, repo_id) in [("priv", &priv_id), ("ruled", &ruled_id)] {
         let routes = [
             info_path(&owner_did, repo),
             rev_path(&owner_did, repo, "main"),
@@ -1045,7 +1045,8 @@ async fn all_routes_deny_private_and_ruled_repos(pool: sqlx::PgPool) {
                 let resp = req.send().await.expect("send");
                 assert_eq!(resp.status().as_u16(), 404, "{repo} {route} {label}");
                 // Denial must not echo whether a repo or release exists:
-                // the body is the same not-found shape a missing repo gets.
+                // the body is the same not-found shape a missing repo gets,
+                // {owner}/{name} exactly as spelled, never the internal id.
                 let body: Value = resp.json().await.expect("denial body");
                 let text = body.to_string();
                 assert!(
@@ -1053,7 +1054,13 @@ async fn all_routes_deny_private_and_ruled_repos(pool: sqlx::PgPool) {
                     "{repo} {route} {label}: {body}"
                 );
                 assert!(
-                    !text.contains("private") && !text.contains("forbidden"),
+                    text.contains(&format!("'{owner_did}/{repo}'")),
+                    "{repo} {route} {label} wrong shape: {body}"
+                );
+                assert!(
+                    !text.contains(repo_id.as_str())
+                        && !text.contains("private")
+                        && !text.contains("forbidden"),
                     "{repo} {route} {label} leaked: {body}"
                 );
             }

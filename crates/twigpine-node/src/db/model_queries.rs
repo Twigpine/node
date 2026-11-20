@@ -1197,14 +1197,15 @@ impl Db {
         Ok(sqlx::query_scalar(
             "UPDATE model_durability_jobs
              SET attempts = attempts + 1, last_error = $2, updated_at = $3
-             WHERE id = $1
+             WHERE id = $1 AND state = 'pending'
              RETURNING attempts",
         )
         .bind(id)
         .bind(err)
         .bind(ts_now())
-        .fetch_one(&self.pool)
-        .await?)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0))
     }
 
     /// Terminal failure: the job leaves the drain set until an operator
