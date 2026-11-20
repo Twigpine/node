@@ -476,9 +476,9 @@ struct Manifest {
 /// case it is the most recent and sorts as newest in the merge tie-break. A mined
 /// anchor is always `Some(_)` (0 if the gateway reported an unreadable height) so
 /// a malformed height can never masquerade as pending/newest.
-struct TxRef {
-    id: String,
-    height: Option<u64>,
+pub(crate) struct TxRef {
+    pub(crate) id: String,
+    pub(crate) height: Option<u64>,
 }
 
 /// Edges requested per Arweave GraphQL page (`first:` in the discovery query) and
@@ -486,7 +486,7 @@ struct TxRef {
 /// `ARWEAVE_DISCOVERY_QUERY` MUST equal this constant; `query_first_matches_page_size`
 /// pins that invariant at test time (the query keeps a literal because `format!`-ing
 /// the brace-heavy GraphQL body would be error-prone).
-const ARWEAVE_PAGE_SIZE: usize = 100;
+pub(crate) const ARWEAVE_PAGE_SIZE: usize = 100;
 
 /// Paginated discovery query: manifests tagged for this repo, newest first, with
 /// `pageInfo` for cursor pagination and `block{height}` for the recency tie-break.
@@ -496,10 +496,10 @@ const ARWEAVE_DISCOVERY_QUERY: &str = r#"query($repo:String!,$cursor:String){tra
 /// plus pagination state. `has_next` is `None` when the response omitted
 /// `pageInfo` entirely (an older or partial gateway), which the discovery loop
 /// treats as terminal but flags when the page was full (possible truncation).
-struct TxPage {
-    refs: Vec<TxRef>,
-    has_next: Option<bool>,
-    end_cursor: Option<String>,
+pub(crate) struct TxPage {
+    pub(crate) refs: Vec<TxRef>,
+    pub(crate) has_next: Option<bool>,
+    pub(crate) end_cursor: Option<String>,
 }
 
 /// Parse one Arweave GraphQL `transactions` page: each edge's tx id and block
@@ -514,7 +514,7 @@ struct TxPage {
 /// (It does not bound the response body itself: `reqwest` buffers and deserializes
 /// the whole body before this runs — an unbounded-body concern shared by every
 /// gateway read in this file, addressed separately if it ever matters.)
-fn parse_tx_page(v: &serde_json::Value) -> TxPage {
+pub(crate) fn parse_tx_page(v: &serde_json::Value) -> TxPage {
     let txns = v.get("data").and_then(|d| d.get("transactions"));
     let refs: Vec<TxRef> = txns
         .and_then(|t| t.get("edges"))
@@ -566,7 +566,7 @@ fn parse_tx_page(v: &serde_json::Value) -> TxPage {
 
 /// Order a block height so that a not-yet-mined anchor (`None`) sorts above any
 /// mined one, and mined anchors order by ascending height. Higher rank == newer.
-fn height_rank(h: Option<u64>) -> (u8, u64) {
+pub(crate) fn height_rank(h: Option<u64>) -> (u8, u64) {
     match h {
         None => (1, 0),    // pending anchor: newest
         Some(v) => (0, v), // mined: by block height
