@@ -151,6 +151,34 @@ pub fn start(
     });
 }
 
+/// Build the sync worker's HTTP client.
+///
+/// Peer URLs are attacker-influenceable, so the client follows no redirects
+/// (a 3xx to a loopback or private address must not be followed), ignores
+/// proxy environment variables (a proxy would resolve the peer's name itself,
+/// past the address check), and connects only to addresses the resolver policy
+/// has checked. Each call is bounded at 30 seconds so a stalled peer cannot
+/// hang the worker.
+///
+/// Panics rather than falling back to `reqwest::Client::new()`: the default
+/// builder follows redirects and honors proxies, which would silently
+/// reintroduce the SSRF vector this builder closes.
+fn build_sync_http_client() -> reqwest::Client {
+    build_sync_http_client_with(crate::resolver_policy::ResolverPolicy::production())
+}
+
+fn build_sync_http_client_with(
+    resolver: crate::resolver_policy::ResolverPolicy,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(Arc::new(resolver))
+        .build()
+        .expect("failed to build sync HTTP client")
+}
+
 async fn run(
     db: Arc<Db>,
     config: Arc<Config>,
@@ -158,25 +186,22 @@ async fn run(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
-    // Bound each peer HTTP call (withheld-paths lookup + replica registration)
-    // so a stalled peer cannot hang the worker.
-    // No redirects: peer URLs are attacker-influenceable, so a 3xx to a
-    // loopback/private address must not be followed (SSRF guard, matching the
-    // shared http_client and announce-time validation).
-    // Panic rather than fall back to reqwest::Client::new(): the default
-    // builder follows redirects, which would silently reintroduce the SSRF
-    // vector Policy::none() is here to close.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("failed to build no-redirect sync HTTP client");
+    let client = build_sync_http_client();
+    let git_source = GitSource::production();
     info!("sync worker started (auto_sync=true)");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                process_batch(&db, &config, &keypair, machine_id.as_deref(), &client).await;
+                process_batch(
+                    &db,
+                    &config,
+                    &keypair,
+                    machine_id.as_deref(),
+                    &client,
+                    &git_source,
+                )
+                .await;
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -220,12 +245,347 @@ fn sync_lag_from_origin_timestamp(
     (lag <= MAX_SYNC_LAG_OBSERVATION).then_some(lag)
 }
 
+enum GitSource {
+    Hardened {
+        resolver: crate::resolver_policy::ResolverPolicy,
+        git_bin: String,
+    },
+    /// Local-path and file:// tests only. No production code can build this.
+    #[cfg(test)]
+    Unhardened,
+}
+
+impl GitSource {
+    fn production() -> Self {
+        GitSource::Hardened {
+            resolver: crate::resolver_policy::ResolverPolicy::production(),
+            git_bin: "git".to_string(),
+        }
+    }
+
+    async fn prepare(&self, origin_url: &str, repo: &str) -> anyhow::Result<NetworkGit> {
+        match self {
+            GitSource::Hardened { resolver, git_bin } => {
+                NetworkGit::prepare(origin_url, repo, resolver, git_bin).await
+            }
+            #[cfg(test)]
+            GitSource::Unhardened => Ok(NetworkGit::unhardened(&format!("{origin_url}/{repo}"))),
+        }
+    }
+}
+
+/// Oldest git that reads config from the environment (`GIT_CONFIG_COUNT`).
+const MIN_ENV_CONFIG_GIT: (u64, u64) = (2, 31);
+/// Oldest git with `http.curloptResolve`. Same floor as the upstream mirror
+/// worker (`MIN_CURL_OPT_RESOLVE_GIT` in `upstream_mirror.rs`).
+const MIN_CURL_OPT_RESOLVE_GIT: (u64, u64) = (2, 37);
+const GIT_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Versions already read, by binary path. Only a successful read is cached, so
+/// a transient spawn failure is retried on the next row instead of sticking.
+static GIT_VERSIONS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (u64, u64)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Same parse as `parse_git_version` in `upstream_mirror.rs`.
+fn parse_git_version(output: &str) -> Option<(u64, u64)> {
+    let version = output.split_whitespace().find(|part| {
+        part.as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit())
+    })?;
+    let mut parts = version.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+async fn git_version(git_bin: &str) -> Option<(u64, u64)> {
+    if let Some(v) = GIT_VERSIONS.lock().ok()?.get(git_bin) {
+        return Some(*v);
+    }
+    let mut cmd = tokio::process::Command::new(git_bin);
+    scrub_ambient_git_env(&mut cmd);
+    cmd.arg("--version").kill_on_drop(true);
+    let out = tokio::time::timeout(GIT_VERSION_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let version = parse_git_version(&String::from_utf8_lossy(&out.stdout))?;
+    GIT_VERSIONS
+        .lock()
+        .ok()?
+        .insert(git_bin.to_string(), version);
+    Some(version)
+}
+
+/// Git config for a peer fetch of `url`, as environment key/value entries.
+/// Copied from `fetch_command` in `upstream_mirror.rs`, except that both
+/// `protocol.http.allow` and `protocol.https.allow` are `always` because peer
+/// URLs may be plain http. URL-scoped config outranks the generic keys, so each
+/// http and credential control is repeated at the exact URL.
+fn peer_git_config(url: &str, curlopt_resolve: Option<&str>) -> Vec<(String, String)> {
+    let http_scope = |name: &str| format!("http.{url}.{name}");
+    let mut config = vec![
+        ("http.proxy".to_string(), "".to_string()),
+        // A mirror's own `remote.origin.proxy` outranks `http.proxy`.
+        ("remote.origin.proxy".to_string(), "".to_string()),
+        ("http.followRedirects".to_string(), "false".to_string()),
+        // Reset inherited multi-valued resolver entries before the pin.
+        ("http.curloptResolve".to_string(), "".to_string()),
+        ("http.extraHeader".to_string(), "".to_string()),
+        ("http.cookieFile".to_string(), "".to_string()),
+        ("http.saveCookies".to_string(), "false".to_string()),
+        ("http.sslVerify".to_string(), "true".to_string()),
+        (http_scope("proxy"), "".to_string()),
+        (http_scope("followRedirects"), "false".to_string()),
+        (http_scope("curloptResolve"), "".to_string()),
+        (http_scope("extraHeader"), "".to_string()),
+        (http_scope("cookieFile"), "".to_string()),
+        (http_scope("saveCookies"), "false".to_string()),
+        (http_scope("sslVerify"), "true".to_string()),
+    ];
+    if let Some(resolve) = curlopt_resolve {
+        config.extend([
+            ("http.curloptResolve".to_string(), resolve.to_string()),
+            (http_scope("curloptResolve"), resolve.to_string()),
+        ]);
+    }
+    config.extend([
+        ("credential.helper".to_string(), "".to_string()),
+        (format!("credential.{url}.helper"), "".to_string()),
+        ("credential.interactive".to_string(), "false".to_string()),
+        ("core.askPass".to_string(), "false".to_string()),
+        ("fetch.recurseSubmodules".to_string(), "false".to_string()),
+        // No second, unchecked pack or bundle URL from the peer.
+        ("fetch.uriprotocols".to_string(), "".to_string()),
+        ("fetch.bundleURI".to_string(), "".to_string()),
+        ("protocol.allow".to_string(), "never".to_string()),
+        ("protocol.http.allow".to_string(), "always".to_string()),
+        ("protocol.https.allow".to_string(), "always".to_string()),
+    ]);
+    config
+}
+
+/// Drop inherited Git environment a peer fetch must not honor. Config files
+/// are already redirected to `/dev/null`, but these variables still reach a
+/// spawned git: `GIT_DIR`/`GIT_WORK_TREE` retarget it at a different repo,
+/// `GIT_COMMON_DIR` and the object-directory variables retarget its refs and
+/// objects, `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG`/`GIT_CONFIG_COUNT` inject
+/// config that bypasses the file redirects, `GIT_EXEC_PATH` swaps the transport helpers git runs,
+/// `GIT_SSL_NO_VERIFY` relaxes TLS, and the askpass/ssh variables run
+/// operator-chosen programs or block on a prompt.
+fn scrub_ambient_git_env(cmd: &mut tokio::process::Command) {
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_EXEC_PATH",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_SSL_NO_VERIFY",
+    ] {
+        cmd.env_remove(var);
+    }
+}
+
+/// A local `git` command with the ambient git environment scrubbed. Every
+/// sync git spawn on the default binary goes through here.
+fn local_git() -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("git");
+    scrub_ambient_git_env(&mut cmd);
+    cmd
+}
+
+/// The `http.curloptResolve` entry pinning `host:port` to `addrs`. No `+`
+/// prefix: that form needs libcurl 7.75, and an older libcurl reads the `+`
+/// as part of the hostname, so the pin would never match.
+fn resolve_pin(host: &str, port: u16, mut addrs: Vec<std::net::IpAddr>) -> String {
+    addrs.sort_unstable();
+    let list = addrs
+        .iter()
+        .map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+            std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{host}:{port}:{list}")
+}
+
+/// A git handle for one peer row: the git binary, one canonical remote string
+/// and the hardened config for it. Built per row by [`NetworkGit::prepare`],
+/// which refuses the peer before any git process starts.
+struct NetworkGit {
+    git_bin: String,
+    remote: String,
+    config: Vec<(String, String)>,
+}
+
+impl NetworkGit {
+    /// Parse the stored origin once and build the handle from its canonical
+    /// form. Refuses a URL git could read differently from `reqwest::Url`
+    /// (userinfo, a backslash, a fragment, a query, a scheme other than http or
+    /// https), a git too old to take environment config, and a hostname that
+    /// fails the resolver policy or that git cannot pin. The checked addresses
+    /// of a hostname are pinned with `http.curloptResolve`, so git dials the
+    /// addresses that were checked. An IP-literal origin gets the same
+    /// classification a resolved answer gets, the same hardening, and no pin.
+    async fn prepare(
+        origin_url: &str,
+        repo: &str,
+        resolver: &crate::resolver_policy::ResolverPolicy,
+        git_bin: &str,
+    ) -> anyhow::Result<Self> {
+        // The URL parser turns a backslash into a slash and git does not, so
+        // `http://a.example\@127.0.0.1:1/x` has host a.example for one and
+        // 127.0.0.1 for the other. Refuse it outright.
+        if origin_url.contains('\\') || repo.contains('\\') {
+            anyhow::bail!("peer URL contains a backslash");
+        }
+        let url = reqwest::Url::parse(origin_url)
+            .map_err(|e| anyhow::anyhow!("peer URL is not a valid URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            anyhow::bail!("peer URL scheme {:?} is not http or https", url.scheme());
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            anyhow::bail!("peer URL carries credentials");
+        }
+        if url.fragment().is_some() || url.query().is_some() {
+            anyhow::bail!("peer URL carries a fragment or query");
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("peer URL has no host"))?
+            .to_ascii_lowercase();
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("peer URL has no known port"))?;
+        let literal = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .ok();
+
+        // The only string git sees: the canonical serialization plus the repo.
+        let remote = format!("{}/{repo}", url.as_str().trim_end_matches('/'));
+        let remote_url = reqwest::Url::parse(&remote)
+            .map_err(|e| anyhow::anyhow!("peer remote is not a valid URL: {e}"))?;
+        if remote_url.query().is_some()
+            || remote_url.fragment().is_some()
+            || remote_url
+                .host_str()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+                != Some(host.as_str())
+            || remote_url.port_or_known_default() != Some(port)
+            || remote_url.path() != format!("{}/{}", url.path().trim_end_matches('/'), repo)
+        {
+            anyhow::bail!("repo path changes how the peer URL is read");
+        }
+
+        // A failed version read can be transient (spawn error, timeout), so
+        // the row is deferred, not failed. A version below a floor is final.
+        let Some(version) = git_version(git_bin).await else {
+            return Err(anyhow::Error::new(SyncDeferred(
+                "cannot read the git version, refusing the peer fetch".to_string(),
+            )));
+        };
+        if version < MIN_ENV_CONFIG_GIT {
+            anyhow::bail!(
+                "peer sync requires Git 2.31+ for hardened config; found {}.{}",
+                version.0,
+                version.1
+            );
+        }
+        if literal.is_none() && version < MIN_CURL_OPT_RESOLVE_GIT {
+            anyhow::bail!(
+                "peer sync requires Git 2.37+ to pin a hostname; found {}.{}",
+                version.0,
+                version.1
+            );
+        }
+
+        let pin = if let Some(ip) = literal {
+            // No lookup happens for a literal, so there is nothing to pin,
+            // but the address still gets the same classification a resolved
+            // answer gets: the stored-URL gate is the only other check on
+            // this arm, and a row that predates it must still refuse here.
+            if !crate::api::peers::mirror_upstream_ip_permitted(ip) {
+                anyhow::bail!("peer host {host} is not a public address");
+            }
+            None
+        } else {
+            let addrs = resolver
+                .resolve_host(&host)
+                .await
+                .map_err(|d| anyhow::anyhow!("peer host {host} refused: {d}"))?;
+            Some(resolve_pin(&host, port, addrs))
+        };
+
+        Ok(Self {
+            git_bin: git_bin.to_string(),
+            config: peer_git_config(&remote, pin.as_deref()),
+            remote,
+        })
+    }
+
+    /// A handle with no hardening, for the tests that clone local paths and
+    /// `file://` URLs. It does not exist outside test builds.
+    #[cfg(test)]
+    fn unhardened(remote: &str) -> Self {
+        Self {
+            git_bin: "git".to_string(),
+            remote: remote.to_string(),
+            config: Vec::new(),
+        }
+    }
+
+    fn remote(&self) -> &str {
+        &self.remote
+    }
+
+    /// The non-empty `http.curloptResolve` pin, if this handle carries one.
+    fn pin(&self) -> Option<&str> {
+        self.config
+            .iter()
+            .find(|(k, v)| k == "http.curloptResolve" && !v.is_empty())
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// A git command carrying this handle's config, with the ambient git
+    /// config scrubbed so an operator's own proxy, header or credential helper
+    /// is never sent to a peer-chosen host.
+    fn command(&self) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.git_bin);
+        scrub_ambient_git_env(&mut cmd);
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", self.config.len().to_string());
+        for (i, (key, value)) in self.config.iter().enumerate() {
+            cmd.env(format!("GIT_CONFIG_KEY_{i}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{i}"), value);
+        }
+        cmd
+    }
+}
+
 async fn process_batch(
     db: &Db,
     config: &Config,
     keypair: &Keypair,
     machine_id: Option<&str>,
     client: &reqwest::Client,
+    git_source: &GitSource,
 ) {
     let items = match db.dequeue_pending_syncs(10).await {
         Ok(v) => v,
@@ -365,9 +725,19 @@ async fn process_batch(
             }
         }
 
-        // Remote URL matches twigpine-node git smart HTTP route: /{owner}/{repo}
-        // (no .git suffix — the server routes don't include it)
-        let remote_url = format!("{}/{}", origin_url, item.repo);
+        // The remote matches twigpine-node git smart HTTP route: /{owner}/{repo}
+        // (no .git suffix, the server routes don't include it). Git is handed the
+        // canonical form built here, never the stored peer string. A refusal
+        // takes the same failure path as a failed clone or fetch. It runs before
+        // any peer HTTP request: the HTTP client dials an IP literal without the
+        // resolver policy, so the literal check here has to come first.
+        let net = match git_source.prepare(&origin_url, &item.repo).await {
+            Ok(net) => net,
+            Err(e) => {
+                handle_sync_item_error(db, &item, &origin_url, e).await;
+                continue;
+            }
+        };
 
         let withheld = fetch_withheld(client, &origin_url, owner_short, repo_name).await;
         let exists = local_path.exists();
@@ -394,9 +764,9 @@ async fn process_batch(
         }
 
         let result = if exists {
-            fetch_repo(&local_path, &remote_url, mode).await
+            fetch_repo(&local_path, &net, mode).await
         } else {
-            clone_repo(&remote_url, &local_path, mode).await
+            clone_repo(&net, &local_path, mode).await
         };
 
         match result {
@@ -693,8 +1063,8 @@ async fn replicate_encrypted_blobs(
 }
 
 /// Run a git subprocess, returning an error with stderr on non-zero exit.
-async fn git_run(args: &[&str]) -> anyhow::Result<()> {
-    let out = tokio::process::Command::new("git")
+async fn git_output(mut cmd: tokio::process::Command, args: &[&str]) -> anyhow::Result<()> {
+    let out = cmd
         .args(args)
         .output()
         .await
@@ -704,6 +1074,14 @@ async fn git_run(args: &[&str]) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("git {args:?} failed: {stderr}"));
     }
     Ok(())
+}
+
+async fn git_run(args: &[&str]) -> anyhow::Result<()> {
+    git_output(local_git(), args).await
+}
+
+async fn git_run_net(net: &NetworkGit, args: &[&str]) -> anyhow::Result<()> {
+    git_output(net.command(), args).await
 }
 
 /// Observe `gitlawb_sync_lag_seconds` for one dequeued row, but only when the
@@ -749,7 +1127,7 @@ async fn mirror_ref_tip(repo: &std::path::Path, ref_name: &str) -> TipProbe {
     // allow-unbounded-git: bounded by the tokio::time::timeout wrapping this
     // read below, plus kill_on_drop; rev-parse is a metadata lookup, not a
     // transfer, so the 10s cap is generous.
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = local_git();
     cmd.kill_on_drop(true);
     let out = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -780,15 +1158,12 @@ async fn mirror_ref_tip(repo: &std::path::Path, ref_name: &str) -> TipProbe {
 /// Run a git subprocess, ignoring a non-zero exit. Used for idempotent
 /// `config --unset`, which exits non-zero when the key is already absent.
 async fn git_run_lenient(args: &[&str]) {
-    let _ = tokio::process::Command::new("git")
-        .args(args)
-        .output()
-        .await;
+    let _ = local_git().args(args).output().await;
 }
 
 /// Read a single git config value; `None` if unset or on error.
 async fn git_config_get(repo: &str, key: &str) -> Option<String> {
-    let out = tokio::process::Command::new("git")
+    let out = local_git()
         .args(["-C", repo, "config", "--get", key])
         .output()
         .await
@@ -798,6 +1173,50 @@ async fn git_config_get(repo: &str, key: &str) -> Option<String> {
     }
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+/// Write the fetch-time hardening into the mirror's own config, so a git
+/// child that later only reads the repo (a promisor lazy fetch from a
+/// serving read, an operator's manual fetch) still gets the checked pin, a
+/// blanked proxy, and the protocol rules instead of whatever the ambient
+/// environment hands it. URL-scoped entries stay env-only: the generic keys
+/// cover the stored remote, which is the same URL. A pin gone stale on a
+/// legitimately rotated host fails the lazy fetch until the next sync
+/// refresh, which is the fail-closed side.
+async fn persist_peer_git_config(net: &NetworkGit, local_str: &str) -> anyhow::Result<()> {
+    persist_generic_git_config(net, local_str).await?;
+    if let Some(pin) = net.pin() {
+        git_run(&[
+            "-C",
+            local_str,
+            "config",
+            "--replace-all",
+            "http.curloptResolve",
+            pin,
+        ])
+        .await?;
+    } else {
+        git_run_lenient(&[
+            "-C",
+            local_str,
+            "config",
+            "--unset-all",
+            "http.curloptResolve",
+        ])
+        .await;
+    }
+    Ok(())
+}
+
+/// The non-pin, non-URL-scoped part of [`persist_peer_git_config`].
+async fn persist_generic_git_config(net: &NetworkGit, local_str: &str) -> anyhow::Result<()> {
+    for (key, value) in net.config.iter().filter(|(k, _)| !k.contains("://")) {
+        if key == "http.curloptResolve" {
+            continue;
+        }
+        git_run(&["-C", local_str, "config", "--replace-all", key, value]).await?;
+    }
+    Ok(())
 }
 
 /// Probe an existing mirror's `remote.origin.promisor` config as a three-valued
@@ -810,7 +1229,7 @@ async fn git_config_get(repo: &str, key: &str) -> Option<String> {
 /// non-zero codes (e.g. 128 for a bad path or unreadable config) on error. A spawn
 /// failure or any non-{0,1} exit is `Unknown`.
 async fn existing_promisor_state(repo: &str) -> PromisorProbe {
-    let out = match tokio::process::Command::new("git")
+    let out = match local_git()
         .args(["-C", repo, "config", "--get", "remote.origin.promisor"])
         .output()
         .await
@@ -910,7 +1329,7 @@ async fn prune_git(
     let fut = async {
         // allow-unbounded-git: bounded by the tokio::time::timeout wrapping
         // this future below, plus kill_on_drop.
-        let mut cmd = tokio::process::Command::new("git");
+        let mut cmd = local_git();
         cmd.kill_on_drop(true);
         cmd.arg("-C").arg(local_path).args(args);
         cmd.output().await
@@ -1055,6 +1474,25 @@ impl std::fmt::Display for PruneFailed {
 
 impl std::error::Error for PruneFailed {}
 
+/// Marker for a failure a retry can clear that is not a prune: a transient
+/// `git --version` read, or a local config write around a peer transfer.
+/// Handled like [`PruneFailed`]: the row stays `pending`.
+#[derive(Debug)]
+struct SyncDeferred(String);
+
+impl std::fmt::Display for SyncDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sync deferred: {}", self.0)
+    }
+}
+
+impl std::error::Error for SyncDeferred {}
+
+/// Wrap a local mirror config write failure as [`SyncDeferred`].
+fn defer_config_write(e: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(SyncDeferred(format!("mirror config write failed: {e}")))
+}
+
 /// Marker for deterministic mirror-prune refusals: the identity check (path
 /// is not itself a repo) and malformed `show-ref` output cannot clear on
 /// retry — re-running fetch+prune every tick would spin forever on a
@@ -1105,6 +1543,11 @@ async fn handle_sync_item_error(
         crate::metrics::record_sync_processed("deferred");
         return;
     }
+    if err.downcast_ref::<SyncDeferred>().is_some() {
+        warn!(repo = %item.repo, origin = %origin_url, err = %err, "sync deferred; leaving sync row pending for retry");
+        crate::metrics::record_sync_processed("deferred");
+        return;
+    }
     warn!(repo = %item.repo, origin = %origin_url, err = %err, "repo sync failed");
     let _ = db.mark_sync_failed(&item.id).await;
     crate::metrics::record_sync_processed("failed");
@@ -1114,17 +1557,18 @@ async fn handle_sync_item_error(
 /// `Promisor` mode adds `--filter=blob:limit=10g`, which marks the repo a git
 /// promisor (so a pack with origin-omitted withheld blobs is accepted) while
 /// the huge size limit means every blob the origin *does* send is kept.
-async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> anyhow::Result<()> {
+async fn clone_repo(net: &NetworkGit, local_path: &Path, mode: MirrorMode) -> anyhow::Result<()> {
     let local_str = local_path.to_str().unwrap_or(".");
     let mut args = vec!["clone", "--mirror"];
     if mode == MirrorMode::Promisor {
         args.push("--filter=blob:limit=10g");
     }
     args.push("--");
-    args.push(remote_url);
+    args.push(net.remote());
     args.push(local_str);
 
-    let out = tokio::process::Command::new("git")
+    let out = net
+        .command()
         .args(&args)
         .output()
         .await
@@ -1134,6 +1578,10 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow::anyhow!("git clone --mirror failed: {stderr}"));
     }
+    // The transfer is done; a local config write failing here is retryable.
+    persist_peer_git_config(net, local_str)
+        .await
+        .map_err(defer_config_write)?;
     // A fresh mirror imports everything the origin advertises, including any
     // planted non-exempt `refs/gitlawb/*` ref; prune before serving from it.
     // Prune outcome flows through `wrap_prune_error`: transient failures
@@ -1153,11 +1601,39 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
 /// a promisor (the repo went private -> public) clears the partial-clone config
 /// and `--refetch`es, so the once-withheld, now-public blobs are backfilled
 /// rather than left permanently missing.
-async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> anyhow::Result<()> {
+async fn fetch_repo(local_path: &Path, net: &NetworkGit, mode: MirrorMode) -> anyhow::Result<()> {
     let local_str = local_path.to_str().unwrap_or(".");
 
+    // Publish the hardening and the new pin before the new URL, so a lazy
+    // fetch that reads the mirror config between the two never sees the new
+    // origin without its pin. Existing pins stay until the post-fetch
+    // persist below replaces them all with this one.
+    persist_generic_git_config(net, local_str)
+        .await
+        .map_err(defer_config_write)?;
+    if let Some(pin) = net.pin() {
+        git_run(&[
+            "-C",
+            local_str,
+            "config",
+            "--replace-all",
+            "--fixed-value",
+            "http.curloptResolve",
+            pin,
+            pin,
+        ])
+        .await
+        .map_err(defer_config_write)?;
+    }
+
     git_run(&[
-        "-C", local_str, "remote", "set-url", "origin", "--", remote_url,
+        "-C",
+        local_str,
+        "remote",
+        "set-url",
+        "origin",
+        "--",
+        net.remote(),
     ])
     .await?;
 
@@ -1176,7 +1652,18 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
                 "blob:limit=10g",
             ])
             .await?;
-            git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
+            git_run_net(
+                net,
+                &[
+                    "-C",
+                    local_str,
+                    "fetch",
+                    "--no-auto-maintenance",
+                    "--prune",
+                    "origin",
+                ],
+            )
+            .await
         }
         MirrorMode::Plain => {
             let was_promisor = git_config_get(local_str, "remote.origin.promisor")
@@ -1200,13 +1687,39 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
                     "remote.origin.partialclonefilter",
                 ])
                 .await;
-                git_run(&["-C", local_str, "fetch", "--refetch", "--prune", "origin"]).await
+                git_run_net(
+                    net,
+                    &[
+                        "-C",
+                        local_str,
+                        "fetch",
+                        "--refetch",
+                        "--no-auto-maintenance",
+                        "--prune",
+                        "origin",
+                    ],
+                )
+                .await
             } else {
-                git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
+                git_run_net(
+                    net,
+                    &[
+                        "-C",
+                        local_str,
+                        "fetch",
+                        "--no-auto-maintenance",
+                        "--prune",
+                        "origin",
+                    ],
+                )
+                .await
             }
         }
     };
     fetch_result?;
+    persist_peer_git_config(net, local_str)
+        .await
+        .map_err(defer_config_write)?;
     // Prune after every fetch (see above); outcome flows through
     // `wrap_prune_error` like the clone path.
     prune_non_exempt_gitlawb_refs(local_path)
@@ -1219,6 +1732,7 @@ mod tests {
     use super::*;
     use sqlx::PgPool;
     use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     #[test]
@@ -1404,7 +1918,9 @@ mod tests {
     async fn promisor_clone_marks_promisor_and_keeps_objects() {
         let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
         let dest = td.path().join("mirror.git");
-        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+        clone_repo(&NetworkGit::unhardened(&url), &dest, MirrorMode::Promisor)
+            .await
+            .unwrap();
 
         assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
         assert_eq!(git_config(&dest, "remote.origin.mirror"), "true");
@@ -1417,7 +1933,9 @@ mod tests {
     async fn plain_clone_is_not_promisor() {
         let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
         let dest = td.path().join("mirror.git");
-        clone_repo(&url, &dest, MirrorMode::Plain).await.unwrap();
+        clone_repo(&NetworkGit::unhardened(&url), &dest, MirrorMode::Plain)
+            .await
+            .unwrap();
 
         assert_eq!(git_config(&dest, "remote.origin.promisor"), "");
         assert_eq!(git_config(&dest, "remote.origin.mirror"), "true");
@@ -1427,7 +1945,9 @@ mod tests {
     async fn probe_reports_promisor_for_promisor_mirror() {
         let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
         let dest = td.path().join("mirror.git");
-        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+        clone_repo(&NetworkGit::unhardened(&url), &dest, MirrorMode::Promisor)
+            .await
+            .unwrap();
 
         let probe = existing_promisor_state(dest.to_str().unwrap()).await;
         assert_eq!(probe, PromisorProbe::Promisor);
@@ -1440,7 +1960,9 @@ mod tests {
         // Unknown (which would wrongly preserve and upgrade a plain mirror).
         let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
         let dest = td.path().join("mirror.git");
-        clone_repo(&url, &dest, MirrorMode::Plain).await.unwrap();
+        clone_repo(&NetworkGit::unhardened(&url), &dest, MirrorMode::Plain)
+            .await
+            .unwrap();
 
         let probe = existing_promisor_state(dest.to_str().unwrap()).await;
         assert_eq!(probe, PromisorProbe::NotPromisor);
@@ -1466,7 +1988,7 @@ mod tests {
         let dest = td.path().join("mirror.git");
         let injected = "--upload-pack=false";
 
-        let err = clone_repo(injected, &dest, MirrorMode::Plain)
+        let err = clone_repo(&NetworkGit::unhardened(injected), &dest, MirrorMode::Plain)
             .await
             .expect_err("a remote that is not a repository must fail the clone")
             .to_string();
@@ -1511,7 +2033,7 @@ mod tests {
             .success());
 
         let injected = "--upload-pack=false";
-        let _ = fetch_repo(&local, injected, MirrorMode::Plain).await;
+        let _ = fetch_repo(&local, &NetworkGit::unhardened(injected), MirrorMode::Plain).await;
 
         assert_eq!(
             git_config_get(local_str, "remote.origin.url")
@@ -1535,7 +2057,9 @@ mod tests {
     async fn promisor_fetch_updates_existing_mirror() {
         let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
         let dest = td.path().join("mirror.git");
-        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+        clone_repo(&NetworkGit::unhardened(&url), &dest, MirrorMode::Promisor)
+            .await
+            .unwrap();
         let before = object_count(&dest);
 
         // Add a second commit to the origin working tree and push to the bare
@@ -1546,7 +2070,9 @@ mod tests {
         g(&["commit", "-qm", "second"], &origin);
         g(&["push", "-q", &url, "HEAD"], &origin);
 
-        fetch_repo(&dest, &url, MirrorMode::Promisor).await.unwrap();
+        fetch_repo(&dest, &NetworkGit::unhardened(&url), MirrorMode::Promisor)
+            .await
+            .unwrap();
 
         assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
         assert!(object_count(&dest) > before, "fetch pulled the new commit");
@@ -1559,10 +2085,14 @@ mod tests {
         // config and refetch instead of leaving the mirror a promisor forever.
         let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
         let dest = td.path().join("mirror.git");
-        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+        clone_repo(&NetworkGit::unhardened(&url), &dest, MirrorMode::Promisor)
+            .await
+            .unwrap();
         assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
 
-        fetch_repo(&dest, &url, MirrorMode::Plain).await.unwrap();
+        fetch_repo(&dest, &NetworkGit::unhardened(&url), MirrorMode::Plain)
+            .await
+            .unwrap();
 
         assert_eq!(git_config(&dest, "remote.origin.promisor"), "");
         assert_eq!(git_config(&dest, "remote.origin.partialclonefilter"), "");
@@ -1895,6 +2425,21 @@ mod tests {
     /// Run one `process_batch` against `repos_dir`, cloning the test config and
     /// overriding only the repo root.
     async fn run_batch(state: &crate::state::AppState, repos_dir: &Path) {
+        run_batch_with(
+            state,
+            repos_dir,
+            &reqwest::Client::new(),
+            &GitSource::Unhardened,
+        )
+        .await;
+    }
+
+    async fn run_batch_with(
+        state: &crate::state::AppState,
+        repos_dir: &Path,
+        client: &reqwest::Client,
+        git_source: &GitSource,
+    ) {
         let mut cfg = (*state.config).clone();
         cfg.repos_dir = repos_dir.to_path_buf();
         process_batch(
@@ -1902,7 +2447,8 @@ mod tests {
             &cfg,
             &Keypair::generate(),
             None,
-            &reqwest::Client::new(),
+            client,
+            git_source,
         )
         .await;
     }
@@ -3143,6 +3689,1187 @@ mod tests {
             status_of(state.db.pool(), "sync-prune-invalid").await,
             "failed",
             "deterministic prune refusal must fail the row, not defer forever"
+        );
+    }
+
+    /// A resolver whose lookup answers `127.0.0.1` for every name, plus a
+    /// counter of how many lookups it served.
+    fn loopback_resolver() -> (
+        crate::resolver_policy::ResolverPolicy,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let policy = crate::resolver_policy::ResolverPolicy::new(
+            move |_host| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(vec!["127.0.0.1".parse().unwrap()]) })
+            },
+            Duration::from_secs(5),
+            32,
+        );
+        (policy, calls)
+    }
+
+    /// Bind a loopback listener and count the connections it accepts.
+    async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = accepted.clone();
+        tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (port, accepted)
+    }
+
+    /// A loopback listener on a plain std thread, for the parent arm of an
+    /// isolated-child test: the tokio listener above cannot be polled while
+    /// `run_isolated` blocks the current-thread runtime waiting on the child.
+    fn std_counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = accepted.clone();
+        std::thread::spawn(move || {
+            for _ in listener.incoming() {
+                a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (port, accepted)
+    }
+
+    #[tokio::test]
+    async fn sync_client_refuses_a_name_that_resolves_to_loopback_in_fetch_withheld() {
+        let (resolver, calls) = loopback_resolver();
+        let client = build_sync_http_client_with(resolver);
+        let (port, accepted) = counting_listener().await;
+        let origin = format!("http://rebind.invalid:{port}");
+        assert!(
+            crate::api::peers::is_public_http_url(&origin),
+            "the witness URL must pass the string gate so only resolution can refuse it"
+        );
+
+        let out = fetch_withheld(&client, &origin, "owner", "repo").await;
+
+        assert!(out.is_none());
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // Same proxy-bypass guard as the shared client: a configured proxy would
+    // resolve the peer's hostname itself, skipping the resolver policy. The
+    // parent binds the decoy proxy listener and sets HTTP_PROXY/ALL_PROXY on
+    // the child; the child requests an IP-literal URL on a second listener.
+    #[tokio::test]
+    async fn sync_client_ignores_env_proxy() {
+        use crate::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            let (proxy_port, proxy_hits) = std_counting_listener();
+            let proxy = format!("http://127.0.0.1:{proxy_port}");
+            run_isolated(
+                "sync::tests::sync_client_ignores_env_proxy",
+                &[
+                    ("HTTP_PROXY", proxy.as_str()),
+                    ("ALL_PROXY", proxy.as_str()),
+                ],
+            );
+            assert_eq!(
+                proxy_hits.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the client must not dial the configured proxy"
+            );
+            return;
+        }
+        let (port, accepted) = counting_listener().await;
+        let _ = build_sync_http_client()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // Same end-to-end check as the shared client: the production sync client
+    // builder must wire the real resolver policy, not just the injected one
+    // the other tests use. Run in a child so a proxy in the runner's
+    // environment cannot intercept the request.
+    #[tokio::test]
+    async fn sync_production_client_refuses_localhost() {
+        use crate::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            run_isolated("sync::tests::sync_production_client_refuses_localhost", &[]);
+            return;
+        }
+        let (port, accepted) = counting_listener().await;
+
+        let res = build_sync_http_client()
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await;
+
+        assert!(
+            res.is_err(),
+            "the production sync client must refuse localhost"
+        );
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sync_client_refuses_a_name_that_resolves_to_loopback_in_register_replica() {
+        let (resolver, calls) = loopback_resolver();
+        let client = build_sync_http_client_with(resolver);
+        let (port, accepted) = counting_listener().await;
+        let origin = format!("http://rebind.invalid:{port}");
+        assert!(
+            crate::api::peers::is_public_http_url(&origin),
+            "the witness URL must pass the string gate so only resolution can refuse it"
+        );
+
+        register_replica_with_origin(
+            &client,
+            &Keypair::generate(),
+            Some("https://mirror.example"),
+            &origin,
+            "owner",
+            "repo",
+        )
+        .await;
+
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // ── hardened git for peer clone and fetch ────────────────────────────────
+
+    /// Write an executable fake git. The body must start with a shebang line.
+    /// Written, flushed and closed, then exec'd once before use, so a test
+    /// never races ETXTBSY (same approach as `git/store.rs`).
+    fn write_fake_git(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        // std has no stable `ErrorKind` for ETXTBSY. EAGAIN is a transient spawn
+        // failure under process pressure; neither means the script ran.
+        const ETXTBSY: i32 = 26;
+        const EAGAIN: i32 = 11;
+        let (shebang, rest) = body
+            .split_once('\n')
+            .expect("a fake git body starts with a shebang line");
+        let body = format!("{shebang}\nif [ -n \"$FAKE_GIT_SETTLE\" ]; then exit 0; fi\n{rest}");
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..100 {
+            match Command::new(path).env("FAKE_GIT_SETTLE", "1").status() {
+                Ok(_) => return,
+                Err(e) if matches!(e.raw_os_error(), Some(ETXTBSY | EAGAIN)) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("settle exec of fake git failed: {}: {e}", path.display()),
+            }
+        }
+        panic!(
+            "fake git still ETXTBSY after 100 attempts: {}",
+            path.display()
+        );
+    }
+
+    /// A fake git that prints `version_text` for `--version` and otherwise
+    /// appends its argv and environment to a record file, then exits 0.
+    /// Returns (binary path, record path).
+    fn fake_git(dir: &Path, version_text: &str) -> (String, PathBuf) {
+        let bin = dir.join("fake-git");
+        let record = dir.join("record");
+        write_fake_git(
+            &bin,
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"--version\" ]; then echo '{version_text}'; exit 0; fi\n\
+                 {{\n\
+                 echo INVOKED\n\
+                 for a in \"$@\"; do echo \"ARG=$a\"; done\n\
+                 env | sed 's/^/ENV:/'\n\
+                 }} >> '{}'\n\
+                 exit 0\n",
+                record.display()
+            ),
+        );
+        (bin.to_str().unwrap().to_string(), record)
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        invocations: usize,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+    }
+
+    fn read_record(record: &Path) -> Recorded {
+        let Ok(text) = std::fs::read_to_string(record) else {
+            return Recorded::default();
+        };
+        let mut out = Recorded::default();
+        for line in text.lines() {
+            if line == "INVOKED" {
+                out.invocations += 1;
+            } else if let Some(arg) = line.strip_prefix("ARG=") {
+                out.args.push(arg.to_string());
+            } else if let Some(var) = line.strip_prefix("ENV:") {
+                if let Some((k, v)) = var.split_once('=') {
+                    out.env.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// The `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` pairs the fake git saw.
+    fn recorded_config(rec: &Recorded) -> Vec<(String, String)> {
+        let count: usize = rec
+            .env
+            .get("GIT_CONFIG_COUNT")
+            .expect("GIT_CONFIG_COUNT is set")
+            .parse()
+            .unwrap();
+        (0..count)
+            .map(|i| {
+                (
+                    rec.env[&format!("GIT_CONFIG_KEY_{i}")].clone(),
+                    rec.env[&format!("GIT_CONFIG_VALUE_{i}")].clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn answering(answers: &[&str]) -> (crate::resolver_policy::ResolverPolicy, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let answers: Vec<std::net::IpAddr> = answers.iter().map(|a| a.parse().unwrap()).collect();
+        let policy = crate::resolver_policy::ResolverPolicy::new(
+            move |_host| {
+                c.fetch_add(1, Ordering::SeqCst);
+                let a = answers.clone();
+                Box::pin(async move { Ok(a) })
+            },
+            Duration::from_secs(5),
+            32,
+        );
+        (policy, calls)
+    }
+
+    /// Run `clone_repo` through `net` into a scratch directory. The fake git
+    /// creates nothing, so the call itself is expected to fail afterwards.
+    async fn clone_through(net: &NetworkGit) {
+        let td = TempDir::new().unwrap();
+        let _ = clone_repo(net, &td.path().join("m.git"), MirrorMode::Plain).await;
+    }
+
+    const PUBLIC_V4: &str = "93.184.216.34";
+    const PUBLIC_V6: &str = "2606:2800:220:1::1";
+
+    #[tokio::test]
+    async fn git_refuses_a_hostname_that_resolves_to_loopback() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, calls) = answering(&["127.0.0.1"]);
+
+        let res = NetworkGit::prepare("http://rebind.example", "owner/repo", &resolver, &bin).await;
+
+        assert!(res.is_err(), "a loopback answer must be refused");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(read_record(&record).invocations, 0);
+    }
+
+    #[tokio::test]
+    async fn git_refuses_a_mixed_answer() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, _) = answering(&[PUBLIC_V4, "169.254.169.254"]);
+
+        let res = NetworkGit::prepare("http://mixed.example", "owner/repo", &resolver, &bin).await;
+
+        assert!(res.is_err(), "one non-public answer refuses the whole peer");
+        assert_eq!(read_record(&record).invocations, 0);
+    }
+
+    /// `git ls-remote 'http://a.example\@127.0.0.1:1/x'` dials 127.0.0.1 while
+    /// the URL parser reads the host as `a.example`. The origin must be refused
+    /// before any lookup or git process, and nothing may connect.
+    #[tokio::test]
+    async fn git_refuses_a_backslash_origin_before_lookup_or_spawn() {
+        let (port, accepted) = counting_listener().await;
+        let (resolver, calls) = answering(&[PUBLIC_V4]);
+        let origin = format!("http://a.example\\@127.0.0.1:{port}");
+
+        let res = NetworkGit::prepare(&origin, "owner/repo", &resolver, "git").await;
+        if let Ok(net) = &res {
+            // Reached only on a regression: real git shows whether it connects.
+            clone_through(net).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        assert!(res.is_err(), "a backslash origin must be refused");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no lookup before refusal");
+        assert_eq!(accepted.load(Ordering::SeqCst), 0, "nothing may connect");
+    }
+
+    #[tokio::test]
+    async fn git_refuses_origins_git_would_read_differently() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, calls) = answering(&[PUBLIC_V4]);
+
+        for origin in [
+            "http://user:pw@a.example",
+            "http://user@a.example",
+            "http://a.example#frag",
+            "http://a.example#",
+            "http://a.example?q=1",
+            "http://a.example?",
+            "http://a.example\\x",
+            "git://a.example",
+            "ssh://a.example",
+            "file:///tmp/x",
+            "ext::sh -c id",
+            "ftp://a.example",
+            "a.example",
+        ] {
+            let res = NetworkGit::prepare(origin, "owner/repo", &resolver, &bin).await;
+            assert!(res.is_err(), "{origin:?} must be refused");
+        }
+        for repo in ["owner/repo?x=1", "owner/repo#f", "owner\\repo"] {
+            let res = NetworkGit::prepare("http://a.example", repo, &resolver, &bin).await;
+            assert!(res.is_err(), "repo {repo:?} must be refused");
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(read_record(&record).invocations, 0);
+    }
+
+    #[tokio::test]
+    async fn git_pins_a_public_answer_with_a_resolve_entry() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, _) = answering(&[PUBLIC_V4]);
+
+        let net = NetworkGit::prepare("http://a.example", "owner/repo", &resolver, &bin)
+            .await
+            .expect("a public answer is accepted");
+        clone_through(&net).await;
+
+        let rec = read_record(&record);
+        assert_eq!(rec.invocations, 1);
+        let config = recorded_config(&rec);
+        let pin = format!("a.example:80:{PUBLIC_V4}");
+        let scoped = "http.http://a.example/owner/repo.curloptResolve".to_string();
+        assert!(config.contains(&("http.curloptResolve".to_string(), pin.clone())));
+        assert!(config.contains(&(scoped.clone(), pin.clone())));
+        // The reset has to come before the pin, or it would erase it.
+        for key in ["http.curloptResolve", scoped.as_str()] {
+            let reset = config
+                .iter()
+                .position(|(k, v)| k == key && v.is_empty())
+                .expect("reset entry");
+            let set = config
+                .iter()
+                .position(|(k, v)| k == key && *v == pin)
+                .unwrap();
+            assert!(reset < set, "reset of {key} must precede its pin");
+        }
+    }
+
+    #[tokio::test]
+    async fn git_pins_every_checked_address_with_bracketed_ipv6() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, _) = answering(&[PUBLIC_V6, PUBLIC_V4, PUBLIC_V4]);
+
+        let net = NetworkGit::prepare("https://b.example:8443", "owner/repo", &resolver, &bin)
+            .await
+            .unwrap();
+        clone_through(&net).await;
+
+        let config = recorded_config(&read_record(&record));
+        let pin = format!("b.example:8443:{PUBLIC_V4},[{PUBLIC_V6}]");
+        assert!(config.contains(&("http.curloptResolve".to_string(), pin)));
+    }
+
+    #[tokio::test]
+    async fn git_receives_the_canonical_remote_not_the_stored_string() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, _) = answering(&[PUBLIC_V4]);
+        let stored = "http://A.Example:80";
+
+        let net = NetworkGit::prepare(stored, "owner/repo", &resolver, &bin)
+            .await
+            .unwrap();
+        clone_through(&net).await;
+
+        let rec = read_record(&record);
+        let raw = format!("{stored}/owner/repo");
+        assert!(
+            rec.args
+                .contains(&"http://a.example/owner/repo".to_string()),
+            "git must receive the canonical remote: {:?}",
+            rec.args
+        );
+        assert!(
+            !rec.args.contains(&raw),
+            "the raw string must not reach git"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_runs_an_ip_literal_origin_hardened_and_unpinned() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, calls) = answering(&[PUBLIC_V4]);
+
+        let net = NetworkGit::prepare(
+            &format!("http://[{PUBLIC_V6}]:8080"),
+            "owner/repo",
+            &resolver,
+            &bin,
+        )
+        .await
+        .expect("an IP literal needs no lookup");
+        clone_through(&net).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no lookup for a literal");
+        let rec = read_record(&record);
+        assert_eq!(rec.invocations, 1);
+        assert!(rec
+            .args
+            .contains(&format!("http://[{PUBLIC_V6}]:8080/owner/repo")));
+        let config = recorded_config(&rec);
+        assert!(config.contains(&("http.proxy".to_string(), String::new())));
+        assert!(
+            config
+                .iter()
+                .all(|(k, v)| !(k.ends_with("curloptResolve") && !v.is_empty())),
+            "a literal gets no pin: {config:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_refuses_a_non_public_literal_origin() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, calls) = answering(&[]);
+
+        for origin in [
+            "http://127.0.0.1:8080",
+            "http://169.254.169.254",
+            "http://10.0.0.1",
+            "http://198.18.0.1:8080",
+            "http://[::1]",
+            "http://[fd00::1]",
+        ] {
+            let res = NetworkGit::prepare(origin, "owner/repo", &resolver, &bin).await;
+            assert!(res.is_err(), "{origin} must be refused");
+        }
+        assert_eq!(read_record(&record).invocations, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a literal never resolves");
+    }
+
+    #[tokio::test]
+    async fn git_refuses_a_repo_path_the_url_parser_rewrites() {
+        let td = TempDir::new().unwrap();
+        let (bin, _record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, _) = answering(&[PUBLIC_V4]);
+
+        for repo in ["a/%2e%2e/b", "a/%2E%2E/b", "a/%2e/b"] {
+            let res = NetworkGit::prepare("http://a.example", repo, &resolver, &bin).await;
+            assert!(res.is_err(), "{repo} must be refused");
+        }
+    }
+
+    #[test]
+    fn command_removes_the_ambient_git_environment() {
+        let net = NetworkGit {
+            git_bin: "git".to_string(),
+            remote: "http://a.example/owner/repo".to_string(),
+            config: Vec::new(),
+        };
+        let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = net
+            .command()
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_EXEC_PATH",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_SSL_NO_VERIFY",
+        ] {
+            assert!(
+                envs.iter().any(|(k, v)| k == var && v.is_none()),
+                "{var} must be env_removed from the spawned git"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_through_net_carries_the_pin_and_persists_the_hardening() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, _) = answering(&[PUBLIC_V4]);
+        let net = NetworkGit::prepare("http://a.example", "owner/repo", &resolver, &bin)
+            .await
+            .unwrap();
+        let repo = td.path().join("m.git");
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["remote", "add", "origin", "http://placeholder.invalid"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        fetch_repo(&repo, &net, MirrorMode::Plain).await.unwrap();
+
+        let rec = read_record(&record);
+        assert!(
+            rec.args.contains(&"--no-auto-maintenance".to_string()),
+            "fetch must carry the maintenance guard: {:?}",
+            rec.args
+        );
+        let config = recorded_config(&rec);
+        let pin = format!("a.example:80:{PUBLIC_V4}");
+        assert!(config.contains(&("http.curloptResolve".to_string(), pin)));
+
+        // The mirror's own config now carries the pin and the hardening, so a
+        // later lazy fetch inherits the same checked address.
+        let local = repo.to_str().unwrap();
+        assert_eq!(
+            git_config_get(local, "http.curloptResolve")
+                .await
+                .as_deref(),
+            Some(format!("a.example:80:{PUBLIC_V4}").as_str())
+        );
+        assert_eq!(
+            git_config_get(local, "http.followRedirects")
+                .await
+                .as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            git_config_get(local, "protocol.http.allow")
+                .await
+                .as_deref(),
+            Some("always")
+        );
+        assert_eq!(
+            git_config_get(local, "remote.origin.url").await.as_deref(),
+            Some("http://a.example/owner/repo")
+        );
+    }
+
+    /// Every key the hardening has to carry, checked as one table so deleting
+    /// any single entry turns this red.
+    #[tokio::test]
+    async fn git_config_carries_every_hardening_key() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, _) = answering(&[]);
+        let url = "http://93.184.216.34:8080/owner/repo";
+
+        let net = NetworkGit::prepare("http://93.184.216.34:8080", "owner/repo", &resolver, &bin)
+            .await
+            .unwrap();
+        clone_through(&net).await;
+
+        let rec = read_record(&record);
+        let mut got = recorded_config(&rec);
+        let http = |name: &str| format!("http.{url}.{name}");
+        let mut want: Vec<(String, String)> = vec![
+            ("http.proxy".into(), "".into()),
+            ("remote.origin.proxy".into(), "".into()),
+            ("http.followRedirects".into(), "false".into()),
+            ("http.curloptResolve".into(), "".into()),
+            ("http.extraHeader".into(), "".into()),
+            ("http.cookieFile".into(), "".into()),
+            ("http.saveCookies".into(), "false".into()),
+            ("http.sslVerify".into(), "true".into()),
+            (http("proxy"), "".into()),
+            (http("followRedirects"), "false".into()),
+            (http("curloptResolve"), "".into()),
+            (http("extraHeader"), "".into()),
+            (http("cookieFile"), "".into()),
+            (http("saveCookies"), "false".into()),
+            (http("sslVerify"), "true".into()),
+            ("credential.helper".into(), "".into()),
+            (format!("credential.{url}.helper"), "".into()),
+            ("credential.interactive".into(), "false".into()),
+            ("core.askPass".into(), "false".into()),
+            ("fetch.recurseSubmodules".into(), "false".into()),
+            ("fetch.uriprotocols".into(), "".into()),
+            ("fetch.bundleURI".into(), "".into()),
+            ("protocol.allow".into(), "never".into()),
+            ("protocol.http.allow".into(), "always".into()),
+            ("protocol.https.allow".into(), "always".into()),
+        ];
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(rec.env["GIT_CONFIG_GLOBAL"], "/dev/null");
+        assert_eq!(rec.env["GIT_CONFIG_NOSYSTEM"], "1");
+    }
+
+    #[tokio::test]
+    async fn git_config_blanks_the_proxy_under_an_inherited_proxy_variable() {
+        use super::super::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            run_isolated(
+                "sync::tests::git_config_blanks_the_proxy_under_an_inherited_proxy_variable",
+                &[("HTTP_PROXY", "http://127.0.0.1:9")],
+            );
+            return;
+        }
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.43.0");
+        let (resolver, _) = answering(&[PUBLIC_V4]);
+
+        let net = NetworkGit::prepare("http://a.example", "owner/repo", &resolver, &bin)
+            .await
+            .unwrap();
+        clone_through(&net).await;
+
+        let rec = read_record(&record);
+        assert_eq!(
+            rec.env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:9"),
+            "the child must really have inherited the proxy variable"
+        );
+        let config = recorded_config(&rec);
+        assert!(config.contains(&("http.proxy".to_string(), String::new())));
+        assert!(config.contains(&(
+            "http.http://a.example/owner/repo.proxy".to_string(),
+            String::new()
+        )));
+    }
+
+    #[tokio::test]
+    async fn git_below_2_31_refuses_every_origin() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.30.2");
+        let (resolver, _) = answering(&[PUBLIC_V4]);
+
+        for origin in ["http://a.example", "http://93.184.216.34:8080"] {
+            let res = NetworkGit::prepare(origin, "owner/repo", &resolver, &bin).await;
+            assert!(res.is_err(), "{origin} must be refused on git 2.30");
+        }
+        assert_eq!(read_record(&record).invocations, 0);
+    }
+
+    #[tokio::test]
+    async fn git_2_36_refuses_a_hostname_and_runs_an_ip_literal() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "git version 2.36.1");
+        let (resolver, _) = answering(&[PUBLIC_V4]);
+
+        let res = NetworkGit::prepare("http://a.example", "owner/repo", &resolver, &bin).await;
+        assert!(res.is_err(), "no pin support, so no hostname origin");
+        assert_eq!(read_record(&record).invocations, 0);
+
+        let net = NetworkGit::prepare("http://93.184.216.34:8080", "owner/repo", &resolver, &bin)
+            .await
+            .expect("a literal needs no pin");
+        clone_through(&net).await;
+        assert_eq!(read_record(&record).invocations, 1);
+    }
+
+    #[tokio::test]
+    async fn git_with_an_unreadable_version_refuses_a_hostname() {
+        let td = TempDir::new().unwrap();
+        let (bin, record) = fake_git(td.path(), "no version here");
+        let (resolver, _) = answering(&[PUBLIC_V4]);
+
+        let res = NetworkGit::prepare("http://a.example", "owner/repo", &resolver, &bin).await;
+        assert!(res.is_err(), "an unreadable version fails closed");
+        assert_eq!(read_record(&record).invocations, 0);
+
+        let missing = td.path().join("no-such-git");
+        let res = NetworkGit::prepare(
+            "http://a.example",
+            "owner/repo",
+            &resolver,
+            missing.to_str().unwrap(),
+        )
+        .await;
+        assert!(res.is_err(), "a binary that cannot run fails closed");
+    }
+
+    /// Real git against a loopback listener that answers 302 to a second
+    /// loopback listener. The second one must never see a connection.
+    #[tokio::test]
+    async fn git_does_not_follow_a_redirect() {
+        let (second_port, second) = counting_listener().await;
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let hits = first_hits.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = first.accept().await {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{second_port}/x\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        // Prepare refuses a private literal now, and this test needs a
+        // loopback dial: build the hardened handle directly, the same shape
+        // `prepare` returns for a public origin.
+        let remote = format!("http://127.0.0.1:{first_port}/owner/repo");
+        let net = NetworkGit {
+            git_bin: "git".to_string(),
+            remote: remote.clone(),
+            config: peer_git_config(&remote, None),
+        };
+        let td = TempDir::new().unwrap();
+
+        let res = clone_repo(&net, &td.path().join("m.git"), MirrorMode::Plain).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(res.is_err(), "the redirected clone cannot succeed");
+        assert!(
+            first_hits.load(Ordering::SeqCst) >= 1,
+            "git must have reached the first listener"
+        );
+        assert_eq!(
+            second.load(Ordering::SeqCst),
+            0,
+            "the redirect was followed"
+        );
+    }
+
+    #[sqlx::test]
+    async fn process_batch_refuses_a_peer_that_resolves_to_loopback_before_git(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let git_dir = TempDir::new().unwrap();
+        let (bin, record) = fake_git(git_dir.path(), "git version 2.43.0");
+        let (resolver, calls) = loopback_resolver();
+        let (port, accepted) = counting_listener().await;
+        let did = "did:key:z6MkRebind";
+        seed_local_peer(&pool, did, &format!("http://rebind.invalid:{port}")).await;
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+
+        let source = GitSource::Hardened {
+            resolver: resolver.clone(),
+            git_bin: bin,
+        };
+        run_batch_with(
+            &state,
+            &repos_dir,
+            &build_sync_http_client_with(resolver),
+            &source,
+        )
+        .await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(read_record(&record).invocations, 0);
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        assert!(!repos_dir.join("z6Mkfoo").join("hello.git").exists());
+    }
+
+    /// Every variable `scrub_ambient_git_env` removes, for the env checks below.
+    const SCRUBBED: [&str; 15] = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_EXEC_PATH",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_SSL_NO_VERIFY",
+    ];
+
+    #[test]
+    fn local_git_removes_the_ambient_git_environment() {
+        let cmd = local_git();
+        let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        for var in SCRUBBED {
+            assert!(
+                envs.iter().any(|(k, v)| k == var && v.is_none()),
+                "{var} must be env_removed from local git"
+            );
+        }
+    }
+
+    /// `NetworkGit::command` scrubs `GIT_CONFIG_COUNT` and then sets its own.
+    #[test]
+    fn command_sets_its_own_config_count_after_the_scrub() {
+        let remote = "http://a.example/owner/repo";
+        let net = NetworkGit {
+            git_bin: "git".to_string(),
+            remote: remote.to_string(),
+            config: peer_git_config(remote, None),
+        };
+        let cmd = net.command();
+        let count = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "GIT_CONFIG_COUNT")
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+        assert_eq!(count, Some(net.config.len().to_string()));
+    }
+
+    /// Every default-binary git spawn in the production part of this file goes
+    /// through `local_git`, so the only `Command::new("git")` is inside it.
+    #[test]
+    fn production_git_spawns_go_through_local_git() {
+        let src = include_str!("sync.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("test module marker");
+        assert_eq!(
+            production.matches("Command::new(\"git\")").count(),
+            1,
+            "a production git spawn bypasses local_git"
+        );
+    }
+
+    /// An inherited `GIT_DIR` must not retarget the promisor probe at a decoy
+    /// repo. The parent builds both repos; the child runs with `GIT_DIR` set.
+    #[tokio::test]
+    async fn promisor_probe_ignores_an_inherited_git_dir() {
+        use crate::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            let td = TempDir::new().unwrap();
+            let decoy = td.path().join("decoy.git");
+            let mirror = td.path().join("mirror.git");
+            for repo in [&decoy, &mirror] {
+                g(&["init", "-q", "--bare", repo.to_str().unwrap()], td.path());
+            }
+            g(&["config", "remote.origin.promisor", "true"], &mirror);
+            run_isolated(
+                "sync::tests::promisor_probe_ignores_an_inherited_git_dir",
+                &[
+                    ("GIT_DIR", decoy.to_str().unwrap()),
+                    ("SYNC_TEST_MIRROR", mirror.to_str().unwrap()),
+                ],
+            );
+            return;
+        }
+        let mirror = std::env::var("SYNC_TEST_MIRROR").unwrap();
+        assert_eq!(
+            existing_promisor_state(&mirror).await,
+            PromisorProbe::Promisor
+        );
+    }
+
+    /// A fake git that runs the real git, then plants `config.lock` in the
+    /// mirror (the `-C` directory, else the last argument), so the next
+    /// config write fails.
+    fn locking_git(dir: &Path) -> String {
+        let bin = dir.join("locking-git");
+        write_fake_git(
+            &bin,
+            "#!/bin/sh\n\
+             git \"$@\" || exit $?\n\
+             dir=\n\
+             prev=\n\
+             for a; do if [ \"$prev\" = \"-C\" ]; then dir=$a; fi; prev=$a; done\n\
+             [ -n \"$dir\" ] || dir=$prev\n\
+             touch \"$dir/config.lock\"\n",
+        );
+        bin.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_config_write_failure_after_a_clone_or_fetch_defers() {
+        let (_remote_td, remote) = bare_remote(&[("a.txt", b"hi\n")]);
+        let td = TempDir::new().unwrap();
+        let net = NetworkGit {
+            git_bin: locking_git(td.path()),
+            remote: remote.clone(),
+            config: vec![("http.proxy".to_string(), String::new())],
+        };
+
+        let mirror = td.path().join("m.git");
+        let err = clone_repo(&net, &mirror, MirrorMode::Plain)
+            .await
+            .expect_err("the config write after the clone must fail");
+        assert!(mirror.join("HEAD").exists(), "the clone itself completed");
+        assert!(
+            err.downcast_ref::<SyncDeferred>().is_some(),
+            "clone-side config write failure must defer: {err:#}"
+        );
+
+        // Same for a fetch: clear the lock so the pre-fetch writes succeed and
+        // the git wrapper plants it again after the fetch.
+        std::fs::remove_file(mirror.join("config.lock")).unwrap();
+        let err = fetch_repo(&mirror, &net, MirrorMode::Plain)
+            .await
+            .expect_err("the config write after the fetch must fail");
+        assert!(
+            err.downcast_ref::<SyncDeferred>().is_some(),
+            "fetch-side config write failure must defer: {err:#}"
+        );
+    }
+
+    async fn seed_pending(pool: &PgPool, id: &str) {
+        sqlx::query(
+            "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at)
+             VALUES ($1, $2, $3, $4, $5, NULL, 'pending', $6)",
+        )
+        .bind(id)
+        .bind("z6Mkfoo/hello")
+        .bind("did:key:z6MkOrigin")
+        .bind("refs/heads/main")
+        .bind("0".repeat(40))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn sync_deferred_leaves_the_row_pending(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        seed_pending(&pool, "sync-deferred").await;
+        let item = crate::db::SyncQueueItem {
+            id: "sync-deferred".to_string(),
+            repo: "z6Mkfoo/hello".to_string(),
+            node_did: "did:key:z6MkOrigin".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            new_sha: "0".repeat(40),
+            cid: None,
+            status: "pending".to_string(),
+            enqueued_at: chrono::Utc::now().to_rfc3339(),
+            origin_timestamp: None,
+        };
+        handle_sync_item_error(
+            &state.db,
+            &item,
+            "http://origin.example",
+            defer_config_write(anyhow::anyhow!("could not lock config file")),
+        )
+        .await;
+        let row: (String,) = sqlx::query_as("SELECT status FROM sync_queue WHERE id = $1")
+            .bind("sync-deferred")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, "pending");
+    }
+
+    /// A git binary that cannot be run is a transient condition: the row stays
+    /// pending, and no peer HTTP request is made.
+    #[sqlx::test]
+    async fn process_batch_defers_when_the_git_version_cannot_be_read(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let (resolver, _) = loopback_resolver();
+        let (port, accepted) = counting_listener().await;
+        let did = "did:key:z6MkNoGit";
+        seed_local_peer(&pool, did, &format!("http://a.example:{port}")).await;
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+
+        let source = GitSource::Hardened {
+            resolver: resolver.clone(),
+            git_bin: home
+                .path()
+                .join("no-such-git")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        };
+        run_batch_with(
+            &state,
+            &repos_dir,
+            &build_sync_http_client_with(resolver),
+            &source,
+        )
+        .await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "pending");
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+    }
+
+    /// The HTTP client dials an IP literal without the resolver policy, so a
+    /// literal the git policy refuses must be refused before any peer request.
+    #[sqlx::test]
+    async fn process_batch_refuses_a_literal_peer_before_any_http(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let (resolver, _) = loopback_resolver();
+        let (port, accepted) = counting_listener().await;
+        let did = "did:key:z6MkLiteral";
+        seed_local_peer(&pool, did, &format!("http://127.0.0.1:{port}")).await;
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+
+        run_batch_with(
+            &state,
+            &repos_dir,
+            &build_sync_http_client_with(resolver),
+            &GitSource::production(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "a peer request was sent"
+        );
+    }
+
+    /// A mirror's own `remote.origin.proxy` must not route a peer fetch.
+    #[tokio::test]
+    async fn fetch_ignores_a_mirror_remote_proxy() {
+        use crate::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            run_isolated("sync::tests::fetch_ignores_a_mirror_remote_proxy", &[]);
+            return;
+        }
+        let (proxy_port, proxy_hits) = counting_listener().await;
+        let (peer_port, _) = counting_listener().await;
+        let td = TempDir::new().unwrap();
+        let mirror = td.path().join("m.git");
+        g(
+            &["init", "-q", "--bare", mirror.to_str().unwrap()],
+            td.path(),
+        );
+        let remote = format!("http://127.0.0.1:{peer_port}/x");
+        g(&["remote", "add", "origin", &remote], &mirror);
+        g(
+            &[
+                "config",
+                "remote.origin.proxy",
+                &format!("http://127.0.0.1:{proxy_port}"),
+            ],
+            &mirror,
+        );
+        let net = NetworkGit {
+            git_bin: "git".to_string(),
+            remote: remote.clone(),
+            config: peer_git_config(&remote, None),
+        };
+
+        let _ = fetch_repo(&mirror, &net, MirrorMode::Plain).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            0,
+            "the fetch went through the mirror's remote proxy"
+        );
+    }
+
+    async fn ls_remote_hits(pin: Option<&str>, port: u16) {
+        let remote = format!("http://pinned.invalid:{port}/x");
+        let net = NetworkGit {
+            git_bin: "git".to_string(),
+            remote: remote.clone(),
+            config: peer_git_config(&remote, pin),
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(20),
+            net.command().args(["ls-remote", "--", &remote]).output(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    /// Real git and libcurl honor the pin format `prepare` builds.
+    #[tokio::test]
+    async fn git_dials_the_pinned_address() {
+        let (port, accepted) = counting_listener().await;
+        let pin = resolve_pin("pinned.invalid", port, vec!["127.0.0.1".parse().unwrap()]);
+        ls_remote_hits(Some(&pin), port).await;
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 1,
+            "the pin {pin} was not honored"
+        );
+
+        let (port, accepted) = counting_listener().await;
+        ls_remote_hits(None, port).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 0, "no pin, no dial");
+    }
+
+    /// The new pin is in the mirror config before the new origin URL, so a
+    /// failed fetch never leaves the new URL without its pin.
+    #[tokio::test]
+    async fn fetch_publishes_the_new_pin_with_the_new_origin() {
+        let td = TempDir::new().unwrap();
+        let mirror = td.path().join("m.git");
+        g(
+            &["init", "-q", "--bare", mirror.to_str().unwrap()],
+            td.path(),
+        );
+        g(
+            &["remote", "add", "origin", "http://a.invalid:1/x"],
+            &mirror,
+        );
+        g(
+            &["config", "http.curloptResolve", "a.invalid:1:127.0.0.1"],
+            &mirror,
+        );
+        let remote = "http://b.invalid:1/x";
+        let pin = "b.invalid:1:127.0.0.1";
+        let net = NetworkGit {
+            git_bin: "git".to_string(),
+            remote: remote.to_string(),
+            config: peer_git_config(remote, Some(pin)),
+        };
+
+        let res = fetch_repo(&mirror, &net, MirrorMode::Plain).await;
+        assert!(res.is_err(), "port 1 refuses, so the fetch fails");
+
+        assert_eq!(git_config(&mirror, "remote.origin.url"), remote);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&mirror)
+            .args(["config", "--get-all", "http.curloptResolve"])
+            .output()
+            .unwrap();
+        let pins = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            pins.lines().any(|l| l == pin),
+            "the new origin has no pin in the mirror config: {pins:?}"
         );
     }
 }

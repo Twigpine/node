@@ -1097,7 +1097,8 @@ pub(crate) async fn run_encrypt_pin_task_for_test(
         owner_did,
         repo_name,
         irys_url: String::new(),
-        http_client: std::sync::Arc::clone(&state.http_client),
+        // Only used for the operator-configured Irys endpoint.
+        http_client: Arc::new(crate::operator_http_client().clone()),
         node_did: state.node_did.to_string(),
         node_keypair: std::sync::Arc::clone(&state.node_keypair),
         git_bin: state.git_bin.clone(),
@@ -4477,7 +4478,8 @@ pub(crate) async fn post_receive_replication_tail(
             owner_did: record.owner_did.clone(),
             repo_name: record.name.clone(),
             irys_url: state.config.irys_url.clone(),
-            http_client: std::sync::Arc::clone(&state.http_client),
+            // Only used for the operator-configured Irys endpoint.
+            http_client: Arc::new(crate::operator_http_client().clone()),
             node_did: state.node_did.to_string(),
             node_keypair: std::sync::Arc::clone(&state.node_keypair),
             git_bin: state.git_bin.clone(),
@@ -4517,7 +4519,11 @@ pub(crate) async fn post_receive_replication_tail(
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
         let repo_id = record.id.clone();
+        // Peer notify targets peer-chosen URLs and keeps the policy client.
         let http_client = Arc::clone(&state.http_client);
+        // Pinata and Irys are operator-configured and may be private, as in
+        // the reconciliation sweep.
+        let operator_client = crate::operator_http_client();
         let node_did_str = state.node_did.to_string();
         let repo_slug = format!(
             "{}/{}",
@@ -4599,7 +4605,7 @@ pub(crate) async fn post_receive_replication_tail(
                 (
                     announce,
                     crate::pinata::pin_new_objects(
-                        &http_client,
+                        operator_client,
                         &pinata_upload_url,
                         &pinata_jwt,
                         &repo_path_clone,
@@ -4711,7 +4717,8 @@ pub(crate) async fn post_receive_replication_tail(
                         timestamp: now_ts.clone(),
                         node_did: node_did_str.clone(),
                     };
-                    match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor).await
+                    match crate::arweave::anchor_ref_update(operator_client, &irys_url, &anchor)
+                        .await
                     {
                         Ok(tx_id) if !tx_id.is_empty() => {
                             let arweave_url = crate::arweave::arweave_url(&tx_id);
@@ -16578,6 +16585,120 @@ mod tests {
             .expect("a coalesced push still fires its own announce");
         assert_eq!(broadcast.new_sha, c2);
         assert_eq!(broadcast.ref_name, "refs/heads/main");
+    }
+
+    /// The live push path reaches operator-configured Pinata and Irys endpoints
+    /// whose hostname resolves to loopback, as the reconciliation sweep does.
+    /// The state carries the real policy client, which refuses `localhost`, so
+    /// this fails if either call goes back to `state.http_client`. Runs in a
+    /// child with proxy variables stripped so a runner proxy cannot intercept
+    /// the operator client's request. Not `sqlx::test`: parent and child would
+    /// share its database name, so the child makes its own scratch database.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn f2a_push_reaches_operator_endpoints_on_a_loopback_hostname() {
+        use crate::isolated_child::{in_child, run_isolated};
+        use std::str::FromStr;
+        if !in_child() {
+            run_isolated(
+                "api::repos::tests::f2a_push_reaches_operator_endpoints_on_a_loopback_hostname",
+                &[],
+            );
+            return;
+        }
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let admin = sqlx::PgPool::connect(&url).await.unwrap();
+        let db_name = format!(
+            "f2a_loopback_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .unwrap()
+            .database(&db_name);
+        let pool = sqlx::PgPool::connect_with(opts).await.unwrap();
+        f2a_loopback_operator_endpoints_body(pool.clone()).await;
+        pool.close().await;
+        sqlx::query(&format!(r#"DROP DATABASE "{db_name}" WITH (FORCE)"#))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn f2a_loopback_operator_endpoints_body(pool: sqlx::PgPool) {
+        let repo = tempfile::TempDir::new().unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        u5_init_repo(repo.path());
+        let c1 = u5_commit_file(repo.path(), "a.txt", "one\n");
+        let c2 = u5_commit_file(repo.path(), "secret/s.txt", "two\n");
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+        let (mut state, rec) = f2a_state(pool, &git_bin, "z6f2aloop", "p1", true).await;
+        state.http_client = std::sync::Arc::new(
+            crate::build_http_client().expect("failed to build production http client"),
+        );
+        let (pinata, cid) = f2a_pinata(&mut state).await;
+        let mut irys = mockito::Server::new_async().await;
+        let irys_mock = irys
+            .mock("POST", "/upload")
+            .with_status(200)
+            .with_body(r#"{"id":"f2alooptx"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let mut cfg = (*state.config).clone();
+        cfg.pinata_upload_url = format!("http://localhost:{}/", pinata.socket_address().port());
+        cfg.irys_url = format!("http://localhost:{}", irys.socket_address().port());
+        state.config = std::sync::Arc::new(cfg);
+
+        // Hold the in-flight key so the push coalesces and only the per-push
+        // tail runs.
+        let _inflight = match state.encrypt_inflight.try_begin(
+            &crate::state::repo_identity_key(&rec.owner_did, &rec.name),
+            Vec::new(),
+        ) {
+            crate::state::BeginOutcome::Admitted(g) => g,
+            crate::state::BeginOutcome::Coalesced => panic!("the first begin must admit"),
+        };
+
+        post_receive_replication_tail(
+            state.clone(),
+            rec.clone(),
+            vec![RefUpdate {
+                old_sha: c1.clone(),
+                new_sha: c2.clone(),
+                ref_name: "refs/heads/main".to_string(),
+            }],
+            repo.path().to_path_buf(),
+            F2A_PUSHER.to_string(),
+            None,
+            None,
+        )
+        .await;
+
+        let mapped = f2a_wait_for_branch_cid(
+            &state.db,
+            &f2a_slug(&rec),
+            "the branch to CID mapping via a loopback-hostname Pinata",
+        )
+        .await;
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].sha, c2);
+        assert_eq!(mapped[0].cid, cid);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !irys_mock.matched_async().await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the Irys anchor via a loopback hostname"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     /// A push handler whose `release` parks at its pre-unlock point, so a test can
