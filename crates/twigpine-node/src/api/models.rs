@@ -39,7 +39,7 @@ fn hosting_enabled(state: &AppState) -> Result<()> {
 /// Model hosting only serves fully public repositories: a private repo, or
 /// a public one carrying any path-scoped visibility rule, refuses with a
 /// clear 4xx rather than partially publishing.
-fn require_fully_public(record: &RepoRecord, rules: &[VisibilityRule]) -> Result<()> {
+pub(crate) fn require_fully_public(record: &RepoRecord, rules: &[VisibilityRule]) -> Result<()> {
     // A mirror row (slash-form id) carries a vacuous publicity pair: its
     // is_public is hardcoded true and rules never sync, so passing this
     // check on one means nothing. Mirrors are replication-managed, not

@@ -343,6 +343,7 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
         crate::db::model_queries::PublishOutcome::Published => {}
         crate::db::model_queries::PublishOutcome::NoLongerPublic => {
             reject_release(state, release_id, "repository is no longer fully public").await?;
+            return Ok(());
         }
         crate::db::model_queries::PublishOutcome::NotVerifying => {
             // The row settled while this pass ran: a rejected release's ref
@@ -355,8 +356,13 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
             if rejected {
                 remove_release_ref(&state.git_bin, &disk_path, &release.commit_sha).await;
             }
+            return Ok(());
         }
     }
+    // Published: enqueue the pin + anchor job set. Idempotent, so a
+    // verify retry after a crash re-runs this harmlessly, and the worker
+    // drains it under the durability budget.
+    crate::models::durability::enqueue_for_release(state, release_id).await?;
     Ok(())
 }
 

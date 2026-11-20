@@ -1052,6 +1052,22 @@ pub struct Config {
     /// operations, share this per-IP budget with REST task reads.
     #[arg(long, env = "TWIGPINE_TASK_READ_RATE_LIMIT", default_value_t = 1200)]
     pub task_read_rate_limit: usize,
+
+    /// Per-client-IP rate limit for the HF-compatible model read routes
+    /// (`/hf/api/models/...` and `/hf/.../resolve/...`), in requests per hour.
+    /// These reads run the publicity gate plus release and manifest lookups
+    /// before any answer, so the brake bounds the cost of anonymous probes.
+    /// Keyed on the resolved client IP via `TWIGPINE_TRUSTED_PROXY`.
+    /// `0` disables. Default: 600.
+    #[arg(long, env = "TWIGPINE_HF_READ_RATE_LIMIT", default_value_t = 600)]
+    pub hf_read_rate_limit: usize,
+
+    /// Maximum concurrent model `resolve` body streams. A chunked download
+    /// holds block-store connections for the life of the response, so this
+    /// bounds how many slow readers can run before later requests defer.
+    /// Default: 16.
+    #[arg(long, env = "TWIGPINE_MODEL_DOWNLOAD_PERMITS", default_value_t = 16)]
+    pub model_download_permits: usize,
 }
 
 /// Default for `--key-path`. Resolved through [`default_key_location`].
