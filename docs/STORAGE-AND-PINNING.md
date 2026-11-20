@@ -117,8 +117,19 @@ successful upload, can still cause a repeat upload attempt.
 > Filecoin deals or self-hosted clusters without touching push logic) is tracked
 > separately.
 
+## Model releases
+
+Published model releases reuse the same two tiers: the model durability
+worker pins each release's content blocks, manifest, reconstruction object,
+git-stored files, and block map through `pin_model_object` on the configured
+sinks (`crates/twigpine-node/src/models/durability.rs`), then posts one
+Arweave anchor through Irys. A warm tier plus Irys is what makes
+`twigpine model fetch` work with the node gone; see
+[MODEL-HOSTING.md](MODEL-HOSTING.md).
+
 ## See also
 
 - [RUN-A-NODE.md](RUN-A-NODE.md): provisioning and running a node
+- [MODEL-HOSTING.md](MODEL-HOSTING.md): model release publishing, reading, and independent fetch
 - `crates/twigpine-node/src/ipfs_pin.rs`: hot-tier implementation
 - `crates/twigpine-node/src/pinata.rs`: warm-tier implementation
