@@ -283,14 +283,36 @@ async fn execute_job(
                 .db
                 .model_durability_done_cids(job.release_id, KIND_BLOCK)
                 .await?;
-            let map: serde_json::Map<String, serde_json::Value> = pairs
+            let blocks: serde_json::Map<String, serde_json::Value> = pairs
                 .into_iter()
                 .map(|(sha, cid)| (sha, serde_json::Value::String(cid)))
                 .collect();
+            // Git-stored files live in the commit, not the block store, so
+            // nothing else ever pins them. Pin each here and index it by
+            // its manifest sha256, or a fetch without this node can rebuild
+            // every chunked file and still miss config.json.
+            let manifest_bytes = git_bytes(state, release, MANIFEST_PATH).await?;
+            let manifest = twigpine_core::model::manifest::Manifest::parse(&manifest_bytes)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("manifest parse: {e}")))?;
+            let mut files = serde_json::Map::new();
+            for file in manifest
+                .files
+                .iter()
+                .filter(|f| f.storage == twigpine_core::model::manifest::StorageKind::Git)
+            {
+                let data = git_bytes(state, release, &file.path).await?;
+                match pin_bytes(state, &file.sha256, &data, fence).await? {
+                    JobOutcome::Done(cid) => {
+                        files.insert(file.sha256.clone(), serde_json::Value::String(cid));
+                    }
+                    JobOutcome::Deferred => return Ok(JobOutcome::Deferred),
+                }
+            }
             let payload = serde_json::json!({
                 "schema": "gitlawb/model-block-map/v1",
                 "release": release.commit_sha,
-                "blocks": map,
+                "blocks": blocks,
+                "files": files,
             });
             let bytes = serde_json::to_vec(&payload)
                 .map_err(|e| AppError::Internal(anyhow::anyhow!("block map serialize: {e}")))?;
@@ -696,7 +718,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let block_dir = tempfile::tempdir().unwrap();
-        let manifest = br#"{"schema":"gitlawb/model-release/v1","files":[]}"#.to_vec();
+        let manifest = br#"{"schema":"gitlawb/model-release/v1","repo":"did:owner/m","publisher_did":"did:owner","license":"MIT","files":[]}"#.to_vec();
         let commit = make_release_git(dir.path(), &manifest, "sig");
         let manifest_sha = sha256_hex(&manifest);
         let block_bytes = b"BLOCKBYTES-durability".to_vec();
@@ -824,6 +846,127 @@ mod tests {
         map_cid_holder.assert_async().await;
     }
 
+    /// A git-stored file never touches the block store, so only the map
+    /// job pins it. The map must index it under `files` keyed by the
+    /// manifest sha256 or an off-node fetch cannot rebuild it.
+    #[sqlx::test]
+    async fn block_map_indexes_git_files(pool: sqlx::PgPool) {
+        let mut kubo = mockito::Server::new_async().await;
+        let mut irys = mockito::Server::new_async().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let block_dir = tempfile::tempdir().unwrap();
+        let config_bytes = br#"{"arch":"test-GITFILE"}"#.to_vec();
+        let config_sha = sha256_hex(&config_bytes);
+        std::fs::write(dir.path().join("config.json"), &config_bytes).unwrap();
+        let manifest = format!(
+            r#"{{"schema":"gitlawb/model-release/v1","repo":"did:owner/m","publisher_did":"did:owner","license":"MIT","files":[{{"path":"config.json","size":{},"sha256":"{config_sha}","format":"text","storage":"git"}}]}}"#,
+            config_bytes.len()
+        )
+        .into_bytes();
+        let commit = make_release_git(dir.path(), &manifest, "sig");
+        let block_bytes = b"BLOCKBYTES-gitfiles".to_vec();
+
+        let mut state = test_state_with(pool.clone(), |cfg| {
+            cfg.ipfs_api = kubo.url();
+            cfg.irys_url = irys.url();
+        })
+        .await;
+        let store: Arc<dyn BlockStore> = Arc::new(
+            crate::blockstore::fs::FsBlockStore::new(block_dir.path().to_path_buf()).unwrap(),
+        );
+        state.block_store = Some(store.clone());
+
+        let block_sha = put_block(&store, &block_bytes).await;
+        seed_block_row(&state.db, &block_sha, block_bytes.len() as u64).await;
+        seed_repo(&state.db, "r1", true, dir.path()).await;
+        let release_id = seed_release(
+            &state.db,
+            "r1",
+            &commit,
+            "published",
+            &sha256_hex(&manifest),
+            None,
+            std::slice::from_ref(&block_sha),
+        )
+        .await;
+
+        for (marker, data) in [
+            ("BLOCKBYTES", &block_bytes),
+            ("model-release/v1", &manifest),
+            ("GITFILE", &config_bytes),
+        ] {
+            kubo.mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                .match_body(mockito::Matcher::Regex(marker.to_string()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    r#"{{"Hash":"{}"}}"#,
+                    twigpine_core::cid::Cid::from_git_object_bytes(data)
+                ))
+                .create_async()
+                .await;
+        }
+        // Capture the map object the job posts so the `files` index can be
+        // asserted directly, not through a second read of Kubo.
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_in = captured.clone();
+        kubo.mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .match_body(mockito::Matcher::Regex("model-block-map".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |req| {
+                let body: &[u8] = req.body().map(|b| b.as_slice()).unwrap_or(&[]);
+                let start = body
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|i| i + 4)
+                    .unwrap_or(0);
+                let end = body
+                    .windows(2)
+                    .rposition(|w| w == b"\r\n")
+                    .unwrap_or(body.len());
+                let object = body[start..end].to_vec();
+                *captured_in.lock().unwrap() = object.clone();
+                format!(
+                    r#"{{"Hash":"{}"}}"#,
+                    twigpine_core::cid::Cid::from_git_object_bytes(&object)
+                )
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+        irys.mock("POST", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"TXGIT"}"#)
+            .create_async()
+            .await;
+
+        enqueue_for_release(&state, release_id).await.unwrap();
+        for _ in 0..4 {
+            durability_pass(&state).await.unwrap();
+        }
+
+        // The captured slice can carry multipart framing after the object;
+        // parse the first complete JSON value rather than exact bounds.
+        let map: serde_json::Value =
+            serde_json::Deserializer::from_slice(&captured.lock().unwrap())
+                .into_iter::<serde_json::Value>()
+                .next()
+                .expect("map body holds a value")
+                .expect("map body parses");
+        let expected_cid =
+            twigpine_core::cid::Cid::from_git_object_bytes(&config_bytes).to_string();
+        assert_eq!(
+            map["files"][&config_sha].as_str(),
+            Some(expected_cid.as_str()),
+            "git-stored file must index into the map: {map}"
+        );
+        assert!(map["blocks"][&block_sha].is_string(), "blocks kept: {map}");
+    }
+
     /// While a pin job is still pending, the map and anchor defer rather
     /// than posting incomplete addresses; once the object appears the next
     /// pass completes the chain.
@@ -834,7 +977,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let block_dir = tempfile::tempdir().unwrap();
-        let manifest = br#"{"schema":"gitlawb/model-release/v1","files":[]}"#.to_vec();
+        let manifest = br#"{"schema":"gitlawb/model-release/v1","repo":"did:owner/m","publisher_did":"did:owner","license":"MIT","files":[]}"#.to_vec();
         let commit = make_release_git(dir.path(), &manifest, "sig");
         let block_bytes = b"BLOCKBYTES-later".to_vec();
         let block_sha = sha256_hex(&block_bytes);
