@@ -8,6 +8,8 @@
 //! share.
 
 pub mod claim;
+pub mod durability;
+pub mod serve;
 pub mod sweep;
 pub mod verify;
 

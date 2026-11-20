@@ -236,8 +236,10 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
         git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
             16,
         ),
+        hf_read_rate_limiter: RateLimiter::new(1200, Duration::from_secs(3600)),
         git_bin: "git".to_string(),
         block_store,
+        model_download_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
     }
 }
 

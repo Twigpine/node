@@ -33,6 +33,11 @@ name = "models_api"
 path = "tests/models_api.rs"
 required-features = ["test-harness"]
 
+[[test]]
+name = "hf_api"
+path = "tests/hf_api.rs"
+required-features = ["test-harness"]
+
 [dependencies]
 twigpine-core = { path = "../twigpine-core" }
 async-trait = "0.1"

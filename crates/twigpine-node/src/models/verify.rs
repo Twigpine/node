@@ -323,7 +323,12 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
             "git update-ref",
         )
         .await;
+        return Ok(());
     }
+    // Published: enqueue the pin + anchor job set. Idempotent, so a
+    // verify retry after a crash re-runs this harmlessly, and the worker
+    // drains it under the durability budget.
+    crate::models::durability::enqueue_for_release(state, release_id).await?;
     Ok(())
 }
 

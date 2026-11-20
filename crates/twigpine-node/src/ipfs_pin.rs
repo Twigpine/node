@@ -1707,6 +1707,24 @@ pub async fn pin_git_object(
     Ok(cid)
 }
 
+/// Pin one model content object's bytes on the local Kubo node.
+///
+/// This is [`pin_git_object`] under a name that says what the durability
+/// worker is doing: the bytes are arbitrary content, the add goes in with
+/// `raw-leaves=true&cid-version=1&pin=true`, and the returned `Hash` is a
+/// PROVIDER CID recorded next to (never instead of) the sha256 that keys
+/// the object. For objects over Kubo's chunk threshold the returned CID is
+/// the dag-pb root rather than the raw-leaf CID the small-object case
+/// computes locally.
+pub async fn pin_model_object(
+    ipfs_api: &str,
+    sha256_hex: &str,
+    data: &[u8],
+    request_timeout: Option<Duration>,
+) -> Result<String> {
+    pin_git_object(ipfs_api, sha256_hex, data, request_timeout).await
+}
+
 /// Fetch raw bytes for a CID from the local Kubo node (`/api/v0/cat`).
 pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
     if ipfs_api.is_empty() {
