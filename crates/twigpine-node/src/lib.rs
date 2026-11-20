@@ -26,6 +26,7 @@ mod p2p;
 mod pinata;
 mod rate_limit;
 mod reconciliation;
+mod resolver_policy;
 pub mod server;
 pub mod state;
 mod sync;
@@ -788,7 +789,10 @@ pub async fn run() -> Result<()> {
     {
         let db = state.db.clone();
         let config = Arc::clone(&state.config);
-        let http_client = Arc::clone(&state.http_client);
+        // The sweep only talks to operator-configured endpoints (Pinata,
+        // Irys, Kubo), which may legitimately be private: it gets the
+        // operator client, not the peer-traffic policy client.
+        let http_client = Arc::new(operator_http_client().clone());
         let node_keypair = Arc::clone(&state.node_keypair);
         let node_did = state.node_did.clone();
         let pin_sem = Arc::clone(&state.pin_semaphore);
@@ -1717,6 +1721,7 @@ async fn gossip_task(
                     client.as_ref(),
                     &mut failed_once,
                     peers,
+                    crate::api::peers::mirror_upstream_ip_permitted,
                 )
                 .await;
             }
@@ -1804,11 +1809,50 @@ fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool
 /// `reqwest::Client::new()` — its default follows redirects. Kept as a named
 /// builder so tests bind the redirect guarantee to the real client the node
 /// runs, not a hand-rolled equivalent.
+///
+/// Two more guarantees sit next to the redirect one. Hostnames resolve through
+/// the resolver policy, which refuses any answer that is empty, oversized or
+/// holds a non-public address, so a name that points at loopback, a private
+/// range or cloud metadata never gets a connection. And environment proxies
+/// are ignored: a proxy would receive the hostname and resolve it itself,
+/// which skips the policy.
 fn build_http_client() -> reqwest::Result<reqwest::Client> {
+    build_http_client_with(resolver_policy::ResolverPolicy::production())
+}
+
+/// `build_http_client` over a caller-supplied resolver, so tests can inject the
+/// lookup. Production code passes `ResolverPolicy::production()`.
+fn build_http_client_with(
+    resolver: resolver_policy::ResolverPolicy,
+) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(OUTBOUND_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(resolver))
+        .build()
+}
+
+/// Build the HTTP client for the operator's own endpoints (the Kubo API).
+///
+/// It has the same timeout and no-redirect settings as `build_http_client`, no
+/// address policy on resolved hosts, and it keeps the system proxy settings. The
+/// Kubo endpoint is documented as co-located, so its hostname may legitimately
+/// resolve to a loopback or private address. Only URLs the operator configured
+/// belong on this client. Never hand it a URL that a peer, a repo owner or any
+/// other remote party chose; those go through `build_http_client`.
+fn build_operator_http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(OUTBOUND_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
+}
+
+/// Process-wide operator client. See `build_operator_http_client`.
+pub(crate) fn operator_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| build_operator_http_client().expect("failed to build operator http client"))
 }
 
 const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1961,18 +2005,40 @@ fn load_or_create_keypair_at(key_path: &std::path::Path) -> Result<Keypair> {
     Ok(kp)
 }
 
+// reqwest dials an IP-literal host without calling the resolver, so the
+// resolver policy never sees it. Classify literals here; hostnames pass on to
+// the policy. An unparseable URL is refused too.
+fn peer_url_literal_permitted(http_url: &str, permit: fn(std::net::IpAddr) -> bool) -> bool {
+    let Ok(parsed) = url::Url::parse(http_url) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => permit(std::net::IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => permit(std::net::IpAddr::V6(v6)),
+        Some(url::Host::Domain(_)) => true,
+        None => false,
+    }
+}
+
 async fn gossip_ping_round(
     db: &Db,
     client: &reqwest::Client,
     failed_once: &mut HashSet<String>,
     peers: Vec<db::PeerRecord>,
+    permit: fn(std::net::IpAddr) -> bool,
 ) {
     {
         let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
         failed_once.retain(|did| current_dids.contains(did.as_str()));
     }
     for peer in peers {
-        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        // A refused URL counts as a failed probe, like a connection error.
+        let ok = if peer_url_literal_permitted(&peer.http_url, permit) {
+            ping_peer_readiness(client, &peer.http_url).await
+        } else {
+            warn!(did = %peer.did, "peer url refused by address policy; not pinging");
+            false
+        };
         match peer_ping_db_update(failed_once, &peer.did, ok) {
             Some(reachable) => {
                 if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
@@ -2081,7 +2147,7 @@ mod rate_limit_env_tests {
 #[cfg(test)]
 mod gossip_ssrf_tests {
     use super::{
-        gossip_ping_round, peer_ping_db_update, ping_peer_readiness,
+        gossip_ping_round, peer_ping_db_update, peer_url_literal_permitted, ping_peer_readiness,
         ping_peer_readiness_with_timeout,
     };
     use axum::{http::StatusCode, routing::get, Router};
@@ -2097,6 +2163,11 @@ mod gossip_ssrf_tests {
     // fails ping_peer_readiness_does_not_follow_redirect.
     fn production_http_client() -> reqwest::Client {
         super::build_http_client().expect("failed to build production http client")
+    }
+
+    // Lets tests that use a loopback mock exercise the round itself.
+    fn permit_all(_: std::net::IpAddr) -> bool {
+        true
     }
 
     #[test]
@@ -2155,6 +2226,7 @@ mod gossip_ssrf_tests {
             &production_http_client(),
             &mut failed_once,
             state.db.list_peers().await.unwrap(),
+            permit_all,
         )
         .await;
         assert!(
@@ -2183,6 +2255,7 @@ mod gossip_ssrf_tests {
             &production_http_client(),
             &mut failed_once,
             state.db.list_peers().await.unwrap(),
+            permit_all,
         )
         .await;
         assert!(
@@ -2378,6 +2451,284 @@ mod gossip_ssrf_tests {
     async fn ping_peer_readiness_reports_unready_on_connection_error() {
         let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
         assert!(!ok, "a connection error must count as an unready peer");
+    }
+
+    // A loopback listener that counts accepted connections and answers 200, so
+    // a refused request shows as a zero count and a leak shows as a hit.
+    async fn counting_listener() -> (u16, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        (port, accepted)
+    }
+
+    // A loopback listener on a plain std thread, for the parent arm of an
+    // isolated-child test: the tokio listener above cannot be polled while
+    // `run_isolated` blocks the current-thread runtime waiting on the child.
+    fn std_counting_listener() -> (u16, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for _ in listener.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (port, accepted)
+    }
+
+    // A policy client whose lookup answers `answers` for every host, plus the
+    // count of lookups it was asked to make.
+    fn fake_policy_client(answers: Vec<std::net::IpAddr>) -> (reqwest::Client, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let policy = crate::resolver_policy::ResolverPolicy::new(
+            move |_host| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let answers = answers.clone();
+                Box::pin(async move { Ok(answers) })
+            },
+            Duration::from_secs(5),
+            32,
+        );
+        let client =
+            super::build_http_client_with(policy).expect("failed to build policy http client");
+        (client, calls)
+    }
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    // The witness host passes the string gate, so only resolution can refuse it.
+    const WITNESS_HOST: &str = "rebind.invalid";
+
+    #[tokio::test]
+    async fn shared_client_refuses_a_name_that_resolves_to_loopback() {
+        let (port, accepted) = counting_listener().await;
+        let url = format!("http://{WITNESS_HOST}:{port}/");
+        assert!(crate::api::peers::is_public_http_url(&url));
+        let (client, calls) = fake_policy_client(vec![ip("127.0.0.1")]);
+
+        let res = client.get(&url).send().await;
+
+        assert!(res.is_err(), "a loopback answer must be refused");
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the policy was not asked");
+    }
+
+    #[tokio::test]
+    async fn shared_client_refuses_each_non_public_answer_shape() {
+        let cases: [(&str, Vec<std::net::IpAddr>); 4] = [
+            ("link-local metadata", vec![ip("169.254.169.254")]),
+            ("rfc1918", vec![ip("10.0.0.1")]),
+            ("mapped loopback", vec![ip("::ffff:127.0.0.1")]),
+            (
+                "public plus loopback",
+                vec![ip("93.184.216.34"), ip("127.0.0.1")],
+            ),
+        ];
+        for (label, answers) in cases {
+            let (port, accepted) = counting_listener().await;
+            let url = format!("http://{WITNESS_HOST}:{port}/");
+            assert!(crate::api::peers::is_public_http_url(&url));
+            let (client, calls) = fake_policy_client(answers);
+
+            let res = client.get(&url).send().await;
+
+            assert!(res.is_err(), "{label}: the request must be refused");
+            assert_eq!(accepted.load(Ordering::SeqCst), 0, "{label}: leaked");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{label}: not consulted");
+        }
+    }
+
+    // Drives the real production lookup: localhost resolves from /etc/hosts
+    // with no network query. Run in a child so a proxy in the runner's
+    // environment cannot intercept the request.
+    #[tokio::test]
+    async fn production_client_refuses_localhost() {
+        use crate::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            run_isolated(
+                "gossip_ssrf_tests::production_client_refuses_localhost",
+                &[],
+            );
+            return;
+        }
+        let (port, accepted) = counting_listener().await;
+
+        let res = production_http_client()
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await;
+
+        assert!(res.is_err(), "the production client must refuse localhost");
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+    }
+
+    // A configured proxy receives the target hostname and resolves it itself,
+    // which bypasses the resolver policy, so the shared client must ignore
+    // proxy env vars. The parent binds the decoy "proxy" listener and points
+    // HTTP_PROXY/ALL_PROXY at it; the child requests an IP-literal URL on a
+    // second listener, which needs no resolution. If the client honored the
+    // proxy, the decoy sees a connection.
+    #[tokio::test]
+    async fn shared_client_ignores_env_proxy() {
+        use crate::isolated_child::{in_child, run_isolated};
+        if !in_child() {
+            let (proxy_port, proxy_hits) = std_counting_listener();
+            let proxy = format!("http://127.0.0.1:{proxy_port}");
+            run_isolated(
+                "gossip_ssrf_tests::shared_client_ignores_env_proxy",
+                &[
+                    ("HTTP_PROXY", proxy.as_str()),
+                    ("ALL_PROXY", proxy.as_str()),
+                ],
+            );
+            assert_eq!(
+                proxy_hits.load(Ordering::SeqCst),
+                0,
+                "the client must not dial the configured proxy"
+            );
+            return;
+        }
+        let (port, accepted) = counting_listener().await;
+        production_http_client()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect("an IP-literal request must succeed");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    // The announce funnel stores a hostname the string gate accepts. The ping
+    // rounds must then never reach the listener it resolves to.
+    #[sqlx::test]
+    async fn gossip_ping_round_never_reaches_a_name_that_resolves_to_loopback(pool: PgPool) {
+        let (port, accepted) = counting_listener().await;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let did = "did:key:z6Mkrmsd28nDTPBjk55EJCSjtJLVJDZffyczjBEHvywhutM4";
+        let url = format!("http://{WITNESS_HOST}:{port}");
+        state
+            .db
+            .upsert_peer(did, &url, crate::db::PeerWriteAuthority::Unproven)
+            .await
+            .expect("the string gate accepts the witness host");
+        // Start reachable so the final false is a change the rounds caused.
+        state.db.mark_peer_ping(did, true).await.unwrap();
+        let (client, calls) = fake_policy_client(vec![ip("127.0.0.1")]);
+
+        let mut failed_once = HashSet::new();
+        for _ in 0..2 {
+            gossip_ping_round(
+                state.db.as_ref(),
+                &client,
+                &mut failed_once,
+                state.db.list_peers().await.unwrap(),
+                crate::api::peers::mirror_upstream_ip_permitted,
+            )
+            .await;
+        }
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        let peer = state
+            .db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .unwrap();
+        assert!(!peer.last_ping_ok, "a refused peer must end up unreachable");
+    }
+
+    // A pre-gate row can hold an IP literal, which reqwest dials without the
+    // resolver. The round must refuse it before any request is sent.
+    #[sqlx::test]
+    async fn gossip_ping_round_never_dials_a_refused_ip_literal(pool: PgPool) {
+        let (port, accepted) = counting_listener().await;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let did = "did:key:z6MkGossipLiteralRefused";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, TRUE, $3)",
+        )
+        .bind(did)
+        .bind(format!("http://127.0.0.1:{port}"))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut failed_once = HashSet::new();
+        for _ in 0..2 {
+            gossip_ping_round(
+                state.db.as_ref(),
+                &production_http_client(),
+                &mut failed_once,
+                state.db.list_peers().await.unwrap(),
+                crate::api::peers::mirror_upstream_ip_permitted,
+            )
+            .await;
+        }
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        let peer = state
+            .db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .unwrap();
+        assert!(
+            !peer.last_ping_ok,
+            "a refused literal must end up unreachable"
+        );
+    }
+
+    #[test]
+    fn peer_url_literal_classifier_refuses_non_public_literals() {
+        let permit = crate::api::peers::mirror_upstream_ip_permitted;
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://10.0.0.1",
+            "http://203.0.113.10",
+            "http://[::1]:8080",
+            "http://[fd00::1]",
+            "http://[::ffff:127.0.0.1]",
+            "not a url",
+        ] {
+            assert!(
+                !peer_url_literal_permitted(url, permit),
+                "{url} must be refused"
+            );
+        }
+        for url in [
+            "http://8.8.8.8",
+            "http://[2606:4700::1111]",
+            "https://peer.example.com",
+        ] {
+            assert!(peer_url_literal_permitted(url, permit), "{url} must pass");
+        }
     }
 }
 
@@ -4341,5 +4692,146 @@ mod identity_key_storage_tests {
             !data.join("keys").exists(),
             "rejection must not create a file named keys"
         );
+    }
+}
+
+/// Test helper for tests that must not see the runner's proxy environment.
+///
+/// Environment variables are shared by every test thread in the process, so a
+/// test cannot clear them in place. `run_isolated` instead re-runs the current
+/// test binary as a child process, filtered to one test by exact name, with all
+/// eight proxy variables removed and a marker set. The test body calls
+/// `in_child()` and runs its real assertions only when it is true; in the parent
+/// it calls `run_isolated` and returns.
+#[cfg(test)]
+pub(crate) mod isolated_child {
+    const MARKER: &str = "TWIGPINE_ISOLATED_CHILD";
+
+    const PROXY_VARS: [&str; 8] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+
+    /// True inside the child process started by `run_isolated`.
+    pub(crate) fn in_child() -> bool {
+        std::env::var_os(MARKER).is_some()
+    }
+
+    /// Re-run `test_name` (the full path as `cargo test` lists it, for example
+    /// `some_tests::some_test`) in a child process with no proxy variables, then
+    /// set `extra_env` on top. Panics unless the child exits with success and
+    /// reports that exactly one test ran, so a misspelled name cannot pass by
+    /// matching nothing.
+    pub(crate) fn run_isolated(test_name: &str, extra_env: &[(&str, &str)]) {
+        let exe = std::env::current_exe().expect("current test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([test_name, "--exact", "--nocapture", "--test-threads=1"]);
+        for var in PROXY_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.env(MARKER, "1");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        let out = cmd
+            .output()
+            .expect("failed to start the child test process");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "child test {test_name} failed with {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "child test {test_name} did not run exactly one test\n--- stdout ---\n{stdout}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod operator_client_tests {
+    use super::isolated_child::{in_child, run_isolated};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // The operator's Kubo endpoint is documented as co-located, so a hostname
+    // that resolves to loopback must stay reachable through this client.
+    #[tokio::test]
+    async fn operator_client_reaches_a_hostname_that_resolves_to_loopback() {
+        if !in_child() {
+            run_isolated(
+                "operator_client_tests::operator_client_reaches_a_hostname_that_resolves_to_loopback",
+                &[],
+            );
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let resp = super::operator_http_client()
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await
+            .expect("the operator client must reach a loopback hostname");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_client_does_not_follow_a_redirect() {
+        if !in_child() {
+            run_isolated(
+                "operator_client_tests::operator_client_does_not_follow_a_redirect",
+                &[],
+            );
+            return;
+        }
+        let mut server = mockito::Server::new_async().await;
+        let target = server
+            .mock("GET", "/landed")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let redirect = server
+            .mock("GET", "/start")
+            .with_status(302)
+            .with_header("location", &format!("{}/landed", server.url()))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let resp = super::operator_http_client()
+            .get(format!("{}/start", server.url()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 302);
+        redirect.assert_async().await;
+        target.assert_async().await;
     }
 }
