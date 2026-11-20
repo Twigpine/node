@@ -4364,10 +4364,75 @@ mod tests {
         )
         .await;
         assert!(res.is_err(), "a failed ref write must refuse the create");
+        assert!(
+            shim.parent().unwrap().join("committed").exists(),
+            "the ref write must have committed before the failure, or this proves nothing"
+        );
         let issues = crate::git::issues::list_issues(&live).expect("list issues");
         assert!(
             issues.is_empty(),
             "no issue ref may survive a refused create, got {issues:?}"
+        );
+    }
+
+    /// #282: the failed-create cleanup runs on the guard's lock-hold budget, not
+    /// on a fresh git timeout. A ref delete that never returns must not keep the
+    /// lock-pool session past the hold, and the tree whose ref could not be
+    /// removed must be quarantined so a later reader reconciles it with the
+    /// stored generation instead of serving or publishing the unacknowledged issue.
+    #[sqlx::test]
+    async fn create_issue_failed_cleanup_is_bounded_by_the_hold_deadline(pool: PgPool) {
+        use crate::git::repo_store::tests as rs_tests;
+
+        let mock = rs_tests::S3Mock::start().await;
+        let owner = "did:key:zISSUESTALLCLEANUPAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "stall-cleanup";
+        let mut state = test_state_with(pool.clone(), |c| c.git_service_timeout_secs = 25).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let live = crate::git::repo_store::validated_repo_disk_path(disk.path(), owner, repo_name)
+            .expect("repo path");
+        let mut seeded = seed_repo(owner, repo_name);
+        seeded.disk_path = live.to_string_lossy().to_string();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, Duration::from_secs(1)),
+            rs_tests::mock_tigris(&mock),
+        )
+        .with_lock_hold_timeout(Duration::from_secs(3));
+        let shim = git_shim::create("gl-stall-delete-git", git_shim::Behavior::StallRefDelete);
+        state.git_bin = shim.to_str().unwrap().to_string();
+
+        let started = std::time::Instant::now();
+        let res = crate::api::issues::create_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(AuthenticatedDid(owner.to_string())),
+            axum::extract::Path((owner.to_string(), repo_name.to_string())),
+            axum::Json(crate::api::issues::CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        mock.shutdown();
+
+        assert!(res.is_err(), "a failed ref write must refuse the create");
+        assert!(
+            shim.parent().unwrap().join("committed").exists(),
+            "the ref write must have committed before the failure, or this proves nothing"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "cleanup must stop at the 3s hold deadline, not run a fresh 25s git timeout (took {elapsed:?})"
+        );
+        assert!(
+            crate::git::repo_store::quarantine_path(&live)
+                .expect("marker path")
+                .exists(),
+            "a tree whose orphan ref could not be removed must be quarantined"
         );
     }
 

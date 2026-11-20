@@ -84,14 +84,19 @@ pub async fn create_issue(
         write_deadline,
     );
 
-    let deadline = std::time::Instant::now() + git_timeout;
     let git_bin = state.git_bin.clone();
     let issue_id_for_comp = issue_id.clone();
 
     let release_result = if create_result.is_ok() {
+        // A fresh budget from now, clamped to what the hold still funds. An
+        // expired hold leaves no deadline, and the compensation is then only
+        // reachable after a definite publish refusal, where it is best-effort.
+        let comp_deadline = guard
+            .hold_deadline(git_timeout)
+            .unwrap_or_else(std::time::Instant::now);
         guard
             .release_compensating(true, move |path| {
-                git_issues::delete_issue_ref(&git_bin, path, &issue_id_for_comp, deadline)
+                git_issues::delete_issue_ref(&git_bin, path, &issue_id_for_comp, comp_deadline)
             })
             .await
             .into_result()
@@ -101,12 +106,29 @@ pub async fn create_issue(
         // ref is absent. A refused create publishes nothing, so drop any such
         // ref before the lock goes; left behind, a later writer would publish
         // an issue whose id the client never received.
-        if let Err(e) =
+        //
+        // The removal runs on the guard's hold budget, never a fresh git
+        // timeout: it holds the lock-pool session, which the hold deadline
+        // exists to cap. When the hold is spent, or the delete fails or is
+        // killed at it, the ref may still be on the live tree. Dropping the
+        // guard unreleased then quarantines that tree (a later read reconciles
+        // it with the stored generation) and closes the session, so the lock
+        // is freed on time and the unacknowledged issue is never served or
+        // published.
+        let removed = guard.hold_deadline(git_timeout).is_some_and(|deadline| {
             git_issues::delete_issue_ref(&git_bin, guard.path(), &issue_id_for_comp, deadline)
-        {
-            tracing::warn!(repo = %repo, err = %e, "could not remove the issue ref after a failed create");
+                .map_err(|e| {
+                    tracing::warn!(repo = %repo, err = %e, "could not remove the issue ref after a failed create");
+                })
+                .is_ok()
+        });
+        if removed {
+            guard.release(false).await.into_result()
+        } else {
+            tracing::warn!(repo = %repo, "failed-create cleanup did not finish inside the lock-hold budget; quarantining the tree");
+            drop(guard);
+            Ok(())
         }
-        guard.release(false).await.into_result()
     };
     release_result?;
 

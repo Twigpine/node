@@ -1595,7 +1595,7 @@ fn unwritten_quarantines(
 }
 
 /// Sidecar path for a live repo directory: `.{name}.git.quarantine` beside it.
-fn quarantine_path(local_path: &Path) -> Option<PathBuf> {
+pub(crate) fn quarantine_path(local_path: &Path) -> Option<PathBuf> {
     let parent = local_path.parent()?;
     let file_name = local_path.file_name()?.to_string_lossy().to_string();
     Some(parent.join(format!(".{file_name}.quarantine")))
