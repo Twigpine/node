@@ -325,6 +325,10 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::delete(labels::remove_label),
             )
             .route(
+                "/api/v1/repos/{owner}/{repo}/homepage",
+                axum::routing::put(repos::set_homepage),
+            )
+            .route(
                 "/api/v1/repos/{owner}/{repo}/visibility",
                 axum::routing::put(visibility::set_visibility)
                     .delete(visibility::remove_visibility)

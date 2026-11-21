@@ -240,6 +240,16 @@ pub struct RepoResponse {
     pub forked_from: Option<String>,
 }
 
+/// `GET /api/v1/repos/:owner/:repo`: the repo plus its owner-set homepage.
+/// Only this route carries `homepage`; the list, federated, create, and fork
+/// responses keep `RepoResponse` as is.
+#[derive(Debug, Serialize)]
+pub struct RepoDetailResponse {
+    #[serde(flatten)]
+    repo: RepoResponse,
+    homepage: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct InfoRefsQuery {
     pub service: Option<String>,
@@ -504,12 +514,78 @@ pub async fn get_repo(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
     auth: Option<Extension<AuthenticatedDid>>,
-) -> Result<Json<RepoResponse>> {
+) -> Result<Json<RepoDetailResponse>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
     let count = state.db.count_stars(&record.id).await.unwrap_or(0);
-    Ok(Json(to_response(&record, &state, count)))
+    let homepage = state.db.get_repo_homepage(&record.id).await?;
+    Ok(Json(RepoDetailResponse {
+        repo: to_response(&record, &state, count),
+        homepage,
+    }))
+}
+
+/// Body of `PUT /api/v1/repos/:owner/:repo/homepage`. A null or absent
+/// `homepage` clears it. Unknown fields are refused, so a typo such as
+/// `homepage_url` is an error instead of a silent clear.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomepageRequest {
+    #[serde(default)]
+    homepage: Option<String>,
+}
+
+/// Write the homepage for an already-gated repo. Zero rows matched means the
+/// repo was deleted after the gate ran, which reads as the missing-repo 404
+/// rather than a success.
+pub(crate) async fn store_homepage(
+    db: &crate::db::Db,
+    record: &RepoRecord,
+    homepage: Option<&str>,
+) -> Result<()> {
+    if db.set_repo_homepage(&record.id, homepage).await? == 0 {
+        return Err(AppError::RepoNotFound(format!(
+            "{}/{}",
+            record.owner_did, record.name
+        )));
+    }
+    Ok(())
+}
+
+/// PUT /api/v1/repos/:owner/:repo/homepage
+///
+/// Owner-only. The body is checked first because that check reads no repo
+/// state, so a malformed request answers the same for every caller and repo.
+/// Then the read gate (an unreadable repo is the missing-repo 404), then the
+/// owner gate (403), then the write.
+pub async fn set_homepage(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
+    Path((owner, name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>> {
+    // Parsed here rather than by the `Json` extractor, which answers a wrong
+    // field type or an unknown field with 422 and a wrong content type with
+    // 415; every malformed body is the same 400.
+    let req: HomepageRequest = serde_json::from_slice(&body)
+        .map_err(|_| AppError::BadRequest("body must be {\"homepage\": string | null}".into()))?;
+    let homepage = req.homepage.as_deref().map(validate_homepage).transpose()?;
+
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
+    crate::api::require_repo_owner(&record, &auth.0)?;
+
+    // A mirror row (slash-form id) belongs to the node that owns the repo; an
+    // edit here would be overwritten by the next sync.
+    if record.id.contains('/') {
+        return Err(AppError::Conflict(
+            "a mirrored repo's homepage is set on its origin node".into(),
+        ));
+    }
+
+    store_homepage(&state.db, &record, homepage).await?;
+    Ok(Json(serde_json::json!({ "homepage": homepage })))
 }
 
 /// GET /api/v1/repos/:owner/:repo/commits
@@ -6278,7 +6354,6 @@ const MAX_HOMEPAGE_BYTES: usize = 2048;
 /// unchanged: callers store these exact bytes, because `Url::parse` silently
 /// strips tabs and newlines, so storing a normalized form (or validating one
 /// and storing another) would let a value through that was never checked.
-#[allow(dead_code)]
 fn validate_homepage(raw: &str) -> Result<&str> {
     let bad = |why: &str| AppError::BadRequest(format!("homepage {why}"));
     if raw.is_empty() {

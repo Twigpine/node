@@ -19384,6 +19384,581 @@ mod tests {
         assert!(labels.contains(&"bug".to_string()));
     }
 
+    // ── PUT /repos/{owner}/{repo}/homepage ───────────────────────────────
+
+    const HP_OWNER: &str = "did:key:zHPOwner0000000000000000000000000000000000";
+    const HP_OWNER_SHORT: &str = "zHPOwner0000000000000000000000000000000000";
+    const HP_STRANGER: &str = "did:key:zHPStranger000000000000000000000000000000";
+
+    fn homepage_router(state: &crate::state::AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/homepage",
+                axum::routing::put(crate::api::repos::set_homepage),
+            )
+            .with_state(state.clone())
+    }
+
+    fn put_homepage(did: &str, owner: &str, repo: &str, body: &str) -> Request<Body> {
+        signed_request_as(
+            did,
+            Method::PUT,
+            &format!("/api/v1/repos/{owner}/{repo}/homepage"),
+            Body::from(body.to_owned()),
+        )
+    }
+
+    async fn stored_homepage(
+        state: &crate::state::AppState,
+        owner: &str,
+        repo: &str,
+    ) -> Option<String> {
+        let id = state.db.get_repo(owner, repo).await.unwrap().unwrap().id;
+        state.db.get_repo_homepage(&id).await.unwrap()
+    }
+
+    #[sqlx::test]
+    async fn set_homepage_owner_sets_clears_and_resets(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(HP_OWNER, "hp-owner"))
+            .await
+            .unwrap();
+        let url = "https://example.com/project?ref=1#top";
+        let body = format!(r#"{{"homepage":"{url}"}}"#);
+
+        // Full did:key form and the bare key form both own the repo, and
+        // setting the same value twice is not an error.
+        for did in [HP_OWNER, HP_OWNER_SHORT, HP_OWNER] {
+            let resp = homepage_router(&state)
+                .oneshot(put_homepage(did, HP_OWNER_SHORT, "hp-owner", &body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "caller {did}");
+            assert_eq!(
+                body_json(resp).await,
+                serde_json::json!({ "homepage": url })
+            );
+            assert_eq!(
+                stored_homepage(&state, HP_OWNER_SHORT, "hp-owner")
+                    .await
+                    .as_deref(),
+                Some(url),
+                "the exact submitted bytes are stored"
+            );
+        }
+
+        // Clearing: an explicit null, then an empty object, each from a set value.
+        for clear in [r#"{"homepage":null}"#, "{}"] {
+            let resp = homepage_router(&state)
+                .oneshot(put_homepage(HP_OWNER, HP_OWNER_SHORT, "hp-owner", &body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let resp = homepage_router(&state)
+                .oneshot(put_homepage(HP_OWNER, HP_OWNER_SHORT, "hp-owner", clear))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{clear}");
+            assert_eq!(
+                body_json(resp).await,
+                serde_json::json!({ "homepage": null }),
+                "{clear}"
+            );
+            assert_eq!(
+                stored_homepage(&state, HP_OWNER_SHORT, "hp-owner").await,
+                None
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn set_homepage_bad_body_is_400_for_every_caller_and_repo(pool: PgPool) {
+        let state = test_state(pool).await;
+        let kept = "https://kept.example.com";
+        state
+            .db
+            .create_repo(&seed_repo(HP_OWNER, "hp-body"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_repo(&seed_private_repo(HP_OWNER, "hp-body-priv"))
+            .await
+            .unwrap();
+        let id = state
+            .db
+            .get_repo(HP_OWNER_SHORT, "hp-body")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        assert_eq!(
+            state.db.set_repo_homepage(&id, Some(kept)).await.unwrap(),
+            1
+        );
+
+        let bad_bodies = [
+            r#"{"homepage":"javascript:alert(1)"}"#,
+            r#"{"homepage":"http://localhost"}"#,
+            r#"{"homepage":"https://user:pw@example.com"}"#,
+            r#"{"homepage":""}"#,
+            r#"{"homepage":"https://x.example","description":"y"}"#,
+            r#"{"homepage":7}"#,
+            "not json",
+        ];
+        for bad in bad_bodies {
+            let mut seen: Vec<(StatusCode, Vec<u8>)> = Vec::new();
+            // Owner on a public repo, stranger on a public repo, stranger on a
+            // private repo, and a repo that does not exist: the check consults
+            // no repo state, so all four answer identically.
+            for (did, repo) in [
+                (HP_OWNER, "hp-body"),
+                (HP_STRANGER, "hp-body"),
+                (HP_STRANGER, "hp-body-priv"),
+                (HP_STRANGER, "hp-body-missing"),
+            ] {
+                let resp = homepage_router(&state)
+                    .oneshot(put_homepage(did, HP_OWNER_SHORT, repo, bad))
+                    .await
+                    .unwrap();
+                seen.push(status_and_bytes(resp).await);
+            }
+            for (status, _) in &seen {
+                assert_eq!(*status, StatusCode::BAD_REQUEST, "{bad}");
+            }
+            // Bodies for the validator rejections are byte-identical across callers.
+            if bad.contains("homepage\":\"") && !bad.contains("description") {
+                assert!(seen.windows(2).all(|w| w[0].1 == w[1].1), "{bad}");
+            }
+        }
+        assert_eq!(
+            stored_homepage(&state, HP_OWNER_SHORT, "hp-body")
+                .await
+                .as_deref(),
+            Some(kept),
+            "a rejected body leaves the stored value unchanged"
+        );
+    }
+
+    #[sqlx::test]
+    async fn set_homepage_non_owner_gets_403_and_nothing_is_written(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(HP_OWNER, "hp-pub"))
+            .await
+            .unwrap();
+        let resp = homepage_router(&state)
+            .oneshot(put_homepage(
+                HP_STRANGER,
+                HP_OWNER_SHORT,
+                "hp-pub",
+                r#"{"homepage":"https://stranger.example.com"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "forbidden");
+        assert_eq!(body["message"], crate::api::REPO_OWNER_ONLY_MESSAGE);
+        assert_eq!(
+            stored_homepage(&state, HP_OWNER_SHORT, "hp-pub").await,
+            None
+        );
+    }
+
+    #[sqlx::test]
+    async fn set_homepage_stranger_gets_the_missing_repo_404(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let state = test_state(pool).await;
+        let secret = "https://private-fixture-token-8841.example.com";
+        let attempt = r#"{"homepage":"https://stranger-attempt-5520.example.com"}"#;
+
+        state
+            .db
+            .create_repo(&seed_private_repo(HP_OWNER, "hp-private"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_repo(&seed_repo(HP_OWNER, "hp-hidden"))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_repo(&seed_repo(HP_OWNER, "hp-quar"))
+            .await
+            .unwrap();
+        let hidden_id = state
+            .db
+            .get_repo(HP_OWNER_SHORT, "hp-hidden")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        state
+            .db
+            .set_visibility_rule(&hidden_id, "/", VisibilityMode::B, &[], HP_OWNER)
+            .await
+            .unwrap();
+        let quar_id = state
+            .db
+            .get_repo(HP_OWNER_SHORT, "hp-quar")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        state.db.set_repo_quarantine(&quar_id, true).await.unwrap();
+        for repo in ["hp-private", "hp-hidden", "hp-quar"] {
+            let id = state
+                .db
+                .get_repo(HP_OWNER_SHORT, repo)
+                .await
+                .unwrap()
+                .unwrap()
+                .id;
+            assert_eq!(
+                state.db.set_repo_homepage(&id, Some(secret)).await.unwrap(),
+                1
+            );
+        }
+
+        // The missing-repo body, normalized by the requested name.
+        let missing = homepage_router(&state)
+            .oneshot(put_homepage(
+                HP_STRANGER,
+                HP_OWNER_SHORT,
+                "hp-nothing",
+                attempt,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing_body = String::from_utf8(status_and_bytes(missing).await.1).unwrap();
+        assert!(missing_body.contains("repo_not_found"), "{missing_body}");
+        let expected = missing_body.replace("hp-nothing", "<repo>");
+
+        for repo in ["hp-private", "hp-hidden", "hp-quar"] {
+            let resp = homepage_router(&state)
+                .oneshot(put_homepage(HP_STRANGER, HP_OWNER_SHORT, repo, attempt))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{repo}");
+            let headers = format!("{:?}", resp.headers());
+            let body = String::from_utf8(status_and_bytes(resp).await.1).unwrap();
+            assert_eq!(body.replace(repo, "<repo>"), expected, "{repo}");
+            for token in ["private-fixture-token-8841", "stranger-attempt-5520"] {
+                assert!(!body.contains(token), "{repo} body leaks {token}");
+                assert!(!headers.contains(token), "{repo} headers leak {token}");
+            }
+            assert_eq!(
+                stored_homepage(&state, HP_OWNER_SHORT, repo)
+                    .await
+                    .as_deref(),
+                Some(secret),
+                "{repo} homepage unchanged"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn set_homepage_unsigned_request_is_401_before_any_lookup(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(HP_OWNER, "hp-anon"))
+            .await
+            .unwrap();
+        // One request for a real repo and one for a missing repo: identical 401.
+        let mut bodies = Vec::new();
+        for repo in ["hp-anon", "hp-anon-missing"] {
+            let resp = crate::server::build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri(format!("/api/v1/repos/{HP_OWNER_SHORT}/{repo}/homepage"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"homepage":"https://example.com"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{repo}");
+            bodies.push(String::from_utf8(status_and_bytes(resp).await.1).unwrap());
+        }
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(
+            stored_homepage(&state, HP_OWNER_SHORT, "hp-anon").await,
+            None
+        );
+    }
+
+    #[sqlx::test]
+    async fn set_homepage_refuses_a_mirror_only_row_with_409(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo(
+                "z6MkHPMirrorOwner",
+                "hp-mirror",
+                "/tmp/hp-mirror",
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        let record = state
+            .db
+            .get_repo("z6MkHPMirrorOwner", "hp-mirror")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.id.contains('/'), "fixture must be a slash-form id");
+        state
+            .db
+            .set_repo_quarantine(&record.id, false)
+            .await
+            .unwrap();
+
+        let resp = homepage_router(&state)
+            .oneshot(put_homepage(
+                "did:key:z6MkHPMirrorOwner",
+                "z6MkHPMirrorOwner",
+                "hp-mirror",
+                r#"{"homepage":"https://example.com"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(state.db.get_repo_homepage(&record.id).await.unwrap(), None);
+    }
+
+    #[sqlx::test]
+    async fn store_homepage_on_a_removed_repo_is_404_not_success(pool: PgPool) {
+        let state = test_state(pool).await;
+        let gone = RepoRecord {
+            id: "deleted-after-the-gate".to_string(),
+            ..seed_repo(HP_OWNER, "hp-gone")
+        };
+        let err = crate::api::repos::store_homepage(&state.db, &gone, Some("https://example.com"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::AppError::RepoNotFound(_)),
+            "{err:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn fork_does_not_inherit_the_source_homepage(pool: PgPool) {
+        use twigpine_core::http_sig::sign_request;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let repos_dir = std::path::PathBuf::from("/tmp");
+        let owner_dir = repos_dir.join(owner_did.replace([':', '/'], "_"));
+        let _cleanup = OwnerDirGuard(owner_dir.clone());
+
+        let state = test_state_with(pool, |cfg| cfg.repos_dir = repos_dir.clone()).await;
+        let source = seed_repo(&owner_did, "hp-fork-src");
+        state.db.create_repo(&source).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .set_repo_homepage(&source.id, Some("https://example.com/src"))
+                .await
+                .unwrap(),
+            1
+        );
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        crate::git::store::init_bare(&crate::git::store::repo_disk_path(
+            &repos_dir,
+            &owner_did,
+            "hp-fork-src",
+        ))
+        .unwrap();
+
+        let path = format!("/api/v1/repos/{short}/hp-fork-src/fork");
+        let body = serde_json::to_vec(&serde_json::json!({ "name": "hp-fork-copy" })).unwrap();
+        let signed = sign_request(&kp, "POST", &path, &body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header("content-type", "application/json")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let fork_body = body_json(resp).await;
+        assert!(
+            fork_body.get("homepage").is_none(),
+            "a fork response keeps its current shape: {fork_body}"
+        );
+        assert_eq!(stored_homepage(&state, &short, "hp-fork-copy").await, None);
+        assert_eq!(
+            stored_homepage(&state, &short, "hp-fork-src")
+                .await
+                .as_deref(),
+            Some("https://example.com/src")
+        );
+    }
+
+    // ── GET /repos/{owner}/{repo} carries the homepage ───────────────────
+
+    fn get_repo_router(state: &crate::state::AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}",
+                axum::routing::get(crate::api::repos::get_repo),
+            )
+            .route(
+                "/api/v1/repos",
+                axum::routing::get(crate::api::repos::list_repos),
+            )
+            .with_state(state.clone())
+    }
+
+    fn contains_key_anywhere(v: &serde_json::Value, key: &str) -> bool {
+        match v {
+            serde_json::Value::Object(m) => {
+                m.contains_key(key) || m.values().any(|c| contains_key_anywhere(c, key))
+            }
+            serde_json::Value::Array(a) => a.iter().any(|c| contains_key_anywhere(c, key)),
+            _ => false,
+        }
+    }
+
+    #[sqlx::test]
+    async fn get_repo_always_has_a_homepage_key_and_returns_the_stored_bytes(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(HP_OWNER, "hp-get");
+        state.db.create_repo(&repo).await.unwrap();
+        let uri = format!("/api/v1/repos/{HP_OWNER_SHORT}/hp-get");
+
+        // No homepage: the key is present and null, not absent.
+        let resp = get_repo_router(&state)
+            .oneshot(anon_get(&uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body.as_object().unwrap().contains_key("homepage"), "{body}");
+        assert!(body["homepage"].is_null(), "{body}");
+        assert_eq!(
+            body["name"], "hp-get",
+            "the existing fields are still there"
+        );
+        assert!(body["clone_url"].is_string(), "{body}");
+
+        // Set through the owner route, then read back anonymously.
+        let url = "HTTPS://Example.com/Docs?ref=twigpine#start";
+        let resp = homepage_router(&state)
+            .oneshot(put_homepage(
+                HP_OWNER,
+                HP_OWNER_SHORT,
+                "hp-get",
+                &format!(r#"{{"homepage":"{url}"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(
+            get_repo_router(&state)
+                .oneshot(anon_get(&uri))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["homepage"], url, "exact stored bytes");
+
+        // Cleared again: back to null, key still present.
+        state.db.set_repo_homepage(&repo.id, None).await.unwrap();
+        let body = body_json(
+            get_repo_router(&state)
+                .oneshot(anon_get(&uri))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(body.as_object().unwrap().contains_key("homepage"));
+        assert!(body["homepage"].is_null());
+    }
+
+    #[sqlx::test]
+    async fn get_repo_denial_does_not_leak_the_homepage(pool: PgPool) {
+        let state = test_state(pool).await;
+        let token = "https://private-fixture-token-7713.example.com";
+        let repo = seed_private_repo(HP_OWNER, "hp-get-priv");
+        state.db.create_repo(&repo).await.unwrap();
+        state
+            .db
+            .set_repo_homepage(&repo.id, Some(token))
+            .await
+            .unwrap();
+        let uri = format!("/api/v1/repos/{HP_OWNER_SHORT}/hp-get-priv");
+
+        for caller in [None, Some(HP_STRANGER)] {
+            let req = match caller {
+                None => anon_get(&uri),
+                Some(did) => signed_request_as(did, Method::GET, &uri, Body::empty()),
+            };
+            let resp = get_repo_router(&state).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{caller:?}");
+            let headers = format!("{:?}", resp.headers());
+            let body = String::from_utf8(status_and_bytes(resp).await.1).unwrap();
+            assert!(!body.contains("7713"), "{caller:?} body leaks the homepage");
+            assert!(
+                !headers.contains("7713"),
+                "{caller:?} headers leak the homepage"
+            );
+        }
+
+        // The owner reads it.
+        let resp = get_repo_router(&state)
+            .oneshot(signed_request_as(
+                HP_OWNER,
+                Method::GET,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["homepage"], token);
+    }
+
+    #[sqlx::test]
+    async fn repo_list_rows_do_not_carry_a_homepage_key(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(HP_OWNER, "hp-list");
+        state.db.create_repo(&repo).await.unwrap();
+        state
+            .db
+            .set_repo_homepage(&repo.id, Some("https://example.com/list"))
+            .await
+            .unwrap();
+        let resp = get_repo_router(&state)
+            .oneshot(anon_get("/api/v1/repos"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(
+            body.to_string().contains("hp-list"),
+            "fixture repo must be in the listing: {body}"
+        );
+        assert!(!contains_key_anywhere(&body, "homepage"), "{body}");
+    }
+
     #[sqlx::test]
     async fn list_repo_bounties_gate_denies_anon_on_private(pool: PgPool) {
         let state = test_state(pool).await;

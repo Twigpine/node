@@ -7,14 +7,25 @@ use crate::db::{Db, RepoRecord, MAX_VISIBLE_REPO_PAGE_SIZE, MAX_VISIBLE_TASK_PAG
 
 use super::types::{AgentTaskReadType, RefUpdateType, RepoPageType, RepoType, TaskPageType};
 
-fn repo_type(repo: RepoRecord) -> RepoType {
-    RepoType {
-        name: repo.name,
-        owner_did: repo.owner_did,
-        description: repo.description,
-        default_branch: repo.default_branch,
-        created_at: repo.created_at.to_rfc3339(),
-    }
+/// Map visible repos to GraphQL nodes, reading every homepage in one query
+/// keyed by the ids that survived the visibility filter and truncation.
+async fn repo_types(db: &Db, repos: Vec<RepoRecord>) -> Result<Vec<RepoType>> {
+    let ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
+    let mut homepages = db
+        .list_repo_homepages(&ids)
+        .await
+        .map_err(crate::graphql::graphql_db_err)?;
+    Ok(repos
+        .into_iter()
+        .map(|repo| RepoType {
+            homepage: homepages.remove(&repo.id),
+            name: repo.name,
+            owner_did: repo.owner_did,
+            description: repo.description,
+            default_branch: repo.default_branch,
+            created_at: repo.created_at.to_rfc3339(),
+        })
+        .collect())
 }
 
 fn repo_cursor(repo: &RepoRecord) -> String {
@@ -91,7 +102,7 @@ impl QueryRoot {
         }
         // Preserve the legacy activity ordering for complete, small lists.
         repos.sort_by_key(|repo| std::cmp::Reverse(repo.updated_at));
-        Ok(repos.into_iter().map(repo_type).collect())
+        repo_types(db, repos).await
     }
 
     /// Bounded visible repositories ordered by owner and name. Continue with
@@ -137,7 +148,7 @@ impl QueryRoot {
         repos.truncate(limit as usize);
         let end_cursor = repos.last().map(repo_cursor);
         Ok(RepoPageType {
-            nodes: repos.into_iter().map(repo_type).collect(),
+            nodes: repo_types(db, repos).await?,
             has_next_page,
             end_cursor,
         })
@@ -533,6 +544,122 @@ mod tests {
         assert_eq!(p201["hasNextPage"], true);
         assert_eq!(p201["nodes"], p200["nodes"]);
         assert_eq!(p201["endCursor"], p200["endCursor"]);
+    }
+
+    #[sqlx::test]
+    async fn repos_carry_their_own_homepage_and_a_private_one_stays_out(pool: PgPool) {
+        let db = db(pool).await;
+        let private_token = "https://private-fixture-token-6602.example.com";
+        for (id, public) in [
+            ("hp-a", true),
+            ("hp-b", true),
+            ("hp-none", true),
+            ("hp-priv", false),
+        ] {
+            db.create_repo(&repo(id, OWNER, id, public)).await.unwrap();
+        }
+        for (id, url) in [
+            ("hp-a", "https://a.example.com/one"),
+            ("hp-b", "https://b.example.com/two"),
+            ("hp-priv", private_token),
+        ] {
+            assert_eq!(db.set_repo_homepage(id, Some(url)).await.unwrap(), 1);
+        }
+        let schema = schema(db);
+
+        let homepages = |json: &serde_json::Value, field: &str| -> Vec<(String, Option<String>)> {
+            let rows = if field == "repos" {
+                json["repos"].as_array().unwrap().clone()
+            } else {
+                json["reposPage"]["nodes"].as_array().unwrap().clone()
+            };
+            let mut out: Vec<_> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r["name"].as_str().unwrap().to_owned(),
+                        r["homepage"].as_str().map(str::to_owned),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let expected = vec![
+            (
+                "hp-a".to_owned(),
+                Some("https://a.example.com/one".to_owned()),
+            ),
+            (
+                "hp-b".to_owned(),
+                Some("https://b.example.com/two".to_owned()),
+            ),
+            ("hp-none".to_owned(), None),
+        ];
+
+        // Anonymous: each public repo carries its own homepage, null where
+        // unset, and the private repo and its homepage are nowhere.
+        let resp = anon(&schema, "{ repos { name homepage } }").await;
+        assert!(resp.errors.is_empty(), "{:?}", resp.errors);
+        let json = resp.data.into_json().unwrap();
+        assert_eq!(homepages(&json, "repos"), expected);
+        assert!(!json.to_string().contains("6602"));
+        assert!(!json.to_string().contains("hp-priv"));
+
+        let resp = anon(&schema, "{ reposPage { nodes { name homepage } } }").await;
+        assert!(resp.errors.is_empty(), "{:?}", resp.errors);
+        let json = resp.data.into_json().unwrap();
+        assert_eq!(homepages(&json, "reposPage"), expected);
+        assert!(!json.to_string().contains("6602"));
+        assert!(!json.to_string().contains("hp-priv"));
+
+        // A signed stranger sees what an anonymous caller sees.
+        for query in [
+            "{ repos { name homepage } }",
+            "{ reposPage { nodes { name homepage } } }",
+        ] {
+            let resp = authed(&schema, query, "did:key:zStranger").await;
+            assert!(resp.errors.is_empty(), "{:?}", resp.errors);
+            assert!(!resp.data.into_json().unwrap().to_string().contains("6602"));
+        }
+
+        // The owner, signed, sees the private repo with its homepage.
+        let resp = authed(&schema, "{ repos { name homepage } }", OWNER).await;
+        assert!(resp.errors.is_empty(), "{:?}", resp.errors);
+        let json = resp.data.into_json().unwrap();
+        assert!(homepages(&json, "repos")
+            .contains(&("hp-priv".to_owned(), Some(private_token.to_owned()))));
+
+        // limit: 1 pages: every node carries its own repo's homepage.
+        let mut cursor: Option<String> = None;
+        let mut seen = Vec::new();
+        loop {
+            let resp = schema
+                .execute(
+                    async_graphql::Request::new(
+                        "query($after: String) { reposPage(limit: 1, after: $after) { nodes { name homepage } hasNextPage endCursor } }",
+                    )
+                    .variables(async_graphql::Variables::from_json(
+                        serde_json::json!({ "after": cursor }),
+                    )),
+                )
+                .await;
+            assert!(resp.errors.is_empty(), "{:?}", resp.errors);
+            let json = resp.data.into_json().unwrap();
+            let page = &json["reposPage"];
+            let nodes = page["nodes"].as_array().unwrap();
+            assert_eq!(nodes.len(), 1);
+            seen.push((
+                nodes[0]["name"].as_str().unwrap().to_owned(),
+                nodes[0]["homepage"].as_str().map(str::to_owned),
+            ));
+            if !page["hasNextPage"].as_bool().unwrap() {
+                break;
+            }
+            cursor = Some(page["endCursor"].as_str().unwrap().to_owned());
+        }
+        seen.sort();
+        assert_eq!(seen, expected);
     }
 
     #[sqlx::test]

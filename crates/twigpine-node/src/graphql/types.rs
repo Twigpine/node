@@ -9,6 +9,8 @@ pub struct RepoType {
     pub description: Option<String>,
     pub default_branch: String,
     pub created_at: String,
+    /// Absolute http(s) URL the repo's owner set, or null.
+    pub homepage: Option<String>,
 }
 
 #[derive(SimpleObject)]

@@ -1406,6 +1406,7 @@ mod completeness {
         ("create_webhook", NotDrivenReason::ReadGatingMutation),
         ("delete_webhook", NotDrivenReason::ReadGatingMutation),
         ("set_visibility", NotDrivenReason::ReadGatingMutation),
+        ("set_homepage", NotDrivenReason::ReadGatingMutation),
         ("remove_visibility", NotDrivenReason::ReadGatingMutation),
         ("protect_branch", NotDrivenReason::ReadGatingMutation),
         ("unprotect_branch", NotDrivenReason::ReadGatingMutation),
