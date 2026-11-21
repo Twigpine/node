@@ -946,21 +946,23 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
     );
 
     // P1 (cont): every explicit pre-git refusal must call refuse_receive_pack_before_git
-    // to terminalize the intent. Exactly 6 occurrences: the five inline call
+    // to terminalize the intent. Exactly 8 occurrences: the seven inline call
     // sites (lease cap, per-source cap, write pool, acquire timeout, acquire
-    // error) plus the drop-guard's own pre-git spawn. The post-git guard phase
-    // calls mark_receive_pack_interrupted (a different name), so deleting any
-    // one inline site drops the count to 5 and turns this red. The parse and
-    // namespace refusals correctly carry no call: they return before the
-    // intent insert, so there is no aggregate to terminalize.
+    // error, and the two expired lock-hold deadline sheds, one before the
+    // tree is handed out and one at the receive-pack re-clamp) plus the
+    // drop-guard's own pre-git spawn. The post-git guard phase calls mark_receive_pack_interrupted (a
+    // different name), so deleting any one inline site drops the count to 7
+    // and turns this red. The parse and namespace refusals correctly carry no
+    // call: they return before the intent insert, so there is no aggregate to
+    // terminalize.
     assert_eq!(
         repos.matches("refuse_receive_pack_before_git(").count(),
-        6,
-        "P1 wiring: exactly 6 refuse_receive_pack_before_git calls expected (5 \
+        8,
+        "P1 wiring: exactly 8 refuse_receive_pack_before_git calls expected (7 \
          inline refusal sites + guard pre-git spawn); deleting any inline site \
          must turn this red"
     );
-    // Pin the five inline sites by their reason literals, so a site that stops
+    // Pin the seven inline sites by their reason literals, so a site that stops
     // terminalizing (or is renumbered away) fails by name, not just by count.
     for reason in [
         "repo write-lease waiter cap reached",
@@ -968,6 +970,7 @@ fn issue_26_namespace_gate_and_refusal_wiring() {
         "git write pool saturated",
         "acquire_write timed out",
         "acquire_write failed",
+        "write-lock hold deadline expired before git",
         "handler dropped before git started",
     ] {
         assert!(

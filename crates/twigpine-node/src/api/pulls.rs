@@ -221,7 +221,7 @@ pub async fn merge_pr(
 
     let guard = state
         .repo_store
-        .acquire_write(&record.owner_did, &record.name)
+        .acquire_write_without_hold_deadline(&record.owner_did, &record.name)
         .await
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &name))?;
     let disk_path = guard.path().to_path_buf();
@@ -877,6 +877,86 @@ mod merge_rollback_tests {
             tip_after, main_tip,
             "a refused publish must rewind the local merge to the pre-merge tip"
         );
+    }
+
+    /// #282: merge never consults the hold deadline, so it takes its guard
+    /// without one (`acquire_write_without_hold_deadline`). A merge that lands
+    /// under a zero-length operator timeout still publishes; a stamped
+    /// deadline would rewind the completed merge and 5xx the caller.
+    #[sqlx::test]
+    async fn merge_pr_without_hold_deadline_publishes(pool: PgPool) {
+        use crate::git::repo_store::tests as rs_tests;
+
+        let mock = rs_tests::S3Mock::start().await;
+        let owner = "did:key:zMERGENOHOLDAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "nohold-merge";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+            rs_tests::mock_tigris(&mock),
+        )
+        .with_lock_hold_timeout(std::time::Duration::ZERO);
+        let live = crate::git::repo_store::validated_repo_disk_path(disk.path(), owner, repo_name)
+            .expect("repo path");
+        let (main_tip, _feature_tip) = seeded_merge_repo(&live);
+
+        let mut seeded = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: repo_name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: String::new(),
+            forked_from: None,
+            machine_id: None,
+        };
+        seeded.disk_path = live.to_string_lossy().to_string();
+        let repo_id = seeded.id.clone();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        let now = Utc::now().to_rfc3339();
+        state
+            .db
+            .create_pr(&PullRequest {
+                id: Uuid::new_v4().to_string(),
+                repo_id: repo_id.clone(),
+                number: 1,
+                title: "nohold".to_string(),
+                body: None,
+                author_did: owner.to_string(),
+                source_branch: "feature".to_string(),
+                target_branch: "main".to_string(),
+                status: "open".to_string(),
+                merged_by_did: None,
+                merged_at: None,
+                head_commit: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .expect("seed PR");
+
+        let res = merge_pr(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string(), 1)),
+        )
+        .await;
+        let _ = res.expect("a merge with no hold deadline must publish");
+
+        let merged = state.db.get_pr(&repo_id, 1).await.unwrap().unwrap();
+        assert_eq!(merged.status, "merged");
+        let tip_after = git(&live, &["rev-parse", "refs/heads/main"]);
+        assert_ne!(
+            tip_after, main_tip,
+            "the merge commit must stay on main, not be rewound"
+        );
+
+        mock.shutdown();
     }
 }
 

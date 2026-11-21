@@ -21,6 +21,9 @@ fn main() -> std::io::Result<()> {
     let cwd = std::env::current_dir()?;
     let hang = mode == "hang"
         || (mode == "hang-repo" && cwd.file_name().is_some_and(|name| name == parameter))
+        || (mode == "stall-ref-delete"
+            && args.first().is_some_and(|arg| arg == "update-ref")
+            && args.get(1).is_some_and(|arg| arg == "-d"))
         || (mode == "hang-oid"
             && (args.iter().any(|arg| arg == parameter)
                 || input
@@ -55,5 +58,20 @@ fn main() -> std::io::Result<()> {
     if let Some(bytes) = input {
         child.stdin.take().unwrap().write_all(&bytes)?;
     }
-    std::process::exit(child.wait()?.code().unwrap_or(1));
+    let code = child.wait()?.code().unwrap_or(1);
+    // A ref write that commits and then reports failure, the state a runner
+    // that kills a child at its deadline cannot tell from a clean failure.
+    let committed_then_failed = (mode == "fail-after-update-ref" || mode == "stall-ref-delete")
+        && args.first().is_some_and(|arg| arg == "update-ref")
+        && args.get(1).is_some_and(|arg| arg != "-d");
+    if committed_then_failed && code == 0 {
+        // Checkpoint for the test: the ref write really committed before the
+        // reported failure, so a rollback assertion cannot pass vacuously.
+        std::fs::write(executable.parent().unwrap().join("committed"), b"1")?;
+    }
+    std::process::exit(if committed_then_failed && code == 0 {
+        1
+    } else {
+        code
+    });
 }
