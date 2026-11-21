@@ -716,7 +716,11 @@ async fn model_info_follows_main_not_repo_wide_newest(pool: sqlx::PgPool) {
         let sha = v["sha"]
             .as_str()
             .or_else(|| v["branches"][0]["targetCommit"].as_str());
-        assert_eq!(sha, Some(on_main.commit.as_str()), "{path} must follow main");
+        assert_eq!(
+            sha,
+            Some(on_main.commit.as_str()),
+            "{path} must follow main"
+        );
     }
 
     node.shutdown().await;
