@@ -89,6 +89,11 @@ Mounted routes: `GET /hf/api/models/{owner}/{repo}`,
 Anonymous reads work on fully public repos; HF bearer tokens carry no
 signature and read as anonymous.
 
+The default release is the same on every route: model info, `refs` and
+`revision/main` all name the newest published release on `main`, then on the
+repo's git default branch. A release published from any other branch is
+reachable by its branch name or commit, never as the default.
+
 One size limit to know: current `huggingface_hub` releases refuse plain
 downloads of a single file over 50 GiB, so `model publish` warns when a
 chunked file passes that line.

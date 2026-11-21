@@ -819,8 +819,9 @@ impl Db {
         Ok(row.map(Into::into))
     }
 
-    /// The newest published release on the repo, whatever branch recorded it
-    /// (the `refs` endpoint's default target).
+    /// The newest published release on the repo, whatever branch recorded it.
+    /// Only an existence check: HF default-release resolution is
+    /// `release_for_rev(.., "main")`, which is branch-scoped.
     pub async fn model_release_newest(&self, repo_id: &str) -> Result<Option<ModelRelease>> {
         let row = sqlx::query_as::<_, ReleaseTuple>(&format!(
             "SELECT {RELEASE_COLS} FROM model_releases
