@@ -638,8 +638,16 @@ pub async fn run() -> Result<()> {
             std::time::Duration::from_secs(3600),
             200_000,
         ),
+        hf_read_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.hf_read_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
         git_bin: "git".to_string(),
         block_store,
+        model_download_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.model_download_permits.max(1),
+        )),
     };
 
     // One-time re-encryption of any webhook HMAC secrets still resting as
@@ -663,6 +671,9 @@ pub async fn run() -> Result<()> {
     }
     if config.task_read_rate_limit == 0 {
         tracing::warn!("TWIGPINE_TASK_READ_RATE_LIMIT=0 — per-IP task read rate limiting disabled");
+    }
+    if config.hf_read_rate_limit == 0 {
+        tracing::warn!("TWIGPINE_HF_READ_RATE_LIMIT=0: per-IP HF read rate limiting disabled");
     }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
@@ -922,12 +933,11 @@ pub async fn run() -> Result<()> {
 
     // Model hosting workers (verify + sweep) only run while the operator
     // flag is on; the block store is the flag's live form.
-    let mut model_workers = Vec::new();
     if state.block_store.is_some() {
-        model_workers.push(tokio::spawn(models::verify::run_verify_worker(
-            state.clone(),
-        )));
-        model_workers.push(tokio::spawn(models::sweep::run_sweep_worker(state.clone())));
+        let _model_verify_worker = tokio::spawn(models::verify::run_verify_worker(state.clone()));
+        let _model_sweep_worker = tokio::spawn(models::sweep::run_sweep_worker(state.clone()));
+        let _model_durability_worker =
+            tokio::spawn(models::durability::run_durability_worker(state.clone()));
     }
 
     // `into_make_service_with_connect_info` exposes the socket peer address as
@@ -1788,6 +1798,7 @@ mod rate_limiter_sweep_tests {
         state.ipfs_rate_limiter = RateLimiter::new(10, window);
         state.ipfs_work_rate_limiter = RateLimiter::new(10, window);
         state.task_read_rate_limiter = RateLimiter::new(10, window);
+        state.hf_read_rate_limiter = RateLimiter::new(10, window);
 
         let limiters = |s: &crate::state::AppState| {
             [
@@ -1802,6 +1813,7 @@ mod rate_limiter_sweep_tests {
                 s.ipfs_rate_limiter.clone(),
                 s.ipfs_work_rate_limiter.clone(),
                 s.task_read_rate_limiter.clone(),
+                s.hf_read_rate_limiter.clone(),
             ]
         };
         for l in limiters(&state) {

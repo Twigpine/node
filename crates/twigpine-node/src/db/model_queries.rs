@@ -824,6 +824,300 @@ impl Db {
             .await?;
         Ok(())
     }
+
+    // ── release resolution (HF read surface) ───────────────────────────────
+
+    /// The newest published release recorded on `branch` (the revision
+    /// resolution the HF read surface applies).
+    pub async fn model_release_for_branch(
+        &self,
+        repo_id: &str,
+        branch: &str,
+    ) -> Result<Option<ModelRelease>> {
+        let row = sqlx::query_as::<_, ReleaseTuple>(&format!(
+            "SELECT {RELEASE_COLS} FROM model_releases
+             WHERE repo_id = $1 AND branch = $2 AND state = 'published'
+             ORDER BY id DESC LIMIT 1"
+        ))
+        .bind(repo_id)
+        .bind(branch)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    /// The newest published release on the repo, whatever branch recorded it.
+    /// Only an existence check: HF default-release resolution is
+    /// `release_for_rev(.., "main")`, which is branch-scoped.
+    pub async fn model_release_newest(&self, repo_id: &str) -> Result<Option<ModelRelease>> {
+        let row = sqlx::query_as::<_, ReleaseTuple>(&format!(
+            "SELECT {RELEASE_COLS} FROM model_releases
+             WHERE repo_id = $1 AND state = 'published'
+             ORDER BY id DESC LIMIT 1"
+        ))
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    /// Every block a release references, in stable order. The
+    /// `pin_block` job material and (after the pins land) the block-CID
+    /// map's key set.
+    pub async fn model_release_blocks(&self, release_id: i64) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT block_sha256 FROM model_release_blocks
+             WHERE release_id = $1 ORDER BY block_sha256",
+        )
+        .bind(release_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    // ── durability jobs ────────────────────────────────────────────────────
+
+    /// Idempotent enqueue: the (release, kind, object) unique key makes a
+    /// re-run a no-op, so the publish path, a retry, and the startup
+    /// backfill all share it. One statement, so a release's job set is
+    /// all-or-nothing.
+    pub async fn model_durability_enqueue(
+        &self,
+        release_id: i64,
+        jobs: &[(&str, &str)],
+    ) -> Result<u64> {
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+        let kinds: Vec<&str> = jobs.iter().map(|(k, _)| *k).collect();
+        let keys: Vec<&str> = jobs.iter().map(|(_, o)| *o).collect();
+        let now = ts_now();
+        let inserted = sqlx::query(
+            "INSERT INTO model_durability_jobs
+                 (release_id, kind, object_key, state, attempts, created_at, updated_at)
+             SELECT $1, j.k, j.o, 'pending', 0, $2, $2
+             FROM unnest($3::text[], $4::text[]) AS j(k, o)
+             ON CONFLICT (release_id, kind, object_key) DO NOTHING",
+        )
+        .bind(release_id)
+        .bind(now)
+        .bind(&kinds)
+        .bind(&keys)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(inserted)
+    }
+
+    /// Published releases with no durability rows at all: the startup
+    /// backfill set. A release's rows are inserted atomically, so "none"
+    /// cannot split from "partial" under a crash.
+    pub async fn model_releases_missing_durability(&self, limit: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT r.id FROM model_releases r
+             WHERE r.state = 'published'
+               AND NOT EXISTS (
+                     SELECT 1 FROM model_durability_jobs j WHERE j.release_id = r.id)
+             ORDER BY r.id LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Oldest pending jobs, bounded. A pending row is work the worker has
+    /// not completed; a `failed` row stays out of the drain (an operator
+    /// or a later fix decides it, not the loop).
+    pub async fn model_durability_pending(&self, limit: i64) -> Result<Vec<DurabilityJob>> {
+        Ok(sqlx::query_as::<_, DurabilityTuple>(
+            "SELECT id, release_id, kind, object_key, state, attempts, provider_cid
+             FROM model_durability_jobs
+             WHERE state = 'pending' ORDER BY id LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect())
+    }
+
+    /// Record the provider CID and mark the job done. The CID is metadata:
+    /// `object_key` (the sha256) stays the resolver key no matter what the
+    /// provider answered.
+    pub async fn model_durability_done(&self, id: i64, provider_cid: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE model_durability_jobs
+             SET state = 'done', provider_cid = $2, last_error = NULL, updated_at = $3
+             WHERE id = $1 AND state = 'pending'",
+        )
+        .bind(id)
+        .bind(provider_cid)
+        .bind(ts_now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Bump the attempt count and record the error, leaving the job
+    /// pending for the next pass. Returns the new attempt count so the
+    /// caller can fail the job past its retry budget.
+    pub async fn model_durability_record_error(&self, id: i64, err: &str) -> Result<i32> {
+        Ok(sqlx::query_scalar(
+            "UPDATE model_durability_jobs
+             SET attempts = attempts + 1, last_error = $2, updated_at = $3
+             WHERE id = $1 AND state = 'pending'
+             RETURNING attempts",
+        )
+        .bind(id)
+        .bind(err)
+        .bind(ts_now())
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0))
+    }
+
+    /// Terminal failure: the job leaves the drain set until an operator
+    /// (or a corrected re-enqueue path) resets it.
+    pub async fn model_durability_mark_failed(&self, id: i64, err: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE model_durability_jobs
+             SET state = 'failed', last_error = $2, updated_at = $3
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(err)
+        .bind(ts_now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Fail every pending job for a release in one update: the
+    /// "repo is no longer fully public" stop, where nothing further is
+    /// pinned and the anchor never posts.
+    pub async fn model_durability_fail_pending(
+        &self,
+        release_id: i64,
+        reason: &str,
+    ) -> Result<u64> {
+        Ok(sqlx::query(
+            "UPDATE model_durability_jobs
+             SET state = 'failed', last_error = $2, updated_at = $3
+             WHERE release_id = $1 AND state = 'pending'",
+        )
+        .bind(release_id)
+        .bind(reason)
+        .bind(ts_now())
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    /// (pending, failed) counts for a release's jobs matching `pred`
+    /// (`kind = $2` or `kind <> $2`), the job-gate inputs.
+    async fn model_durability_counts(
+        &self,
+        release_id: i64,
+        kind: &str,
+        pred: &str,
+    ) -> Result<(i64, i64)> {
+        let (pending, failed): (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FILTER (WHERE state = 'pending'),
+                    COUNT(*) FILTER (WHERE state = 'failed')
+             FROM model_durability_jobs
+             WHERE release_id = $1 AND kind {pred} $2",
+        ))
+        .bind(release_id)
+        .bind(kind)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((pending.unwrap_or(0), failed.unwrap_or(0)))
+    }
+
+    /// (pending, failed) counts for a release's jobs of `kind`, the
+    /// `pin_block_map` gate (`pin_block`) and the anchor gate.
+    pub async fn model_durability_kind_counts(
+        &self,
+        release_id: i64,
+        kind: &str,
+    ) -> Result<(i64, i64)> {
+        self.model_durability_counts(release_id, kind, "=").await
+    }
+
+    /// (pending, failed) counts for a release's jobs of every kind EXCEPT
+    /// `kind`, the anchor gate ("only after all pin jobs are done").
+    pub async fn model_durability_other_counts(
+        &self,
+        release_id: i64,
+        kind: &str,
+    ) -> Result<(i64, i64)> {
+        self.model_durability_counts(release_id, kind, "<>").await
+    }
+
+    /// (object_key, provider_cid) pairs for done jobs of `kind`, keyed so
+    /// the block map can map every block sha to its provider CID.
+    pub async fn model_durability_done_cids(
+        &self,
+        release_id: i64,
+        kind: &str,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT object_key, provider_cid FROM model_durability_jobs
+             WHERE release_id = $1 AND kind = $2 AND state = 'done'
+             ORDER BY object_key",
+        )
+        .bind(release_id)
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The provider CID of the done job of `kind`, when one exists
+    /// (manifest, reconstruction, map lookups for the anchor payload).
+    pub async fn model_durability_done_cid(
+        &self,
+        release_id: i64,
+        kind: &str,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT provider_cid FROM model_durability_jobs
+             WHERE release_id = $1 AND kind = $2 AND state = 'done'
+             LIMIT 1",
+        )
+        .bind(release_id)
+        .bind(kind)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+}
+
+/// One `model_durability_jobs` row.
+#[derive(Debug, Clone)]
+pub struct DurabilityJob {
+    pub id: i64,
+    pub release_id: i64,
+    pub kind: String,
+    pub object_key: String,
+    pub state: String,
+    pub attempts: i32,
+    pub provider_cid: Option<String>,
+}
+
+type DurabilityTuple = (i64, i64, String, String, String, i32, Option<String>);
+
+impl From<DurabilityTuple> for DurabilityJob {
+    fn from(t: DurabilityTuple) -> Self {
+        DurabilityJob {
+            id: t.0,
+            release_id: t.1,
+            kind: t.2,
+            object_key: t.3,
+            state: t.4,
+            attempts: t.5,
+            provider_cid: t.6,
+        }
+    }
 }
 
 #[cfg(test)]

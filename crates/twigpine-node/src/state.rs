@@ -378,6 +378,14 @@ pub struct AppState {
     /// The same per-IP hourly budget applies to GraphQL `tasks` / `task`
     /// queries and WebSocket task queries via `TaskReadBrake`.
     pub task_read_rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for the HF-compatible model read routes.
+    /// `/hf/api/models/...` and `/hf/.../resolve/...` are anonymously
+    /// reachable and run the publicity gate plus release lookups before any
+    /// answer, so an unauthenticated prober costs the node real work per
+    /// request whether or not anything is served. Keyed on the resolved
+    /// client IP via `push_limiter_trust`; layered on the HF route group
+    /// via `rate_limit_by_ip`.
+    pub hf_read_rate_limiter: RateLimiter,
     /// The `git` executable the served-git withheld-blob walk spawns. Production is
     /// `"git"` (resolved via PATH); injectable so a fake `git` can drive the walk's
     /// process-group teardown in handler tests without mutating the process-global
@@ -386,6 +394,14 @@ pub struct AppState {
     /// Content-addressed model block store. `None` unless model hosting is
     /// enabled, so every read site must handle the flag-off shape.
     pub block_store: Option<Arc<dyn crate::blockstore::BlockStore>>,
+    /// Bounds concurrent model `resolve` body streams. A chunked download
+    /// holds store connections for the life of the response, so a slow
+    /// reader could otherwise pin every store slot indefinitely; a pool of
+    /// its own (not `git_read_semaphore`) because model downloads can run
+    /// for minutes on multi-GiB files and must not starve git reads.
+    /// Acquirers DEFER (wait) when the pool is full; a download shed at
+    /// admission would read as a spurious 503 to a resumable fetcher.
+    pub model_download_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -434,6 +450,7 @@ impl AppState {
         self.peer_write_rate_limiter.cleanup().await;
         self.task_read_rate_limiter.cleanup().await;
         self.federated_rate_limiter.cleanup().await;
+        self.hf_read_rate_limiter.cleanup().await;
     }
 
     /// Legacy-probe budget wired from the `TWIGPINE_IPFS_MAX_LEGACY_PROBES` operator

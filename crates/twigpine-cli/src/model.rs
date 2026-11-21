@@ -1,4 +1,5 @@
-//! `twigpine model` — open-weight model publishing (KTD14).
+//! `twigpine model`: open-weight model publishing (KTD14) and independent
+//! release fetching (KTD15).
 //!
 //! `twigpine model publish` runs inside a local clone of a fully public
 //! Twigpine repo: it classifies files by the chunking threshold, packs the
@@ -6,11 +7,19 @@
 //! blocks under an upload session (resuming from a `.git` state file after an
 //! interruption), commits the signed manifest, pushes, claims the release,
 //! and polls until the node's verification publishes it.
+//!
+//! `twigpine model fetch` rebuilds a published release without the node: it
+//! finds release anchors by Irys tag on an Arweave gateway, pulls the
+//! manifest, reconstruction object, and sha256-to-CID block map off an IPFS
+//! gateway, verifies the manifest signature against a caller-supplied owner
+//! DID (never a DID read out of the anchor), and writes byte-verified files
+//! in an HF-snapshot-like layout.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Digest as _;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -23,11 +32,14 @@ use twigpine_core::model::manifest::{
     MANIFEST_SCHEMA_V1,
 };
 use twigpine_core::model::reconstruction::{
-    pack_file_with, BlockEntry, DedupIndex, Reconstruction,
+    pack_file_with, BlockEntry, DedupIndex, FileEntry, Reconstruction,
 };
 
-use crate::http::{json_or_denial, read_body_capped_bytes, read_json, NodeClient};
+use crate::http::{
+    json_or_denial, read_body_capped_bytes, read_json, sanitize_node_msg, NodeClient,
+};
 use crate::identity::load_keypair_from_dir;
+use twigpine_core::did::Did;
 
 const DEFAULT_CHUNK_THRESHOLD: u64 = 10 * 1024 * 1024;
 const SESSION_HEADER: &str = "x-twigpine-model-session";
@@ -42,10 +54,42 @@ const RECONSTRUCTION_FETCH_CAP: usize = 64 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const POLL_BUDGET: Duration = Duration::from_secs(300);
 
+// ── fetch constants ─────────────────────────────────────────────────────────
+/// Cap on one anchor transaction body: the anchor is a few hundred bytes of
+/// JSON, so a body past this is not one.
+const ANCHOR_BODY_CAP: usize = 1024 * 1024;
+/// Cap on a fetched manifest: a 5,000-file manifest is a couple of MiB of
+/// JSON; larger is not one.
+const MANIFEST_FETCH_CAP: usize = 16 * 1024 * 1024;
+/// Cap on the sha256 -> provider-CID block map; thousands of entries fit in
+/// a few hundred KiB.
+const BLOCK_MAP_FETCH_CAP: usize = 64 * 1024 * 1024;
+/// One content block fetched whole: bounded by the node's 128 MiB block cap,
+/// so the read cap is one byte past it.
+const OBJECT_FETCH_CAP: usize = (128 * 1024 * 1024) + 1;
+/// Resident budget for the fetched-block LRU. Blocks are ~64 MiB each, so a
+/// few shared blocks stay hot across chunked files without holding the model.
+const BLOCK_CACHE_BUDGET: usize = 256 * 1024 * 1024;
+/// Anchor candidates tried before giving up; anchors iterate newest first so
+/// the cap only binds a repo with an absurd anchor history.
+const MAX_ANCHOR_CANDIDATES: usize = 64;
+
+const ANCHOR_SCHEMA: &str = "gitlawb/model-release-anchor/v1";
+const BLOCK_MAP_SCHEMA: &str = "gitlawb/model-block-map/v1";
+
+/// Paginated discovery query for release anchors, mirroring clone.rs's
+/// `ARWEAVE_DISCOVERY_QUERY` with the model-release schema tag. Edges come
+/// back newest-first (`sort:HEIGHT_DESC`); the refs are re-sorted locally by
+/// block height as well so a gateway that ignores `sort` still tries the
+/// newest candidates first.
+const ANCHOR_DISCOVERY_QUERY: &str = r#"query($repo:String!,$cursor:String){transactions(tags:[{name:"App-Name",values:["twigpine","gitlawb"]},{name:"Schema",values:["gitlawb/model-release-anchor/v1"]},{name:"Repo",values:[$repo]}],first:100,after:$cursor,sort:HEIGHT_DESC){pageInfo{hasNextPage endCursor}edges{cursor node{id block{height}}}}}"#;
+
 #[derive(Subcommand)]
 pub enum ModelCmd {
     /// Publish the working tree as a signed model release
     Publish(PublishArgs),
+    /// Rebuild a published release from Arweave and IPFS, without the node
+    Fetch(FetchArgs),
 }
 
 #[derive(Args)]
@@ -78,9 +122,41 @@ pub struct PublishArgs {
     pub dir: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub struct FetchArgs {
+    /// Repo to fetch: <owner_did>/<name>
+    pub repo: String,
+    /// Owner DID the release manifest must verify against. Required: the
+    /// anchor's own DID fields are untrusted text and are never used as the
+    /// verifying key.
+    #[arg(long)]
+    pub expect_did: String,
+    /// Release commit to fetch (default: the newest anchor that verifies)
+    #[arg(long)]
+    pub revision: Option<String>,
+    /// Output directory (default: <repo>-<commit8>)
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// Arweave gateway for release-anchor discovery and bodies
+    #[arg(
+        long,
+        default_value = "https://arweave.net",
+        env = "TWIGPINE_ARWEAVE_GATEWAY"
+    )]
+    pub arweave_gateway: String,
+    /// IPFS gateway for the manifest, block map, and content objects
+    #[arg(
+        long,
+        default_value = "https://dweb.link",
+        env = "TWIGPINE_IPFS_GATEWAY"
+    )]
+    pub ipfs_gateway: String,
+}
+
 pub async fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
         ModelCmd::Publish(a) => cmd_publish(a).await,
+        ModelCmd::Fetch(a) => cmd_fetch(a).await,
     }
 }
 
@@ -274,8 +350,6 @@ fn tracked_paths(root: &Path) -> Result<HashSet<String>> {
     Ok(out)
 }
 
-/// Paths listed inside the managed .gitignore block (empty when there is no
-/// block): previously published chunked files.
 /// One repo-relative path as a gitignore pattern line: pattern
 /// metacharacters and a trailing space are backslash-escaped.
 fn escape_gitignore_path(p: &str) -> String {
@@ -309,6 +383,8 @@ fn unescape_gitignore_path(line: &str) -> String {
     out
 }
 
+/// Paths listed inside the managed .gitignore block (empty when there is no
+/// block): previously published chunked files.
 fn managed_block_paths(gitignore: &str) -> Vec<String> {
     let mut inside = false;
     let mut out = Vec::new();
@@ -453,7 +529,7 @@ fn save_state(path: &Path, state: &PublishState) -> Result<()> {
 
 // ── misc ────────────────────────────────────────────────────────────────────
 
-/// `<owner>/<repo>@<40-hex commit>` -> ((owner, name), commit).
+/// `<owner>/<repo>@<hex commit>` -> ((owner, name), commit).
 fn parse_parent(spec: &str) -> Result<((String, String), String)> {
     let (repo, commit) = spec
         .rsplit_once('@')
@@ -464,8 +540,8 @@ fn parse_parent(spec: &str) -> Result<((String, String), String)> {
     if owner.is_empty() || name.is_empty() || name.contains('/') {
         bail!("parent must be <owner>/<repo>@<commit>");
     }
-    if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("parent commit must be a 40-hex sha");
+    if !twigpine_core::cid::is_hex_oid(commit) {
+        bail!("parent commit must be a hex sha");
     }
     Ok(((owner.to_string(), name.to_string()), commit.to_string()))
 }
@@ -1004,6 +1080,747 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
             }
         }
     }
+}
+
+// ── fetch ───────────────────────────────────────────────────────────────────
+
+/// What a verified fetch produced. Returned by [`fetch_model`] so callers
+/// (the CLI wrapper, the node e2e test) can report or assert on the run.
+#[derive(Debug)]
+pub struct FetchReport {
+    /// `<owner_did>/<name>` as fetched.
+    pub repo: String,
+    /// Release commit the verified anchor named.
+    pub release_commit: String,
+    /// Arweave transaction id of the anchor used.
+    pub anchor_tx: String,
+    /// Files written under `output_dir`.
+    pub files: usize,
+    /// Total bytes written.
+    pub bytes: u64,
+    /// Where the release was rebuilt.
+    pub output_dir: PathBuf,
+    /// One line per skipped candidate anchor, in the order they were tried.
+    pub warnings: Vec<String>,
+}
+
+/// The anchor JSON, exactly as `arweave::anchor_model_release` posts it.
+/// Identity fields are record-keeping only: `owner_did` is used to SELECT a
+/// candidate, never as the verifying key (KTD15).
+#[derive(Debug, Deserialize)]
+struct ReleaseAnchorBody {
+    schema: String,
+    repo: String,
+    owner_did: String,
+    release_commit: String,
+    manifest_sha256: String,
+    manifest_cid: String,
+    #[serde(default)]
+    reconstruction_sha256: Option<String>,
+    #[serde(default)]
+    reconstruction_cid: Option<String>,
+    block_map_cid: String,
+    claim_signature: String,
+}
+
+/// The sha256 -> provider-CID index pinned by the block-map job. `files`
+/// indexes git-stored files by manifest sha256 and may be absent on maps
+/// produced before the git-file fix; `blocks` indexes content blocks.
+#[derive(Debug, Deserialize)]
+struct BlockMapBody {
+    schema: String,
+    #[serde(default)]
+    blocks: HashMap<String, String>,
+    #[serde(default)]
+    files: HashMap<String, String>,
+}
+
+/// Record one skip reason: sanitized once, then both the terminal and the
+/// report get the same line.
+fn note_skip(warnings: &mut Vec<String>, msg: String) {
+    let line = sanitize_node_msg(&msg);
+    eprintln!("warning: {line}");
+    warnings.push(line);
+}
+
+/// The shared client plus the two gateway base URLs, bundled so the helper
+/// signatures stay small.
+struct Net<'a> {
+    client: &'a reqwest::Client,
+    ag: &'a str,
+    ig: &'a str,
+}
+
+/// GET `url` and return at most `cap` bytes. `what` names the object for the
+/// error. A truncated or dead-mid-read body is an error, not a partial object.
+async fn get_capped(
+    client: &reqwest::Client,
+    url: &str,
+    cap: usize,
+    what: &str,
+) -> Result<Vec<u8>> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("{what} request failed"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("{what} fetch returned {status}");
+    }
+    let capped = read_body_capped_bytes(resp, cap).await;
+    if capped.truncated {
+        bail!("{what} body exceeded the {cap}-byte cap");
+    }
+    if capped.read_failed {
+        bail!("{what} body failed mid-read");
+    }
+    Ok(capped.bytes)
+}
+
+/// Discover release-anchor transactions for `repo` on the Arweave gateway,
+/// newest first. Same paginated, bounded loop shape as clone.rs's manifest
+/// discovery, sharing its page parser.
+async fn discover_release_anchors(
+    net: &Net<'_>,
+    repo: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<crate::clone::TxRef> {
+    const MAX_PAGES: usize = 1000;
+    const MAX_TX_IDS: usize = 10_000;
+    let mut after: Option<String> = None;
+    let mut prev_cursor: Option<String> = None;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut refs: Vec<crate::clone::TxRef> = Vec::new();
+    for page_num in 0..MAX_PAGES {
+        let gql_body = json!({
+            "query": ANCHOR_DISCOVERY_QUERY,
+            "variables": { "repo": repo, "cursor": after },
+        });
+        let response: Option<Value> = match net
+            .client
+            .post(format!("{}/graphql", net.ag))
+            .json(&gql_body)
+            .send()
+            .await
+        {
+            // Status-first, capped, sanitized: the gateway is untrusted text.
+            Ok(r) => read_json(r, "anchor discovery").await.ok(),
+            Err(_) => None,
+        };
+        let value = match response {
+            Some(v) => v,
+            None => {
+                // A failure after discovery began leaves a knowingly partial
+                // candidate set; a page-1 failure just means no anchors here.
+                if page_num > 0 {
+                    note_skip(
+                        warnings,
+                        "Arweave anchor discovery was interrupted by a gateway error".to_string(),
+                    );
+                }
+                break;
+            }
+        };
+        let page = crate::clone::parse_tx_page(&value);
+        let full = page.refs.len() >= crate::clone::ARWEAVE_PAGE_SIZE;
+        for r in page.refs {
+            if seen.insert(r.id.clone()) {
+                refs.push(r);
+            }
+        }
+        if refs.len() >= MAX_TX_IDS {
+            note_skip(
+                warnings,
+                format!("Arweave anchor discovery hit the {MAX_TX_IDS}-transaction cap"),
+            );
+            break;
+        }
+        match page.has_next {
+            Some(true) => match page.end_cursor {
+                Some(c) if Some(&c) != prev_cursor.as_ref() => {
+                    prev_cursor = Some(c.clone());
+                    after = Some(c);
+                }
+                _ => break,
+            },
+            Some(false) => break,
+            // No pageInfo: terminal. A full page without it may be a silently
+            // truncated gateway, so flag that like clone.rs does.
+            None => {
+                if full {
+                    note_skip(
+                        warnings,
+                        "Arweave gateway returned a full page without pagination \
+                         metadata; anchor discovery may be incomplete"
+                            .to_string(),
+                    );
+                }
+                break;
+            }
+        }
+    }
+    // The query asks for HEIGHT_DESC; rank locally too so an edge order a
+    // gateway gets wrong still tries the newest candidate first. Pending
+    // anchors (no block) rank newest, matching clone.rs's tie-break.
+    refs.sort_by(|a, b| {
+        crate::clone::height_rank(b.height).cmp(&crate::clone::height_rank(a.height))
+    });
+    refs
+}
+
+/// Whether an untrusted id (anchor tx, provider CID) is safe to interpolate
+/// as one path segment of a gateway URL. Alnum plus the base32/base64url
+/// punctuation CIDs and tx ids actually use; `/`, `?`, `#`, and `..` would
+/// rewrite the request path on the gateway host.
+fn url_path_safe(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains("..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'='))
+}
+
+/// One anchor candidate through its trust gates: fetch the body, parse the
+/// anchor JSON, then fetch the manifest and verify it against the expected
+/// DID. Returns `Some(..)` only when the manifest verifies; every failure is
+/// a warning plus `None` so the next candidate gets tried.
+async fn verify_candidate(
+    net: &Net<'_>,
+    tx_id: &str,
+    repo: &str,
+    expect_did: &Did,
+    revision: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Option<(ReleaseAnchorBody, Manifest)> {
+    if !url_path_safe(tx_id) {
+        note_skip(warnings, "anchor tx id is not URL-safe".to_string());
+        return None;
+    }
+    let mut skip = |why: String| {
+        note_skip(warnings, format!("anchor {tx_id}: {why}"));
+        None
+    };
+    let body = match get_capped(
+        net.client,
+        &format!("{}/{tx_id}", net.ag),
+        ANCHOR_BODY_CAP,
+        "anchor",
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => return skip(format!("{e}")),
+    };
+    let anchor: ReleaseAnchorBody = match serde_json::from_slice(&body) {
+        Ok(a) => a,
+        Err(e) => return skip(format!("anchor body is not valid JSON: {e}")),
+    };
+    if anchor.schema != ANCHOR_SCHEMA {
+        return skip(format!("unknown anchor schema {:?}", anchor.schema));
+    }
+    // release_commit is unsigned anchor text that lands in the default
+    // output directory name: require a real hex commit shape (40 for sha1
+    // repos, 64 for sha256 repos), never a path fragment.
+    if !twigpine_core::cid::is_hex_oid(&anchor.release_commit) {
+        return skip("release_commit is not a hex commit".to_string());
+    }
+    if !url_path_safe(&anchor.manifest_cid)
+        || !url_path_safe(&anchor.block_map_cid)
+        || anchor
+            .reconstruction_cid
+            .as_deref()
+            .is_some_and(|c| !url_path_safe(c))
+    {
+        return skip("anchor names a CID that is not URL-safe".to_string());
+    }
+    if anchor.repo != repo {
+        return skip(format!(
+            "anchor names repo {:?}, expected {repo}",
+            anchor.repo
+        ));
+    }
+    // The anchor's DID chooses which anchors to try; it is never the
+    // verifying key. A mismatch here is the strongest possible signal the
+    // manifest will not verify, so skip without spending the fetch.
+    if anchor.owner_did != expect_did.to_string() {
+        return skip(format!(
+            "anchor names owner {}, expected {}",
+            anchor.owner_did, expect_did
+        ));
+    }
+    if let Some(want) = revision {
+        if anchor.release_commit != want {
+            return skip(format!(
+                "anchor names commit {}, expected {want}",
+                anchor.release_commit
+            ));
+        }
+    }
+    let manifest_bytes = match get_capped(
+        net.client,
+        &format!("{}/ipfs/{}", net.ig, anchor.manifest_cid),
+        MANIFEST_FETCH_CAP,
+        "manifest",
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => return skip(format!("{e}")),
+    };
+    let got = sha256_hex(&manifest_bytes);
+    if got != anchor.manifest_sha256 {
+        return skip(format!(
+            "manifest bytes hash to {got}, anchor claims {}",
+            anchor.manifest_sha256
+        ));
+    }
+    let manifest = match manifest::verify(&manifest_bytes, &anchor.claim_signature, expect_did) {
+        Ok(m) => m,
+        Err(e) => return skip(format!("manifest verification failed: {e}")),
+    };
+    if manifest.repo != repo {
+        return skip(format!(
+            "verified manifest names repo {:?}, expected {repo}",
+            manifest.repo
+        ));
+    }
+    Some((anchor, manifest))
+}
+
+/// Byte-budgeted LRU over fetched content blocks. A fine-tuned release
+/// shares blocks across files, so a small cache saves re-fetches; the model
+/// itself never sits resident.
+struct BlockCache {
+    map: HashMap<String, Vec<u8>>,
+    order: std::collections::VecDeque<String>,
+    used: usize,
+}
+
+impl BlockCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            used: 0,
+        }
+    }
+
+    fn get(&mut self, sha: &str) -> Option<&[u8]> {
+        if self.map.contains_key(sha) {
+            self.order.retain(|k| k != sha);
+            self.order.push_back(sha.to_string());
+            return self.map.get(sha).map(|v| v.as_slice());
+        }
+        None
+    }
+
+    fn insert(&mut self, sha: String, bytes: Vec<u8>) {
+        if bytes.len() > BLOCK_CACHE_BUDGET {
+            return;
+        }
+        while self.used + bytes.len() > BLOCK_CACHE_BUDGET {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if let Some(v) = self.map.remove(&old) {
+                        self.used -= v.len();
+                    }
+                }
+                None => break,
+            }
+        }
+        self.used += bytes.len();
+        self.map.insert(sha.clone(), bytes);
+        self.order.push_back(sha);
+    }
+}
+
+/// What chunked rebuild needs to fetch one content block: the network
+/// handle, the untrusted block map, and the shared byte-budgeted cache.
+struct BlockSource<'a> {
+    client: &'a reqwest::Client,
+    ig: &'a str,
+    map: &'a BlockMapBody,
+    cache: &'a mut BlockCache,
+}
+
+impl BlockSource<'_> {
+    /// Fetch one content block through the block map and hash-check it
+    /// against its sha256 key. The map is untrusted (it arrived through the
+    /// anchor), so the hash is what binds bytes to the manifest's claim, not
+    /// the CID.
+    async fn block(&mut self, sha: &str) -> Result<Vec<u8>> {
+        if let Some(hit) = self.cache.get(sha) {
+            return Ok(hit.to_vec());
+        }
+        let cid = self
+            .map
+            .blocks
+            .get(sha)
+            .with_context(|| format!("block map has no CID for block {sha}"))?;
+        if !url_path_safe(cid) {
+            bail!("block {sha} maps to a CID that is not URL-safe");
+        }
+        let bytes = get_capped(
+            self.client,
+            &format!("{}/ipfs/{cid}", self.ig),
+            OBJECT_FETCH_CAP,
+            &format!("block {sha}"),
+        )
+        .await?;
+        let got = sha256_hex(&bytes);
+        if got != sha {
+            bail!("block {sha} content hashes to {got}");
+        }
+        self.cache.insert(sha.to_string(), bytes.clone());
+        Ok(bytes)
+    }
+}
+
+/// Byte offset of each chunk inside a block, the prefix sum over its chunk
+/// table (same layout `reconstruction::chunk_offsets` uses).
+fn chunk_offsets(block: &BlockEntry) -> Vec<u64> {
+    block
+        .chunks
+        .iter()
+        .scan(0u64, |off, c| {
+            let start = *off;
+            *off += c.len;
+            Some(start)
+        })
+        .collect()
+}
+
+/// Rebuild one chunked file into `out_path` from its terms, streaming to
+/// disk. Per-chunk sha256s are verified as slices are consumed and the
+/// whole-file digest is checked against the manifest at the end, so at most
+/// a handful of blocks are ever resident.
+async fn rebuild_chunked(
+    source: &mut BlockSource<'_>,
+    rec: &Reconstruction,
+    file: &FileEntry,
+    expect_sha: &str,
+    expect_size: u64,
+    out_path: &Path,
+) -> Result<u64> {
+    let blocks: HashMap<&str, &BlockEntry> =
+        rec.blocks.iter().map(|b| (b.sha256.as_str(), b)).collect();
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(out_path)
+            .with_context(|| format!("create {}", out_path.display()))?,
+    );
+    let mut hasher = sha2::Sha256::new();
+    let mut written = 0u64;
+    for term in &file.terms {
+        let block = blocks
+            .get(term.block.as_str())
+            .with_context(|| format!("{}: term names unknown block {}", file.path, term.block))?;
+        let data = source.block(&term.block).await?;
+        if data.len() as u64 != block.size {
+            bail!(
+                "block {} serves {} bytes, reconstruction declares {}",
+                term.block,
+                data.len(),
+                block.size
+            );
+        }
+        let offsets = chunk_offsets(block);
+        let mut rel = offsets.get(term.chunk_start as usize).copied().unwrap_or(0) as usize;
+        for chunk in &block.chunks[term.chunk_start as usize..term.chunk_end as usize] {
+            let slice = &data[rel..rel + chunk.len as usize];
+            let got = sha256_hex(slice);
+            if got != chunk.sha256 {
+                bail!(
+                    "{}: chunk {} in block {} fails its sha256 check",
+                    file.path,
+                    chunk.sha256,
+                    term.block
+                );
+            }
+            out.write_all(slice)
+                .with_context(|| format!("write {}", out_path.display()))?;
+            hasher.update(slice);
+            written += chunk.len;
+            rel += chunk.len as usize;
+        }
+    }
+    out.flush()
+        .with_context(|| format!("write {}", out_path.display()))?;
+    if written != expect_size {
+        bail!(
+            "{}: rebuilt {written} bytes, manifest declares {expect_size}",
+            file.path
+        );
+    }
+    let digest = hex::encode(hasher.finalize());
+    if digest != expect_sha {
+        bail!(
+            "{}: rebuilt bytes hash to {digest}, manifest declares {expect_sha}",
+            file.path
+        );
+    }
+    Ok(written)
+}
+
+/// A manifest path must land strictly inside the output dir: relative, all
+/// normal components, no traversal. The manifest is signed, but the check is
+/// what keeps a signed bad path from writing outside `--output`.
+fn safe_output_path(base: &Path, rel: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    let p = Path::new(rel);
+    let mut parts = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::Normal(s) => parts.push(s),
+            _ => bail!("manifest path {rel:?} is not a plain relative path"),
+        }
+    }
+    if parts.is_empty() {
+        bail!("manifest path is empty");
+    }
+    Ok(base.join(p))
+}
+
+/// Rebuild a published release from Arweave and IPFS, without the node
+/// (KTD15). Anchors are unsigned JSON anyone can post, so each candidate is
+/// tried in turn: the anchor body selects candidates (repo, owner DID,
+/// optional commit), then the manifest's signature must verify against
+/// `expect_did` or the candidate is skipped with a warning. The first
+/// candidate whose manifest verifies is THE release; every object after
+/// that (reconstruction, block map, blocks, git files) is sha256-checked
+/// against the signed manifest's claims, and a hash failure fails the fetch
+/// naming the object.
+pub async fn fetch_model(args: &FetchArgs) -> Result<FetchReport> {
+    let (owner, name) = args
+        .repo
+        .split_once('/')
+        .filter(|(o, n)| !o.is_empty() && !n.is_empty() && !n.contains('/'))
+        .context("repo must be <owner>/<name>")?;
+    // Anchors tag the full DID; accept the bare DID key (the HF-safe form)
+    // by normalizing to did:key, matching the node's repo lookup.
+    let owner = if owner.starts_with("did:") {
+        owner.to_string()
+    } else {
+        format!("did:key:{owner}")
+    };
+    let repo = format!("{owner}/{name}");
+    let expect_did: Did = args
+        .expect_did
+        .parse()
+        .context("--expect-did is not a valid DID")?;
+    let ag = args.arweave_gateway.trim_end_matches('/');
+    let ig = args.ipfs_gateway.trim_end_matches('/');
+    // Blocks can run 128 MiB, so the client budget is generous; small
+    // objects keep their own shorter reads through the same client.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .context("failed to build HTTP client")?;
+    let mut warnings: Vec<String> = Vec::new();
+    let net = Net {
+        client: &client,
+        ag,
+        ig,
+    };
+
+    let refs = discover_release_anchors(&net, &repo, &mut warnings).await;
+    let (anchor_tx, anchor, manifest) = {
+        let mut found = None;
+        for r in refs.iter().take(MAX_ANCHOR_CANDIDATES) {
+            if let Some(v) = verify_candidate(
+                &net,
+                &r.id,
+                &repo,
+                &expect_did,
+                args.revision.as_deref(),
+                &mut warnings,
+            )
+            .await
+            {
+                found = Some((r.id.clone(), v.0, v.1));
+                break;
+            }
+        }
+        match found {
+            Some(v) => v,
+            None => bail!(
+                "no release anchor for {repo} verified against DID {expect_did} \
+                 ({} candidate(s) tried)",
+                refs.len().min(MAX_ANCHOR_CANDIDATES)
+            ),
+        }
+    };
+
+    // The manifest verified: from here a broken object is a fetch failure
+    // naming the object, not another candidate.
+    let rec = match &manifest.reconstruction {
+        None => None,
+        Some(rec_ref) => {
+            let rec_cid = anchor.reconstruction_cid.as_deref().with_context(|| {
+                format!(
+                    "verified anchor names no reconstruction CID but the manifest \
+                     declares one ({})",
+                    rec_ref.sha256
+                )
+            })?;
+            if !url_path_safe(rec_cid) {
+                bail!("reconstruction CID {rec_cid:?} is not URL-safe");
+            }
+            let bytes = get_capped(
+                &client,
+                &format!("{ig}/ipfs/{rec_cid}"),
+                RECONSTRUCTION_FETCH_CAP,
+                "reconstruction object",
+            )
+            .await?;
+            let got = sha256_hex(&bytes);
+            if got != rec_ref.sha256 {
+                bail!(
+                    "reconstruction object hashes to {got}, manifest declares {}",
+                    rec_ref.sha256
+                );
+            }
+            if let Some(claimed) = &anchor.reconstruction_sha256 {
+                if *claimed != rec_ref.sha256 {
+                    bail!(
+                        "anchor claims reconstruction {claimed}, the signed manifest \
+                         declares {}",
+                        rec_ref.sha256
+                    );
+                }
+            }
+            Some(
+                Reconstruction::parse(&bytes)
+                    .map_err(|e| anyhow::anyhow!("reconstruction object is invalid: {e}"))?,
+            )
+        }
+    };
+
+    let map_bytes = get_capped(
+        &client,
+        &format!("{ig}/ipfs/{}", anchor.block_map_cid),
+        BLOCK_MAP_FETCH_CAP,
+        "block map",
+    )
+    .await?;
+    let map: BlockMapBody =
+        serde_json::from_slice(&map_bytes).context("block map is not valid JSON")?;
+    if map.schema != BLOCK_MAP_SCHEMA {
+        bail!("block map has unknown schema {:?}", map.schema);
+    }
+
+    let out_dir = args.output.clone().unwrap_or_else(|| {
+        // `release_commit` is untrusted anchor text: truncate by chars so a
+        // multi-byte boundary cannot panic, like a raw byte slice would.
+        let short: String = anchor.release_commit.chars().take(8).collect();
+        PathBuf::from(format!("{name}-{short}"))
+    });
+    if out_dir.exists() {
+        let non_empty = out_dir
+            .read_dir()
+            .with_context(|| format!("output path {} is not a directory", out_dir.display()))?
+            .next()
+            .is_some();
+        if non_empty {
+            bail!("output directory {} is not empty", out_dir.display());
+        }
+    }
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+
+    let rec_by_path: HashMap<&str, &FileEntry> = rec
+        .as_ref()
+        .map(|r| r.files.iter().map(|f| (f.path.as_str(), f)).collect())
+        .unwrap_or_default();
+    let mut cache = BlockCache::new();
+    let mut total = 0u64;
+    for file in &manifest.files {
+        let out_path = safe_output_path(&out_dir, &file.path)?;
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match file.storage {
+            StorageKind::Git => {
+                // Git-stored bytes are pinned by the block-map job under
+                // `files` keyed by manifest sha256; `blocks` is the fallback
+                // for maps written before that index existed.
+                let cid = map
+                    .files
+                    .get(&file.sha256)
+                    .or_else(|| map.blocks.get(&file.sha256))
+                    .with_context(|| {
+                        format!(
+                            "{}: block map has no CID for file {}",
+                            file.path, file.sha256
+                        )
+                    })?;
+                if !url_path_safe(cid) {
+                    bail!("{}: block map CID is not URL-safe", file.path);
+                }
+                let bytes = get_capped(
+                    &client,
+                    &format!("{ig}/ipfs/{cid}"),
+                    OBJECT_FETCH_CAP,
+                    &format!("file {}", file.path),
+                )
+                .await?;
+                let got = sha256_hex(&bytes);
+                if got != file.sha256 {
+                    bail!(
+                        "{}: fetched bytes hash to {got}, manifest declares {}",
+                        file.path,
+                        file.sha256
+                    );
+                }
+                std::fs::write(&out_path, &bytes)
+                    .with_context(|| format!("write {}", out_path.display()))?;
+                total += bytes.len() as u64;
+            }
+            StorageKind::Chunked => {
+                let entry = rec_by_path.get(file.path.as_str()).with_context(|| {
+                    format!(
+                        "{}: reconstruction object has no entry for a manifest file",
+                        file.path
+                    )
+                })?;
+                let rec = rec.as_ref().expect("chunked file implies reconstruction");
+                let mut source = BlockSource {
+                    client: &client,
+                    ig,
+                    map: &map,
+                    cache: &mut cache,
+                };
+                total +=
+                    rebuild_chunked(&mut source, rec, entry, &file.sha256, file.size, &out_path)
+                        .await?;
+            }
+        }
+    }
+
+    Ok(FetchReport {
+        repo,
+        release_commit: anchor.release_commit,
+        anchor_tx,
+        files: manifest.files.len(),
+        bytes: total,
+        output_dir: out_dir,
+        warnings,
+    })
+}
+
+async fn cmd_fetch(args: FetchArgs) -> Result<()> {
+    let report = fetch_model(&args).await?;
+    println!(
+        "fetched {} release {}",
+        sanitize_node_msg(&report.repo),
+        sanitize_node_msg(&report.release_commit)
+    );
+    println!("  anchor:   {}", sanitize_node_msg(&report.anchor_tx));
+    println!(
+        "  verified: {} file(s), {} byte(s)",
+        report.files, report.bytes
+    );
+    println!("  output:   {}", report.output_dir.display());
+    Ok(())
 }
 
 #[cfg(test)]
