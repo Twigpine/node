@@ -7901,10 +7901,12 @@ impl Db {
         // value, this comparison, and the existing trim_end_matches call sites.
         //
         // last_ping_ok is NOT a trust signal. An unauthenticated caller can
-        // clear it by announcing a different URL, and until #248 lands can also
-        // set it through the unauthenticated GET /api/v1/peers/{did}/ping, which
-        // writes mark_peer_ping from the stored URL's own probe response. Do not
-        // build a new consumer on this flag as if it were attacker-resistant.
+        // clear it by announcing a different URL. Since #248 the anonymous
+        // GET /api/v1/peers/{did}/ping endpoint is read-only (the periodic
+        // gossip loop owns this flag through mark_peer_ping and requires
+        // consecutive failures before clearing it), but the announce path
+        // still lets anyone clobber the flag. Do not build a new consumer on
+        // this flag as if it were attacker-resistant.
         //
         // Only the federated repo fan-out in api/repos.rs gates on this flag.
         // Four consumers act on a repointed http_url regardless of it (sync.rs's
