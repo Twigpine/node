@@ -1513,15 +1513,16 @@ async fn discover_release_anchors(
             "query": ANCHOR_DISCOVERY_QUERY,
             "variables": { "repo": repo, "cursor": after },
         });
-        let response = match net
+        let response: Option<Value> = match net
             .client
             .post(format!("{}/graphql", net.ag))
             .json(&gql_body)
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
-            _ => None,
+            // Status-first, capped, sanitized: the gateway is untrusted text.
+            Ok(r) => read_json(r, "anchor discovery").await.ok(),
+            Err(_) => None,
         };
         let value = match response {
             Some(v) => v,
