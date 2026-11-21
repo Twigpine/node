@@ -6269,9 +6269,142 @@ fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)
         .collect()
 }
 
+/// Longest homepage URL accepted, in bytes.
+const MAX_HOMEPAGE_BYTES: usize = 2048;
+
+/// Accept a repo homepage only when it is an absolute http(s) URL on a public
+/// host, at most `MAX_HOMEPAGE_BYTES`, with no credentials and no control,
+/// whitespace, backslash, or bidi-format characters. Returns the input
+/// unchanged: callers store these exact bytes, because `Url::parse` silently
+/// strips tabs and newlines, so storing a normalized form (or validating one
+/// and storing another) would let a value through that was never checked.
+#[allow(dead_code)]
+fn validate_homepage(raw: &str) -> Result<&str> {
+    let bad = |why: &str| AppError::BadRequest(format!("homepage {why}"));
+    if raw.is_empty() {
+        return Err(bad("must not be empty"));
+    }
+    if raw.len() > MAX_HOMEPAGE_BYTES {
+        return Err(bad(&format!("must be at most {MAX_HOMEPAGE_BYTES} bytes")));
+    }
+    // A backslash is refused outright: the WHATWG parser reads
+    // `https://example.com\@127.0.0.1/` as host `example.com`, while an RFC 3986
+    // parser reads host `127.0.0.1`, and a consumer of the stored string may
+    // use either.
+    if raw.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || c == '\\'
+            || twigpine_core::sanitize::is_bidi_format(c)
+    }) {
+        return Err(bad(
+            "must not contain control, whitespace, backslash, or bidi-format characters",
+        ));
+    }
+    let url = reqwest::Url::parse(raw).map_err(|_| bad("must be an absolute http or https URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(bad("must be an absolute http or https URL"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(bad("must not contain credentials"));
+    }
+    if !crate::api::peers::is_public_http_url(raw) {
+        return Err(bad(crate::api::peers::PUBLIC_HTTP_URL_REQUIREMENT));
+    }
+    Ok(raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Homepage validation ──────────────────────────────────────────────────
+
+    fn homepage_rejected(raw: &str) -> bool {
+        matches!(validate_homepage(raw), Err(AppError::BadRequest(_)))
+    }
+
+    #[test]
+    fn homepage_accepts_public_http_urls_unchanged() {
+        for ok in [
+            "https://example.com",
+            "http://example.com/docs?ref=twigpine#start",
+            "HTTPS://Example.com",
+        ] {
+            assert_eq!(validate_homepage(ok).unwrap(), ok, "{ok}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_non_http_schemes_and_relative_urls() {
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "file:///etc/passwd",
+            "ftp://example.com",
+            "//example.com",
+            "example.com",
+        ] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_embedded_credentials() {
+        for bad in ["https://user:pw@example.com", "https://user@example.com"] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_control_whitespace_and_bidi_characters() {
+        for bad in [
+            "https://exam\nple.com",
+            " https://example.com",
+            "https://example.com\t",
+            "https://exam\u{202E}ple.com",
+            "https://example.com/a b",
+            "https://example.com/\u{0}",
+        ] {
+            assert!(homepage_rejected(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_a_backslash_anywhere() {
+        for bad in [
+            "https://example.com\\@127.0.0.1/",
+            "https://example.com\\@evil.internal/",
+            "https://example.com/a\\b",
+        ] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_non_public_hosts() {
+        for bad in [
+            "http://localhost",
+            "http://127.0.0.1",
+            "http://10.0.0.1",
+            "http://169.254.169.254",
+            "http://intranet",
+            "http://box.internal",
+        ] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_enforces_length_cap_and_rejects_empty() {
+        assert!(homepage_rejected(""));
+        let prefix = "https://example.com/";
+        let at_cap = format!("{prefix}{}", "a".repeat(MAX_HOMEPAGE_BYTES - prefix.len()));
+        assert_eq!(at_cap.len(), MAX_HOMEPAGE_BYTES);
+        assert_eq!(validate_homepage(&at_cap).unwrap(), at_cap);
+        let over = format!("{at_cap}a");
+        assert!(homepage_rejected(&over));
+    }
 
     /// #374: the fork path builds its own `git clone --mirror` argv. Driven
     /// through real git so a missing or misplaced `--` fails, matching the
