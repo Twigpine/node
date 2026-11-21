@@ -51,6 +51,53 @@ fn complete_refusal_is_definite(status: u16, code: Option<&str>) -> bool {
     }
 }
 
+/// Aborts an open multipart upload when the write future is dropped before
+/// the complete request is sent. Explicit error paths abort inline; this
+/// covers cancellation, where no later statement runs. The abort needs the
+/// runtime, so it is spawned from `Drop`.
+struct AbortOnDrop {
+    s3: S3Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    armed: bool,
+}
+
+impl AbortOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (s3, bucket, key, upload_id) = (
+            self.s3.clone(),
+            self.bucket.clone(),
+            self.key.clone(),
+            self.upload_id.clone(),
+        );
+        handle.spawn(async move {
+            if let Err(e) = s3
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(&key)
+                .upload_id(upload_id)
+                .send()
+                .await
+            {
+                tracing::warn!(key = %key, "multipart abort after cancel failed: {e}");
+            }
+        });
+    }
+}
+
 pub struct S3BlockStore {
     s3: S3Client,
     bucket: String,
@@ -200,6 +247,13 @@ impl BlockStore for S3BlockStore {
             .await
             .map_err(Self::backend)?;
         let upload_id = upload.upload_id().unwrap_or_default().to_string();
+        let mut guard = AbortOnDrop {
+            s3: self.s3.clone(),
+            bucket: self.bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            armed: true,
+        };
 
         let mut hasher = Sha256::new();
         let mut len: u64 = 0;
@@ -235,14 +289,17 @@ impl BlockStore for S3BlockStore {
 
         if let Err(e) = result {
             self.abort(&key, &upload_id).await;
+            guard.disarm();
             return Err(e);
         }
         if len == 0 {
             self.abort(&key, &upload_id).await;
+            guard.disarm();
             return Err(BlockStoreError::EmptyBlock);
         }
         if hex::encode(hasher.finalize()) != id.as_str() {
             self.abort(&key, &upload_id).await;
+            guard.disarm();
             return Err(BlockStoreError::DigestMismatch);
         }
         if !part_buf.is_empty() {
@@ -251,9 +308,13 @@ impl BlockStore for S3BlockStore {
                 .await
             {
                 self.abort(&key, &upload_id).await;
+                guard.disarm();
                 return Err(e);
             }
         }
+        // From here the commit may land with its answer lost, so a drop must
+        // not abort: the caller reconciles with `size()`.
+        guard.disarm();
         let completed = CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
@@ -272,6 +333,7 @@ impl BlockStore for S3BlockStore {
                 let verdict = Self::classify_complete_failure(&e);
                 if !matches!(verdict, BlockStoreError::Unknown) {
                     self.abort(&key, &upload_id).await;
+                    guard.disarm();
                 }
                 Err(verdict)
             }
@@ -384,6 +446,8 @@ mod tests {
         hang_on_complete: Mutex<bool>,
         /// Largest single part body the mock has received.
         max_part_len: Mutex<usize>,
+        /// Count of AbortMultipartUpload requests received.
+        aborts: Mutex<u32>,
     }
 
     async fn head_handler(
@@ -532,6 +596,7 @@ mod tests {
         Query(q): Query<HashMap<String, String>>,
     ) -> Response {
         if q.contains_key("uploadId") {
+            *st.aborts.lock().unwrap() += 1;
             st.parts.lock().unwrap().retain(|(k, _), _| k != &key);
         } else {
             st.map.lock().unwrap().remove(&key);
@@ -619,6 +684,34 @@ mod tests {
 
         s.delete(&id).await.unwrap();
         assert_eq!(s.size(&id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_put_aborts_the_multipart_upload() {
+        let (url, st) = spawn_mock(false).await;
+        let s = store(&url);
+        let first = vec![7u8; PART_SIZE];
+        let id = id_of(&first);
+        // One full part goes up, then the body stalls forever.
+        let body = futures::stream::iter(vec![Ok(Bytes::from(first))])
+            .chain(futures::stream::pending())
+            .boxed();
+        let r =
+            tokio::time::timeout(Duration::from_secs(3), s.put_verified(&id, body, u64::MAX)).await;
+        assert!(
+            r.is_err(),
+            "the stalled put must be cancelled by the timeout"
+        );
+        // The abort runs on a spawned task after the drop.
+        for _ in 0..50 {
+            if *st.aborts.lock().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(*st.aborts.lock().unwrap(), 1, "cancel must abort once");
+        assert!(st.parts.lock().unwrap().is_empty());
+        assert!(st.map.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -736,7 +829,7 @@ mod tests {
     /// as definitely absent.
     #[tokio::test]
     async fn lost_complete_answer_reports_unknown_then_head_resolves() {
-        let (url, _st) = spawn_mock(true).await;
+        let (url, st) = spawn_mock(true).await;
         let s = S3BlockStore::for_testing("blocks", &url, Duration::from_millis(300));
         let body = vec![9u8; 1024];
         let id = id_of(&body);
@@ -745,6 +838,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BlockStoreError::Unknown), "got {err:?}");
+        // A lost complete answer may have committed: nothing may abort it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(*st.aborts.lock().unwrap(), 0);
         // The write actually committed server-side; a HEAD sees it.
         assert_eq!(
             store(&url).size(&id).await.unwrap(),

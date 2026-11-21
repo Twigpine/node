@@ -99,8 +99,22 @@ impl Reconstruction {
     /// Structural sanity: terms index real blocks, chunk ranges are ordered,
     /// and each file's terms sum to its declared size.
     pub fn validate(&self) -> Result<(), ModelError> {
-        let blocks: HashMap<&str, &BlockEntry> =
-            self.blocks.iter().map(|b| (b.sha256.as_str(), b)).collect();
+        let mut blocks: HashMap<&str, &BlockEntry> = HashMap::new();
+        for b in &self.blocks {
+            if blocks.insert(b.sha256.as_str(), b).is_some() {
+                return Err(ModelError::Invalid(format!(
+                    "duplicate block row {}",
+                    b.sha256
+                )));
+            }
+            let sum = checked_len_sum(b.chunks.iter().map(|c| c.len), &b.sha256)?;
+            if sum != b.size {
+                return Err(ModelError::Invalid(format!(
+                    "block {} declares {} bytes, its chunks sum to {sum}",
+                    b.sha256, b.size
+                )));
+            }
+        }
         for file in &self.files {
             let mut total = 0u64;
             for term in &file.terms {
@@ -126,17 +140,21 @@ impl Reconstruction {
                         block.chunks.len()
                     )));
                 }
-                let span: u64 = block.chunks[term.chunk_start as usize..term.chunk_end as usize]
-                    .iter()
-                    .map(|c| c.len)
-                    .sum();
+                let span = checked_len_sum(
+                    block.chunks[term.chunk_start as usize..term.chunk_end as usize]
+                        .iter()
+                        .map(|c| c.len),
+                    &term.block,
+                )?;
                 if span != term.length {
                     return Err(ModelError::Invalid(format!(
                         "{}: term length {span} != declared {}",
                         file.path, term.length
                     )));
                 }
-                total += term.length;
+                total = total.checked_add(term.length).ok_or_else(|| {
+                    ModelError::Invalid(format!("{}: term lengths overflow", file.path))
+                })?;
             }
             if total != file.size {
                 return Err(ModelError::Invalid(format!(
@@ -360,16 +378,26 @@ pub struct BlockSlice {
 
 /// Byte offset of each chunk inside a block, as a prefix sum over the
 /// chunk table: `offsets[i]` is where chunk `i`'s bytes begin.
-fn chunk_offsets(block: &BlockEntry) -> Vec<u64> {
-    block
-        .chunks
-        .iter()
-        .scan(0u64, |off, c| {
-            let start = *off;
-            *off += c.len;
-            Some(start)
-        })
-        .collect()
+fn chunk_offsets(block: &BlockEntry) -> Result<Vec<u64>, ModelError> {
+    let mut off = 0u64;
+    let mut out = Vec::with_capacity(block.chunks.len());
+    for c in &block.chunks {
+        out.push(off);
+        off = off
+            .checked_add(c.len)
+            .ok_or_else(|| overflow(&block.sha256))?;
+    }
+    Ok(out)
+}
+
+fn overflow(what: &str) -> ModelError {
+    ModelError::Invalid(format!("chunk lengths overflow in {what}"))
+}
+
+/// Sum lengths, refusing a total that wraps `u64`.
+fn checked_len_sum(mut lens: impl Iterator<Item = u64>, what: &str) -> Result<u64, ModelError> {
+    lens.try_fold(0u64, |acc, l| acc.checked_add(l))
+        .ok_or_else(|| overflow(what))
 }
 
 /// Byte range inside a block covering the chunks a term names.
@@ -383,8 +411,8 @@ fn term_span(block: &BlockEntry, term: &Term) -> Result<(u64, u64), ModelError> 
             block.chunks.len()
         )));
     }
-    let offsets = chunk_offsets(block);
-    let len: u64 = block.chunks[start..end].iter().map(|c| c.len).sum();
+    let offsets = chunk_offsets(block)?;
+    let len = checked_len_sum(block.chunks[start..end].iter().map(|c| c.len), &term.block)?;
     Ok((offsets[start], len))
 }
 
@@ -407,19 +435,26 @@ pub fn map_file_range(
         let block = blocks
             .get(term.block.as_str())
             .ok_or_else(|| ModelError::Invalid(format!("unknown block {}", term.block)))?;
-        let term_end = cursor + term.length;
+        // The same guard `rebuild_file` uses, so a reconstruction that
+        // skipped `parse()` gets an error here rather than a slice panic.
+        term_span(block, term)?;
+        let term_end = cursor
+            .checked_add(term.length)
+            .ok_or_else(|| ModelError::Invalid("term lengths overflow".into()))?;
         if term_end <= start || cursor >= end_exclusive {
             cursor = term_end;
             continue;
         }
-        let offsets = chunk_offsets(block);
+        let offsets = chunk_offsets(block)?;
         for (i, chunk) in block.chunks[term.chunk_start as usize..term.chunk_end as usize]
             .iter()
             .enumerate()
         {
             // This chunk covers file bytes [chunk_lo, chunk_hi).
             let chunk_lo = cursor;
-            let chunk_hi = cursor + chunk.len;
+            let chunk_hi = cursor
+                .checked_add(chunk.len)
+                .ok_or_else(|| overflow(&term.block))?;
             cursor = chunk_hi;
             let s = start.max(chunk_lo);
             let e = end_exclusive.min(chunk_hi);
@@ -487,7 +522,9 @@ pub fn rebuild_file<W: Write>(
             }
             out.write_all(data)?;
             file_hasher.update(data);
-            written += chunk.len;
+            written = written
+                .checked_add(chunk.len)
+                .ok_or_else(|| overflow(&term.block))?;
             rel += chunk.len as usize;
         }
     }
@@ -869,5 +906,103 @@ mod tests {
         .unwrap();
         assert_eq!(out, tuned);
         assert_eq!(fetched, packed.file.size);
+    }
+    fn hand_rec(
+        chunk_lens: &[u64],
+        block_size: u64,
+        term_len: u64,
+        file_size: u64,
+    ) -> Reconstruction {
+        let chunks: Vec<ChunkMeta> = chunk_lens
+            .iter()
+            .enumerate()
+            .map(|(i, l)| ChunkMeta {
+                sha256: format!("{i:064x}"),
+                len: *l,
+            })
+            .collect();
+        let n = chunks.len() as u32;
+        Reconstruction {
+            schema: RECONSTRUCTION_SCHEMA_V1.to_string(),
+            files: vec![FileEntry {
+                path: "f".into(),
+                size: file_size,
+                sha256: "0".repeat(64),
+                terms: vec![Term {
+                    block: "b".repeat(64),
+                    chunk_start: 0,
+                    chunk_end: n,
+                    length: term_len,
+                }],
+            }],
+            blocks: vec![BlockEntry {
+                sha256: "b".repeat(64),
+                size: block_size,
+                chunks,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_well_formed_hand_built_reconstruction_validates() {
+        hand_rec(&[3, 4], 7, 7, 7).validate().unwrap();
+    }
+
+    #[test]
+    fn chunk_lengths_that_wrap_u64_are_refused() {
+        // [u64::MAX, 1] wraps to 0: a zero-length term over both chunks
+        // would otherwise pass against a zero-size file.
+        let rec = hand_rec(&[u64::MAX, 1], 0, 0, 0);
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+    }
+
+    #[test]
+    fn term_lengths_that_wrap_the_file_total_are_refused() {
+        let mut rec = hand_rec(&[u64::MAX], u64::MAX, u64::MAX, 1);
+        let t = rec.files[0].terms[0].clone();
+        rec.files[0].terms.push(t.clone());
+        rec.files[0].terms.push(t);
+        // MAX + MAX + MAX wraps to MAX - 2... pick a size the wrap hits.
+        rec.files[0].size = u64::MAX.wrapping_mul(3);
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+    }
+
+    #[test]
+    fn duplicate_block_rows_are_refused() {
+        let mut rec = hand_rec(&[3, 4], 7, 7, 7);
+        let dup = rec.blocks[0].clone();
+        rec.blocks.push(dup);
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+    }
+
+    #[test]
+    fn a_block_size_that_disagrees_with_its_chunks_is_refused() {
+        let rec = hand_rec(&[3, 4], 99, 7, 7);
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+    }
+
+    #[test]
+    fn map_file_range_errors_instead_of_panicking_without_parse() {
+        // Built by hand, never validated: the term names chunks the block
+        // does not have.
+        let mut rec = hand_rec(&[3, 4], 7, 7, 7);
+        rec.files[0].terms[0].chunk_end = 9;
+        let file = rec.files[0].clone();
+        assert!(matches!(
+            map_file_range(&file, &rec, 0, 7),
+            Err(ModelError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn chunk_offsets_overflow_is_an_error_not_a_wrap() {
+        // The block table sums past u64 outside the selected chunks.
+        let mut rec = hand_rec(&[1, u64::MAX, u64::MAX], 0, 1, 1);
+        rec.files[0].terms[0].chunk_end = 1;
+        let file = rec.files[0].clone();
+        assert!(matches!(
+            map_file_range(&file, &rec, 0, 1),
+            Err(ModelError::Invalid(_))
+        ));
     }
 }

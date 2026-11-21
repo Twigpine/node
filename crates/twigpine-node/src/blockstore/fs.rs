@@ -19,6 +19,18 @@ use tokio::io::AsyncWriteExt;
 
 use super::{BlockId, BlockStore, BlockStoreError, PutOutcome};
 
+/// Removes the staged file when the write future is dropped mid-stream.
+/// The explicit `cleanup` calls cover every returned error; this covers
+/// cancellation, where no later statement runs. Removing an already-removed
+/// path is a harmless no-op, so it needs no disarm.
+struct StagedFile(PathBuf);
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub struct FsBlockStore {
     root: PathBuf,
 }
@@ -130,6 +142,8 @@ impl BlockStore for FsBlockStore {
         }
 
         let tmp = self.temp_path();
+        // Declared before `file`, so the handle closes before the removal.
+        let _staged = StagedFile(tmp.clone());
         let mut file = match tokio::fs::File::create(&tmp).await {
             Ok(f) => f,
             Err(e) => return Err(e.into()),
@@ -302,6 +316,29 @@ mod tests {
                 .await
                 .unwrap(),
             PutOutcome::AlreadyPresent
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_put_leaves_no_staged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let id = id_of(b"never finishes");
+        // Bytes arrive, then the body stalls and the caller drops the write.
+        let body = futures::stream::iter(vec![Ok(Bytes::from(vec![1u8; 4096]))])
+            .chain(futures::stream::pending())
+            .boxed();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            s.put_verified(&id, body, u64::MAX),
+        )
+        .await;
+        assert!(r.is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("blocks/tmp"))
+                .unwrap()
+                .count(),
+            0
         );
     }
 

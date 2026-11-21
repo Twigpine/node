@@ -186,8 +186,14 @@ pub fn detect_format(first_bytes: &[u8], path: &str) -> FileFormat {
     // safetensors: an 8-byte little-endian header length followed by '{'.
     // Checked before raw pickle: a header length such as 0x0380 starts with
     // the bytes 0x80 0x03, which the pickle test below would claim.
+    // The header length is capped at the 100 MB the safetensors reader
+    // itself enforces, so a pickle whose byte 8 is '{' is not claimed.
+    const MAX_SAFETENSORS_HEADER: u64 = 100_000_000;
+    let header_len = first_bytes
+        .get(..8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()));
     if first_bytes.len() >= 9
-        && u64::from_le_bytes(first_bytes[..8].try_into().unwrap()) > 0
+        && header_len.is_some_and(|n| n > 0 && n <= MAX_SAFETENSORS_HEADER)
         && first_bytes[8] == b'{'
     {
         return FileFormat::Safetensors;
@@ -340,6 +346,12 @@ mod tests {
                 "header length {len:#x}"
             );
         }
+        // A protocol-2 pickle whose byte 8 happens to be '{' ("a{" string)
+        // has an impossible header length, so it stays pickle.
+        assert_eq!(
+            detect_format(b"\x80\x02X\x02\x00\x00\x00a{q\x00.", "x.bin"),
+            FileFormat::Pickle
+        );
         // A real pickle whose byte 8 is not '{' stays pickle.
         assert_eq!(
             detect_format(b"\x80\x04\x95\x00\x00\x00\x00\x00\x00", "x.bin"),
