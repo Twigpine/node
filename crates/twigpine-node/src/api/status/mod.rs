@@ -278,7 +278,7 @@ pub async fn create_status(
 ///
 /// A 400, not a 500: the material is exactly what the client signed, and what
 /// they signed does not cover what they sent.
-fn require_body_bound_signature(
+pub(crate) fn require_body_bound_signature(
     material: &crate::auth::SignatureMaterial,
     body: &[u8],
 ) -> Result<()> {
@@ -317,7 +317,7 @@ fn require_body_bound_signature(
 /// This is not a nonce, and deliberately so. A nonce table needs pruning and a
 /// pruning window is a second replay window; the claim row IS the record of what
 /// was accepted, so uniqueness on it is self-maintaining.
-fn request_digest(material: &crate::auth::SignatureMaterial, body: &[u8]) -> String {
+pub(crate) fn request_digest(material: &crate::auth::SignatureMaterial, body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for part in [

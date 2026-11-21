@@ -152,7 +152,7 @@ impl BlockStore for FsBlockStore {
         let mut len: u64 = 0;
         let result: Result<(), BlockStoreError> = async {
             while let Some(chunk) = body.next().await {
-                let chunk = chunk?;
+                let chunk = chunk.map_err(BlockStoreError::Body)?;
                 len = len.saturating_add(chunk.len() as u64);
                 if len > max_len {
                     return Err(BlockStoreError::TooLarge(max_len));

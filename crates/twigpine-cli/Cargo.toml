@@ -41,8 +41,9 @@ alloy = { version = "1", default-features = false, features = [
     "rpc-types-eth",
 ] }
 
+ed25519-dalek = { workspace = true }
+
 [dev-dependencies]
 mockito = "1"
 tempfile = "3"
 tokio = { workspace = true }
-ed25519-dalek = { workspace = true }

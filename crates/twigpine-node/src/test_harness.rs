@@ -176,6 +176,15 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
         task_tx.clone(),
         task_cursor_key.clone(),
     ));
+    // Model hosting is ON for the harness node: a filesystem block store in a
+    // temp dir mounts the model routes so the deny sweep can drive their
+    // gates for real. Writes land inside the node's per-test repos dir and
+    // are removed with it.
+    let block_dir = repos_dir.join("model-blocks");
+    std::fs::create_dir_all(&block_dir).expect("create temp block dir");
+    let block_store: Option<Arc<dyn crate::blockstore::BlockStore>> = Some(Arc::new(
+        crate::blockstore::fs::FsBlockStore::new(block_dir).expect("fs block store"),
+    ));
     AppState {
         config: Arc::new(Config::parse_from(["twigpine-node"])),
         db,
@@ -228,7 +237,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
             16,
         ),
         git_bin: "git".to_string(),
-        block_store: None,
+        block_store,
     }
 }
 
@@ -371,9 +380,50 @@ impl TestNode {
         record.id
     }
 
+    /// Seed a published model release row directly, bypassing the claim
+    /// pipeline: deny fixtures need a real row behind the read gate, not the
+    /// full upload-and-verify path.
+    pub async fn seed_model_release(&self, repo_id: &str, commit_sha: &str, publisher_did: &str) {
+        sqlx::query(
+            "INSERT INTO model_releases
+                 (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
+                  claim_signature, claim_signature_input, claim_signing_string,
+                  claim_body, created_at)
+             VALUES ($1,$2,'main',$3,'published',$4,'sig','input','signing',\
+                     decode('00','hex'),$5)",
+        )
+        .bind(repo_id)
+        .bind(commit_sha)
+        .bind(publisher_did)
+        .bind(format!("{commit_sha:0>64}"))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(self.db.pool())
+        .await
+        .expect("seed model release");
+    }
+
+    /// Seed an open model upload session row directly (see
+    /// [`Self::seed_model_release`]): the session-status read row's owner
+    /// twin needs a real session behind the gate.
+    pub async fn seed_model_session(&self, repo_id: &str, session_id: &str, owner_did: &str) {
+        sqlx::query(
+            "INSERT INTO model_upload_sessions
+                 (id, owner_did, repo_id, created_at, expires_at, bytes_received, state)
+             VALUES ($1,$2,$3,$4,$5,0,'open')",
+        )
+        .bind(session_id)
+        .bind(owner_did)
+        .bind(repo_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind((chrono::Utc::now() + chrono::Duration::hours(12)).to_rfc3339())
+        .execute(self.db.pool())
+        .await
+        .expect("seed model session");
+    }
+
     /// Mark `branch` as protected on `repo_id`, so a non-owner push to it is
     /// rejected by the branch-protection gate (used by the deny-prober's
-    /// protected-push probe — #195, F3).
+    /// protected-push probe, #195 F3).
     pub async fn seed_protected_branch(&self, repo_id: &str, branch: &str, created_by: &str) {
         self.db
             .protect_branch(repo_id, branch, created_by)

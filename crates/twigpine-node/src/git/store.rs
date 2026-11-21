@@ -1,6 +1,16 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
+/// Ref namespaces clients must never see: `refs/gitlawb/requests/*` is
+/// internal bookkeeping, and `refs/gitlawb/releases/*` pins published model
+/// releases so gc never prunes them. One shared list keeps the
+/// repo-config writers in lockstep.
+pub(crate) const HIDDEN_REFS: &[(&str, &str)] = &[
+    ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
+    ("transfer.hideRefs", "refs/gitlawb/requests/"),
+    ("uploadpack.hideRefs", "refs/gitlawb/releases/"),
+    ("transfer.hideRefs", "refs/gitlawb/releases/"),
+];
 
 /// Initialize a new bare git repository with SHA-1 object format (default).
 ///
@@ -88,14 +98,11 @@ pub fn init_bare(path: &Path) -> Result<()> {
         Ok(_) => {}
     }
 
-    // Hide the internal marker namespace from clone/fetch
-    // advertisement. `refs/gitlawb/requests/*` carries request UUIDs
-    // and would otherwise leak per-push metadata to every client and
-    // grow advertisement cost with push count.
-    for (key, value) in [
-        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
-        ("transfer.hideRefs", "refs/gitlawb/requests/"),
-    ] {
+    // Hide the internal marker namespaces from clone/fetch
+    // advertisement: `refs/gitlawb/requests/*` would leak per-push
+    // metadata to every client and grow advertisement cost with push
+    // count.
+    for &(key, value) in HIDDEN_REFS {
         // allow-unbounded-git: same init-time local `git config` as above.
         let out = Command::new("git")
             .args(["config", "--add", key, value])
@@ -126,10 +133,7 @@ pub fn ensure_marker_hidden(repo_path: &Path) {
 }
 
 pub fn ensure_marker_hidden_checked(repo_path: &Path) -> Result<()> {
-    for (key, value) in [
-        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
-        ("transfer.hideRefs", "refs/gitlawb/requests/"),
-    ] {
+    for &(key, value) in HIDDEN_REFS {
         // allow-unbounded-git: reached only through the #[allow(dead_code)]
         // ensure_marker_hidden wrapper; the push path runs this config through
         // verify_recovery_prereqs_bounded's timeout runner.
@@ -220,10 +224,7 @@ pub async fn verify_recovery_prereqs_bounded(
             );
         }
     }
-    for (key, value) in [
-        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
-        ("transfer.hideRefs", "refs/gitlawb/requests/"),
-    ] {
+    for &(key, value) in HIDDEN_REFS {
         let current = run_git(git_bin, repo_path, &["config", "--get-all", key], deadline).await?;
         let already = String::from_utf8_lossy(&current.stdout)
             .lines()
@@ -356,7 +357,7 @@ pub async fn delete_marker_bounded(
 /// serving) or a live push's admission permits, lease, and write lock.
 /// `kill_on_drop(true)` makes the timeout real for these plumbing commands
 /// (no helper processes to reparent, unlike receive-pack's pack-objects).
-async fn run_git_bounded(
+pub(crate) async fn run_git_bounded(
     git_bin: &str,
     repo_path: &Path,
     args: &[&str],

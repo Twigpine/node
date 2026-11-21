@@ -264,7 +264,7 @@ impl BlockStore for S3BlockStore {
         // ever resident, never the whole body.
         let result: Result<(), BlockStoreError> = async {
             while let Some(chunk) = body.next().await {
-                let chunk = chunk?;
+                let chunk = chunk.map_err(BlockStoreError::Body)?;
                 len = len.saturating_add(chunk.len() as u64);
                 if len > max_len {
                     return Err(BlockStoreError::TooLarge(max_len));
