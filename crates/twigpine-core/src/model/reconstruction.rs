@@ -99,23 +99,22 @@ impl Reconstruction {
     /// Structural sanity: terms index real blocks, chunk ranges are ordered,
     /// and each file's terms sum to its declared size.
     pub fn validate(&self) -> Result<(), ModelError> {
-        for block in &self.blocks {
-            let sum: u64 = block
-                .chunks
-                .iter()
-                .try_fold(0u64, |acc, c| acc.checked_add(c.len))
-                .ok_or_else(|| {
-                    ModelError::Invalid(format!("block {} chunk lengths overflow", block.sha256))
-                })?;
-            if sum != block.size {
+        let mut blocks: HashMap<&str, &BlockEntry> = HashMap::new();
+        for b in &self.blocks {
+            if blocks.insert(b.sha256.as_str(), b).is_some() {
                 return Err(ModelError::Invalid(format!(
-                    "block {} chunks sum to {sum} but the entry declares {}",
-                    block.sha256, block.size
+                    "duplicate block row {}",
+                    b.sha256
+                )));
+            }
+            let sum = checked_len_sum(b.chunks.iter().map(|c| c.len), &b.sha256)?;
+            if sum != b.size {
+                return Err(ModelError::Invalid(format!(
+                    "block {} declares {} bytes, its chunks sum to {sum}",
+                    b.sha256, b.size
                 )));
             }
         }
-        let blocks: HashMap<&str, &BlockEntry> =
-            self.blocks.iter().map(|b| (b.sha256.as_str(), b)).collect();
         for file in &self.files {
             let mut total = 0u64;
             for term in &file.terms {
@@ -141,12 +140,12 @@ impl Reconstruction {
                         block.chunks.len()
                     )));
                 }
-                let span: u64 = block.chunks[term.chunk_start as usize..term.chunk_end as usize]
-                    .iter()
-                    .try_fold(0u64, |acc, c| acc.checked_add(c.len))
-                    .ok_or_else(|| {
-                        ModelError::Invalid(format!("{}: term lengths overflow", file.path))
-                    })?;
+                let span = checked_len_sum(
+                    block.chunks[term.chunk_start as usize..term.chunk_end as usize]
+                        .iter()
+                        .map(|c| c.len),
+                    &term.block,
+                )?;
                 if span != term.length {
                     return Err(ModelError::Invalid(format!(
                         "{}: term length {span} != declared {}",
@@ -154,7 +153,7 @@ impl Reconstruction {
                     )));
                 }
                 total = total.checked_add(term.length).ok_or_else(|| {
-                    ModelError::Invalid(format!("{}: file size overflow", file.path))
+                    ModelError::Invalid(format!("{}: term lengths overflow", file.path))
                 })?;
             }
             if total != file.size {
@@ -231,10 +230,13 @@ fn seal_pending<F: FnMut(Block) -> std::io::Result<()>>(
     if pending.is_empty() {
         return Ok(());
     }
-    let chunks = std::mem::take(pending);
+    let mut chunks = std::mem::take(pending);
     let mut data = Vec::with_capacity(chunks.iter().map(|c| c.len).sum::<usize>());
-    for c in &chunks {
+    for c in &mut chunks {
         data.extend_from_slice(&c.data);
+        // The bytes now live in `data`; keeping the chunk's copy would hold
+        // every sealed block twice. Chunk metadata (sha256, len) stays.
+        c.data = Vec::new();
     }
     let block = Block {
         sha256: sha256_hex(&data),
@@ -382,16 +384,26 @@ pub struct BlockSlice {
 
 /// Byte offset of each chunk inside a block, as a prefix sum over the
 /// chunk table: `offsets[i]` is where chunk `i`'s bytes begin.
-fn chunk_offsets(block: &BlockEntry) -> Vec<u64> {
-    block
-        .chunks
-        .iter()
-        .scan(0u64, |off, c| {
-            let start = *off;
-            *off += c.len;
-            Some(start)
-        })
-        .collect()
+fn chunk_offsets(block: &BlockEntry) -> Result<Vec<u64>, ModelError> {
+    let mut off = 0u64;
+    let mut out = Vec::with_capacity(block.chunks.len());
+    for c in &block.chunks {
+        out.push(off);
+        off = off
+            .checked_add(c.len)
+            .ok_or_else(|| overflow(&block.sha256))?;
+    }
+    Ok(out)
+}
+
+fn overflow(what: &str) -> ModelError {
+    ModelError::Invalid(format!("chunk lengths overflow in {what}"))
+}
+
+/// Sum lengths, refusing a total that wraps `u64`.
+fn checked_len_sum(mut lens: impl Iterator<Item = u64>, what: &str) -> Result<u64, ModelError> {
+    lens.try_fold(0u64, |acc, l| acc.checked_add(l))
+        .ok_or_else(|| overflow(what))
 }
 
 /// Byte range inside a block covering the chunks a term names.
@@ -405,8 +417,8 @@ fn term_span(block: &BlockEntry, term: &Term) -> Result<(u64, u64), ModelError> 
             block.chunks.len()
         )));
     }
-    let offsets = chunk_offsets(block);
-    let len: u64 = block.chunks[start..end].iter().map(|c| c.len).sum();
+    let offsets = chunk_offsets(block)?;
+    let len = checked_len_sum(block.chunks[start..end].iter().map(|c| c.len), &term.block)?;
     Ok((offsets[start], len))
 }
 
@@ -429,19 +441,26 @@ pub fn map_file_range(
         let block = blocks
             .get(term.block.as_str())
             .ok_or_else(|| ModelError::Invalid(format!("unknown block {}", term.block)))?;
-        let term_end = cursor + term.length;
+        // The same guard `rebuild_file` uses, so a reconstruction that
+        // skipped `parse()` gets an error here rather than a slice panic.
+        term_span(block, term)?;
+        let term_end = cursor
+            .checked_add(term.length)
+            .ok_or_else(|| ModelError::Invalid("term lengths overflow".into()))?;
         if term_end <= start || cursor >= end_exclusive {
             cursor = term_end;
             continue;
         }
-        let offsets = chunk_offsets(block);
+        let offsets = chunk_offsets(block)?;
         for (i, chunk) in block.chunks[term.chunk_start as usize..term.chunk_end as usize]
             .iter()
             .enumerate()
         {
             // This chunk covers file bytes [chunk_lo, chunk_hi).
             let chunk_lo = cursor;
-            let chunk_hi = cursor + chunk.len;
+            let chunk_hi = cursor
+                .checked_add(chunk.len)
+                .ok_or_else(|| overflow(&term.block))?;
             cursor = chunk_hi;
             let s = start.max(chunk_lo);
             let e = end_exclusive.min(chunk_hi);
@@ -509,7 +528,9 @@ pub fn rebuild_file<W: Write>(
             }
             out.write_all(data)?;
             file_hasher.update(data);
-            written += chunk.len;
+            written = written
+                .checked_add(chunk.len)
+                .ok_or_else(|| overflow(&term.block))?;
             rel += chunk.len as usize;
         }
     }
@@ -542,6 +563,80 @@ mod tests {
         rec.files.push(packed.file.clone());
         rec.blocks.extend(packed.block_entries.clone());
         (rec, packed)
+    }
+
+    /// Deterministic non-repeating bytes that count what was consumed, so a
+    /// test can see how much of the input had been read when a block sealed.
+    struct CountingGen {
+        left: usize,
+        state: u64,
+        read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for CountingGen {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left);
+            for b in &mut buf[..n] {
+                self.state = self
+                    .state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (self.state >> 56) as u8;
+            }
+            self.left -= n;
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn pack_file_with_hands_over_each_block_while_reading() {
+        let total = BLOCK_TARGET + 8 * 1024 * 1024;
+        let read = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let reader = CountingGen {
+            left: total,
+            state: 1,
+            read: read.clone(),
+        };
+        let mut read_at_block: Vec<usize> = Vec::new();
+        let mut cleared = true;
+        let (file, entries) = pack_file_with("w.bin", reader, &DedupIndex::new(), |b| {
+            read_at_block.push(read.get());
+            cleared &= b.chunks.iter().all(|c| c.data.is_empty() && c.len > 0);
+            assert_eq!(b.data.len(), b.chunks.iter().map(|c| c.len).sum::<usize>());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(file.size, total as u64);
+        assert!(read_at_block.len() >= 2, "expected two sealed blocks");
+        // The first block reached the sink long before the input ended: the
+        // packer held about one block, not the file.
+        assert!(
+            read_at_block[0] <= BLOCK_TARGET + 4 * crate::model::chunking::CHUNK_MAX,
+            "first block sealed after {} bytes read",
+            read_at_block[0]
+        );
+        assert!(read_at_block[0] < total);
+        assert!(cleared, "a sealed block still carries per-chunk buffers");
+        assert_eq!(entries.len(), read_at_block.len());
+    }
+
+    #[test]
+    fn pack_file_with_propagates_a_sink_error() {
+        let read = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let reader = CountingGen {
+            left: BLOCK_TARGET + 1024 * 1024,
+            state: 2,
+            read: read.clone(),
+        };
+        let err = pack_file_with("w.bin", reader, &DedupIndex::new(), |_| {
+            Err(std::io::Error::other("sink full"))
+        })
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.to_string(), "sink full");
+        // The error stopped the read; the rest of the input was not consumed.
+        assert!(read.get() < BLOCK_TARGET + 1024 * 1024);
     }
 
     #[test]
@@ -817,5 +912,103 @@ mod tests {
         .unwrap();
         assert_eq!(out, tuned);
         assert_eq!(fetched, packed.file.size);
+    }
+    fn hand_rec(
+        chunk_lens: &[u64],
+        block_size: u64,
+        term_len: u64,
+        file_size: u64,
+    ) -> Reconstruction {
+        let chunks: Vec<ChunkMeta> = chunk_lens
+            .iter()
+            .enumerate()
+            .map(|(i, l)| ChunkMeta {
+                sha256: format!("{i:064x}"),
+                len: *l,
+            })
+            .collect();
+        let n = chunks.len() as u32;
+        Reconstruction {
+            schema: RECONSTRUCTION_SCHEMA_V1.to_string(),
+            files: vec![FileEntry {
+                path: "f".into(),
+                size: file_size,
+                sha256: "0".repeat(64),
+                terms: vec![Term {
+                    block: "b".repeat(64),
+                    chunk_start: 0,
+                    chunk_end: n,
+                    length: term_len,
+                }],
+            }],
+            blocks: vec![BlockEntry {
+                sha256: "b".repeat(64),
+                size: block_size,
+                chunks,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_well_formed_hand_built_reconstruction_validates() {
+        hand_rec(&[3, 4], 7, 7, 7).validate().unwrap();
+    }
+
+    #[test]
+    fn chunk_lengths_that_wrap_u64_are_refused() {
+        // [u64::MAX, 1] wraps to 0: a zero-length term over both chunks
+        // would otherwise pass against a zero-size file.
+        let rec = hand_rec(&[u64::MAX, 1], 0, 0, 0);
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+    }
+
+    #[test]
+    fn term_lengths_that_wrap_the_file_total_are_refused() {
+        let mut rec = hand_rec(&[u64::MAX], u64::MAX, u64::MAX, 1);
+        let t = rec.files[0].terms[0].clone();
+        rec.files[0].terms.push(t.clone());
+        rec.files[0].terms.push(t);
+        // MAX + MAX + MAX wraps to MAX - 2... pick a size the wrap hits.
+        rec.files[0].size = u64::MAX.wrapping_mul(3);
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+    }
+
+    #[test]
+    fn duplicate_block_rows_are_refused() {
+        let mut rec = hand_rec(&[3, 4], 7, 7, 7);
+        let dup = rec.blocks[0].clone();
+        rec.blocks.push(dup);
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+    }
+
+    #[test]
+    fn a_block_size_that_disagrees_with_its_chunks_is_refused() {
+        let rec = hand_rec(&[3, 4], 99, 7, 7);
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+    }
+
+    #[test]
+    fn map_file_range_errors_instead_of_panicking_without_parse() {
+        // Built by hand, never validated: the term names chunks the block
+        // does not have.
+        let mut rec = hand_rec(&[3, 4], 7, 7, 7);
+        rec.files[0].terms[0].chunk_end = 9;
+        let file = rec.files[0].clone();
+        assert!(matches!(
+            map_file_range(&file, &rec, 0, 7),
+            Err(ModelError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn chunk_offsets_overflow_is_an_error_not_a_wrap() {
+        // The block table sums past u64 outside the selected chunks.
+        let mut rec = hand_rec(&[1, u64::MAX, u64::MAX], 0, 1, 1);
+        rec.files[0].terms[0].chunk_end = 1;
+        let file = rec.files[0].clone();
+        assert!(matches!(
+            map_file_range(&file, &rec, 0, 1),
+            Err(ModelError::Invalid(_))
+        ));
     }
 }
