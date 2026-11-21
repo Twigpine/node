@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.0](https://github.com/Twigpine/node/compare/v0.8.1...v0.9.0) (2026-11-21)
+
+
+### Features
+
+* **cli:** npm twigpine cli ([#615](https://github.com/Twigpine/node/issues/615)) ([17395b4](https://github.com/Twigpine/node/commit/17395b4f83ac280a2e7a6ec17f4d3b86947bb2a3))
+
+
+### Bug Fixes
+
+* **node:** bound the write guard's lock-pool hold with a lock-hold deadline ([#613](https://github.com/Twigpine/node/issues/613)) ([721429a](https://github.com/Twigpine/node/commit/721429a8b09fd997cc20d74df806613bd1e9e135))
+* **node:** refuse non-public resolved addresses on outbound clients ([#612](https://github.com/Twigpine/node/issues/612)) ([7544cbd](https://github.com/Twigpine/node/commit/7544cbd6972cb7af2a5977e41361883076ec7e14))
+
 ## [0.8.1](https://github.com/Twigpine/node/compare/v0.8.0...v0.8.1) (2026-11-18)
 
 
