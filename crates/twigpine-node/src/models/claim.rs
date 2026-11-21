@@ -176,7 +176,10 @@ pub async fn claim_release(
     db.model_tx_advisory_lock(&mut tx, CLAIM_LOCK_KEY).await?;
 
     // Replay by request digest, then idempotent re-claim by (repo, commit):
-    // both return the original row.
+    // both return the original row, whatever its state. A rejected release
+    // is final for that commit: verification judges the pinned, immutable
+    // commit, so a retry would re-run the same checks, and the publisher
+    // retries by minting a new commit.
     if let Some(existing) = db
         .model_tx_release_by_digest(&mut tx, &material.request_digest)
         .await?

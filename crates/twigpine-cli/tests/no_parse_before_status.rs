@@ -66,6 +66,7 @@ const CONVERTED_IN_186: &[&str] = &[
     "changelog.rs",
     "issue.rs",
     "mcp.rs",
+    "model.rs",
     "peer.rs",
     "pr.rs",
     "protect.rs",

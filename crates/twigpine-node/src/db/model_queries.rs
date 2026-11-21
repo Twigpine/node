@@ -174,11 +174,12 @@ impl Db {
                AND s.bytes_received + $1 + COALESCE((
                      SELECT SUM(o.bytes_received) FROM model_upload_sessions o
                      WHERE o.owner_did = s.owner_did AND o.state = 'open' AND o.id <> s.id
+                       AND o.expires_at > $4
                    ), 0) <= $5
                AND COALESCE((SELECT SUM(q.bytes_used) FROM model_quota_usage q), 0)
                    + COALESCE((
                        SELECT SUM(o2.bytes_received) FROM model_upload_sessions o2
-                       WHERE o2.state = 'open'
+                       WHERE o2.state = 'open' AND o2.expires_at > $4
                      ), 0)
                    + $1 <= $6
              RETURNING {SESSION_COLS}"
@@ -211,8 +212,14 @@ impl Db {
     }
 
     /// Book the stored block against the session in one transaction. `true`
-    /// when this PUT was a duplicate within the session (the admission
-    /// credit was refunded).
+    /// when the admission credit was refunded: a duplicate within the
+    /// session, or a block a verifying or published release of the session's
+    /// own owner already carries. Claim authorizes that release's blocks
+    /// without a session link and billed them at claim, so the block is
+    /// neither charged nor linked here; a link would outlive the release and
+    /// hold the block unbilled once it is rejected. Blocks carried by another
+    /// publisher's release, or held only by other open sessions, are still
+    /// charged and linked.
     pub async fn model_record_block(
         &self,
         session_id: &str,
@@ -231,17 +238,34 @@ impl Db {
         .bind(ts_now())
         .execute(&mut *tx)
         .await?;
-        let linked = sqlx::query(
-            "INSERT INTO model_session_blocks (session_id, block_sha256)
-             VALUES ($1, $2)
-             ON CONFLICT (session_id, block_sha256) DO NOTHING",
+        let own_release_carries = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM model_release_blocks rb
+                 JOIN model_releases r ON r.id = rb.release_id
+                 JOIN model_upload_sessions s ON s.owner_did = r.publisher_did
+                 WHERE rb.block_sha256 = $1 AND s.id = $2
+                   AND r.state IN ('verifying', 'published'))",
         )
-        .bind(session_id)
         .bind(block_sha)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if linked == 0 {
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let linked = if own_release_carries {
+            0
+        } else {
+            sqlx::query(
+                "INSERT INTO model_session_blocks (session_id, block_sha256)
+                 VALUES ($1, $2)
+                 ON CONFLICT (session_id, block_sha256) DO NOTHING",
+            )
+            .bind(session_id)
+            .bind(block_sha)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        };
+        let refund = linked == 0;
+        if refund {
             sqlx::query(
                 "UPDATE model_upload_sessions
                  SET bytes_received = GREATEST(bytes_received - $1, 0)
@@ -253,7 +277,7 @@ impl Db {
             .await?;
         }
         tx.commit().await?;
-        Ok(linked == 0)
+        Ok(refund)
     }
 
     pub async fn model_release_by_commit(
@@ -493,11 +517,14 @@ impl Db {
     /// Node-wide used bytes: claimed quota plus every open session's bytes.
     pub async fn model_tx_node_used(&self, tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
         // SUM over bigint returns numeric; cast back so the i64 decode holds.
+        // A session past its wall-clock expiry is dead before the sweep
+        // flips its state, so it does not count against the cap.
         Ok(sqlx::query_scalar::<_, Option<i64>>(
             "SELECT (COALESCE((SELECT SUM(bytes_used) FROM model_quota_usage), 0)
                   + COALESCE((SELECT SUM(bytes_received) FROM model_upload_sessions
-                              WHERE state = 'open'), 0))::bigint",
+                              WHERE state = 'open' AND expires_at > $1), 0))::bigint",
         )
+        .bind(ts_now())
         .fetch_one(&mut **tx)
         .await?
         .unwrap_or(0))
@@ -1213,6 +1240,176 @@ mod tests {
         assert!(db.model_tx_block_still_dead(&mut tx, &sha).await.unwrap());
         db.model_tx_delete_block_row(&mut tx, &sha).await.unwrap();
         tx.commit().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn caps_ignore_wall_clock_dead_open_sessions(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        // A same-owner peer and a different-owner peer each hold 900 bytes.
+        let peer_same = db.model_open_session("did:owner", "r1", 60).await.unwrap();
+        let peer_other = db.model_open_session("did:other", "r1", 60).await.unwrap();
+        for s in [&peer_same, &peer_other] {
+            db.model_admit_bytes(&s.id, 900, 3600, 10_000, 100_000)
+                .await
+                .unwrap()
+                .expect("peer admission");
+        }
+        // Past the wall-clock TTL the rows still say 'open' until the sweep.
+        sqlx::query("UPDATE model_upload_sessions SET expires_at = $1")
+            .bind("2000-01-01T00:00:00+00:00")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Claim-side node total must not count the dead sessions.
+        let mut tx = db.model_begin().await.unwrap();
+        assert_eq!(db.model_tx_node_used(&mut tx).await.unwrap(), 0);
+        tx.rollback().await.unwrap();
+
+        // Per-owner term: the dead same-owner peer must not eat the cap.
+        let live = db.model_open_session("did:owner", "r1", 60).await.unwrap();
+        assert!(db
+            .model_admit_bytes(&live.id, 200, 3600, 1000, 100_000)
+            .await
+            .unwrap()
+            .is_some());
+        // Node-wide term: both dead peers (1800) must not eat a 1000 cap.
+        let live2 = db.model_open_session("did:third", "r1", 60).await.unwrap();
+        assert!(db
+            .model_admit_bytes(&live2.id, 200, 3600, 10_000, 1000)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    async fn seed_release_with_block(
+        pool: &sqlx::PgPool,
+        publisher: &str,
+        state: &str,
+        commit: &str,
+        sha: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO model_blocks (sha256, size, created_at) VALUES ($1, 100, 't')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha)
+        .execute(pool)
+        .await
+        .unwrap();
+        let rid: i64 = sqlx::query_scalar(
+            "INSERT INTO model_releases
+                 (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
+                  claim_signature, claim_signature_input, claim_signing_string,
+                  claim_body, created_at)
+             VALUES ('r1', $1, 'main', $3, $2, 'm', 's', 'i', 'ss', '\\x00', 't')
+             RETURNING id",
+        )
+        .bind(commit)
+        .bind(state)
+        .bind(publisher)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO model_release_blocks (release_id, block_sha256) VALUES ($1, $2)")
+            .bind(rid)
+            .bind(sha)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn session_bytes(pool: &sqlx::PgPool, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT bytes_received FROM model_upload_sessions WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn record_block_refunds_only_bytes_a_live_release_already_carries(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+
+        // Block already carried by the owner's published release: claim
+        // authorizes it without a link and billed it, so the PUT is free
+        // and leaves no link behind to outlive the release.
+        let carried = "d".repeat(64);
+        seed_release_with_block(&pool, "did:owner", "published", "c1", &carried).await;
+        let s = db
+            .model_open_session("did:owner", "r1", 3600)
+            .await
+            .unwrap();
+        db.model_admit_bytes(&s.id, 100, 3600, 1000, 10_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .model_record_block(&s.id, &carried, 100, 100)
+            .await
+            .unwrap());
+        assert_eq!(session_bytes(&pool, &s.id).await, 0);
+        let links: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM model_session_blocks WHERE session_id = $1")
+                .bind(&s.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(links, 0);
+
+        // Another publisher's published release bills its owner, not this
+        // session, and the session needs the link to claim the block.
+        let theirs = "9".repeat(64);
+        seed_release_with_block(&pool, "did:other", "published", "c3", &theirs).await;
+        db.model_admit_bytes(&s.id, 100, 3600, 1000, 10_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!db
+            .model_record_block(&s.id, &theirs, 100, 100)
+            .await
+            .unwrap());
+        assert_eq!(session_bytes(&pool, &s.id).await, 100);
+
+        // Block only in a rejected release: nothing bills it, so the
+        // session keeps the charge.
+        let dead = "e".repeat(64);
+        seed_release_with_block(&pool, "did:owner", "rejected", "c2", &dead).await;
+        let s2 = db
+            .model_open_session("did:owner", "r1", 3600)
+            .await
+            .unwrap();
+        db.model_admit_bytes(&s2.id, 100, 3600, 1000, 10_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!db
+            .model_record_block(&s2.id, &dead, 100, 100)
+            .await
+            .unwrap());
+        assert_eq!(session_bytes(&pool, &s2.id).await, 100);
+
+        // Block held only by another open session: that session is the
+        // one billed, and a refund here would let a session pair hold
+        // unbilled bytes once the first expires.
+        let held = "f".repeat(64);
+        let a = db
+            .model_open_session("did:owner", "r1", 3600)
+            .await
+            .unwrap();
+        let b = db
+            .model_open_session("did:owner", "r1", 3600)
+            .await
+            .unwrap();
+        for x in [&a, &b] {
+            db.model_admit_bytes(&x.id, 100, 3600, 1000, 10_000)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(!db.model_record_block(&a.id, &held, 100, 100).await.unwrap());
+        assert!(!db.model_record_block(&b.id, &held, 100, 100).await.unwrap());
+        assert_eq!(session_bytes(&pool, &b.id).await, 100);
     }
 
     #[sqlx::test]

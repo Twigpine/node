@@ -4331,6 +4331,122 @@ mod tests {
         );
     }
 
+    /// #282: the create handler runs its ref write through the bounded runner,
+    /// which can report failure for a child it killed after `update-ref` had
+    /// already committed. The handler must not release the guard over a ref it
+    /// cannot rule out: it removes the ref first, so no unpublished issue
+    /// survives a refused create to be published by a later writer.
+    #[sqlx::test]
+    async fn create_issue_removes_a_ref_a_failed_bounded_write_may_have_committed(pool: PgPool) {
+        let owner = "did:key:zISSUEORPHANAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "orphan-create";
+        let mut state = test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let live = crate::git::repo_store::validated_repo_disk_path(disk.path(), owner, repo_name)
+            .expect("repo path");
+        let mut seeded = seed_repo(owner, repo_name);
+        seeded.disk_path = live.to_string_lossy().to_string();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, Duration::from_secs(1)),
+        );
+        let shim = git_shim::create("gl-orphan-git", git_shim::Behavior::FailAfterUpdateRef);
+        state.git_bin = shim.to_str().unwrap().to_string();
+
+        let res = crate::api::issues::create_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(AuthenticatedDid(owner.to_string())),
+            axum::extract::Path((owner.to_string(), repo_name.to_string())),
+            axum::Json(crate::api::issues::CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        assert!(res.is_err(), "a failed ref write must refuse the create");
+        assert!(
+            shim.parent().unwrap().join("committed").exists(),
+            "the ref write must have committed before the failure, or this proves nothing"
+        );
+        let issues = crate::git::issues::list_issues(&live).expect("list issues");
+        assert!(
+            issues.is_empty(),
+            "no issue ref may survive a refused create, got {issues:?}"
+        );
+    }
+
+    /// #282: the failed-create cleanup runs on the guard's lock-hold budget, not
+    /// on a fresh git timeout. A ref delete that never returns must not keep the
+    /// lock-pool session past the hold, and the tree whose ref could not be
+    /// removed must be quarantined so a later reader reconciles it with the
+    /// stored generation instead of serving or publishing the unacknowledged issue.
+    #[sqlx::test]
+    async fn create_issue_failed_cleanup_is_bounded_by_the_hold_deadline(pool: PgPool) {
+        use crate::git::repo_store::tests as rs_tests;
+
+        let mock = rs_tests::S3Mock::start().await;
+        let owner = "did:key:zISSUESTALLCLEANUPAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "stall-cleanup";
+        let mut state = test_state_with(pool.clone(), |c| c.git_service_timeout_secs = 25).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let live = crate::git::repo_store::validated_repo_disk_path(disk.path(), owner, repo_name)
+            .expect("repo path");
+        let mut seeded = seed_repo(owner, repo_name);
+        seeded.disk_path = live.to_string_lossy().to_string();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, Duration::from_secs(1)),
+            rs_tests::mock_tigris(&mock),
+        )
+        .with_lock_hold_timeout(Duration::from_secs(3));
+        let shim = git_shim::create("gl-stall-delete-git", git_shim::Behavior::StallRefDelete);
+        state.git_bin = shim.to_str().unwrap().to_string();
+
+        let started = std::time::Instant::now();
+        let res = crate::api::issues::create_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(AuthenticatedDid(owner.to_string())),
+            axum::extract::Path((owner.to_string(), repo_name.to_string())),
+            axum::Json(crate::api::issues::CreateIssueRequest {
+                title: "t".to_string(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(res.is_err(), "a failed ref write must refuse the create");
+        assert!(
+            shim.parent().unwrap().join("committed").exists(),
+            "the ref write must have committed before the failure, or this proves nothing"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "cleanup must stop at the 3s hold deadline, not run a fresh 25s git timeout (took {elapsed:?})"
+        );
+        assert!(
+            crate::git::repo_store::quarantine_path(&live)
+                .expect("marker path")
+                .exists(),
+            "a tree whose orphan ref could not be removed must be quarantined"
+        );
+        // The session went back with the drop: a second write on the same repo
+        // must get the advisory lock rather than shed as busy.
+        let second = state
+            .repo_store
+            .acquire_write(owner, repo_name)
+            .await
+            .expect("the advisory lock must be free after the failed create");
+        let _ = second.release(false).await;
+        mock.shutdown();
+    }
+
     /// Adversarial-review D3-1: register binds the registered DID to the signer.
     /// A caller signed as A cannot register a different DID B (no spoofed
     /// registration or trust row under a victim DID). Rejected before any write.

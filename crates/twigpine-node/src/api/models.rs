@@ -94,7 +94,7 @@ pub async fn get_model_session(
         .db
         .model_load_session(&id)
         .await?
-        .filter(|s| s.repo_id == record.id)
+        .filter(|s| s.repo_id == record.id && s.expires_at > models::ts_now())
         .ok_or_else(|| AppError::NotFound("model upload session not found".into()))?;
     Ok(Json(json!({
         "session_id": session.id,

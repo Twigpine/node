@@ -94,8 +94,10 @@ pub async fn set_profile(
 
             if req.pin_to_ipfs.unwrap_or(false) && !state.config.pinata_jwt.is_empty() {
                 let profile_json = serde_json::to_vec(&resp).unwrap_or_default();
+                // The Pinata endpoint is operator-configured and may be private,
+                // so it takes the operator client, not the peer-traffic policy one.
                 match pinata::pin_object(
-                    &state.http_client,
+                    crate::operator_http_client(),
                     &state.config.pinata_upload_url,
                     &state.config.pinata_jwt,
                     &format!("profile-{}", did),
@@ -167,5 +169,93 @@ pub async fn get_profile(
             StatusCode::NOT_FOUND,
             Json(json!({ "message": "profile not found" })),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::isolated_child::{in_child, run_isolated};
+    use std::str::FromStr;
+
+    /// A profile pin reaches an operator-configured Pinata endpoint whose hostname
+    /// resolves to loopback, as the push tail and the reconciliation sweep do. The
+    /// state carries the real policy client, which refuses `localhost`, so this
+    /// fails if the call goes back to `state.http_client`. Runs in a child with
+    /// proxy variables stripped so a runner proxy cannot intercept the request.
+    /// Not `sqlx::test`: parent and child would share its database name, so the
+    /// child makes its own scratch database.
+    #[tokio::test]
+    async fn profile_pin_reaches_an_operator_pinata_on_a_loopback_hostname() {
+        if !in_child() {
+            run_isolated(
+                "api::profiles::tests::profile_pin_reaches_an_operator_pinata_on_a_loopback_hostname",
+                &[],
+            );
+            return;
+        }
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let admin = sqlx::PgPool::connect(&url).await.unwrap();
+        let db_name = format!(
+            "profile_pin_loopback_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&url)
+            .unwrap()
+            .database(&db_name);
+        let pool = sqlx::PgPool::connect_with(opts).await.unwrap();
+        profile_pin_loopback_body(pool.clone()).await;
+        pool.close().await;
+        sqlx::query(&format!(r#"DROP DATABASE "{db_name}" WITH (FORCE)"#))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+
+    async fn profile_pin_loopback_body(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.http_client = std::sync::Arc::new(
+            crate::build_http_client().expect("failed to build production http client"),
+        );
+        let mut pinata = mockito::Server::new_async().await;
+        let mock = pinata
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"data":{"cid":"bafyprofileloopback"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let mut cfg = (*state.config).clone();
+        cfg.pinata_jwt = "profile-test-jwt".to_string();
+        cfg.pinata_upload_url = format!("http://localhost:{}/", pinata.socket_address().port());
+        state.config = std::sync::Arc::new(cfg);
+
+        let did = "did:key:z6MkProfilePinLoopbackAAAAAAAAAAAAAAAAAAAAAA".to_string();
+        let (status, Json(body)) = set_profile(
+            State(state),
+            axum::Extension(AuthenticatedDid(did)),
+            Json(SetProfileRequest {
+                display_name: Some("loopback".to_string()),
+                bio: None,
+                avatar_url: None,
+                website: None,
+                socials: None,
+                pin_to_ipfs: Some(true),
+            }),
+        )
+        .await
+        .expect("profile save must succeed");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["profile_cid"], "bafyprofileloopback",
+            "the pin must reach the operator Pinata endpoint, got {body}"
+        );
+        mock.assert_async().await;
     }
 }

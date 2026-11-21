@@ -117,23 +117,33 @@ mod tests {
     #[test]
     fn chunk_data_never_buffers_the_file() {
         // The contract this format depends on: a reader is consumed a chunk
-        // at a time. Guard it by chunking a reader that would panic if read
-        // past its claimed end before the iterator asks for more.
-        struct Stingy {
+        // at a time. Count what the first chunk cost out of a large input.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Counting {
             left: usize,
+            read: Rc<Cell<usize>>,
         }
-        impl Read for Stingy {
+        impl Read for Counting {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 let n = buf.len().min(self.left);
                 self.left -= n;
                 buf[..n].fill(1);
+                self.read.set(self.read.get() + n);
                 Ok(n)
             }
         }
-        let mut it = chunk_reader(Stingy {
-            left: 3 * CHUNK_MAX,
+        let read = Rc::new(Cell::new(0));
+        let mut it = chunk_reader(Counting {
+            left: 64 * 1024 * 1024,
+            read: read.clone(),
         });
         let first = it.next().unwrap().unwrap();
         assert!(first.len <= CHUNK_MAX);
+        assert!(
+            read.get() <= 2 * CHUNK_MAX,
+            "read {} bytes for one chunk",
+            read.get()
+        );
     }
 }

@@ -520,9 +520,10 @@ fn load_state(path: &Path) -> PublishState {
 /// resume set, so it is written and fsync'd rather than left in page cache.
 fn save_state(path: &Path, state: &PublishState) -> Result<()> {
     let bytes = serde_json::to_vec(state)?;
-    let mut f = std::fs::File::create(path).with_context(|| format!("write {}", path.display()))?;
-    f.write_all(&bytes)?;
-    f.sync_all()?;
+    // The file holds the session bearer, so it goes through the owner-only
+    // writer, then is fsync'd (the helper does not sync).
+    crate::secret_file::write(path, &bytes).with_context(|| format!("write {}", path.display()))?;
+    std::fs::File::open(path)?.sync_all()?;
     Ok(())
 }
 
@@ -1874,6 +1875,26 @@ mod tests {
         let text = format!("a\n{GITIGNORE_BEGIN}\nx.bin\ny.bin\n{GITIGNORE_END}\nz\n");
         assert_eq!(managed_block_paths(&text), vec!["x.bin", "y.bin"]);
         assert!(managed_block_paths("nothing here\n").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_state_is_owner_only_even_over_a_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE_NAME);
+        let state = PublishState {
+            session_id: "bearer".to_string(),
+            uploaded: vec![],
+        };
+        save_state(&path, &state).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        // A resume file left loose by an earlier run is tightened on rewrite.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_state(&path, &state).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(load_state(&path), state);
     }
 
     #[test]

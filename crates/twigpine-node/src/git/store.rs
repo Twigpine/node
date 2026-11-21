@@ -172,15 +172,23 @@ pub fn ensure_marker_hidden_checked(repo_path: &Path) -> Result<()> {
 pub async fn verify_recovery_prereqs_bounded(
     git_bin: &str,
     repo_path: &Path,
-    timeout: std::time::Duration,
+    deadline: std::time::Instant,
 ) -> Result<()> {
     use tokio::process::Command as AsyncCommand;
     async fn run_git(
         git_bin: &str,
         repo_path: &Path,
         args: &[&str],
-        timeout: std::time::Duration,
+        deadline: std::time::Instant,
     ) -> Result<std::process::Output> {
+        // Recompute per child: several `git config` calls run in sequence
+        // and one shared deadline must cover them all, not the same
+        // duration spent once per child. `hold_bounded` returns None on an
+        // expired deadline so the child is never spawned.
+        let Some(bound) = super::repo_store::hold_bounded(deadline, std::time::Duration::MAX)
+        else {
+            anyhow::bail!("git {} timed out", args.join(" "));
+        };
         let fut = async {
             // allow-unbounded-git: bounded by the tokio::time::timeout wrapping
             // this future in verify_recovery_prereqs_bounded, plus kill_on_drop.
@@ -188,7 +196,7 @@ pub async fn verify_recovery_prereqs_bounded(
             cmd.kill_on_drop(true);
             cmd.args(args).current_dir(repo_path).output().await
         };
-        tokio::time::timeout(timeout, fut)
+        tokio::time::timeout(bound, fut)
             .await
             .map_err(|_| anyhow::anyhow!("git {} timed out", args.join(" ")))?
             .map_err(|e| anyhow::anyhow!("git {} spawn failed: {e:#}", args.join(" ")))
@@ -197,7 +205,7 @@ pub async fn verify_recovery_prereqs_bounded(
         git_bin,
         repo_path,
         &["config", "--get", "core.logAllRefUpdates"],
-        timeout,
+        deadline,
     )
     .await?;
     let cur = String::from_utf8_lossy(&get.stdout).trim().to_string();
@@ -206,7 +214,7 @@ pub async fn verify_recovery_prereqs_bounded(
             git_bin,
             repo_path,
             &["config", "core.logAllRefUpdates", "always"],
-            timeout,
+            deadline,
         )
         .await?;
         if !out.status.success() {
@@ -217,7 +225,7 @@ pub async fn verify_recovery_prereqs_bounded(
         }
     }
     for &(key, value) in HIDDEN_REFS {
-        let current = run_git(git_bin, repo_path, &["config", "--get-all", key], timeout).await?;
+        let current = run_git(git_bin, repo_path, &["config", "--get-all", key], deadline).await?;
         let already = String::from_utf8_lossy(&current.stdout)
             .lines()
             .any(|l| l.trim() == value);
@@ -226,7 +234,7 @@ pub async fn verify_recovery_prereqs_bounded(
                 git_bin,
                 repo_path,
                 &["config", "--add", key, value],
-                timeout,
+                deadline,
             )
             .await?;
             if !out.status.success() {

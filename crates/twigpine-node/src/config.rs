@@ -532,6 +532,36 @@ pub struct Config {
     )]
     pub lock_held_transfer_timeout_secs: u64,
 
+    /// Maximum wall-clock time a `RepoWriteGuard` may hold its advisory-lock
+    /// pool connection, measured from the instant `pg_try_advisory_lock`
+    /// succeeds, in seconds. Every phase that runs while the lock is held
+    /// (the under-lock Tigris refresh, the caller's own under-lock work; for a
+    /// push, the whole `receive-pack` subprocess, clamped to the lesser of
+    /// `git_service_timeout_secs` and the remaining budget, and `release`'s
+    /// bounded upload/unlock) consumes this one deadline, so a slow or
+    /// stalled push cannot pin a lock-pool slot for the sum of every
+    /// per-phase bound (~1500s worst case before this knob existed). On
+    /// expiry the in-flight git op is torn down and the write fails rather
+    /// than publishing late. Does NOT bound the acquire-side wait for the
+    /// lock (`git_acquire_timeout_secs`), the post-git outcome bookkeeping on
+    /// the main pool, the ~2-4s the detached reaper holds the session while
+    /// the process group dies, or merge writes, which take their guards
+    /// without this deadline and run unbounded git under them. Issue writes
+    /// keep the deadline: an expired one refuses the write before the ref is
+    /// touched, and a create's git is clamped to it, but a close's git runs
+    /// unbounded once started. Must be positive and at most
+    /// `git_service_timeout_secs` (a hold bound above the git timeout can
+    /// never bind before it). Unset (the default) the effective bound is
+    /// `git_service_timeout_secs` itself (600s shipped), so every push keeps
+    /// its stated budget and lowering the git timeout lowers the hold bound
+    /// with it; set explicitly only to tighten the hold below the git budget.
+    #[arg(
+        long,
+        env = "TWIGPINE_WRITE_LOCK_HOLD_TIMEOUT_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
+    )]
+    pub write_lock_hold_timeout_secs: Option<u64>,
+
     /// Maximum time a request waits for a pool connection before failing with
     /// 503, in seconds. Bounds queueing when the database is slow or down.
     #[arg(
@@ -1180,6 +1210,16 @@ impl Config {
     /// lock-pool exhaustion on unrelated repositories.
     pub const DB_LOCK_POOL_NON_PUSH_HEADROOM: u32 = 8;
 
+    /// Effective write-lock hold bound: the explicit knob when set, else
+    /// `git_service_timeout_secs`, so an unset bound always tracks the push
+    /// budget (and a lowered git timeout lowers it too).
+    pub fn write_lock_hold_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.write_lock_hold_timeout_secs
+                .unwrap_or(self.git_service_timeout_secs),
+        )
+    }
+
     /// Cross-field boot validation. Single-field ranges are enforced by clap; this
     /// catches combinations that ship a denial-of-service under otherwise-valid
     /// values. Call once at startup and fail fast on `Err`.
@@ -1191,6 +1231,14 @@ impl Config {
     /// validated.
     pub fn validate(&mut self) -> Result<(), String> {
         self.settle_default_key_paths()?;
+        if self.model_unclaimed_ttl_secs <= self.model_session_ttl_secs {
+            return Err(format!(
+                "TWIGPINE_MODEL_UNCLAIMED_TTL_SECS ({}) must exceed \
+                 TWIGPINE_MODEL_SESSION_TTL_SECS ({}) so an in-progress upload \
+                 is never swept under its publisher",
+                self.model_unclaimed_ttl_secs, self.model_session_ttl_secs
+            ));
+        }
         // Concurrent git writes pin the dedicated lock pool for their whole
         // duration (connection-affine advisory lock in acquire_write). The main
         // pool no longer carries that occupancy.
@@ -1206,6 +1254,16 @@ impl Config {
                 self.max_concurrent_git_pushes,
                 Self::DB_LOCK_POOL_NON_PUSH_HEADROOM
             ));
+        }
+        if let Some(hold) = self.write_lock_hold_timeout_secs {
+            if hold > self.git_service_timeout_secs {
+                return Err(format!(
+                    "TWIGPINE_WRITE_LOCK_HOLD_TIMEOUT_SECS ({}) must not exceed \
+                     TWIGPINE_GIT_SERVICE_TIMEOUT_SECS ({}): a hold bound above the \
+                     git timeout can never bind before it",
+                    hold, self.git_service_timeout_secs
+                ));
+            }
         }
         if self.upstream_mirror_enabled && !self.enforce_owner_push {
             return Err(
@@ -1461,6 +1519,32 @@ mod tests {
     }
 
     #[test]
+    fn model_unclaimed_ttl_must_exceed_session_ttl() {
+        let parse = |unclaimed: &str, session: &str| {
+            let mut config = Config::parse_from([
+                "twigpine-node",
+                "--model-unclaimed-ttl-secs",
+                unclaimed,
+                "--model-session-ttl-secs",
+                session,
+            ]);
+            config.validate()
+        };
+        // Reversed and equal both let the sweep delete blocks under an open
+        // upload session.
+        let reversed = parse("30", "60").unwrap_err();
+        assert!(
+            reversed.contains("TWIGPINE_MODEL_UNCLAIMED_TTL_SECS"),
+            "{reversed}"
+        );
+        assert!(parse("60", "60").is_err());
+        assert!(parse("61", "60").is_ok());
+        // The shipped defaults satisfy the rule.
+        let mut defaults = Config::parse_from(["twigpine-node"]);
+        defaults.validate().unwrap();
+    }
+
+    #[test]
     fn upstream_mirror_worker_is_default_off_and_bounded() {
         let mut config = Config::parse_from(["twigpine-node"]);
         assert!(!config.upstream_mirror_enabled);
@@ -1538,6 +1622,89 @@ mod tests {
         // 0 is a footgun (immediate-504 on every request); clap must reject it.
         assert!(
             Config::try_parse_from(["twigpine-node", "--git-service-timeout-secs", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn write_lock_hold_timeout_defaults_to_git_budget_and_rejects_zero() {
+        let default = Config::parse_from(["twigpine-node"]);
+        assert_eq!(default.write_lock_hold_timeout_secs, None);
+        assert_eq!(
+            default.write_lock_hold_timeout(),
+            std::time::Duration::from_secs(default.git_service_timeout_secs),
+            "an unset hold bound tracks the git service budget so every push keeps its stated budget"
+        );
+        assert_eq!(
+            Config::parse_from(["twigpine-node", "--write-lock-hold-timeout-secs", "120"])
+                .write_lock_hold_timeout_secs,
+            Some(120)
+        );
+        // 0 would expire every write guard the instant its lock lands; clap
+        // must reject it rather than boot a node that can never write.
+        assert!(
+            Config::try_parse_from(["twigpine-node", "--write-lock-hold-timeout-secs", "0"])
+                .is_err()
+        );
+        // Above the 100-year ceiling every derived deadline can represent.
+        assert!(Config::try_parse_from([
+            "twigpine-node",
+            "--write-lock-hold-timeout-secs",
+            "3153600001"
+        ])
+        .is_err());
+    }
+
+    /// An unset hold bound must not turn a lowered git timeout into a boot
+    /// failure: the effective bound simply tracks the configured git budget
+    /// down with it.
+    #[test]
+    fn write_lock_hold_timeout_unset_tracks_a_lowered_git_budget() {
+        let mut config = Config::parse_from(["twigpine-node", "--git-service-timeout-secs", "120"]);
+        config
+            .validate()
+            .expect("a lowered git timeout with the hold bound unset must validate");
+        assert_eq!(
+            config.write_lock_hold_timeout(),
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    /// `validate()` rejects a hold bound above the git service timeout: such a
+    /// bound can never bind before the git op's own timeout, so accepting it
+    /// would let an operator believe a bound exists that never fires.
+    #[test]
+    fn write_lock_hold_timeout_must_not_exceed_the_git_budget() {
+        // Equality is legal: the bound fires exactly at the git timeout.
+        Config::parse_from([
+            "twigpine-node",
+            "--git-service-timeout-secs",
+            "600",
+            "--write-lock-hold-timeout-secs",
+            "600",
+        ])
+        .validate()
+        .expect("hold bound equal to the git budget must validate");
+
+        Config::parse_from([
+            "twigpine-node",
+            "--git-service-timeout-secs",
+            "600",
+            "--write-lock-hold-timeout-secs",
+            "120",
+        ])
+        .validate()
+        .expect("hold bound below the git budget must validate");
+
+        let mut over = Config::parse_from([
+            "twigpine-node",
+            "--git-service-timeout-secs",
+            "60",
+            "--write-lock-hold-timeout-secs",
+            "61",
+        ]);
+        assert!(
+            over.validate().is_err(),
+            "a hold bound above the git service timeout must be rejected at boot"
         );
     }
 
