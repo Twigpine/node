@@ -383,6 +383,9 @@ pub struct AppState {
     /// process-group teardown in handler tests without mutating the process-global
     /// PATH (#174).
     pub git_bin: String,
+    /// Content-addressed model block store. `None` unless model hosting is
+    /// enabled, so every read site must handle the flag-off shape.
+    pub block_store: Option<Arc<dyn crate::blockstore::BlockStore>>,
 }
 
 impl AppState {

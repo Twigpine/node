@@ -316,6 +316,79 @@ pub struct Config {
     #[arg(long, env = "TWIGPINE_MAX_PACK_BYTES", default_value_t = 2_147_483_648)]
     pub max_pack_bytes: usize,
 
+    /// Enable open-weight model hosting: signed release manifests on public
+    /// repos, with weights stored as content-addressed blocks outside git.
+    /// Off by default; when off the node behaves exactly as before.
+    #[arg(long, env = "TWIGPINE_MODEL_HOSTING_ENABLED", default_value_t = false)]
+    pub model_hosting_enabled: bool,
+
+    /// Per-identity storage quota for claimed model blocks, in bytes.
+    /// Default: 256 GiB, enough for a 70B-class bf16 model.
+    #[arg(
+        long,
+        env = "TWIGPINE_MODEL_QUOTA_BYTES",
+        default_value_t = 274_877_906_944
+    )]
+    pub model_quota_bytes: u64,
+
+    /// Total model bytes this node will hold, in bytes: claimed blocks plus
+    /// blocks still sitting in open upload sessions. Default: 1 TiB.
+    #[arg(
+        long,
+        env = "TWIGPINE_MODEL_NODE_QUOTA_BYTES",
+        default_value_t = 1_099_511_627_776
+    )]
+    pub model_node_quota_bytes: u64,
+
+    /// Seconds an uploaded block may sit unclaimed (referenced by no accepted
+    /// release) before the sweep deletes it. Must exceed the session TTL so an
+    /// in-progress upload is never swept under its publisher. Default: 86400.
+    #[arg(
+        long,
+        env = "TWIGPINE_MODEL_UNCLAIMED_TTL_SECS",
+        default_value_t = 86_400
+    )]
+    pub model_unclaimed_ttl_secs: u64,
+
+    /// Base lifetime of an upload session, in seconds. The expiry slides: each
+    /// accepted block renews it, so a slow upload that keeps making progress
+    /// never loses its session. Default: 43200 (12 h).
+    #[arg(
+        long,
+        env = "TWIGPINE_MODEL_SESSION_TTL_SECS",
+        default_value_t = 43_200
+    )]
+    pub model_session_ttl_secs: u64,
+
+    /// Cap, in bytes, on the sum of one identity's open upload sessions.
+    /// Unset means "use the per-identity quota".
+    #[arg(long, env = "TWIGPINE_MODEL_MAX_SESSION_BYTES")]
+    pub model_max_session_bytes: Option<u64>,
+
+    /// Directory where model content blocks are stored when the filesystem
+    /// backend is in use. Sibling of the repos directory under the node data
+    /// dir by default.
+    #[arg(
+        long,
+        env = "TWIGPINE_BLOCKSTORE_DIR",
+        default_value = "./data/model-blocks",
+        global = true
+    )]
+    pub blockstore_dir: PathBuf,
+
+    /// S3-compatible bucket for model content blocks. Empty means the
+    /// filesystem backend at TWIGPINE_BLOCKSTORE_DIR. Uses the same endpoint
+    /// and credential environment the Tigris bucket uses
+    /// (AWS_ENDPOINT_URL_S3, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY), so a
+    /// node already backed by Tigris needs only a bucket name here.
+    #[arg(
+        long,
+        env = "TWIGPINE_BLOCKSTORE_S3_BUCKET",
+        default_value = "",
+        global = true
+    )]
+    pub blockstore_s3_bucket: String,
+
     /// Per-client-IP rate limit for `POST /api/v1/sync/trigger`, in requests per
     /// hour. `/sync/trigger` requires a signature and drives an O(peers) outbound
     /// fan-out per call, so it gets a tight bucket. `0` disables. Default: 60.
@@ -1066,6 +1139,14 @@ impl Config {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// Effective cap on the sum of one identity's open model upload sessions:
+    /// the explicit cap when set, else the per-identity quota (open sessions
+    /// may never exceed what the identity could claim).
+    pub fn effective_model_max_session_bytes(&self) -> u64 {
+        self.model_max_session_bytes
+            .unwrap_or(self.model_quota_bytes)
+    }
+
     /// Resolve ~ in key_path
     pub fn resolved_key_path(&self) -> PathBuf {
         if !self.key_path_given {
@@ -1134,6 +1215,14 @@ impl Config {
     /// validated.
     pub fn validate(&mut self) -> Result<(), String> {
         self.settle_default_key_paths()?;
+        if self.model_unclaimed_ttl_secs <= self.model_session_ttl_secs {
+            return Err(format!(
+                "TWIGPINE_MODEL_UNCLAIMED_TTL_SECS ({}) must exceed \
+                 TWIGPINE_MODEL_SESSION_TTL_SECS ({}) so an in-progress upload \
+                 is never swept under its publisher",
+                self.model_unclaimed_ttl_secs, self.model_session_ttl_secs
+            ));
+        }
         // Concurrent git writes pin the dedicated lock pool for their whole
         // duration (connection-affine advisory lock in acquire_write). The main
         // pool no longer carries that occupancy.
@@ -1365,6 +1454,79 @@ pub(crate) fn validate_web_url(raw: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_hosting_is_off_by_default_with_expected_budgets() {
+        let config = Config::parse_from(["twigpine-node"]);
+        assert!(!config.model_hosting_enabled);
+        assert_eq!(config.model_quota_bytes, 256 << 30);
+        assert_eq!(config.model_node_quota_bytes, 1 << 40);
+        assert_eq!(config.model_unclaimed_ttl_secs, 86_400);
+        assert_eq!(config.model_session_ttl_secs, 43_200);
+        assert_eq!(config.model_max_session_bytes, None);
+        assert_eq!(
+            config.effective_model_max_session_bytes(),
+            config.model_quota_bytes
+        );
+        assert_eq!(config.blockstore_dir, PathBuf::from("./data/model-blocks"));
+        assert_eq!(config.blockstore_s3_bucket, "");
+    }
+
+    #[test]
+    fn model_hosting_flags_parse() {
+        let config = Config::parse_from([
+            "twigpine-node",
+            "--model-hosting-enabled",
+            "--model-quota-bytes",
+            "1024",
+            "--model-node-quota-bytes",
+            "4096",
+            "--model-unclaimed-ttl-secs",
+            "60",
+            "--model-session-ttl-secs",
+            "30",
+            "--model-max-session-bytes",
+            "2048",
+            "--blockstore-dir",
+            "/var/lib/node/blocks",
+            "--blockstore-s3-bucket",
+            "model-blocks",
+        ]);
+        assert!(config.model_hosting_enabled);
+        assert_eq!(config.model_quota_bytes, 1024);
+        assert_eq!(config.model_node_quota_bytes, 4096);
+        assert_eq!(config.model_unclaimed_ttl_secs, 60);
+        assert_eq!(config.model_session_ttl_secs, 30);
+        assert_eq!(config.effective_model_max_session_bytes(), 2048);
+        assert_eq!(config.blockstore_dir, PathBuf::from("/var/lib/node/blocks"));
+        assert_eq!(config.blockstore_s3_bucket, "model-blocks");
+    }
+
+    #[test]
+    fn model_unclaimed_ttl_must_exceed_session_ttl() {
+        let parse = |unclaimed: &str, session: &str| {
+            let mut config = Config::parse_from([
+                "twigpine-node",
+                "--model-unclaimed-ttl-secs",
+                unclaimed,
+                "--model-session-ttl-secs",
+                session,
+            ]);
+            config.validate()
+        };
+        // Reversed and equal both let the sweep delete blocks under an open
+        // upload session.
+        let reversed = parse("30", "60").unwrap_err();
+        assert!(
+            reversed.contains("TWIGPINE_MODEL_UNCLAIMED_TTL_SECS"),
+            "{reversed}"
+        );
+        assert!(parse("60", "60").is_err());
+        assert!(parse("61", "60").is_ok());
+        // The shipped defaults satisfy the rule.
+        let mut defaults = Config::parse_from(["twigpine-node"]);
+        defaults.validate().unwrap();
+    }
 
     #[test]
     fn upstream_mirror_worker_is_default_off_and_bounded() {
