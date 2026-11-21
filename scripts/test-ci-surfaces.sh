@@ -56,7 +56,7 @@ check "empty input" "$(map)" "${nothing[@]}"
 
 # A crate change tests that crate and its reverse deps, nothing else.
 check "twigpine source" "$(map crates/twigpine-cli/src/main.rs)" \
-  rust=true 'rust_packages=-p twigpine-cli' windows=true 'windows_packages=-p twigpine-cli' \
+  rust=true 'rust_packages=-p twigpine-cli -p twigpine-node' windows=true 'windows_packages=-p twigpine-cli' \
   docker=false audit=false "$rust_only"
 out="$(map crates/twigpine-core/src/lib.rs)"
 check "twigpine-core source" "$out" rust=true windows=true \
@@ -64,7 +64,7 @@ check "twigpine-core source" "$out" rust=true windows=true \
 has_packages "twigpine-core fan-out" "$out" twigpine-core icaptcha-client \
   twigpine-attest git-remote-twigpine twigpine-cli twigpine-node
 check "icaptcha-client source" "$(map crates/icaptcha-client/src/lib.rs)" \
-  'rust_packages=-p icaptcha-client -p twigpine-cli' 'windows_packages=-p twigpine-cli'
+  'rust_packages=-p icaptcha-client -p twigpine-cli -p twigpine-node' 'windows_packages=-p twigpine-cli'
 
 # Anything the Rust surface cannot attribute to known crates widens.
 check "unknown crate dir" "$(map crates/no-such-crate/src/lib.rs)" \
@@ -81,7 +81,7 @@ check "bootstrap-peers.json" "$(map bootstrap-peers.json)" \
 # One must-not-skip trigger per non-Rust row.
 check "Dockerfile" "$(map Dockerfile)" docker=true rust=false
 check "crate manifest" "$(map crates/twigpine-cli/Cargo.toml)" \
-  docker=true release_versioning=true 'rust_packages=-p twigpine-cli'
+  docker=true release_versioning=true 'rust_packages=-p twigpine-cli -p twigpine-node'
 check "audit config" "$(map .cargo/audit.toml)" audit=true rust_packages=--workspace
 check "core allowlist" "$(map ci/twigpine-core-allowed-deps.txt)" core_deps=true rust=false
 check "release-please config" "$(map release-please-config.json)" \
@@ -103,7 +103,7 @@ check "--all" "$("$mapper" --all </dev/null)" "${everything[@]}" "$all_languages
 # Names git C-quotes without -z (non-ASCII, tab, quote, newline) still map.
 for name in $'\xc3\xa9.rs' $'a\tb.rs' 'a"b.rs' $'a\nb.rs'; do
   check "quoted name $(printf %q "$name")" "$(map "crates/twigpine-cli/src/$name")" \
-    rust=true 'rust_packages=-p twigpine-cli'
+    rust=true 'rust_packages=-p twigpine-cli -p twigpine-node'
 done
 check "non-ASCII swift" "$(map $'macos-app/Sources/Caf\xc3\xa9.swift')" codeql=true \
   'codeql_matrix={"include":[{"language":"swift","build-mode":"autobuild","runner":"macos-latest"}]}'

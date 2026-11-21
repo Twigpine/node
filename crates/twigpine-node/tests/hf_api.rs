@@ -649,6 +649,79 @@ async fn master_default_branch_serves_hf_main(pool: sqlx::PgPool) {
     node.shutdown().await;
 }
 
+/// With releases on two branches, model info, `revision/main` and `refs`
+/// all name the newest release on `main`, not the repo-wide newest, so a
+/// `huggingface_hub` client sees one commit on every surface.
+#[sqlx::test]
+async fn model_info_follows_main_not_repo_wide_newest(pool: sqlx::PgPool) {
+    let node = spawn_node(pool.clone()).await;
+    let client = bounded_client();
+    let (owner, signing) = owner_with_signing(25);
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "m", true).await;
+    let on_main = seed_release(
+        &node,
+        &pool,
+        &owner_did,
+        &signing,
+        &repo_id,
+        "m",
+        &[("config.json", GIT_FILE)],
+        &[],
+        "main",
+    )
+    .await;
+    let dir_main: (String,) = sqlx::query_as("SELECT disk_path FROM repos WHERE id = $1")
+        .bind(&repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // A later release on another branch gets the higher row id.
+    let on_dev = seed_release(
+        &node,
+        &pool,
+        &owner_did,
+        &signing,
+        &repo_id,
+        "m",
+        &[("config.json", GIT_FILE), ("extra.json", GIT_FILE)],
+        &[],
+        "dev",
+    )
+    .await;
+    assert_ne!(on_main.commit, on_dev.commit);
+    // Serve both commits from the one on-disk repo.
+    let dir_dev: (String,) = sqlx::query_as("SELECT disk_path FROM repos WHERE id = $1")
+        .bind(&repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    run_git(
+        std::path::Path::new(&dir_dev.0),
+        &["fetch", "-q", &dir_main.0, "main"],
+    );
+
+    for path in [
+        info_path(&owner_did, "m"),
+        rev_path(&owner_did, "m", "main"),
+        refs_path(&owner_did, "m"),
+    ] {
+        let resp = client
+            .get(format!("{}{}", node.base_url, path))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status().as_u16(), 200, "{path}");
+        let v: Value = resp.json().await.unwrap();
+        let sha = v["sha"]
+            .as_str()
+            .or_else(|| v["branches"][0]["targetCommit"].as_str());
+        assert_eq!(sha, Some(on_main.commit.as_str()), "{path} must follow main");
+    }
+
+    node.shutdown().await;
+}
+
 /// A plain git commit after the release does not move HF `main`: refs and
 /// model info still name the release commit.
 #[sqlx::test]

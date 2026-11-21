@@ -7,9 +7,10 @@
 //!   GET  /hf/api/models/{owner}/{repo}/refs            branch refs
 //!   HEAD|GET /hf/{owner}/{repo}/resolve/{rev}/{*path}  file bytes
 //!
-//! Metadata comes from the newest published release row and its manifest,
-//! never from arbitrary git history: a plain push after a release does not
-//! move HF `main`. Publicity is checked before any release lookup, so a
+//! Metadata comes from published release rows and their manifests, never
+//! from arbitrary git history: a plain push after a release does not move
+//! HF `main`. Model info, `refs` and `revision/main` all name the same
+//! default release: the newest on `main`, then on the git default branch. Publicity is checked before any release lookup, so a
 //! private, mirrored, or rule-bearing repo answers the same 404 as a
 //! missing one and releases never leak existence.
 //!
@@ -246,9 +247,9 @@ fn tree_entries(manifest: &Manifest, prefix: &str) -> Vec<serde_json::Value> {
     out
 }
 
-/// `GET /hf/api/models/{owner}/{repo}`, model info for the newest
-/// published release (`sha` is the release commit, `siblings` the manifest
-/// file list).
+/// `GET /hf/api/models/{owner}/{repo}`, model info for the default release,
+/// the same one `refs` and `revision/main` name (`sha` is the release
+/// commit, `siblings` the manifest file list).
 pub async fn hf_model_info(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
@@ -258,7 +259,7 @@ pub async fn hf_model_info(
     let caller = caller_did(&auth);
     let (record, rules) = authorize_repo_read(&state, &owner, &name, caller, "/").await?;
     require_fully_public_404(&record, &rules, &owner, &name)?;
-    let Some(release) = state.db.model_release_newest(&record.id).await? else {
+    let Some(release) = release_for_rev(&state, &record, "main").await? else {
         return Ok(hf_deny(StatusCode::NOT_FOUND, "RepoNotFound"));
     };
     let manifest = load_manifest(&state, &record, &release).await?;
