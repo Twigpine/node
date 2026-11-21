@@ -638,6 +638,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/commits",
             get(repos::list_commits),
         )
+        .route("/api/v1/repos/{owner}/{repo}/tags", get(repos::list_tags))
         .route(
             "/api/v1/repos/{owner}/{repo}/tree",
             get(repos::get_tree_root),

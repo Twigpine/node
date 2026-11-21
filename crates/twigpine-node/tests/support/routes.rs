@@ -578,6 +578,18 @@ pub fn deny_bearing_routes() -> &'static [Row] {
         },
         Row {
             method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/tags",
+            gate: GateClass::ReadGate,
+            handler: "repos::list_tags",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
             path: "/api/v1/repos/{owner}/{repo}/tree",
             gate: GateClass::ReadGate,
             handler: "repos::get_tree_root",

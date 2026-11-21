@@ -341,6 +341,7 @@ GET /api/v1/stats
 GET /api/v1/contracts
 GET /api/v1/repos
 GET /api/v1/repos/{owner}/{repo}
+GET /api/v1/repos/{owner}/{repo}/tags
 GET /api/v1/repos/{owner}/{repo}/tree
 GET /api/v1/repos/{owner}/{repo}/blob/{path}
 GET /api/v1/repos/{owner}/{repo}/issues
@@ -356,6 +357,7 @@ Signed write routes include:
 POST /api/v1/repos
 POST /api/register
 POST /api/v1/repos/{owner}/{repo}/fork
+PUT /api/v1/repos/{owner}/{repo}/homepage
 POST /api/v1/repos/{owner}/{repo}/issues
 POST /api/v1/repos/{owner}/{repo}/pulls
 POST /api/v1/repos/{owner}/{repo}/pulls/{number}/merge

@@ -1042,8 +1042,6 @@ fn head_is_genuinely_absent_bounded(
 /// means the head ref is genuinely absent (an unborn branch); a head that is
 /// present but unreadable is an error, as in [`log`] (#400). Both later steps of a
 /// paged read use the returned id, so a push between them cannot shift the page.
-// Called by the commits handler, which lands in a later change.
-#[allow(dead_code)]
 pub fn resolve_head_id_bounded(
     git_bin: &str,
     repo_path: &Path,
@@ -1156,8 +1154,6 @@ impl<'a> PositionScan<'a> {
 /// git. The output is read as it arrives and the child is killed as soon as the
 /// id is found, so memory stays at one chunk however long the history is; a
 /// history that never contains the id is read to its end or to `deadline`.
-// Called by the commits handler, which lands in a later change.
-#[allow(dead_code)]
 pub fn commit_position_bounded(
     git_bin: &str,
     repo_path: &Path,
@@ -1199,8 +1195,6 @@ pub fn commit_position_bounded(
 /// One page of commits reachable from `head_id`: skip `skip`, then take `limit`.
 /// `head_id` is an id from [`resolve_head_id_bounded`], so a failing `git log` is a
 /// read failure and never an empty page; the absent-ref case was settled there.
-// Called by the commits handler, which lands in a later change.
-#[allow(dead_code)]
 pub fn log_bounded(
     git_bin: &str,
     repo_path: &Path,
@@ -1230,6 +1224,76 @@ pub fn log_bounded(
         );
     }
     Ok(parse_log_output(&out))
+}
+
+/// One row of a tag listing. `target` and `target_type` are what the tag points
+/// at: for an annotated tag, the object the tag object names (one level, as
+/// `for-each-ref` peels it, so a tag of a tag reports the inner tag object with
+/// type `tag`), not the tag object itself.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagInfo {
+    pub name: String,
+    pub target: String,
+    pub target_type: String,
+    pub annotated: bool,
+}
+
+/// List up to `max` tags, newest version first by tag name, and whether more
+/// exist. One bounded `for-each-ref` child; it is asked for `max + 1` rows so the
+/// extra one only sets the flag. `version:refname` sorts on names alone, so the
+/// cost does not grow with tag-object reads. Tags on trees and blobs are listed
+/// with their type and never dereferenced. A name that is not UTF-8 cannot be
+/// carried in JSON and is left out. A ref whose object is missing makes git fail,
+/// which is an error here rather than a listing without that tag.
+pub fn list_tags_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    max: usize,
+    deadline: std::time::Instant,
+) -> Result<(Vec<TagInfo>, bool)> {
+    let out = crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &[
+            "for-each-ref",
+            "--sort=-version:refname",
+            &format!("--count={}", max + 1),
+            "--format=%(refname:strip=2)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)",
+            "refs/tags",
+        ],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    let mut records: Vec<&[u8]> = out
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
+    let truncated = records.len() > max;
+    records.truncate(max);
+    let mut tags = Vec::with_capacity(records.len());
+    for record in records {
+        let fields: Vec<&[u8]> = record.split(|b| *b == 0).collect();
+        let [name, object, object_type, peeled, peeled_type] = fields[..] else {
+            bail!("git for-each-ref printed an unexpected tag record");
+        };
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let annotated = !peeled.is_empty();
+        let (target, target_type) = if annotated {
+            (text(peeled), text(peeled_type))
+        } else {
+            (text(object), text(object_type))
+        };
+        tags.push(TagInfo {
+            name: name.to_string(),
+            target,
+            target_type,
+            annotated,
+        });
+    }
+    Ok((tags, truncated))
 }
 
 /// List files in a tree at the given ref and path.
