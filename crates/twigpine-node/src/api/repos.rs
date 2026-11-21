@@ -3007,10 +3007,46 @@ pub async fn git_receive_pack(
         }
         Ok(Ok(g)) => g,
     };
+    // The guard stamps its lock-hold deadline at lock-take inside
+    // acquire_write. Every phase that runs while the lock is held consumes
+    // the remaining budget of that one instant, recomputed at each clamp
+    // rather than carried as a duration that silently ages: a slow push is
+    // cut at the deadline, so it cannot pin its lock-pool slot for the sum
+    // of every per-phase bound (#282).
+    let lock_hold_deadline = guard
+        .lock_hold_deadline()
+        .expect("acquire_write stamps a lock-hold deadline");
+    let git_service_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    // `timeout(0, drive_git_child)` would still spawn git on its first poll,
+    // so an expired deadline sheds here rather than racing inside the bound.
+    // Shed as a git timeout, matching what a mid-git deadline expiry returns.
+    // The shed must precede `guard.path()`: taking the path declares the
+    // tree handed out, and a dropped guard would quarantine a tree no phase
+    // ever touched.
+    let Some(git_timeout) =
+        crate::git::repo_store::hold_bounded(lock_hold_deadline, git_service_timeout)
+    else {
+        // Free the lock and its pool slot before the refusal's DB round trip:
+        // the refusal does not need the lock, and every other pre-git refusal
+        // runs with none held.
+        let _ = guard.release(false).await;
+        if let Err(e) = state
+            .db
+            .refuse_receive_pack_before_git(
+                &request_id,
+                "write-lock hold deadline expired before git",
+            )
+            .await
+        {
+            tracing::warn!(err = %e, request_id = %request_id, "pre-git refusal cleanup failed");
+        }
+        return Err(AppError::Timeout(
+            "write-lock hold deadline expired before git could start".into(),
+        ));
+    };
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
-    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     // Recovery upgrade invariant (best-effort): before the first
     // durable intent or marker relies on reflogs/hidden refs,
     // idempotently enable them for new and upgraded repos. Failures
@@ -3022,11 +3058,17 @@ pub async fn git_receive_pack(
     // Bounded through the configured git binary: the unbounded
     // synchronous variant would run several `git config` children with
     // no timeout while holding both admission permits, the lease, and
-    // the repo write lock.
+    // the repo write lock. The bound is an Instant, not a duration: the
+    // helper runs several children, and one shared deadline stops a slow
+    // sequence from spending the budget several times over.
     if let Err(e) = crate::git::store::verify_recovery_prereqs_bounded(
         &state.git_bin,
         &disk_path,
-        std::time::Duration::from_secs(10),
+        crate::git::repo_store::hold_deadline(
+            lock_hold_deadline,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap_or_else(std::time::Instant::now),
     )
     .await
     {
@@ -3080,39 +3122,50 @@ pub async fn git_receive_pack(
     // marker through the bounded runners using the configured git binary:
     // both hold admission permits, the lease, and the write lock, so an
     // unbounded `hash-object` could pin them all on a hung child.
-    match crate::git::store::marker_value_for_bounded(
-        &state.git_bin,
-        &disk_path,
-        &req_row.request_bytes_hash,
-        std::time::Duration::from_secs(10),
-    )
-    .await
+    // `hold_bounded` returns None on an expired deadline, which skips the
+    // call outright rather than letting `timeout(0)` spawn the child once.
+    if let Some(marker_value_bound) =
+        crate::git::repo_store::hold_bounded(lock_hold_deadline, std::time::Duration::from_secs(10))
     {
-        Ok(marker_value) => {
-            if let Err(e) = crate::git::store::write_marker_bounded(
-                &state.git_bin,
-                &disk_path,
-                &request_id,
-                &marker_value,
-                std::time::Duration::from_secs(10),
-            )
-            .await
-            {
+        match crate::git::store::marker_value_for_bounded(
+            &state.git_bin,
+            &disk_path,
+            &req_row.request_bytes_hash,
+            marker_value_bound,
+        )
+        .await
+        {
+            Ok(marker_value) => {
+                if let Some(marker_write_bound) = crate::git::repo_store::hold_bounded(
+                    lock_hold_deadline,
+                    std::time::Duration::from_secs(10),
+                ) {
+                    if let Err(e) = crate::git::store::write_marker_bounded(
+                        &state.git_bin,
+                        &disk_path,
+                        &request_id,
+                        &marker_value,
+                        marker_write_bound,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            err = %e,
+                            request_id = %request_id,
+                            repo = %name,
+                            "bounded marker write failed; reconcile will quarantine this request"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
                 tracing::warn!(
                     err = %e,
                     request_id = %request_id,
                     repo = %name,
-                    "bounded marker write failed; reconcile will quarantine this request"
+                    "marker value computation failed; reconcile will quarantine this request"
                 );
             }
-        }
-        Err(e) => {
-            tracing::warn!(
-                err = %e,
-                request_id = %request_id,
-                repo = %name,
-                "marker value computation failed; reconcile will quarantine this request"
-            );
         }
     }
 
@@ -3135,12 +3188,49 @@ pub async fn git_receive_pack(
     // guard then marks children uncertain and terminalizes the parent, which
     // the mark_uncertain path below cannot do on a drop — it never runs, and
     // the detached reaper does process teardown only, no DB writes.
+    // Re-clamp at the call: the prereq and marker phases above spent the
+    // same shared deadline, and a bound stamped before them would let
+    // receive-pack overshoot it by whatever they took. `hold_bounded` is
+    // also the zero check: an expired deadline sheds as a git timeout
+    // instead of spawning a receive-pack that is killed on the first poll.
+    let Some(run_bound) = crate::git::repo_store::hold_bounded(lock_hold_deadline, git_timeout)
+    else {
+        // No git child exists yet, so the admission bundle has nothing to
+        // reap: drop it, reclaim the guard and release it before the refusal's
+        // DB round trip, so the lock and its pool slot do not outlive the
+        // deadline. `release(false)` classifies the tree itself (receive-pack
+        // never ran on it), so this future's settlement copy is disarmed
+        // rather than left to quarantine an untouched tree on drop.
+        drop(admission);
+        let reclaimed = guard
+            .lock()
+            .expect("repo write-lock mutex poisoned")
+            .take()
+            .expect("the write lock is only taken here, and only once");
+        let _ = reclaimed.release(false).await;
+        if let Some(settlement) = settlement.as_mut() {
+            settlement.disarm();
+        }
+        if let Err(e) = state
+            .db
+            .refuse_receive_pack_before_git(
+                &request_id,
+                "write-lock hold deadline expired before git",
+            )
+            .await
+        {
+            tracing::warn!(err = %e, request_id = %request_id, "pre-git refusal cleanup failed");
+        }
+        return Err(AppError::Timeout(
+            "write-lock hold deadline expired before git could start".into(),
+        ));
+    };
     _intent_guard.notify_git_started();
     let (receive_raw, exit_ok) = match smart_http::receive_pack_raw_with_reflog(
         &state.git_bin,
         &disk_path,
         body,
-        git_timeout,
+        run_bound,
         Some(admission),
         Some(&reflog_action),
     )
@@ -19416,6 +19506,496 @@ exit 0
             matches!(res, Err(crate::error::AppError::Git(_))),
             "a damaged ref must surface as a git error, not an empty listing"
         );
+    }
+    /// #282 REPRO (RED on main): a push's write guard pins one dedicated
+    /// lock-pool connection for the WHOLE op: taken at `acquire_write`, held
+    /// across `smart_http::receive_pack` under `git_service_timeout_secs`
+    /// (default 600), released only at `release`'s upload tail, with no
+    /// hold-time bound of its own. A saturated pool then starves every other
+    /// repo's `acquire_write`, not just the slow pusher's.
+    ///
+    /// A one-connection lock pool stands in for "the dedicated pool is full":
+    /// one held guard is the smallest case of the flood the issue scales to
+    /// pool size. The shim sleeps on `receive-pack` alone (a slow-but-legit
+    /// push; prereq and marker children stay real and fast), so the held
+    /// window is the git phase itself. The probe asserts the desired
+    /// behaviour (an unrelated write is served while the slow push still
+    /// runs) and goes RED on main, which is the defect.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn repro_282_slow_push_lock_hold_starves_unrelated_writes(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let lock_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .expect("size-1 lock pool on the test database");
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(repos_dir, lock_pool.clone())
+                .with_lock_hold_timeout(std::time::Duration::from_secs(2));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let shim_dir = tempfile::TempDir::new().unwrap();
+        let marker = shim_dir.path().join("receive-pack-started");
+        state.git_bin = write_fake_git(
+            shim_dir.path(),
+            &format!(
+                "#!/bin/sh\ncase \" $*\" in *receive-pack*) : > \"{}\"; sleep 15;; esac\nexec git \"$@\"\n",
+                marker.display()
+            ),
+        );
+
+        let owner_a = "z6hold282a".to_string();
+        let name_a = "slowrepo";
+        let owner_b = "z6hold282b".to_string();
+        let name_b = "otherrepo";
+        let mut repo_a_id = String::new();
+        for (owner, name) in [(&owner_a, name_a), (&owner_b, name_b)] {
+            state
+                .db
+                .upsert_mirror_repo(owner, name, &format!("/unused/{owner}/{name}"), None, false)
+                .await
+                .unwrap();
+            let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+            state
+                .repo_store
+                .init(&rec.owner_did, &rec.name)
+                .await
+                .unwrap();
+            if name == name_a {
+                repo_a_id = rec.id.clone();
+            }
+        }
+
+        let state_a = state.clone();
+        let owner_push = owner_a.clone();
+        let push = tokio::spawn(async move {
+            git_receive_pack(
+                State(state_a),
+                Path((owner_push.clone(), name_a.to_string())),
+                Extension(crate::auth::AuthenticatedDid(format!(
+                    "did:key:{owner_push}"
+                ))),
+                None,
+                crate::rate_limit::PeerAddr(Some(
+                    "203.0.113.77:5000".parse::<SocketAddr>().unwrap(),
+                )),
+                axum::http::HeaderMap::new(),
+                ref_update_body(&"a".repeat(40)),
+            )
+            .await
+        });
+
+        // The push must reach its git phase (the only lock-pool connection
+        // pinned) before the unrelated write is probed.
+        let pin_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lock_pool.num_idle() != 0 {
+            if push.is_finished() {
+                let r = push.await;
+                panic!("push returned before pinning the lock pool: {r:?}");
+            }
+            assert!(
+                std::time::Instant::now() < pin_deadline,
+                "push never pinned the lock pool"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // The pin alone does not prove the git phase: `acquire_write` checks
+        // the connection out before the advisory lock is even attempted, so
+        // an early-dead push would free the slot without the bound ever
+        // firing and the probe below would pass vacuously. Wait for the
+        // shim's own receive-pack marker so the starved write is only probed
+        // while the push is genuinely sleeping inside git.
+        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            if push.is_finished() {
+                let r = push.await;
+                panic!("push returned before reaching its git phase: {r:?}");
+            }
+            assert!(
+                std::time::Instant::now() < marker_deadline,
+                "push never reached git receive-pack"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // The hold bound (2s) plus process-group reap (~4s cap) frees the
+        // slot well inside this window; the shim's own 15s sleep is what the
+        // bound is racing, so a window shorter than the sleep proves the
+        // bound, not the sleep's end, freed the slot.
+        let starved = tokio::time::timeout(
+            std::time::Duration::from_secs(9),
+            state.repo_store.acquire_write(&owner_b, name_b),
+        )
+        .await;
+        let served = matches!(&starved, Ok(Ok(_)));
+        assert!(
+            served,
+            "#282: an unrelated repo's acquire_write must be served once the \
+             slow push's lock-hold deadline passes (still pending after 9s of \
+             a 15s git sleep with a 2s hold bound)"
+        );
+        let push_result = push.await.expect("push task");
+        assert!(
+            push_result.is_err(),
+            "a push cut by its lock-hold deadline must fail, not report success"
+        );
+
+        // A push cut mid-git cannot prove its refs did not land, so the
+        // intent children must go reconcile-owned `uncertain` (or stay
+        // `prepared` for startup reconcile), never terminal `cancelled`.
+        let states: Vec<(String,)> =
+            sqlx::query_as("SELECT state FROM pending_ref_transitions WHERE repo_id = $1")
+                .bind(&repo_a_id)
+                .fetch_all(&pool)
+                .await
+                .expect("pending_ref_transitions rows for repo A");
+        assert!(
+            !states.is_empty(),
+            "the push carried one ref update, so an intent child must exist"
+        );
+        for (state_str,) in &states {
+            assert!(
+                state_str == crate::db::pending_state::UNCERTAIN
+                    || state_str == crate::db::pending_state::PREPARED,
+                "a deadline-cut push's outcome rows must stay reconcile-owned, got {state_str}"
+            );
+        }
+    }
+
+    /// #282, the other half of the bound: it must never free the lock EARLY.
+    /// When the hold deadline ends a push the existing git-timeout machinery
+    /// tears the process group down, and the reaper-carried guard keeps the
+    /// advisory lock until the group is confirmed gone, the same invariant
+    /// `receive_pack_disconnect_holds_the_write_lock_until_the_group_is_reaped`
+    /// pins for the disconnect path, here driven by the deadline instead.
+    ///
+    /// A fake git whose descendant ignores SIGTERM widens the teardown window:
+    /// after the handler's `git_timeout` clamp fires, the group survives the
+    /// reaper's SIGTERM grace and dies only on the SIGKILL escalation. The lock
+    /// probed from an independent session must stay untakeable the whole time
+    /// the descendant lives, and must be takeable once it is gone.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_lock_hold_deadline_keeps_the_lock_until_the_group_is_reaped(
+        pool: sqlx::PgPool,
+    ) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6deadline";
+        let name = "dl1";
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descfile = tmp.path().join("desc.pid");
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in receive-pack)\n\
+             sh -c 'trap \"\" TERM; echo $$ > \"{}\"; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done' &\n\
+             wait; exit 0 ;;\n\
+             esac\n\
+             exec git \"$@\"\n",
+            descfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            None,
+            crate::git::repo_store::build_lock_pool(&pool, 4, std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(300),
+        )
+        .with_lock_hold_timeout(std::time::Duration::from_secs(2));
+        let mut cfg = (*state.config).clone();
+        // Long enough that the service timeout is never what ends this push;
+        // the lock-hold deadline is.
+        cfg.git_service_timeout_secs = 600;
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6deadline-dl1", None, false)
+            .await
+            .unwrap();
+
+        use crate::git::repo_store::advisory_lock_key;
+        let key = advisory_lock_key(&owner.replace([':', '/'], "_"), name);
+        let probe = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with((*pool.connect_options()).clone());
+
+        assert!(
+            write_lock_is_takeable(&probe, key).await,
+            "the write lock must be free before the push"
+        );
+
+        // Same spawn-retry shape as the disconnect test: a freshly written
+        // fake `git` can transiently fail to exec under fork-storm load, and a
+        // losing attempt's future is dropped, which cleans up after itself.
+        const SPAWN_ATTEMPTS: u64 = 12;
+        let (mut fut, desc) = {
+            let mut attempt = 0u64;
+            loop {
+                attempt += 1;
+                let _ = std::fs::remove_file(&descfile);
+                let mut fut = Box::pin(git_receive_pack(
+                    State(state.clone()),
+                    Path((owner.to_string(), name.to_string())),
+                    Extension(crate::auth::AuthenticatedDid(
+                        "did:key:z6deadline".to_string(),
+                    )),
+                    None,
+                    crate::rate_limit::PeerAddr(Some(
+                        "203.0.113.82:5000".parse::<SocketAddr>().unwrap(),
+                    )),
+                    axum::http::HeaderMap::new(),
+                    axum::body::Bytes::from_static(b"0000"),
+                ));
+                let mut found: Option<i32> = None;
+                for _ in 0..500 {
+                    let finished =
+                        tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut)
+                            .await
+                            .is_ok();
+                    if let Some(p) = std::fs::read_to_string(&descfile)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                    {
+                        found = Some(p);
+                        break;
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+                match found {
+                    Some(p) => break (fut, p),
+                    None => {
+                        drop(fut);
+                        assert!(
+                            attempt < SPAWN_ATTEMPTS,
+                            "the push never reached receive-pack after {SPAWN_ATTEMPTS} \
+                             attempts (persistent failure, not a transient runner miss)"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+                    }
+                }
+            }
+        };
+        let _cleanup = KillOnPanic(vec![desc]);
+        assert!(
+            pid_alive(desc),
+            "the receive-pack group must be running when the deadline fires"
+        );
+
+        // The 2s hold deadline ends the push. On the timeout path the future
+        // stays pending while `reap_group_on_timeout` gives the group its
+        // SIGTERM grace and then SIGKILLs: the SIGTERM-ignoring descendant
+        // lives through that whole window, and the write lock (carried by the
+        // guard inside the admission bundle) must stay untakeable for all of
+        // it. A bound that freed early would show up here as takeable while
+        // the group is still on the repo.
+        let mut takeable_while_group_alive = false;
+        let mut saw_live_group_window = false;
+        let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let result = loop {
+            let takeable = write_lock_is_takeable(&probe, key).await;
+            let group_alive = pid_alive(desc);
+            if group_alive {
+                saw_live_group_window = true;
+            }
+            if takeable && group_alive {
+                takeable_while_group_alive = true;
+            }
+            if let Ok(done) =
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await
+            {
+                break done;
+            }
+            assert!(
+                std::time::Instant::now() < poll_deadline,
+                "the deadline-cut push never returned within 20s"
+            );
+        };
+        // The group must already be gone when the push returns: the poll
+        // loop above only samples before each poll, so a release that landed
+        // inside the final poll would otherwise be hidden by the SIGKILL below.
+        let group_alive_at_return = pid_alive(desc);
+        // Clean up regardless so a failure leaves no orphan behind.
+        // SAFETY: kill(2) takes integers only.
+        unsafe {
+            libc::kill(desc, libc::SIGKILL);
+        }
+        assert!(
+            !group_alive_at_return,
+            "the receive-pack group must be gone when the deadline-cut push returns; \
+             the write lock was released while the descendant was still alive"
+        );
+        assert!(
+            result.is_err(),
+            "a push cut by its lock-hold deadline must fail, not report success"
+        );
+        assert!(
+            saw_live_group_window,
+            "the SIGTERM-ignoring descendant should outlive part of teardown; \
+             without that the early-free check below observed nothing"
+        );
+        assert!(
+            !takeable_while_group_alive,
+            "the repo write lock was takeable while the deadline-cut push's \
+             receive-pack group was still alive: the hold bound must never \
+             free the lock early (#282)"
+        );
+        // Postgres frees the advisory lock when it notices the closed session,
+        // which trails the connection drop by a scheduler's tick: poll rather
+        // than probe once, so a loaded database cannot make this flap.
+        let free_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !write_lock_is_takeable(&probe, key).await {
+            assert!(
+                std::time::Instant::now() < free_deadline,
+                "once the deadline-cut push's group is reaped the write lock must \
+                 be free for the next writer"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// #282, the shed that lands after the tree was handed out. When the
+    /// pre-git phases (recovery prereqs, marker) spend the whole lock-hold
+    /// deadline, the handler sheds just before receive-pack would start. By
+    /// then `guard.path()` has declared the tree handed out and the settlement
+    /// token sits in this future, so a bare return would drop it at stage
+    /// `Idle` and quarantine a tree git never ran on, and would hold the lock
+    /// across the refusal's DB call. The shed must release the guard and
+    /// disarm the settlement first.
+    ///
+    /// A real (mock) object store is configured so the stage starts `Idle`;
+    /// with no backend it starts `NoBackend` and settlement never quarantines.
+    ///
+    /// MUTATION (RED): drop the teardown (release and disarm) from the second
+    /// shed and the quarantine-marker assertion fails.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_deadline_shed_after_path_handout_releases_and_does_not_quarantine(
+        pool: sqlx::PgPool,
+    ) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let owner = "z6shedtwo";
+        let name = "shed2";
+        let mock = crate::git::repo_store::tests::S3Mock::start().await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sentinel = tmp.path().join("receive-pack-ran");
+        // Every pre-git child (prereq `config`, marker `hash-object` and
+        // `update-ref`) hangs past the hold deadline and is cut by it; only
+        // `receive-pack` would leave the sentinel behind.
+        let git_bin = write_fake_git(
+            tmp.path(),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in receive-pack) : > \"{}\"; exit 0 ;; esac\nexec sleep 30\n",
+                sentinel.display()
+            ),
+        );
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing_with_tigris(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+            crate::git::repo_store::tests::mock_tigris(&mock),
+        )
+        .with_lock_hold_timeout(std::time::Duration::from_secs(2));
+        let mut cfg = (*state.config).clone();
+        cfg.git_service_timeout_secs = 600;
+        cfg.enforce_owner_push = false;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6shedtwo-shed2", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        // The tree must exist so the pre-git children actually spawn in it.
+        let bare = crate::git::repo_store::validated_repo_disk_path(
+            repos_dir.path(),
+            &rec.owner_did,
+            name,
+        )
+        .expect("test repo path");
+        crate::git::store::init_bare(&bare).expect("a bare repo on disk");
+        let quarantine = p3_quarantine_marker(repos_dir.path(), &rec.owner_did, name);
+
+        use crate::git::repo_store::advisory_lock_key;
+        let key = advisory_lock_key(&owner.replace([':', '/'], "_"), name);
+        let probe = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with((*pool.connect_options()).clone());
+
+        let result = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(
+                "did:key:z6shedtwo".to_string(),
+            )),
+            None,
+            crate::rate_limit::PeerAddr(Some("203.0.113.83:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+
+        let status = match result {
+            Ok(r) => panic!("a deadline-shed push must fail, got {}", r.status()),
+            Err(e) => axum::response::IntoResponse::into_response(e).status(),
+        };
+        assert_eq!(
+            status,
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            "the pre-git deadline shed answers as a git timeout"
+        );
+        assert!(
+            !sentinel.exists(),
+            "receive-pack must never start once the hold deadline is spent"
+        );
+        assert!(
+            !quarantine.exists(),
+            "a shed before receive-pack must not quarantine a tree git never ran on"
+        );
+        let free_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !write_lock_is_takeable(&probe, key).await {
+            assert!(
+                std::time::Instant::now() < free_deadline,
+                "the write lock must be free once the shed returns"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT state, last_error FROM receive_pack_requests")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                crate::db::request_state::REJECTED_AT_GIT.to_string(),
+                Some("write-lock hold deadline expired before git".to_string()),
+            )],
+            "the shed must terminalize its request as a pre-git refusal"
+        );
+        mock.shutdown();
     }
 }
 
