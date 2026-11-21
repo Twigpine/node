@@ -213,11 +213,13 @@ impl Db {
 
     /// Book the stored block against the session in one transaction. `true`
     /// when the admission credit was refunded: a duplicate within the
-    /// session, or a block a verifying or published release already carries
-    /// (that release was billed at claim, and dedup stays free). A block
-    /// held only by other open sessions is still charged here, because a
-    /// refund would let sessions hold bytes nobody bills once the first
-    /// one expires.
+    /// session, or a block a verifying or published release of the session's
+    /// own owner already carries. Claim authorizes that release's blocks
+    /// without a session link and billed them at claim, so the block is
+    /// neither charged nor linked here; a link would outlive the release and
+    /// hold the block unbilled once it is rejected. Blocks carried by another
+    /// publisher's release, or held only by other open sessions, are still
+    /// charged and linked.
     pub async fn model_record_block(
         &self,
         session_id: &str,
@@ -236,27 +238,33 @@ impl Db {
         .bind(ts_now())
         .execute(&mut *tx)
         .await?;
-        let linked = sqlx::query(
-            "INSERT INTO model_session_blocks (session_id, block_sha256)
-             VALUES ($1, $2)
-             ON CONFLICT (session_id, block_sha256) DO NOTHING",
+        let own_release_carries = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM model_release_blocks rb
+                 JOIN model_releases r ON r.id = rb.release_id
+                 JOIN model_upload_sessions s ON s.owner_did = r.publisher_did
+                 WHERE rb.block_sha256 = $1 AND s.id = $2
+                   AND r.state IN ('verifying', 'published'))",
         )
-        .bind(session_id)
         .bind(block_sha)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        let refund = linked == 0
-            || sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (
-                     SELECT 1 FROM model_release_blocks rb
-                     JOIN model_releases r ON r.id = rb.release_id
-                     WHERE rb.block_sha256 = $1
-                       AND r.state IN ('verifying', 'published'))",
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let linked = if own_release_carries {
+            0
+        } else {
+            sqlx::query(
+                "INSERT INTO model_session_blocks (session_id, block_sha256)
+                 VALUES ($1, $2)
+                 ON CONFLICT (session_id, block_sha256) DO NOTHING",
             )
+            .bind(session_id)
             .bind(block_sha)
-            .fetch_one(&mut *tx)
-            .await?;
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        };
+        let refund = linked == 0;
         if refund {
             sqlx::query(
                 "UPDATE model_upload_sessions
@@ -980,7 +988,13 @@ mod tests {
             .is_some());
     }
 
-    async fn seed_release_with_block(pool: &sqlx::PgPool, state: &str, commit: &str, sha: &str) {
+    async fn seed_release_with_block(
+        pool: &sqlx::PgPool,
+        publisher: &str,
+        state: &str,
+        commit: &str,
+        sha: &str,
+    ) {
         sqlx::query(
             "INSERT INTO model_blocks (sha256, size, created_at) VALUES ($1, 100, 't')
              ON CONFLICT DO NOTHING",
@@ -994,11 +1008,12 @@ mod tests {
                  (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
                   claim_signature, claim_signature_input, claim_signing_string,
                   claim_body, created_at)
-             VALUES ('r1', $1, 'main', 'did:owner', $2, 'm', 's', 'i', 'ss', '\\x00', 't')
+             VALUES ('r1', $1, 'main', $3, $2, 'm', 's', 'i', 'ss', '\\x00', 't')
              RETURNING id",
         )
         .bind(commit)
         .bind(state)
+        .bind(publisher)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -1022,10 +1037,11 @@ mod tests {
     async fn record_block_refunds_only_bytes_a_live_release_already_carries(pool: sqlx::PgPool) {
         let db = migrated(pool.clone()).await;
 
-        // Block already carried by a published release: a new session's
-        // link is free, the release was billed at claim.
+        // Block already carried by the owner's published release: claim
+        // authorizes it without a link and billed it, so the PUT is free
+        // and leaves no link behind to outlive the release.
         let carried = "d".repeat(64);
-        seed_release_with_block(&pool, "published", "c1", &carried).await;
+        seed_release_with_block(&pool, "did:owner", "published", "c1", &carried).await;
         let s = db
             .model_open_session("did:owner", "r1", 3600)
             .await
@@ -1039,11 +1055,32 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(session_bytes(&pool, &s.id).await, 0);
+        let links: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM model_session_blocks WHERE session_id = $1")
+                .bind(&s.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(links, 0);
+
+        // Another publisher's published release bills its owner, not this
+        // session, and the session needs the link to claim the block.
+        let theirs = "9".repeat(64);
+        seed_release_with_block(&pool, "did:other", "published", "c3", &theirs).await;
+        db.model_admit_bytes(&s.id, 100, 3600, 1000, 10_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!db
+            .model_record_block(&s.id, &theirs, 100, 100)
+            .await
+            .unwrap());
+        assert_eq!(session_bytes(&pool, &s.id).await, 100);
 
         // Block only in a rejected release: nothing bills it, so the
         // session keeps the charge.
         let dead = "e".repeat(64);
-        seed_release_with_block(&pool, "rejected", "c2", &dead).await;
+        seed_release_with_block(&pool, "did:owner", "rejected", "c2", &dead).await;
         let s2 = db
             .model_open_session("did:owner", "r1", 3600)
             .await
