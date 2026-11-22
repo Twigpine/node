@@ -447,7 +447,10 @@ fn save_state(path: &Path, state: &PublishState) -> Result<()> {
     // The file holds the session bearer, so it goes through the owner-only
     // writer, then is fsync'd (the helper does not sync).
     crate::secret_file::write(path, &bytes).with_context(|| format!("write {}", path.display()))?;
-    std::fs::File::open(path)?.sync_all()?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
     Ok(())
 }
 
@@ -623,8 +626,10 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         }
     }
     eprintln!(
-        "publishing is permanent: blocks are pinned to IPFS and the manifest anchors \
-         to Arweave, so the bytes stay fetchable even if this repo is later removed"
+        "publishing stores the blocks in this node's configured block store and commits a \
+         signed release manifest to git: the bytes stay available only while this node \
+         keeps them and the repo stays readable, and nothing is pinned to IPFS or \
+         anchored to Arweave"
     );
     if !args.yes && !confirm_publish()? {
         println!("aborted");
