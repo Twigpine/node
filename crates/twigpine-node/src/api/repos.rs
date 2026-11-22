@@ -778,11 +778,11 @@ pub async fn list_tags(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let (record, _rules) =
+    let (record, rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let repo = record.name.clone();
-    let (tags, truncated) = run_repo_git_read(
+    let (mut tags, truncated) = run_repo_git_read(
         &state,
         &headers,
         peer,
@@ -794,6 +794,15 @@ pub async fn list_tags(
         },
     )
     .await?;
+
+    // The id of a tree or blob can name content a path rule withholds, so a repo
+    // with any rule lists commit targets only, for every caller. A tag of a tag
+    // reports a tag object and is dropped with the rest. `truncated` stays as git
+    // reported it (driven by its record count, before this filter), so a
+    // rule-bearing repo can return fewer than MAX_TAGS rows with it set.
+    if !rules.is_empty() {
+        tags.retain(|t| t.target_type == "commit");
+    }
 
     Ok(Json(
         serde_json::json!({ "tags": tags, "truncated": truncated }),
@@ -21266,6 +21275,55 @@ mod commits_tags_tests {
             *tag_row(&v, "outer"),
             serde_json::json!({"name": "outer", "target": inner_object, "target_type": "tag", "annotated": true})
         );
+    }
+
+    #[sqlx::test]
+    async fn tags_on_a_repo_with_path_rules_list_only_commit_targets(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        let tree = git_at(&dir, &["rev-parse", &format!("{c}^{{tree}}")], T0);
+        std::fs::write(dir.join("f.txt"), "hello rule fixture").unwrap();
+        let blob = git_at(&dir, &["hash-object", "-w", "f.txt"], T0);
+        git_at(&dir, &["tag", "light", &c], T0);
+        git_at(&dir, &["tag", "-a", "-m", "ann", "ann", &c], T0 + 10);
+        git_at(&dir, &["tag", "on-tree", &tree], T0);
+        git_at(&dir, &["tag", "on-blob", &blob], T0);
+        let inner_object = git_at(&dir, &["rev-parse", "refs/tags/ann"], T0);
+        git_at(
+            &dir,
+            &["tag", "-a", "-m", "outer", "outer", &inner_object],
+            T0 + 20,
+        );
+
+        // No rules: tree and blob tags are listed as before.
+        let v = tags_ok(&fx, "t").await;
+        let mut names = tag_names(&v);
+        names.sort();
+        assert_eq!(names, ["ann", "light", "on-blob", "on-tree", "outer"]);
+
+        let id = fx.repo_id("t").await;
+        fx.state
+            .db
+            .set_visibility_rule(&id, "/secret/**", crate::db::VisibilityMode::B, &[], OWNER)
+            .await
+            .unwrap();
+
+        for caller in [None, Some(STRANGER), Some(OWNER)] {
+            let (status, _, body) = call(&fx.state, caller, Some(PEER), &tags_uri("t")).await;
+            assert_eq!(status, StatusCode::OK, "{caller:?}: {body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let mut names = tag_names(&v);
+            names.sort();
+            assert_eq!(names, ["ann", "light"], "{caller:?}: {body}");
+            assert_eq!(v["truncated"], false, "{caller:?}");
+            for hidden in [&tree, &blob] {
+                assert!(
+                    !body.contains(hidden.as_str()),
+                    "{caller:?}: body names a non-commit object: {body}"
+                );
+            }
+        }
     }
 
     #[sqlx::test]
