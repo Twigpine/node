@@ -6708,14 +6708,26 @@ esac\n";
         assert_eq!(got, b"one\ntwo\n");
     }
 
-    /// A sink that stops ends an endless child at once, and the child's process
-    /// group is gone afterwards. This is not a timeout.
+    /// A sink that stops ends an endless child at once, and the child's whole
+    /// process group is gone afterwards, including a descendant that ignores
+    /// SIGTERM and has closed its inherited stdout and stderr. This is not a
+    /// timeout. A stop path that killed only the leader would leave that descendant
+    /// alive, and its group with it.
     #[cfg(unix)]
     #[test]
     fn run_bounded_git_streaming_stops_and_reaps_an_endless_child() {
         use std::time::Duration;
         let tmp = TempDir::new().unwrap();
-        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\necho $$ > pid\nexec yes abcdefgh\n");
+        // The leader starts the descendant and waits for it to record its pid before
+        // it begins to produce output, so the stop can never beat the descendant's
+        // start. The descendant's loop is bounded so a broken stop path cannot leak
+        // a permanent orphan; the assertion fires well before then.
+        let body = "#!/bin/sh\n\
+echo $$ > pid\n\
+sh -c 'trap \"\" TERM; echo $$ > desc.pid; exec 1>&- 2>&-; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done' &\n\
+while [ ! -s desc.pid ]; do sleep 0.01; done\n\
+exec yes abcdefgh\n";
+        let git_bin = write_fake_git(tmp.path(), body);
         let started = Instant::now();
         let mut seen = 0usize;
         let (_status, _err, stopped) = run_bounded_git_streaming(
@@ -6732,22 +6744,36 @@ esac\n";
         assert!(stopped);
         assert!(seen >= 1000);
         assert!(started.elapsed() < Duration::from_secs(10));
-        let pid: i32 = std::fs::read_to_string(tmp.path().join("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let read_pid = |name: &str| -> i32 {
+            std::fs::read_to_string(tmp.path().join(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let pgid = read_pid("pid");
+        let desc = read_pid("desc.pid");
+        assert_ne!(pgid, desc, "the descendant must be a separate process");
         let mut gone = false;
         for _ in 0..300 {
-            if unsafe { libc::kill(pid, 0) } != 0 {
+            // SAFETY: kill(2) with signal 0 only probes existence; ESRCH means no
+            // process is left in the group.
+            let rc = unsafe { libc::kill(-pgid, 0) };
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
                 gone = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Kill whatever is left so a RED run leaks no orphan.
+        unsafe {
+            libc::kill(desc, libc::SIGKILL);
+            libc::kill(-pgid, libc::SIGKILL);
+        }
         assert!(
             gone,
-            "the stopped child (pid {pid}) must not be left running"
+            "the stopped child's process group (pgid {pgid}, descendant {desc}) must be gone, \
+             not just its leader"
         );
     }
 

@@ -671,8 +671,18 @@ where
         AppError::Overloaded("git service acquisition timed out, retry shortly".into())
     })?
     .map_err(|e| {
-        tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo acquire failed");
-        AppError::Git(GIT_READ_FAILED_MESSAGE.into())
+        if is_expected_transient_acquire_failure(&e) {
+            tracing::warn!(repo = %record.name, err = %format!("{e:#}"), "repo acquire failed");
+        } else {
+            tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo acquire failed");
+        }
+        // A typed refusal is a retryable 503 with a fixed body, the same as the
+        // clone path; anything else is the fixed-message 500, detail logged only.
+        if e.is::<crate::git::repo_store::RepoUnavailable>() {
+            AppError::from(e)
+        } else {
+            AppError::Git(GIT_READ_FAILED_MESSAGE.into())
+        }
     })?;
 
     let git_bin = state.git_bin.clone();
@@ -21483,6 +21493,189 @@ mod commits_tags_tests {
         let (status, _, body) = tags(&fx, "slow").await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    /// A body that must not name where the repo lives or what the store said.
+    fn assert_no_repo_detail(body: &str, dir: &Path) {
+        let path = dir.to_string_lossy().to_string();
+        assert!(!body.contains(&path), "body leaks the repo path: {body}");
+        assert!(
+            !body.contains("quarantine"),
+            "body leaks store detail: {body}"
+        );
+    }
+
+    /// A live tree whose quarantine sidecar cannot be parsed: the store refuses it
+    /// with a typed `RepoUnavailable` that no reconciliation can lift.
+    fn quarantine_unreadable(dir: &Path) {
+        let marker = crate::git::repo_store::quarantine_path(dir).expect("sidecar path");
+        std::fs::write(marker, b"not json").unwrap();
+    }
+
+    /// The status, header and body the clone path gives for the same refusal.
+    fn assert_repo_unavailable_503(status: StatusCode, headers: &HeaderMap, body: &str) {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(
+            headers.get("retry-after").map(|v| v.to_str().unwrap()),
+            Some("1"),
+            "{body}"
+        );
+        assert!(body.contains("repo_unavailable"), "{body}");
+        assert!(
+            body.contains("repository is temporarily unavailable, retry"),
+            "{body}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn commits_an_unreconcilable_quarantined_tree_is_a_retryable_503(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("held", true).await;
+        linear(&dir);
+        quarantine_unreadable(&dir);
+        for query in ["", "limit=3"] {
+            let (status, headers, body) = commits(&fx, "held", query).await;
+            assert_repo_unavailable_503(status, &headers, &body);
+            assert_no_repo_detail(&body, &dir);
+        }
+    }
+
+    #[sqlx::test]
+    async fn tags_an_unreconcilable_quarantined_tree_is_a_retryable_503(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("held", true).await;
+        commit_at(&dir, "c1", T0);
+        quarantine_unreadable(&dir);
+        let (status, headers, body) = tags(&fx, "held").await;
+        assert_repo_unavailable_503(status, &headers, &body);
+        assert_no_repo_detail(&body, &dir);
+    }
+
+    /// An acquire failure with no typed marker keeps the fixed-message 500.
+    #[sqlx::test]
+    async fn an_unexpected_acquire_error_stays_a_fixed_500_without_detail(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("gone", true).await;
+        commit_at(&dir, "c1", T0);
+        // A live path that is a file, not a directory: an acquire failure with no
+        // typed marker.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a repo").unwrap();
+        let path = dir.to_string_lossy().to_string();
+        let (status, _, body) = commits(&fx, "gone", "").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("git read failed"), "{body}");
+        assert!(!body.contains(&path), "body leaks the repo path: {body}");
+        let (status, _, body) = tags(&fx, "gone").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("git read failed"), "{body}");
+        assert!(!body.contains(&path), "body leaks the repo path: {body}");
+    }
+
+    /// Pool and per-caller limits of one, so both guards read as taken or free.
+    fn single_slot_pools(fx: &mut Fx) {
+        fx.state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        fx.state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+    }
+
+    fn caller_slot_is_taken(fx: &Fx) -> bool {
+        fx.state
+            .git_read_per_caller
+            .try_acquire("203.0.113.5")
+            .is_none()
+    }
+
+    #[sqlx::test]
+    async fn a_served_read_returns_both_permits(pool: sqlx::PgPool) {
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("lin", true).await;
+        linear(&dir);
+        single_slot_pools(&mut fx);
+        for uri in [commits_uri("lin", ""), tags_uri("lin")] {
+            let (status, _, body) = call(&fx.state, None, Some(PEER), &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_eq!(fx.state.git_read_semaphore.available_permits(), 1, "{uri}");
+            assert!(!caller_slot_is_taken(&fx), "{uri}");
+        }
+    }
+
+    /// The permits belong to the blocking work, not the handler future: a client that
+    /// disconnects while git is running must not free the slots until git has exited.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn a_disconnect_keeps_both_permits_until_the_git_child_exits(pool: sqlx::PgPool) {
+        use std::time::Duration;
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("slow", true).await;
+        commit_at(&dir, "c1", T0);
+        single_slot_pools(&mut fx);
+        fx.set_deadline_secs(30);
+        let shim = tempfile::TempDir::new().unwrap();
+        let pid_file = shim.path().join("pid");
+        fx.state.git_bin = fake_git(
+            shim.path(),
+            &format!(
+                "#!/bin/sh\ncase \" $*\" in *for-each-ref*) echo $$ > {}; sleep 2;; esac\nexec git \"$@\"\n",
+                pid_file.display()
+            ),
+        );
+
+        let uri = tags_uri("slow");
+        let mut fut = Box::pin(call(&fx.state, None, Some(PEER), &uri));
+        let mut spawned = false;
+        for _ in 0..500 {
+            if tokio::time::timeout(Duration::from_millis(20), &mut fut)
+                .await
+                .is_ok()
+            {
+                panic!("the request finished before the git child could be observed");
+            }
+            if pid_file.exists() {
+                spawned = true;
+                break;
+            }
+        }
+        assert!(spawned, "the fake git child must have started");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(fx.state.git_read_semaphore.available_permits(), 0);
+        assert!(caller_slot_is_taken(&fx));
+
+        // The client disconnects: the handler future is dropped mid-request.
+        drop(fut);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "precondition: the git child must still be running, or this proves nothing"
+        );
+        assert_eq!(
+            fx.state.git_read_semaphore.available_permits(),
+            0,
+            "dropping the handler future must not free the shared read permit"
+        );
+        assert!(
+            caller_slot_is_taken(&fx),
+            "dropping the handler future must not free the per-caller slot"
+        );
+
+        let mut freed = false;
+        for _ in 0..400 {
+            if fx.state.git_read_semaphore.available_permits() == 1 && !caller_slot_is_taken(&fx) {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(freed, "both permits must return once the git child is done");
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "the permits must not be freed before the child has exited"
+        );
     }
 
     #[sqlx::test]
