@@ -7,8 +7,6 @@ use crate::db::{Db, RepoRecord, MAX_VISIBLE_REPO_PAGE_SIZE, MAX_VISIBLE_TASK_PAG
 
 use super::types::{AgentTaskReadType, RefUpdateType, RepoPageType, RepoType, TaskPageType};
 
-/// Map visible repos to GraphQL nodes, reading every homepage in one query
-/// keyed by the ids that survived the visibility filter and truncation.
 async fn repo_types(db: &Db, repos: Vec<RepoRecord>) -> Result<Vec<RepoType>> {
     let ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
     let mut homepages = db

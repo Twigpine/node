@@ -127,7 +127,6 @@ fn child_terminated_without_reaping(pid: i32) -> bool {
     rc == 0 && unsafe { info.si_pid() } != 0
 }
 
-/// Collecting form of [`run_bounded_git_sink_impl`]: every stdout byte is kept.
 #[cfg(unix)]
 fn run_bounded_git_raw_impl(
     git_bin: &str,

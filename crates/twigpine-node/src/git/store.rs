@@ -928,10 +928,8 @@ pub fn log(repo_path: &Path, refname: &str, limit: usize) -> Result<Vec<CommitIn
     Ok(parse_log_output(&output.stdout))
 }
 
-/// Row format `git log` is asked for; [`parse_log_output`] reads exactly this.
 const LOG_FORMAT: &str = "--format=%H%n%an%n%ae%n%at%n%s";
 
-/// Parse `git log` output produced with [`LOG_FORMAT`], five lines per commit.
 fn parse_log_output(stdout: &[u8]) -> Vec<CommitInfo> {
     let stdout = String::from_utf8_lossy(stdout);
     let mut commits = Vec::new();
@@ -1007,7 +1005,6 @@ fn head_is_genuinely_absent_bounded(
         deadline,
     )?;
     if !status.success() {
-        // A detached or malformed HEAD is never "absent".
         return Ok(false);
     }
     let target = String::from_utf8_lossy(&out).trim().to_string();

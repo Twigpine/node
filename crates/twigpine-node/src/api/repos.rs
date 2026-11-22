@@ -518,8 +518,12 @@ pub async fn get_repo(
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
-    let count = state.db.count_stars(&record.id).await.unwrap_or(0);
-    let homepage = state.db.get_repo_homepage(&record.id).await?;
+    let (count, homepage) = tokio::join!(
+        state.db.count_stars(&record.id),
+        state.db.get_repo_homepage(&record.id),
+    );
+    let count = count.unwrap_or(0);
+    let homepage = homepage?;
     Ok(Json(RepoDetailResponse {
         repo: to_response(&record, &state, count),
         homepage,
@@ -588,17 +592,15 @@ pub async fn set_homepage(
     Ok(Json(serde_json::json!({ "homepage": homepage })))
 }
 
-/// Commits returned when `limit` is absent.
 const DEFAULT_COMMITS_PAGE: i64 = 30;
-/// Largest page a caller can ask for; a larger `limit` is clamped to it.
 const MAX_COMMITS_PAGE: i64 = 100;
 /// The one message for every `before` that cannot name a position in the served
 /// history: malformed, unknown, not a commit, or a commit the head does not reach.
 const BAD_BEFORE_MESSAGE: &str =
     "before must be the full id of a commit in the default branch history";
-/// Client message for any git failure that is not a deadline or a shed. The
-/// detail (paths, git stderr) goes to the log only.
 const GIT_READ_FAILED_MESSAGE: &str = "git read failed";
+/// Cap on the git-read deadline so the `Instant` addition cannot overflow.
+const MAX_GIT_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
 
 /// Query of `GET /api/v1/repos/:owner/:repo/commits`. Unknown keys are ignored on
 /// purpose: `gl repo commits` sends `branch`, which the server has never honored.
@@ -675,7 +677,7 @@ where
 
     let git_bin = state.git_bin.clone();
     let budget = std::time::Duration::from_secs(state.config.git_service_timeout_secs)
-        .min(std::time::Duration::from_secs(365 * 24 * 3600));
+        .min(MAX_GIT_READ_DEADLINE);
     let deadline = std::time::Instant::now() + budget;
     let repo = record.name.clone();
     tokio::task::spawn_blocking(move || {
@@ -6542,7 +6544,6 @@ fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)
         .collect()
 }
 
-/// Longest homepage URL accepted, in bytes.
 const MAX_HOMEPAGE_BYTES: usize = 2048;
 
 /// Accept a repo homepage only when it is an absolute http(s) URL on a public

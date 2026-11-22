@@ -249,8 +249,6 @@ mod authz_guard {
             (labels, "add_label", "require_repo_owner("),
             (labels, "remove_label", "authorize_repo_read("),
             (labels, "remove_label", "require_repo_owner("),
-            // Same two-half shape as add_label: the read gate answers the
-            // missing-repo 404 first, then the owner gate answers 403.
             (repos, "set_homepage", "authorize_repo_read("),
             (repos, "set_homepage", "require_repo_owner("),
             // Bucket A' — owner OR author (did_matches against the author),
