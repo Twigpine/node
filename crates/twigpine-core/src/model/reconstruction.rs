@@ -9,7 +9,7 @@
 //! The schema string is part of the signed surface: a reader rejects a tag it
 //! does not know rather than guessing at a later layout.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
@@ -190,8 +190,9 @@ impl Default for Reconstruction {
 pub struct DedupIndex {
     /// chunk sha256 -> (block sha256, chunk index inside that block)
     by_chunk: HashMap<String, (String, u32)>,
-    /// Block ids already indexed: one chunk layout per block id.
-    indexed_blocks: HashSet<String>,
+    /// Block id -> chunk layout, one per block id: seal_pending refuses a
+    /// second layout for an id a prior already carries.
+    layouts: HashMap<String, Vec<ChunkMeta>>,
 }
 
 impl DedupIndex {
@@ -209,9 +210,11 @@ impl DedupIndex {
 
     pub fn add(&mut self, rec: &Reconstruction) {
         for block in &rec.blocks {
-            if !self.indexed_blocks.insert(block.sha256.clone()) {
+            if self.layouts.contains_key(&block.sha256) {
                 continue;
             }
+            self.layouts
+                .insert(block.sha256.clone(), block.chunks.clone());
             for (i, chunk) in block.chunks.iter().enumerate() {
                 // First writer wins: two priors carrying the same chunk are
                 // interchangeable, so keep the earliest.
@@ -230,6 +233,7 @@ fn seal_pending<F: FnMut(Block) -> std::io::Result<()>>(
     pending: &mut Vec<crate::model::chunking::Chunk>,
     terms: &mut [Term],
     block_entries: &mut Vec<BlockEntry>,
+    dedup: &DedupIndex,
     on_block: &mut F,
 ) -> std::io::Result<()> {
     if pending.is_empty() {
@@ -263,6 +267,20 @@ fn seal_pending<F: FnMut(Block) -> std::io::Result<()>>(
             len: c.len as u64,
         })
         .collect();
+    if let Some(prior_layout) = dedup.layouts.get(&block.sha256) {
+        // A prior reconstruction already stores this block: its row lives
+        // there, so a same-layout reseal adds neither a row nor an upload.
+        if *prior_layout == chunks {
+            return Ok(());
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "block {} sealed with a chunk layout that differs from a prior's",
+                block.sha256
+            ),
+        ));
+    }
     if let Some(existing) = block_entries.iter().find(|e| e.sha256 == block.sha256) {
         // Uniform input can seal the same block bytes twice: the second
         // seal adds no row and no sink write, only the id patch above.
@@ -287,6 +305,8 @@ fn seal_pending<F: FnMut(Block) -> std::io::Result<()>>(
 
 /// What `pack_file` produced: the file's entry, the new blocks to store and
 /// upload, and the block entries the reconstruction object must carry.
+/// Blocks a prior reconstruction already holds appear as terms into the
+/// prior's rows, not as rows here.
 pub struct PackedFile {
     pub file: FileEntry,
     pub new_blocks: Vec<Block>,
@@ -317,7 +337,9 @@ pub fn pack_file<R: Read>(
 
 /// `pack_file` with each sealed block handed to `on_block` as it finishes:
 /// the caller can upload and drop it while the file is still packing, so a
-/// file of any size packs in block-sized memory. If packing fails after
+/// file of any size packs in block-sized memory. The returned block entries
+/// omit blocks a prior already carries, the same way terms into prior
+/// blocks carry no row of their own. If packing fails after
 /// `on_block` accepted earlier blocks, those blocks stay in the sink: an
 /// error does not mean nothing was stored.
 pub fn pack_file_with<R: Read, F: FnMut(Block) -> std::io::Result<()>>(
@@ -377,12 +399,24 @@ pub fn pack_file_with<R: Read, F: FnMut(Block) -> std::io::Result<()>>(
                 }),
             }
             if pending_bytes >= BLOCK_TARGET {
-                seal_pending(&mut pending, &mut terms, &mut block_entries, &mut on_block)?;
+                seal_pending(
+                    &mut pending,
+                    &mut terms,
+                    &mut block_entries,
+                    dedup,
+                    &mut on_block,
+                )?;
                 pending_bytes = 0;
             }
         }
     }
-    seal_pending(&mut pending, &mut terms, &mut block_entries, &mut on_block)?;
+    seal_pending(
+        &mut pending,
+        &mut terms,
+        &mut block_entries,
+        dedup,
+        &mut on_block,
+    )?;
 
     let file = FileEntry {
         path: path.to_string(),
@@ -1003,9 +1037,9 @@ mod tests {
 
     #[test]
     fn chunk_lengths_that_wrap_u64_are_refused() {
-        // [u64::MAX, 1] wraps to 0: a zero-length term over both chunks
-        // would otherwise pass against a zero-size file.
-        let rec = hand_rec(&[u64::MAX, 1], 0, 0, 0);
+        // [u64::MAX, 2] wraps to 1, matching the declared sizes, so only
+        // the checked sums refuse it.
+        let rec = hand_rec(&[u64::MAX, 2], 1, 1, 1);
         assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
     }
 
@@ -1141,11 +1175,13 @@ mod tests {
         };
         let mut block_entries = Vec::new();
         let mut terms: Vec<Term> = Vec::new();
+        let dedup = DedupIndex::new();
         let mut pending = vec![mk(&[1, 2]), mk(&[3, 4])];
         seal_pending(
             &mut pending,
             &mut terms,
             &mut block_entries,
+            &dedup,
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -1153,11 +1189,89 @@ mod tests {
         // Same block bytes, split differently: the second seal must fail
         // rather than write a conflicting row for the same id.
         let mut pending = vec![mk(&[1, 2, 3, 4])];
-        let err = seal_pending(&mut pending, &mut terms, &mut block_entries, &mut |_| {
-            panic!("a mismatched reseal must not reach the sink")
-        })
+        let err = seal_pending(
+            &mut pending,
+            &mut terms,
+            &mut block_entries,
+            &dedup,
+            &mut |_| panic!("a mismatched reseal must not reach the sink"),
+        )
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sealing_a_prior_block_id_with_a_different_layout_is_an_error() {
+        // The prior stored the block as one chunk; the same bytes pending
+        // here split into two. The id matches, the layout does not.
+        let prior_id = sha256_hex(&[1, 2, 3, 4]);
+        let mut prior = Reconstruction::new();
+        prior.blocks.push(BlockEntry {
+            sha256: prior_id,
+            size: 4,
+            chunks: vec![ChunkMeta {
+                sha256: sha256_hex(&[1, 2, 3, 4]),
+                len: 4,
+            }],
+        });
+        let dedup = DedupIndex::from_reconstructions(&[&prior]);
+        let mk = |data: &[u8]| crate::model::chunking::Chunk {
+            sha256: sha256_hex(data),
+            len: data.len(),
+            offset: 0,
+            data: data.to_vec(),
+        };
+        let mut block_entries = Vec::new();
+        let mut terms: Vec<Term> = Vec::new();
+        let mut pending = vec![mk(&[1, 2]), mk(&[3, 4])];
+        let err = seal_pending(
+            &mut pending,
+            &mut terms,
+            &mut block_entries,
+            &dedup,
+            &mut |_| panic!("a reseal against a prior must not reach the sink"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sealing_a_block_a_prior_already_carries_adds_no_row_or_upload() {
+        let prior_id = sha256_hex(&[1, 2, 3, 4]);
+        let mut prior = Reconstruction::new();
+        prior.blocks.push(BlockEntry {
+            sha256: prior_id.clone(),
+            size: 4,
+            chunks: vec![ChunkMeta {
+                sha256: prior_id.clone(),
+                len: 4,
+            }],
+        });
+        let dedup = DedupIndex::from_reconstructions(&[&prior]);
+        let mut block_entries = Vec::new();
+        let mut terms = vec![Term {
+            block: String::new(),
+            chunk_start: 0,
+            chunk_end: 1,
+            length: 4,
+        }];
+        let mk = |data: &[u8]| crate::model::chunking::Chunk {
+            sha256: sha256_hex(data),
+            len: data.len(),
+            offset: 0,
+            data: data.to_vec(),
+        };
+        let mut pending = vec![mk(&[1, 2, 3, 4])];
+        seal_pending(
+            &mut pending,
+            &mut terms,
+            &mut block_entries,
+            &dedup,
+            &mut |_| panic!("a block a prior stores is not uploaded again"),
+        )
+        .unwrap();
+        assert!(block_entries.is_empty());
+        assert_eq!(terms[0].block, prior_id);
     }
 
     #[test]
@@ -1179,6 +1293,7 @@ mod tests {
         let mut prior_b = Reconstruction::new();
         prior_b.blocks.push(mk_block(&["ab"]));
         let idx = DedupIndex::from_reconstructions(&[&prior_a, &prior_b]);
+        assert_eq!(idx.layouts[&block_id].len(), 2);
         assert!(idx.by_chunk.contains_key("a"));
         assert!(idx.by_chunk.contains_key("b"));
         assert_eq!(
