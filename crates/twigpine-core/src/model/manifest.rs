@@ -208,6 +208,9 @@ pub fn detect_format(first_bytes: &[u8], path: &str) -> FileFormat {
     if first_bytes.starts_with(b"PK\x03\x04") && matches!(ext, "bin" | "pt" | "pth" | "ckpt") {
         return FileFormat::Pickle;
     }
+    if matches!(ext, "pkl" | "pickle") {
+        return FileFormat::Pickle;
+    }
     if matches!(
         ext,
         // `tokenizer.model` is deliberately absent: it is a sentencepiece
@@ -310,10 +313,21 @@ mod tests {
     #[test]
     fn one_changed_byte_invalidates_the_signature() {
         let (key, did) = keypair(6);
-        let mut bytes = sample_manifest(&did).to_bytes().unwrap();
+        let bytes = sample_manifest(&did).to_bytes().unwrap();
         let sig = sign(&key, &bytes);
-        bytes[10] ^= 1;
-        assert!(verify(&bytes, &sig, &did).is_err());
+        // Tamper inside the signed bytes without breaking the JSON, so the
+        // check proves the signature, not the parser, caught it.
+        let mut tampered = bytes.clone();
+        let at = tampered
+            .windows(b"alice/llm".len())
+            .position(|w| w == b"alice/llm")
+            .unwrap();
+        tampered[at..at + b"alice/llm".len()].copy_from_slice(b"alice/lln");
+        Manifest::parse(&tampered).unwrap();
+        assert!(matches!(
+            verify(&tampered, &sig, &did),
+            Err(ManifestError::BadSignature)
+        ));
     }
 
     #[test]
@@ -368,6 +382,11 @@ mod tests {
             detect_format(b"PK\x03\x04z", "archive.zip"),
             FileFormat::Other
         );
+        // Protocol-0 pickle bytes carry no 0x80 opcode prefix: only the
+        // extension names them.
+        assert_eq!(detect_format(b"(dp0\n.", "model.pkl"), FileFormat::Pickle);
+        assert_eq!(detect_format(b"(dp0\n.", "x.pickle"), FileFormat::Pickle);
+        assert_eq!(detect_format(b"(dp0\n.", "model.bin"), FileFormat::Other);
         assert_eq!(detect_format(b"{\"a\":1}", "config.json"), FileFormat::Text);
         // Sentencepiece models are protobufs, not text.
         assert_eq!(detect_format(b"", "tokenizer.model"), FileFormat::Other);
@@ -410,9 +429,18 @@ mod tests {
             .unwrap();
         let parsed = verify(&bytes, &sig, &did).unwrap();
         assert_eq!(parsed.repo, "alice/llm");
-        // And the frozen signature rejects tampering.
+        // And the frozen signature rejects tampering that stays valid
+        // JSON, so the signature is what fails, not the parser.
         let mut tampered = bytes.clone();
-        *tampered.last_mut().unwrap() ^= 1;
-        assert!(verify(&tampered, &sig, &did).is_err());
+        let at = tampered
+            .windows(b"alice/llm".len())
+            .position(|w| w == b"alice/llm")
+            .unwrap();
+        tampered[at..at + b"alice/llm".len()].copy_from_slice(b"alice/lln");
+        Manifest::parse(&tampered).unwrap();
+        assert!(matches!(
+            verify(&tampered, &sig, &did),
+            Err(ManifestError::BadSignature)
+        ));
     }
 }
