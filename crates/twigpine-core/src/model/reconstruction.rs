@@ -101,6 +101,12 @@ impl Reconstruction {
     pub fn validate(&self) -> Result<(), ModelError> {
         let mut blocks: HashMap<&str, &BlockEntry> = HashMap::new();
         for b in &self.blocks {
+            if b.size == 0 || b.chunks.is_empty() {
+                return Err(ModelError::Invalid(format!(
+                    "block {} carries no bytes",
+                    b.sha256
+                )));
+            }
             if blocks.insert(b.sha256.as_str(), b).is_some() {
                 return Err(ModelError::Invalid(format!(
                     "duplicate block row {}",
@@ -184,6 +190,9 @@ impl Default for Reconstruction {
 pub struct DedupIndex {
     /// chunk sha256 -> (block sha256, chunk index inside that block)
     by_chunk: HashMap<String, (String, u32)>,
+    /// Block id -> chunk layout, one per block id: seal_pending refuses a
+    /// second layout for an id a prior already carries.
+    layouts: HashMap<String, Vec<ChunkMeta>>,
 }
 
 impl DedupIndex {
@@ -207,6 +216,11 @@ impl DedupIndex {
     /// file's fresh block table instead of re-scanning every prior entry.
     pub fn add_block_entries(&mut self, entries: &[BlockEntry]) {
         for block in entries {
+            if self.layouts.contains_key(&block.sha256) {
+                continue;
+            }
+            self.layouts
+                .insert(block.sha256.clone(), block.chunks.clone());
             for (i, chunk) in block.chunks.iter().enumerate() {
                 // First writer wins: two priors carrying the same chunk are
                 // interchangeable, so keep the earliest.
@@ -225,6 +239,7 @@ fn seal_pending<F: FnMut(Block) -> std::io::Result<()>>(
     pending: &mut Vec<crate::model::chunking::Chunk>,
     terms: &mut [Term],
     block_entries: &mut Vec<BlockEntry>,
+    dedup: &DedupIndex,
     on_block: &mut F,
 ) -> std::io::Result<()> {
     if pending.is_empty() {
@@ -250,23 +265,54 @@ fn seal_pending<F: FnMut(Block) -> std::io::Result<()>>(
             term.block = block.sha256.clone();
         }
     }
+    let chunks: Vec<ChunkMeta> = block
+        .chunks
+        .iter()
+        .map(|c| ChunkMeta {
+            sha256: c.sha256.clone(),
+            len: c.len as u64,
+        })
+        .collect();
+    if let Some(prior_layout) = dedup.layouts.get(&block.sha256) {
+        // A prior reconstruction already stores this block: its row lives
+        // there, so a same-layout reseal adds neither a row nor an upload.
+        if *prior_layout == chunks {
+            return Ok(());
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "block {} sealed with a chunk layout that differs from a prior's",
+                block.sha256
+            ),
+        ));
+    }
+    if let Some(existing) = block_entries.iter().find(|e| e.sha256 == block.sha256) {
+        // Uniform input can seal the same block bytes twice: the second
+        // seal adds no row and no sink write, only the id patch above.
+        if existing.chunks == chunks {
+            return Ok(());
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "block {} sealed twice with different chunk layouts",
+                block.sha256
+            ),
+        ));
+    }
     block_entries.push(BlockEntry {
         sha256: block.sha256.clone(),
         size: block.data.len() as u64,
-        chunks: block
-            .chunks
-            .iter()
-            .map(|c| ChunkMeta {
-                sha256: c.sha256.clone(),
-                len: c.len as u64,
-            })
-            .collect(),
+        chunks,
     });
     on_block(block)
 }
 
 /// What `pack_file` produced: the file's entry, the new blocks to store and
 /// upload, and the block entries the reconstruction object must carry.
+/// Blocks a prior reconstruction already holds appear as terms into the
+/// prior's rows, not as rows here.
 pub struct PackedFile {
     pub file: FileEntry,
     pub new_blocks: Vec<Block>,
@@ -297,7 +343,11 @@ pub fn pack_file<R: Read>(
 
 /// `pack_file` with each sealed block handed to `on_block` as it finishes:
 /// the caller can upload and drop it while the file is still packing, so a
-/// file of any size packs in block-sized memory.
+/// file of any size packs in block-sized memory. The returned block entries
+/// omit blocks a prior already carries, the same way terms into prior
+/// blocks carry no row of their own. If packing fails after
+/// `on_block` accepted earlier blocks, those blocks stay in the sink: an
+/// error does not mean nothing was stored.
 pub fn pack_file_with<R: Read, F: FnMut(Block) -> std::io::Result<()>>(
     path: &str,
     reader: R,
@@ -355,12 +405,24 @@ pub fn pack_file_with<R: Read, F: FnMut(Block) -> std::io::Result<()>>(
                 }),
             }
             if pending_bytes >= BLOCK_TARGET {
-                seal_pending(&mut pending, &mut terms, &mut block_entries, &mut on_block)?;
+                seal_pending(
+                    &mut pending,
+                    &mut terms,
+                    &mut block_entries,
+                    dedup,
+                    &mut on_block,
+                )?;
                 pending_bytes = 0;
             }
         }
     }
-    seal_pending(&mut pending, &mut terms, &mut block_entries, &mut on_block)?;
+    seal_pending(
+        &mut pending,
+        &mut terms,
+        &mut block_entries,
+        dedup,
+        &mut on_block,
+    )?;
 
     let file = FileEntry {
         path: path.to_string(),
@@ -382,17 +444,18 @@ pub struct BlockSlice {
     pub len: u64,
 }
 
-/// Byte offset of each chunk inside a block, as a prefix sum over the
-/// chunk table: `offsets[i]` is where chunk `i`'s bytes begin.
+/// Prefix offsets over a block's chunk table: `offsets[i]` is where chunk
+/// `i`'s bytes begin and the final entry is the block's total length.
 fn chunk_offsets(block: &BlockEntry) -> Result<Vec<u64>, ModelError> {
     let mut off = 0u64;
-    let mut out = Vec::with_capacity(block.chunks.len());
+    let mut out = Vec::with_capacity(block.chunks.len() + 1);
     for c in &block.chunks {
         out.push(off);
         off = off
             .checked_add(c.len)
             .ok_or_else(|| overflow(&block.sha256))?;
     }
+    out.push(off);
     Ok(out)
 }
 
@@ -406,8 +469,9 @@ fn checked_len_sum(mut lens: impl Iterator<Item = u64>, what: &str) -> Result<u6
         .ok_or_else(|| overflow(what))
 }
 
-/// Byte range inside a block covering the chunks a term names.
-fn term_span(block: &BlockEntry, term: &Term) -> Result<(u64, u64), ModelError> {
+/// Byte range inside a block covering the chunks a term names, over a
+/// prefix-offset table the caller computed once per block.
+fn term_span(offsets: &[u64], block: &BlockEntry, term: &Term) -> Result<(u64, u64), ModelError> {
     let start = term.chunk_start as usize;
     let end = term.chunk_end as usize;
     if start >= end || end > block.chunks.len() {
@@ -417,9 +481,7 @@ fn term_span(block: &BlockEntry, term: &Term) -> Result<(u64, u64), ModelError> 
             block.chunks.len()
         )));
     }
-    let offsets = chunk_offsets(block)?;
-    let len = checked_len_sum(block.chunks[start..end].iter().map(|c| c.len), &term.block)?;
-    Ok((offsets[start], len))
+    Ok((offsets[start], offsets[end] - offsets[start]))
 }
 
 pub fn map_file_range(
@@ -435,15 +497,26 @@ pub fn map_file_range(
         )));
     }
     let blocks = rec.block_index();
+    let mut offsets_cache: HashMap<&str, Vec<u64>> = HashMap::new();
     let mut out: Vec<BlockSlice> = Vec::new();
     let mut cursor = 0u64;
     for term in &file.terms {
         let block = blocks
             .get(term.block.as_str())
             .ok_or_else(|| ModelError::Invalid(format!("unknown block {}", term.block)))?;
+        if !offsets_cache.contains_key(term.block.as_str()) {
+            offsets_cache.insert(term.block.as_str(), chunk_offsets(block)?);
+        }
+        let offsets = &offsets_cache[term.block.as_str()];
         // The same guard `rebuild_file` uses, so a reconstruction that
         // skipped `parse()` gets an error here rather than a slice panic.
-        term_span(block, term)?;
+        let (_span_offset, span_len) = term_span(offsets, block, term)?;
+        if span_len != term.length {
+            return Err(ModelError::Invalid(format!(
+                "{}: term declares {} bytes, its chunks span {span_len}",
+                file.path, term.length
+            )));
+        }
         let term_end = cursor
             .checked_add(term.length)
             .ok_or_else(|| ModelError::Invalid("term lengths overflow".into()))?;
@@ -451,7 +524,6 @@ pub fn map_file_range(
             cursor = term_end;
             continue;
         }
-        let offsets = chunk_offsets(block)?;
         for (i, chunk) in block.chunks[term.chunk_start as usize..term.chunk_end as usize]
             .iter()
             .enumerate()
@@ -482,6 +554,13 @@ pub fn map_file_range(
         }
         cursor = term_end;
     }
+    let served: u64 = out.iter().map(|s| s.len).sum();
+    if served != end_exclusive - start {
+        return Err(ModelError::Invalid(format!(
+            "{}: range {start}..{end_exclusive} maps to {served} bytes",
+            file.path
+        )));
+    }
     Ok(out)
 }
 
@@ -494,7 +573,10 @@ pub type BlockRangeFetch<'a> = dyn FnMut(&str, u64, u64) -> std::io::Result<Vec<
 /// bytes starting at `offset` inside the named block (a BlockStore range
 /// read or a cache hit on the caller's side). The block id itself is not
 /// re-verified here: blocks are hash-verified when stored, and the chunk
-/// hashes cover the bytes this file actually uses.
+/// hashes cover the bytes this file actually uses. On error `out` may
+/// already hold some or all of the file's bytes, unverified: callers that
+/// publish only verified files should write to a temporary and make it
+/// visible after `Ok`.
 pub fn rebuild_file<W: Write>(
     file: &FileEntry,
     rec: &Reconstruction,
@@ -502,13 +584,18 @@ pub fn rebuild_file<W: Write>(
     out: &mut W,
 ) -> Result<u64, ModelError> {
     let blocks = rec.block_index();
+    let mut offsets_cache: HashMap<&str, Vec<u64>> = HashMap::new();
     let mut file_hasher = sha2::Sha256::new();
     let mut written = 0u64;
     for term in &file.terms {
         let block = blocks
             .get(term.block.as_str())
             .ok_or_else(|| ModelError::Invalid(format!("unknown block {}", term.block)))?;
-        let (offset, span_len) = term_span(block, term)?;
+        if !offsets_cache.contains_key(term.block.as_str()) {
+            offsets_cache.insert(term.block.as_str(), chunk_offsets(block)?);
+        }
+        let offsets = &offsets_cache[term.block.as_str()];
+        let (offset, span_len) = term_span(offsets, block, term)?;
         let bytes = fetch(&term.block, offset, span_len)?;
         if bytes.len() as u64 != span_len {
             return Err(ModelError::Invalid(format!(
@@ -956,9 +1043,9 @@ mod tests {
 
     #[test]
     fn chunk_lengths_that_wrap_u64_are_refused() {
-        // [u64::MAX, 1] wraps to 0: a zero-length term over both chunks
-        // would otherwise pass against a zero-size file.
-        let rec = hand_rec(&[u64::MAX, 1], 0, 0, 0);
+        // [u64::MAX, 2] wraps to 1, matching the declared sizes, so only
+        // the checked sums refuse it.
+        let rec = hand_rec(&[u64::MAX, 2], 1, 1, 1);
         assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
     }
 
@@ -971,6 +1058,34 @@ mod tests {
         // MAX + MAX + MAX wraps to MAX - 2... pick a size the wrap hits.
         rec.files[0].size = u64::MAX.wrapping_mul(3);
         assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+    }
+
+    #[test]
+    fn zero_size_block_rows_are_refused() {
+        // A dangling empty row unreferenced by any term.
+        let mut rec = hand_rec(&[3, 4], 7, 7, 7);
+        rec.files[0].terms.clear();
+        rec.files[0].size = 0;
+        rec.blocks[0].size = 0;
+        rec.blocks[0].chunks.clear();
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+        // A row whose chunks are all zero-length is empty too.
+        let mut rec = hand_rec(&[0, 0], 0, 0, 0);
+        rec.files[0].terms.clear();
+        rec.files[0].size = 0;
+        assert!(matches!(rec.validate(), Err(ModelError::Invalid(_))));
+        // An empty file stays legal: no terms, no blocks, zero bytes.
+        let rec = Reconstruction {
+            schema: RECONSTRUCTION_SCHEMA_V1.into(),
+            files: vec![FileEntry {
+                path: "empty".into(),
+                size: 0,
+                sha256: "0".repeat(64),
+                terms: vec![],
+            }],
+            blocks: vec![],
+        };
+        rec.validate().unwrap();
     }
 
     #[test]
@@ -998,6 +1113,265 @@ mod tests {
             map_file_range(&file, &rec, 0, 7),
             Err(ModelError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn a_resealed_identical_block_is_not_duplicated() {
+        // Uniform input chunks identically, so two windows of pending
+        // chunks seal into blocks with the same content id: the second seal
+        // must patch terms but add neither a block row nor a sink write.
+        let bytes = vec![0u8; 134 * 1024 * 1024];
+        let mut sink: Vec<Block> = Vec::new();
+        let (file, entries) = pack_file_with(
+            "zeros.bin",
+            Cursor::new(bytes.clone()),
+            &DedupIndex::new(),
+            |b| {
+                sink.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let ids: std::collections::HashSet<&str> =
+            entries.iter().map(|e| e.sha256.as_str()).collect();
+        assert_eq!(ids.len(), entries.len(), "duplicate block row sealed");
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for t in &file.terms {
+            *counts.entry(t.block.as_str()).or_default() += 1;
+        }
+        assert!(
+            counts.values().any(|n| *n > 1),
+            "no term revisited a block id"
+        );
+        let sink_ids: std::collections::HashSet<&str> =
+            sink.iter().map(|b| b.sha256.as_str()).collect();
+        assert_eq!(sink_ids.len(), sink.len(), "sink got a block id twice");
+        assert!(entries.len() > 1, "expected at least two unique blocks");
+        let rec = Reconstruction {
+            schema: RECONSTRUCTION_SCHEMA_V1.into(),
+            files: vec![file.clone()],
+            blocks: entries,
+        };
+        rec.validate().unwrap();
+        let store: HashMap<String, Vec<u8>> = sink
+            .iter()
+            .map(|b| (b.sha256.clone(), b.data.clone()))
+            .collect();
+        let mut out = Vec::new();
+        rebuild_file(
+            &file,
+            &rec,
+            &mut |id, off, len| {
+                let block = store.get(id).expect("block");
+                Ok(block[off as usize..(off + len) as usize].to_vec())
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn sealing_the_same_block_id_with_a_different_layout_is_an_error() {
+        let mk = |data: &[u8]| crate::model::chunking::Chunk {
+            sha256: sha256_hex(data),
+            len: data.len(),
+            offset: 0,
+            data: data.to_vec(),
+        };
+        let mut block_entries = Vec::new();
+        let mut terms: Vec<Term> = Vec::new();
+        let dedup = DedupIndex::new();
+        let mut pending = vec![mk(&[1, 2]), mk(&[3, 4])];
+        seal_pending(
+            &mut pending,
+            &mut terms,
+            &mut block_entries,
+            &dedup,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(block_entries.len(), 1);
+        // Same block bytes, split differently: the second seal must fail
+        // rather than write a conflicting row for the same id.
+        let mut pending = vec![mk(&[1, 2, 3, 4])];
+        let err = seal_pending(
+            &mut pending,
+            &mut terms,
+            &mut block_entries,
+            &dedup,
+            &mut |_| panic!("a mismatched reseal must not reach the sink"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sealing_a_prior_block_id_with_a_different_layout_is_an_error() {
+        // The prior stored the block as one chunk; the same bytes pending
+        // here split into two. The id matches, the layout does not.
+        let prior_id = sha256_hex(&[1, 2, 3, 4]);
+        let mut prior = Reconstruction::new();
+        prior.blocks.push(BlockEntry {
+            sha256: prior_id,
+            size: 4,
+            chunks: vec![ChunkMeta {
+                sha256: sha256_hex(&[1, 2, 3, 4]),
+                len: 4,
+            }],
+        });
+        let dedup = DedupIndex::from_reconstructions(&[&prior]);
+        let mk = |data: &[u8]| crate::model::chunking::Chunk {
+            sha256: sha256_hex(data),
+            len: data.len(),
+            offset: 0,
+            data: data.to_vec(),
+        };
+        let mut block_entries = Vec::new();
+        let mut terms: Vec<Term> = Vec::new();
+        let mut pending = vec![mk(&[1, 2]), mk(&[3, 4])];
+        let err = seal_pending(
+            &mut pending,
+            &mut terms,
+            &mut block_entries,
+            &dedup,
+            &mut |_| panic!("a reseal against a prior must not reach the sink"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sealing_a_block_a_prior_already_carries_adds_no_row_or_upload() {
+        let prior_id = sha256_hex(&[1, 2, 3, 4]);
+        let mut prior = Reconstruction::new();
+        prior.blocks.push(BlockEntry {
+            sha256: prior_id.clone(),
+            size: 4,
+            chunks: vec![ChunkMeta {
+                sha256: prior_id.clone(),
+                len: 4,
+            }],
+        });
+        let dedup = DedupIndex::from_reconstructions(&[&prior]);
+        let mut block_entries = Vec::new();
+        let mut terms = vec![Term {
+            block: String::new(),
+            chunk_start: 0,
+            chunk_end: 1,
+            length: 4,
+        }];
+        let mk = |data: &[u8]| crate::model::chunking::Chunk {
+            sha256: sha256_hex(data),
+            len: data.len(),
+            offset: 0,
+            data: data.to_vec(),
+        };
+        let mut pending = vec![mk(&[1, 2, 3, 4])];
+        seal_pending(
+            &mut pending,
+            &mut terms,
+            &mut block_entries,
+            &dedup,
+            &mut |_| panic!("a block a prior stores is not uploaded again"),
+        )
+        .unwrap();
+        assert!(block_entries.is_empty());
+        assert_eq!(terms[0].block, prior_id);
+    }
+
+    #[test]
+    fn the_dedup_index_keeps_one_layout_per_block_id() {
+        let block_id = "x".repeat(64);
+        let mk_block = |chunks: &[&str]| BlockEntry {
+            sha256: block_id.clone(),
+            size: chunks.len() as u64,
+            chunks: chunks
+                .iter()
+                .map(|s| ChunkMeta {
+                    sha256: s.to_string(),
+                    len: 1,
+                })
+                .collect(),
+        };
+        let mut prior_a = Reconstruction::new();
+        prior_a.blocks.push(mk_block(&["a", "b"]));
+        let mut prior_b = Reconstruction::new();
+        prior_b.blocks.push(mk_block(&["ab"]));
+        let idx = DedupIndex::from_reconstructions(&[&prior_a, &prior_b]);
+        assert_eq!(idx.layouts[&block_id].len(), 2);
+        assert!(idx.by_chunk.contains_key("a"));
+        assert!(idx.by_chunk.contains_key("b"));
+        assert_eq!(
+            idx.by_chunk.get("a").map(|(b, _)| b.as_str()),
+            Some(block_id.as_str())
+        );
+        assert!(
+            !idx.by_chunk.contains_key("ab"),
+            "a second layout for an indexed block id must not enter the index"
+        );
+    }
+
+    #[test]
+    fn a_term_length_that_disagrees_with_its_span_is_refused() {
+        // Two one-byte chunks, terms declaring 0 and 2 bytes: a hand-built
+        // reconstruction whose declared lengths lie about the spans.
+        let block_id = "b".repeat(64);
+        let rec = Reconstruction {
+            schema: RECONSTRUCTION_SCHEMA_V1.into(),
+            files: vec![FileEntry {
+                path: "f".into(),
+                size: 2,
+                sha256: "0".repeat(64),
+                terms: vec![
+                    Term {
+                        block: block_id.clone(),
+                        chunk_start: 0,
+                        chunk_end: 1,
+                        length: 0,
+                    },
+                    Term {
+                        block: block_id.clone(),
+                        chunk_start: 1,
+                        chunk_end: 2,
+                        length: 2,
+                    },
+                ],
+            }],
+            blocks: vec![BlockEntry {
+                sha256: block_id,
+                size: 2,
+                chunks: vec![
+                    ChunkMeta {
+                        sha256: "a".repeat(64),
+                        len: 1,
+                    },
+                    ChunkMeta {
+                        sha256: "c".repeat(64),
+                        len: 1,
+                    },
+                ],
+            }],
+        };
+        let file = rec.files[0].clone();
+        assert!(matches!(
+            map_file_range(&file, &rec, 0, 1),
+            Err(ModelError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_range_the_terms_do_not_cover_is_refused() {
+        // The file declares two bytes but its single term covers one:
+        // asking for the second byte must error rather than return a short
+        // map, while an empty range still maps to nothing.
+        let rec = hand_rec(&[1], 1, 1, 2);
+        let file = rec.files[0].clone();
+        assert!(matches!(
+            map_file_range(&file, &rec, 1, 2),
+            Err(ModelError::Invalid(_))
+        ));
+        assert!(map_file_range(&file, &rec, 0, 0).unwrap().is_empty());
     }
 
     #[test]
