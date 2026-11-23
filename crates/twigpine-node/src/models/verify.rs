@@ -544,12 +544,19 @@ mod tests {
             &manifest_bytes,
         )
         .expect("manifest");
-        std::fs::write(dir.path().join(".twigpine/model-release.sig"), sig)
-            .expect("sig");
+        std::fs::write(dir.path().join(".twigpine/model-release.sig"), sig).expect("sig");
         git(dir.path(), &["add", "a.txt", ".twigpine"]);
         git(
             dir.path(),
-            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "r1"],
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "r1",
+            ],
         );
         let commit = git(dir.path(), &["rev-parse", "HEAD"]);
 
@@ -588,28 +595,29 @@ mod tests {
         let worker = tokio::spawn(run_verify_worker(state.clone()));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let state_str = loop {
-            let s: String = sqlx::query_scalar(
-                "SELECT state FROM model_releases WHERE commit_sha = $1",
-            )
-            .bind(&commit)
-            .fetch_one(&pool)
-            .await
-            .expect("release state");
+            let s: String =
+                sqlx::query_scalar("SELECT state FROM model_releases WHERE commit_sha = $1")
+                    .bind(&commit)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("release state");
             if s != "verifying" {
                 break s;
             }
-            assert!(std::time::Instant::now() < deadline, "release never settled");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "release never settled"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         };
         worker.abort();
         assert_eq!(state_str, "rejected");
-        let reason: String = sqlx::query_scalar(
-            "SELECT failure_reason FROM model_releases WHERE commit_sha = $1",
-        )
-        .bind(&commit)
-        .fetch_one(&pool)
-        .await
-        .expect("failure_reason");
+        let reason: String =
+            sqlx::query_scalar("SELECT failure_reason FROM model_releases WHERE commit_sha = $1")
+                .bind(&commit)
+                .fetch_one(&pool)
+                .await
+                .expect("failure_reason");
         assert!(
             reason.contains("verification failed repeatedly"),
             "got: {reason}"
@@ -620,7 +628,15 @@ mod tests {
         git(dir.path(), &["add", "a.txt"]);
         git(
             dir.path(),
-            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "r2"],
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "r2",
+            ],
         );
         let commit2 = git(dir.path(), &["rev-parse", "HEAD"]);
         let record = state

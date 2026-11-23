@@ -1080,7 +1080,10 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("7"), "{msg}");
         assert!(msg.contains("300"), "{msg}");
-        assert!(msg.contains("/api/v1/repos/o/r/models/releases/cc"), "{msg}");
+        assert!(
+            msg.contains("/api/v1/repos/o/r/models/releases/cc"),
+            "{msg}"
+        );
     }
 
     #[test]
