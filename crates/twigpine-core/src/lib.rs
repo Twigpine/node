@@ -8,6 +8,7 @@ pub mod identity;
 pub mod identity_path;
 pub mod legacy_env;
 pub mod legacy_headers;
+pub mod model;
 pub mod node_denial;
 // `url` is the one dependency here that drags a tail (idna, then the icu
 // crates), and twigpine-core is allowlisted to stay embeddable. Every client that

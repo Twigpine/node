@@ -2714,6 +2714,113 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_repo_push_events_ref ON repo_push_events(repo_id, ref_name, seq DESC)",
         ],
     },
+    Migration {
+        // v49: model hosting schema. Nothing reads or writes these tables yet;
+        // later work mounts upload sessions, release claims, and the
+        // durability outbox on top of them. Timestamps stay TEXT (RFC 3339),
+        // the convention every table above follows.
+        version: 49,
+        name: "model_hosting_schema",
+        stmts: &[
+            // An upload session is a bearer capability under which a publisher
+            // streams content-addressed blocks. `bytes_received` bounds what an
+            // open session holds; `expires_at` slides forward on each accepted
+            // block so a slow upload that keeps making progress never loses
+            // its session.
+            r#"CREATE TABLE IF NOT EXISTS model_upload_sessions (
+                id             TEXT NOT NULL PRIMARY KEY,
+                owner_did      TEXT NOT NULL,
+                repo_id        TEXT NOT NULL REFERENCES repos(id),
+                created_at     TEXT NOT NULL,
+                expires_at     TEXT NOT NULL,
+                bytes_received BIGINT NOT NULL DEFAULT 0,
+                state          TEXT NOT NULL CHECK (state IN ('open', 'closed', 'expired'))
+            )"#,
+            // The expiry sweep walks open sessions whose deadline passed.
+            "CREATE INDEX IF NOT EXISTS idx_model_upload_sessions_expiry ON model_upload_sessions (state, expires_at)",
+            // Per-identity open-session byte totals are summed by owner.
+            "CREATE INDEX IF NOT EXISTS idx_model_upload_sessions_owner ON model_upload_sessions (owner_did, state)",
+            // A block is a sha256-addressed run of packed chunks. Its row
+            // existing is the node's record that the bytes are stored;
+            // `unreferenced_since` starts the grace clock once no release or
+            // open session references it.
+            r#"CREATE TABLE IF NOT EXISTS model_blocks (
+                sha256             TEXT NOT NULL PRIMARY KEY CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+                size               BIGINT NOT NULL CHECK (size > 0),
+                created_at         TEXT NOT NULL,
+                unreferenced_since TEXT
+            )"#,
+            // The sweep walks blocks whose grace clock is running.
+            "CREATE INDEX IF NOT EXISTS idx_model_blocks_unreferenced ON model_blocks (unreferenced_since) WHERE unreferenced_since IS NOT NULL",
+            r#"CREATE TABLE IF NOT EXISTS model_session_blocks (
+                session_id   TEXT NOT NULL REFERENCES model_upload_sessions(id),
+                block_sha256 TEXT NOT NULL REFERENCES model_blocks(sha256),
+                PRIMARY KEY (session_id, block_sha256)
+            )"#,
+            // Reverse membership: the sweep asks "does any session still hold
+            // this block?" per block, not per session.
+            "CREATE INDEX IF NOT EXISTS idx_model_session_blocks_block ON model_session_blocks (block_sha256)",
+            // A release is a signed manifest commit claimed against a repo.
+            // Unique on (repo, commit): the commit sha is the release id. The
+            // claim signature material is persisted the way status_claims
+            // persists it, so a replayed claim is a no-op instead of a second
+            // quota charge.
+            r#"CREATE TABLE IF NOT EXISTS model_releases (
+                id                    BIGSERIAL PRIMARY KEY,
+                repo_id               TEXT NOT NULL REFERENCES repos(id),
+                commit_sha            TEXT NOT NULL,
+                branch                TEXT NOT NULL,
+                publisher_did         TEXT NOT NULL,
+                state                 TEXT NOT NULL CHECK (state IN ('verifying', 'published', 'rejected', 'withdrawn')),
+                manifest_sha256       TEXT NOT NULL,
+                reconstruction_sha256 TEXT,
+                failure_reason        TEXT,
+                claim_signature       TEXT NOT NULL,
+                claim_signature_input TEXT NOT NULL,
+                claim_signing_string  TEXT NOT NULL,
+                claim_body            BYTEA NOT NULL,
+                created_at            TEXT NOT NULL,
+                published_at          TEXT,
+                UNIQUE (repo_id, commit_sha)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_model_releases_publisher ON model_releases (publisher_did, state)",
+            // The read surface resolves a branch to its newest published
+            // release.
+            "CREATE INDEX IF NOT EXISTS idx_model_releases_repo_branch ON model_releases (repo_id, branch, state, id DESC)",
+            r#"CREATE TABLE IF NOT EXISTS model_release_blocks (
+                release_id   BIGINT NOT NULL REFERENCES model_releases(id),
+                block_sha256 TEXT NOT NULL REFERENCES model_blocks(sha256),
+                PRIMARY KEY (release_id, block_sha256)
+            )"#,
+            // Reverse membership: the sweeper asks "does any release still
+            // reference this block?", and quota is summed over the distinct
+            // blocks a DID's live releases reference.
+            "CREATE INDEX IF NOT EXISTS idx_model_release_blocks_block ON model_release_blocks (block_sha256)",
+            r#"CREATE TABLE IF NOT EXISTS model_quota_usage (
+                did        TEXT NOT NULL PRIMARY KEY,
+                bytes_used BIGINT NOT NULL DEFAULT 0 CHECK (bytes_used >= 0)
+            )"#,
+            // Durable outbox for pin and anchor work. One row per (release,
+            // kind, object), claimed and retried by a worker; provider_cid
+            // records the returned CID separately from the sha256 that keys
+            // the object, so the content address stays the resolver key.
+            r#"CREATE TABLE IF NOT EXISTS model_durability_jobs (
+                id           BIGSERIAL PRIMARY KEY,
+                release_id   BIGINT NOT NULL REFERENCES model_releases(id),
+                kind         TEXT NOT NULL CHECK (kind IN ('pin_block', 'pin_manifest', 'pin_reconstruction', 'pin_block_map', 'anchor')),
+                object_key   TEXT NOT NULL,
+                state        TEXT NOT NULL CHECK (state IN ('pending', 'done', 'failed')),
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                last_error   TEXT,
+                provider_cid TEXT,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                UNIQUE (release_id, kind, object_key)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_model_durability_jobs_pending ON model_durability_jobs (state, created_at)",
+        ],
+    },
+
     // v49 and v50 are claimed by open PRs #620 (model_hosting_schema) and #622
     // (model_release_claim_digest_and_cascades), which have not merged. This
     // entry takes v51 so it cannot collide with either; the runner never
@@ -7952,11 +8059,16 @@ impl Db {
         // lands first. Normalizing instead would mean canonicalizing the stored
         // value, this comparison, and the existing trim_end_matches call sites.
         //
-        // last_ping_ok is NOT a trust signal. An unauthenticated caller can
-        // clear it by announcing a different URL, and until #248 lands can also
-        // set it through the unauthenticated GET /api/v1/peers/{did}/ping, which
-        // writes mark_peer_ping from the stored URL's own probe response. Do not
-        // build a new consumer on this flag as if it were attacker-resistant.
+        // last_ping_ok is NOT a trust signal. Since #248, the anonymous
+        // GET /api/v1/peers/{did}/ping endpoint is read-only and never writes
+        // it. An unsigned announce cannot change an existing row's http_url
+        // either: it is refused with PeerWriteDenied::UnprovenRepoint and
+        // leaves the row and last_ping_ok unchanged. Two paths clear it: a
+        // signed announce from that peer's own DID with a changed http_url
+        // clears it immediately (via the Proven CASE below), and the periodic
+        // gossip loop clears it through mark_peer_ping only after consecutive
+        // failed probes. Do not build a new consumer on this flag as if it
+        // were attacker-resistant.
         //
         // Only the federated repo fan-out in api/repos.rs gates on this flag.
         // Four consumers act on a repointed http_url regardless of it (sync.rs's
@@ -14341,6 +14453,162 @@ mod migration_tests {
         assert_eq!(cid, "QmLocalGenuine");
     }
 
+    // ── Model hosting schema (v49) ─────────────────────────────────────────
+
+    const V49: i64 = 49;
+
+    const MODEL_TABLES: &[&str] = &[
+        "model_upload_sessions",
+        "model_blocks",
+        "model_session_blocks",
+        "model_releases",
+        "model_release_blocks",
+        "model_quota_usage",
+        "model_durability_jobs",
+    ];
+
+    async fn model_fixture_repo(db: &super::Db, id: &str) {
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, is_public, default_branch,
+                                created_at, updated_at, disk_path)
+             VALUES ($1, $2, 'did:key:zOwner', TRUE, 'main',
+                     '2026-11-19T00:00:00+00:00', '2026-11-19T00:00:00+00:00', $3)",
+        )
+        .bind(id)
+        .bind(format!("model-{id}"))
+        .bind(format!("/srv/repos/{id}.git"))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_model_release(db: &super::Db, repo_id: &str, commit: &str) {
+        sqlx::query(
+            "INSERT INTO model_releases
+                (repo_id, commit_sha, branch, publisher_did, state,
+                 manifest_sha256, claim_signature, claim_signature_input,
+                 claim_signing_string, claim_body, created_at)
+             VALUES ($1, $2, 'main', 'did:key:zOwner', 'verifying',
+                     $3, 'sig', 'input', 'signing', '\\x00', '2026-11-19T00:00:00+00:00')",
+        )
+        .bind(repo_id)
+        .bind(commit)
+        .bind("c".repeat(64))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A fresh database runs the whole chain and lands every model table.
+    #[sqlx::test]
+    async fn migration_v49_fresh_chain_creates_model_tables(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        for table in MODEL_TABLES {
+            assert!(table_exists(&db, table).await, "{table} missing");
+        }
+    }
+
+    /// A node already at the previous version gains the same tables through
+    /// the runner, not just a fresh chain. Rolling back by dropping the v49
+    /// objects keeps the test honest if the statements were ever appended to
+    /// an already-applied entry.
+    #[sqlx::test]
+    async fn migration_v49_upgrade_path_adds_model_tables(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        for table in MODEL_TABLES.iter().rev() {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM schema_migrations WHERE version >= $1")
+            .bind(V49)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        for table in MODEL_TABLES {
+            assert!(
+                table_exists(&db, table).await,
+                "{table} missing after upgrade on an existing node"
+            );
+        }
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = $1")
+                .bind(V49)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, 1, "v49 must be recorded as applied");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    /// The release id is (repo, commit): a second claim of the same commit on
+    /// the same repo is a replay the schema refuses.
+    #[sqlx::test]
+    async fn model_releases_rejects_duplicate_repo_commit(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        model_fixture_repo(&db, "repo-model").await;
+
+        insert_model_release(&db, "repo-model", SHA_A).await;
+        let second = sqlx::query(
+            "INSERT INTO model_releases
+                (repo_id, commit_sha, branch, publisher_did, state,
+                 manifest_sha256, claim_signature, claim_signature_input,
+                 claim_signing_string, claim_body, created_at)
+             VALUES ('repo-model', $1, 'main', 'did:key:zOwner', 'verifying',
+                     $2, 'sig', 'input', 'signing', '\\x00', '2026-11-19T00:00:00+00:00')",
+        )
+        .bind(SHA_A)
+        .bind("d".repeat(64))
+        .execute(&db.pool)
+        .await;
+        assert!(
+            second.is_err(),
+            "a duplicate (repo, commit) release must violate the unique constraint"
+        );
+
+        // A different commit on the same repo is a different release.
+        insert_model_release(&db, "repo-model", SHA_B).await;
+    }
+
+    /// The block table accepts only a 64-lowercase-hex content address: the
+    /// id is derived from the bytes everywhere it is used, so a malformed id
+    /// in the table would corrupt every reference to it.
+    #[sqlx::test]
+    async fn model_blocks_rejects_malformed_sha(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        for bad in ["nothex", &"A".repeat(64), &"g".repeat(64), &"e".repeat(63)] {
+            let result = sqlx::query(
+                "INSERT INTO model_blocks (sha256, size, created_at)
+                 VALUES ($1, 10, '2026-11-19T00:00:00+00:00')",
+            )
+            .bind(bad)
+            .execute(&db.pool)
+            .await;
+            assert!(result.is_err(), "block id {bad:?} must be rejected");
+        }
+        sqlx::query(
+            "INSERT INTO model_blocks (sha256, size, created_at)
+             VALUES ($1, 10, '2026-11-19T00:00:00+00:00')",
+        )
+        .bind("e".repeat(64))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
     // ── Repo homepage (v51) ──────────────────────────────────────────────────
 
     /// The version this branch's migration claims; the upgrade test derives its
@@ -14381,7 +14649,6 @@ mod migration_tests {
             .execute(&db.pool)
             .await
             .unwrap();
-
         let prior = MIGRATIONS
             .iter()
             .map(|m| m.version)
