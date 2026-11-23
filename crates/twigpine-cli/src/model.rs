@@ -959,10 +959,10 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         }
     }
     eprintln!(
-        "publishing stores the blocks in this node's configured block store and commits a \
-         signed release manifest to git: the bytes stay available only while this node \
-         keeps them and the repo stays readable, and nothing is pinned to IPFS or \
-         anchored to Arweave"
+        "publishing is permanent where the node has durability configured: blocks are pinned \
+         to IPFS and the release anchor is posted to Arweave, and neither can be taken back. \
+         With no IPFS tier and no Irys configured, the bytes stay on this node only and stay \
+         available only while it keeps them"
     );
     if !args.yes && !confirm_publish()? {
         println!("aborted");
