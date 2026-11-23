@@ -712,11 +712,13 @@ where
 ///
 /// `limit` (default 30, clamped into 1..=100) and `before=<commit id>`. `before`
 /// is a position in the served head's own history order: the page is what follows
-/// that commit in the order an unpaged listing prints, so a client that sends the
-/// last row's `hash` sees every commit once, including history reachable only
-/// through a merge's second parent. It is compared against `git rev-list` output
-/// and never handed to git. Head resolution, position lookup and the page read run
-/// under one deadline on a blocking thread that holds the read permits.
+/// that commit in the order an unpaged listing prints. Within one head the walk
+/// visits every commit once, including history reachable only through a merge's
+/// second parent. Paging is not a snapshot: each request resolves the head again,
+/// so a head change between pages can skip or repeat commits. `before` is compared
+/// against `git rev-list` output and never handed to git. Head resolution,
+/// position lookup and the page read run under one deadline on a blocking thread
+/// that holds the read permits.
 pub async fn list_commits(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
