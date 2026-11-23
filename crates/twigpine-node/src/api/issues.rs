@@ -471,6 +471,19 @@ pub async fn close_issue(
         .map_err(|e| crate::api::repos::acquire_write_app_error(&e, &repo))?;
     let disk_path = guard.path().to_path_buf();
 
+    // ONE lock-hold deadline funds every git child under the guard: the
+    // re-authorize re-read, the rollback snapshot, the close itself and the
+    // publish-refusal rollback. An expired deadline refuses before anything
+    // runs; a child killed at it surfaces as GitServiceTimeout, which the arms
+    // below map to the retryable 503 rather than a 500 git_error.
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let Some(hold_deadline) = guard.hold_deadline(git_timeout) else {
+        let _ = guard.release(false).await;
+        tracing::warn!(repo = %repo, "lock-hold deadline expired before the issue close; refusing");
+        return Err(AppError::RepoUnavailable);
+    };
+    let git_bin = state.git_bin.clone();
+
     // Re-read under the guard and RE-AUTHORIZE against what we read, rather than
     // only confirming the issue still exists. The pre-lock read decided whether to
     // take the lock; it cannot be the authorization decision, because acquire_write
@@ -478,7 +491,7 @@ pub async fn close_issue(
     // than the one the author was read from. Checking existence alone would leave the
     // whole decision resting on the earlier read of a tree we are no longer looking
     // at. The blob is already in hand here, so this costs a deserialize.
-    match git_issues::get_issue(&disk_path, &issue_id) {
+    match git_issues::get_issue_bounded(&git_bin, &disk_path, &issue_id, hold_deadline) {
         Ok(Some(raw)) => {
             let author_now: Option<String> = serde_json::from_str::<IssueRecord>(&raw)
                 .ok()
@@ -512,40 +525,36 @@ pub async fn close_issue(
         }
         Err(e) => {
             let _ = guard.release(false).await;
-            return Err(AppError::Git(e.to_string()));
+            // A re-read that could not answer is not an authorization answer:
+            // a child killed at the hold deadline is the retryable refusal,
+            // never the 403/404 an unanswered check would otherwise fall into.
+            return Err(close_git_app_error(e));
         }
     }
 
     // Snapshot the issue's pre-close JSON so a failed durable upload can roll
     // the close back on local disk, mirroring create_issue. Best-effort: if the
     // snapshot read fails we proceed without a rollback closure (the close still
-    // applies and a failed upload still surfaces as a 5xx below).
+    // applies and a failed upload still surfaces as a 5xx below). A snapshot
+    // read that hits the deadline is swallowed the same way: the bounded close
+    // below then fails at once on its own first child.
     //
     // Resolve first so the compensating rewrite below lands on the SAME ref the
     // close mutates. The path id may be an 8-char prefix, and rewriting
     // refs/gitlawb/issues/{prefix} with the pre-close content would leave the
     // canonical {full_id} ref closed while the client saw a 5xx.
-    let full_issue_id = git_issues::resolve_issue_id(&disk_path, &issue_id)
-        .ok()
-        .flatten();
-    let prior_json = full_issue_id
-        .as_deref()
-        .and_then(|id| git_issues::get_issue(&disk_path, id).ok().flatten());
+    let full_issue_id =
+        git_issues::resolve_issue_id_bounded(&git_bin, &disk_path, &issue_id, hold_deadline)
+            .ok()
+            .flatten();
+    let prior_json = full_issue_id.as_deref().and_then(|id| {
+        git_issues::get_issue_bounded(&git_bin, &disk_path, id, hold_deadline)
+            .ok()
+            .flatten()
+    });
 
-    // An expired lock-hold deadline refuses before the ref is touched. The
-    // close's own git children are not clamped to it (there is no bounded
-    // close), so this bounds when the write may START, not how long it runs.
-    if guard
-        .hold_deadline(std::time::Duration::from_secs(
-            state.config.git_service_timeout_secs,
-        ))
-        .is_none()
-    {
-        let _ = guard.release(false).await;
-        tracing::warn!(repo = %repo, "lock-hold deadline expired before the issue close; refusing");
-        return Err(AppError::RepoUnavailable);
-    }
-    let close_result = git_issues::close_issue(&disk_path, &issue_id);
+    let close_result =
+        git_issues::close_issue_bounded(&git_bin, &disk_path, &issue_id, hold_deadline);
 
     // Always release the advisory lock — even on error; upload to Tigris only on success.
     // Same short-circuit as create_issue, and before the 200 body below. With a
@@ -553,26 +562,56 @@ pub async fn close_issue(
     // content instead of leaving the local repo closed while the client saw 5xx.
     let release_result = match (close_result.is_ok(), prior_json, full_issue_id) {
         (true, Some(json), Some(resolved_id)) => {
-            let git_bin = state.git_bin.clone();
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(state.config.git_service_timeout_secs);
             guard
                 .release_compensating(true, move |path| {
                     // Same bounded-write strategy create_issue's compensator
-                    // uses: the rollback rewrites the ref with the pre-close
-                    // content through the deadline-aware runner, so a hung git
-                    // cannot stall the guard past git_service_timeout.
-                    git_issues::create_issue_bounded(&git_bin, path, &resolved_id, &json, deadline)
+                    // uses, funded by the SAME hold deadline the close ran on:
+                    // the rollback rewrites the ref with the pre-close content
+                    // through the deadline-aware runner, so a hung git cannot
+                    // stall the guard past the lock hold.
+                    git_issues::create_issue_bounded(
+                        &git_bin,
+                        path,
+                        &resolved_id,
+                        &json,
+                        hold_deadline,
+                    )
                 })
                 .await
                 .into_result()
+        }
+        (false, Some(json), Some(resolved_id)) => {
+            // A bounded close that erred may have committed its update-ref
+            // before the kill, the same uncertainty create's cleanup covers.
+            // Rewrite the pre-close JSON on the same hold budget before
+            // releasing; when the hold is spent or the rewrite fails, drop the
+            // guard unreleased so the tree quarantines rather than serve or
+            // publish an unacknowledged close.
+            let restored = git_issues::create_issue_bounded(
+                &git_bin,
+                &disk_path,
+                &resolved_id,
+                &json,
+                hold_deadline,
+            )
+            .map_err(|e| {
+                tracing::warn!(repo = %repo, err = %e, "could not restore the issue ref after a failed close");
+            })
+            .is_ok();
+            if restored {
+                guard.release(false).await.into_result()
+            } else {
+                tracing::warn!(repo = %repo, "failed-close rollback did not finish inside the lock-hold budget; quarantining the tree");
+                drop(guard);
+                Ok(())
+            }
         }
         _ => guard.release(close_result.is_ok()).await.into_result(),
     };
     release_result?;
 
     let updated = close_result
-        .map_err(|e| AppError::Git(e.to_string()))?
+        .map_err(close_git_app_error)?
         .ok_or_else(|| AppError::RepoNotFound(format!("issue {issue_id} not found")))?;
 
     let issue: serde_json::Value = serde_json::from_str(&updated)
@@ -581,6 +620,19 @@ pub async fn close_issue(
     tracing::info!(repo = %repo, issue = %issue_id, "issue closed");
 
     Ok(Json(issue))
+}
+
+/// Map a bounded-git failure under the close guard to the error the client
+/// should see: a child killed at the lock-hold deadline is the retryable 503
+/// the refresh path uses, anything else keeps the git 500 it has always been.
+fn close_git_app_error(e: anyhow::Error) -> AppError {
+    if e.downcast_ref::<crate::git::smart_http::GitServiceTimeout>()
+        .is_some()
+    {
+        AppError::RepoUnavailable
+    } else {
+        AppError::Git(e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1814,6 +1866,159 @@ mod lock_pool_shed_tests {
             Some(open_json.as_str()),
             "the issue must still be open: the close may not write past the deadline"
         );
+    }
+
+    /// #282: a git child of the close that hangs is torn down at the lock-hold
+    /// deadline instead of pinning the lock-pool connection for the shim's own
+    /// 30s sleep. The handler must answer the retryable 503 inside the bound,
+    /// the session must come back (a second write on a one-connection lock pool
+    /// succeeds), and the issue ref must still be open.
+    #[sqlx::test]
+    async fn close_issue_bounded_git_cannot_outlive_the_lock_hold(pool: PgPool) {
+        use crate::test_support::git_shim;
+
+        let owner = "did:key:zISSUEHANGCLOSEAAAAAAAAAAAAAAAAAAAA";
+        let repo_name = "hangclose";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let live = crate::git::repo_store::validated_repo_disk_path(disk.path(), owner, repo_name)
+            .expect("repo path");
+        let mut seeded = seed_repo(owner, repo_name);
+        seeded.disk_path = live.to_string_lossy().to_string();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        let full_id = "abc12345-0000-0000-0000-000000000000";
+        let open_json = serde_json::to_string(&IssueRecord {
+            id: full_id.to_string(),
+            title: "seeded".to_string(),
+            body: Some(String::new()),
+            author: Some(owner.to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "open".to_string(),
+            signed_payload: None,
+        })
+        .expect("serialize seeded issue");
+        git_issues::create_issue(&live, full_id, &open_json).expect("seed issue");
+
+        // One lock-pool connection, so a session still pinned by the wedged
+        // close would shed or stall the probe write below.
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 1, std::time::Duration::from_secs(1)),
+        )
+        .with_lock_hold_timeout(std::time::Duration::from_secs(2));
+        // Every bounded git child the close spawns has the live repo as its
+        // cwd, so a repo-scoped hang stalls the first one under the guard.
+        let shim = git_shim::create(
+            "gl-close-hang-git",
+            git_shim::Behavior::HangRepo("hangclose.git"),
+        );
+        state.git_bin = shim.to_str().unwrap().to_string();
+
+        let started = std::time::Instant::now();
+        let res = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                repo_name.to_string(),
+                full_id.to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+            crate::auth::LedgerTicket::already_spent(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let err = res.expect_err("a hung under-lock git must refuse the close");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a child killed at the hold deadline is the retryable 503, not a 500"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "the close must stop at the 2s hold deadline plus teardown, not run the shim's 30s hang (took {elapsed:?})"
+        );
+
+        // The lock-pool session came back: a fresh write on the one-connection
+        // pool acquires instead of shedding as busy.
+        let second = state
+            .repo_store
+            .acquire_write(owner, repo_name)
+            .await
+            .expect("the hung close must not keep the lock-pool slot");
+        second
+            .release(false)
+            .await
+            .into_result()
+            .expect("probe release");
+
+        assert_eq!(
+            git_issues::get_issue(&live, full_id)
+                .expect("read the ref")
+                .as_deref(),
+            Some(open_json.as_str()),
+            "the issue must still be open: the killed child wrote nothing"
+        );
+    }
+
+    /// The positive twin of the hold tests: a normal close on a store whose
+    /// hold deadline is generous still runs to completion and returns the
+    /// closed issue.
+    #[sqlx::test]
+    async fn close_issue_under_a_generous_hold_deadline_still_closes(pool: PgPool) {
+        let owner = "did:key:zISSUECLOSEBOUNDOKAAAAAAAAAAAAAAAAA";
+        let repo_name = "boundclose-ok";
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let disk = tempfile::TempDir::new().unwrap();
+        let live = crate::git::repo_store::validated_repo_disk_path(disk.path(), owner, repo_name)
+            .expect("repo path");
+        let mut seeded = seed_repo(owner, repo_name);
+        seeded.disk_path = live.to_string_lossy().to_string();
+        state.db.create_repo(&seeded).await.expect("seed repo");
+        crate::git::store::init_bare(&live).expect("init bare repo");
+        let full_id = "def99999-0000-0000-0000-000000000000";
+        let open_json = serde_json::to_string(&IssueRecord {
+            id: full_id.to_string(),
+            title: "seeded".to_string(),
+            body: Some(String::new()),
+            author: Some(owner.to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "open".to_string(),
+            signed_payload: None,
+        })
+        .expect("serialize seeded issue");
+        git_issues::create_issue(&live, full_id, &open_json).expect("seed issue");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            disk.path().to_path_buf(),
+            crate::git::repo_store::build_lock_pool(&pool, 2, std::time::Duration::from_secs(1)),
+        )
+        .with_lock_hold_timeout(std::time::Duration::from_secs(60));
+
+        let res = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((
+                owner.to_string(),
+                repo_name.to_string(),
+                full_id.to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+            crate::auth::LedgerTicket::already_spent(),
+        )
+        .await;
+        let Json(issue) = res.expect("a normal close must succeed under the hold bound");
+        assert_eq!(issue["status"], "closed");
+        let stored: serde_json::Value = serde_json::from_str(
+            &git_issues::get_issue(&live, full_id)
+                .expect("read the ref")
+                .expect("ref still present"),
+        )
+        .expect("stored issue parses");
+        assert_eq!(stored["status"], "closed");
     }
 
     /// The compensating rewrite after a refused publish must land on the ref the

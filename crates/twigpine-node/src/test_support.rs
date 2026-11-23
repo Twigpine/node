@@ -29,7 +29,7 @@ use crate::auth::AuthenticatedDid;
 use crate::state::AppState;
 
 #[path = "test_git_shim.rs"]
-mod git_shim;
+pub(crate) mod git_shim;
 
 /// Build an [`AppState`] over a real, migrated Postgres pool (from `#[sqlx::test]`).
 /// Runs the schema migrations first, because the per-test database starts empty.
