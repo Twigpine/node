@@ -524,6 +524,8 @@ pub struct MarkerCleanup {
     pub dead_letter: bool,
 }
 
+pub mod model_queries;
+
 /// The lifecycle states of a row in `pending_ref_transitions`. Persisted as a
 /// TEXT column with one of these string values; the constants are the canonical
 /// spellings, and tests + the recovery drain all use them so a typo on one
@@ -2818,6 +2820,30 @@ const MIGRATIONS: &[Migration] = &[
                 UNIQUE (release_id, kind, object_key)
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_model_durability_jobs_pending ON model_durability_jobs (state, created_at)",
+        ],
+    },
+    Migration {
+        version: 50,
+        name: "model_release_claim_digest_and_cascades",
+        stmts: &[
+            // Replayed claims resolve by request digest instead of writing a
+            // second row, mirroring status_claims' dedupe.
+            "ALTER TABLE model_releases ADD COLUMN IF NOT EXISTS claim_request_digest TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_model_releases_request_digest ON model_releases (claim_request_digest) WHERE claim_request_digest IS NOT NULL",
+            // One in-flight verification per publisher: claim admission's
+            // check is check-then-act under the advisory lock, and this index
+            // is the backstop that makes a bug there still fail closed.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_model_releases_one_verifying ON model_releases (publisher_did) WHERE state = 'verifying'",
+            // A deleted repo takes its sessions, releases, and links with it.
+            // The FK constraints are re-declared with ON DELETE CASCADE; the
+            // names are Postgres defaults (table_column_fkey).
+            "ALTER TABLE model_upload_sessions DROP CONSTRAINT IF EXISTS model_upload_sessions_repo_id_fkey, ADD CONSTRAINT model_upload_sessions_repo_id_fkey FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE",
+            "ALTER TABLE model_session_blocks DROP CONSTRAINT IF EXISTS model_session_blocks_session_id_fkey, ADD CONSTRAINT model_session_blocks_session_id_fkey FOREIGN KEY (session_id) REFERENCES model_upload_sessions(id) ON DELETE CASCADE",
+            "ALTER TABLE model_session_blocks DROP CONSTRAINT IF EXISTS model_session_blocks_block_sha256_fkey, ADD CONSTRAINT model_session_blocks_block_sha256_fkey FOREIGN KEY (block_sha256) REFERENCES model_blocks(sha256) ON DELETE CASCADE",
+            "ALTER TABLE model_releases DROP CONSTRAINT IF EXISTS model_releases_repo_id_fkey, ADD CONSTRAINT model_releases_repo_id_fkey FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE",
+            "ALTER TABLE model_release_blocks DROP CONSTRAINT IF EXISTS model_release_blocks_release_id_fkey, ADD CONSTRAINT model_release_blocks_release_id_fkey FOREIGN KEY (release_id) REFERENCES model_releases(id) ON DELETE CASCADE",
+            "ALTER TABLE model_release_blocks DROP CONSTRAINT IF EXISTS model_release_blocks_block_sha256_fkey, ADD CONSTRAINT model_release_blocks_block_sha256_fkey FOREIGN KEY (block_sha256) REFERENCES model_blocks(sha256) ON DELETE CASCADE",
+            "ALTER TABLE model_durability_jobs DROP CONSTRAINT IF EXISTS model_durability_jobs_release_id_fkey, ADD CONSTRAINT model_durability_jobs_release_id_fkey FOREIGN KEY (release_id) REFERENCES model_releases(id) ON DELETE CASCADE",
         ],
     },
 ];
@@ -14430,7 +14456,7 @@ mod migration_tests {
                 (repo_id, commit_sha, branch, publisher_did, state,
                  manifest_sha256, claim_signature, claim_signature_input,
                  claim_signing_string, claim_body, created_at)
-             VALUES ($1, $2, 'main', 'did:key:zOwner', 'verifying',
+             VALUES ($1, $2, 'main', 'did:key:zOwner', 'published',
                      $3, 'sig', 'input', 'signing', '\\x00', '2026-11-19T00:00:00+00:00')",
         )
         .bind(repo_id)
@@ -14507,7 +14533,7 @@ mod migration_tests {
                 (repo_id, commit_sha, branch, publisher_did, state,
                  manifest_sha256, claim_signature, claim_signature_input,
                  claim_signing_string, claim_body, created_at)
-             VALUES ('repo-model', $1, 'main', 'did:key:zOwner', 'verifying',
+             VALUES ('repo-model', $1, 'main', 'did:key:zOwner', 'published',
                      $2, 'sig', 'input', 'signing', '\\x00', '2026-11-19T00:00:00+00:00')",
         )
         .bind(SHA_A)
