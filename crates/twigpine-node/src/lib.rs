@@ -416,7 +416,8 @@ pub async fn run() -> Result<()> {
         tigris,
         lock_pool,
         std::time::Duration::from_secs(config.lock_held_transfer_timeout_secs),
-    );
+    )
+    .with_lock_hold_timeout(config.write_lock_hold_timeout());
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory. Max and window
@@ -1030,7 +1031,8 @@ async fn run_admin_command(command: config::Command, config: &Config) -> Result<
                 object_store,
                 lock_pool,
                 std::time::Duration::from_secs(config.lock_held_transfer_timeout_secs),
-            );
+            )
+            .with_lock_hold_timeout(config.write_lock_hold_timeout());
             admin::run_purge_spam(&db, &repo_store, &config.repos_dir, execute)
                 .await
                 .map(|_| ())
