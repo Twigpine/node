@@ -35,6 +35,22 @@ pub struct FsBlockStore {
     root: PathBuf,
 }
 
+/// Directories to fsync after `create_dir_all(dir)`, deepest first: the
+/// parent of every ancestor. A relative root's chain ends at an empty
+/// parent, whose entry lives in the current directory.
+fn ancestor_parents(dir: &Path) -> Vec<PathBuf> {
+    dir.ancestors()
+        .map_while(|d| d.parent())
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                p.to_path_buf()
+            }
+        })
+        .collect()
+}
+
 impl FsBlockStore {
     pub fn new(root: PathBuf) -> io::Result<Self> {
         let tmp = root.join("tmp");
@@ -43,9 +59,8 @@ impl FsBlockStore {
         // parent of every directory in the chain, deepest first. A retry
         // after a crash mid-init finds every dir present and must still
         // persist the names create_dir_all made the first time.
-        for dir in tmp.ancestors() {
-            let Some(parent) = dir.parent() else { break };
-            fsync_dir_blocking(parent)?;
+        for parent in ancestor_parents(&tmp) {
+            fsync_dir_blocking(&parent)?;
         }
         Ok(Self { root })
     }
@@ -313,6 +328,31 @@ mod tests {
 
     fn store(dir: &tempfile::TempDir) -> FsBlockStore {
         FsBlockStore::new(dir.path().join("blocks")).unwrap()
+    }
+
+    #[test]
+    fn ancestor_parents_maps_a_relative_roots_top_to_the_cwd() {
+        // A relative root's ancestor chain ends at a path with an empty
+        // parent: fsyncing "" is ENOENT, so the chain must name "." there.
+        let parents = ancestor_parents(Path::new("data/blocks/tmp"));
+        assert_eq!(
+            parents,
+            vec![
+                PathBuf::from("data/blocks"),
+                PathBuf::from("data"),
+                PathBuf::from("."),
+            ]
+        );
+        assert!(!parents.iter().any(|p| p.as_os_str().is_empty()));
+        let abs = ancestor_parents(Path::new("/a/b/c"));
+        assert_eq!(
+            abs,
+            vec![
+                PathBuf::from("/a/b"),
+                PathBuf::from("/a"),
+                PathBuf::from("/")
+            ]
+        );
     }
 
     #[tokio::test]
