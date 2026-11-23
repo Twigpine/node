@@ -12,6 +12,10 @@ use crate::state::AppState;
 /// wedged: the worker died mid-verify or hit a persistent internal error.
 const STALE_VERIFY_SECS: i64 = 6 * 3600;
 
+/// Bound on one store delete: the sweep holds a block row lock while it
+/// runs, and a wedged backend would otherwise hold that lock forever.
+const BLOCK_DELETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug, Default)]
 pub struct SweepStats {
     pub sessions_expired: u64,
@@ -62,10 +66,17 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepStats, AppError> {
             tx.commit().await?;
             continue;
         };
-        match store.delete(&id).await {
-            Ok(()) | Err(crate::blockstore::BlockStoreError::NotFound) => {}
-            Err(e) => {
+        // A wedged backend must not hold the row lock forever: bound the
+        // delete and skip the block on expiry, releasing the transaction.
+        match tokio::time::timeout(BLOCK_DELETE_TIMEOUT, store.delete(&id)).await {
+            Ok(Ok(())) | Ok(Err(crate::blockstore::BlockStoreError::NotFound)) => {}
+            Ok(Err(e)) => {
                 tracing::warn!("block {sha} store delete failed: {e}");
+                tx.commit().await?;
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!("block {sha} store delete timed out; skipping");
                 tx.commit().await?;
                 continue;
             }
