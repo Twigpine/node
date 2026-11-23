@@ -1048,6 +1048,9 @@ pub fn resolve_head_id_bounded(
     if let Some(id) = rev_parse_commit_bounded(git_bin, repo_path, "HEAD", deadline)? {
         return Ok(Some(id));
     }
+    if !head_is_genuinely_absent_bounded(git_bin, repo_path, deadline)? {
+        bail!("git log failed for HEAD: ref is present but unreadable");
+    }
     let preferred = format!("refs/heads/{preferred_branch}");
     if let Some(id) = rev_parse_commit_bounded(git_bin, repo_path, &preferred, deadline)? {
         return Ok(Some(id));
@@ -4408,6 +4411,31 @@ mod tests {
         git_at(&work, &["branch", "-m", "side", "alpha"], T0 + 310);
         assert_eq!(resolve("nope"), Some(side_id));
         let _ = main_id;
+    }
+
+    #[test]
+    fn resolve_head_id_head_ref_present_but_commit_missing_is_an_error() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let main_id = commit_at(&work, "m", T0 + 100);
+        git_at(&work, &["checkout", "-q", "-b", "side"], T0 + 150);
+        let side_id = commit_at(&work, "s", T0 + 200);
+        git_at(&work, &["checkout", "-q", "main"], T0 + 250);
+        let git_dir = work.join(".git");
+
+        // main's ref still names the commit, but the object is gone: HEAD is
+        // present yet unreadable, which is an error (#400), not a fallback to
+        // the preferred branch's history.
+        let (dir, file) = main_id.split_at(2);
+        std::fs::remove_file(git_dir.join("objects").join(dir).join(file)).unwrap();
+
+        let out = super::resolve_head_id_bounded("git", &git_dir, "side", far_deadline());
+        assert!(
+            out.is_err(),
+            "a present-but-unreadable HEAD must not serve another branch: {out:?}"
+        );
+        let _ = side_id;
     }
 
     #[test]
