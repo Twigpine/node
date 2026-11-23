@@ -119,6 +119,25 @@ fn git_lines(root: &Path, args: &[&str]) -> Result<Vec<String>> {
         .collect())
 }
 
+/// `git` with `GIT_INDEX_FILE` pointed at a dedicated index, so the release
+/// commit is built from an index the user's own staging never touches.
+fn git_index(root: &Path, index: &Path, args: &[&str]) -> Result<Output> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_INDEX_FILE", index)
+        .output()
+        .context("failed to run git")?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out)
+}
+
 fn git_nul(root: &Path, args: &[&str]) -> Result<Vec<String>> {
     let out = git(root, args)?;
     let text = String::from_utf8(out.stdout).context("git output was not utf-8")?;
@@ -206,6 +225,24 @@ fn detect_remote(root: &Path) -> Result<(String, String, String)> {
                 continue;
             };
             if let Some((did, repo)) = urls.iter().find_map(|u| parse_remote_url(u)) {
+                // The push must land on the repo the session and claim calls
+                // use: a push URL naming a different twigpine repo is an
+                // ambiguous destination, not a slow failure after upload.
+                let push_urls = git_lines(
+                    root,
+                    &["remote", "get-url", "--push", "--all", &name],
+                )
+                .unwrap_or_default();
+                for u in &push_urls {
+                    if let Some((pdid, prepo)) = parse_remote_url(u) {
+                        if pdid != did || prepo != repo {
+                            bail!(
+                                "remote {name} pushes to {pdid}/{prepo} but fetches from \
+                                 {did}/{repo}; fix the remote's push URL and retry"
+                            );
+                        }
+                    }
+                }
                 return Ok((name, did, repo));
             }
         }
@@ -259,6 +296,9 @@ struct Scan {
     /// Ignored files at or over the threshold that are not managed: warned
     /// and skipped (see [`classify`]).
     skipped_ignored: Vec<String>,
+    /// Tracked paths gone from the worktree but not staged for deletion:
+    /// staged into the release commit without entering the manifest.
+    deleted: Vec<String>,
 }
 
 /// Tracked paths from `git ls-files -s`, minus submodule gitlinks (mode
@@ -280,13 +320,14 @@ fn tracked_paths(root: &Path) -> Result<HashSet<String>> {
 
 /// Paths listed inside the managed .gitignore block (empty when there is no
 /// block): previously published chunked files.
-/// One repo-relative path as a gitignore pattern line: pattern
-/// metacharacters and a trailing space are backslash-escaped.
+/// One repo-relative path as a gitignore pattern line: anchored at the repo
+/// root so it matches only this path, with pattern metacharacters and a
+/// trailing space backslash-escaped.
 fn escape_gitignore_path(p: &str) -> String {
-    let mut out = String::new();
+    let mut out = String::from("/");
     let mut chars = p.chars().peekable();
     while let Some(c) = chars.next() {
-        if matches!(c, '\\' | '!' | '#' | '[' | ']') {
+        if matches!(c, '\\' | '!' | '#' | '[' | ']' | '*' | '?') {
             out.push('\\');
         }
         if c == ' ' && chars.peek().is_none() {
@@ -298,6 +339,9 @@ fn escape_gitignore_path(p: &str) -> String {
 }
 
 fn unescape_gitignore_path(line: &str) -> String {
+    // Generated patterns are root-anchored; older unanchored blocks decode
+    // unchanged either way.
+    let line = line.strip_prefix('/').unwrap_or(line);
     let mut out = String::new();
     let mut escaped = false;
     for c in line.chars() {
@@ -346,16 +390,23 @@ fn scan_files(root: &Path, gitignore: &str, threshold: u64) -> Result<Scan> {
         chunked_files: Vec::new(),
         refused: Vec::new(),
         skipped_ignored: Vec::new(),
+        deleted: Vec::new(),
     };
     let mut consider = |path: &str, is_tracked: bool| {
         if path.starts_with(".twigpine/") {
             return; // release metadata is never a manifest file
         }
-        // A path that vanished between listing and stat (or a tracked file
-        // deleted in the worktree, whose staged deletion `git add -A` picks
-        // up) is simply not in the publishable set.
-        let Ok(meta) = std::fs::symlink_metadata(root.join(path)) else {
-            return;
+        // A path that vanished between listing and stat is not publishable;
+        // a tracked one records an unstaged deletion the commit must carry
+        // so the released tree drops the file too.
+        let meta = match std::fs::symlink_metadata(root.join(path)) {
+            Ok(m) => m,
+            Err(_) => {
+                if is_tracked {
+                    scan.deleted.push(path.to_string());
+                }
+                return;
+            }
         };
         if !meta.is_file() && !meta.file_type().is_symlink() {
             return;
@@ -392,6 +443,7 @@ fn scan_files(root: &Path, gitignore: &str, threshold: u64) -> Result<Scan> {
     scan.chunked_files.sort();
     scan.refused.sort();
     scan.skipped_ignored.sort();
+    scan.deleted.sort();
     Ok(scan)
 }
 
@@ -484,16 +536,30 @@ fn read_head(path: &Path, n: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Bytes of the staged index blob for `path`: exactly what the release
-/// commit will store, filters and symlink handling included.
-fn staged_blob(root: &Path, path: &str) -> Result<Vec<u8>> {
+/// Bytes of the blob staged for `path` in the dedicated release index:
+/// exactly what the release commit will store, filters and symlink handling
+/// included.
+fn staged_blob(root: &Path, index: &Path, path: &str) -> Result<Vec<u8>> {
     // Resolve the blob sha through the index rather than `:{path}` revspec
     // syntax: a path that opens with magic characters is parsed as revspec
-    // there, not as a filename.
-    let out = git(root, &["ls-files", "-s", "-z", "--", path])?;
+    // there, not as a filename. Literal pathspecs keep a path that LOOKS
+    // like magic from resolving to a different entry.
+    let out = git_index(
+        root,
+        index,
+        &["--literal-pathspecs", "ls-files", "-s", "-z", "--", path],
+    )?;
     let stdout = String::from_utf8(out.stdout).context("ls-files output was not utf-8")?;
-    // `<mode> <sha> <stage>\t<path>`: the sha is the second blank field.
-    let sha = stdout
+    // `<mode> <sha> <stage>\t<path>`: require the returned entry to name the
+    // exact path asked for, so a resolution surprise fails loudly.
+    let (meta, name) = stdout
+        .trim_end_matches('\0')
+        .split_once('\t')
+        .with_context(|| format!("{path} is not staged in the index"))?;
+    if name != path {
+        bail!("{path} resolved to a different index path: {name}");
+    }
+    let sha = meta
         .split(' ')
         .nth(1)
         .filter(|s| !s.is_empty())
@@ -788,11 +854,17 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     }
     // Terms into earlier blocks need those entries in this object: a reader
     // resolves term.block against rec.blocks only.
-    let needed: HashSet<String> = rec
+    // Sorted so the appended block rows (and therefore the serialized
+    // reconstruction object and its sha) are identical across processes on
+    // a retried publish.
+    let mut needed: Vec<String> = rec
         .files
         .iter()
         .flat_map(|f| f.terms.iter().map(|t| t.block.clone()))
+        .collect::<HashSet<_>>()
+        .into_iter()
         .collect();
+    needed.sort();
     let mut present: HashSet<String> = rec.blocks.iter().map(|b| b.sha256.clone()).collect();
     for sha in needed {
         if present.contains(&sha) {
@@ -826,47 +898,76 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         println!("uploaded reconstruction object");
     }
 
-    // 7. Managed .gitignore block, then stage exactly the publishable set
-    //    through a NUL pathspec: a bare `git add -A` would sweep in work the
-    //    scan never saw (files created or un-ignored during the upload, or
-    //    index changes staged for something else).
+    // 7. Managed .gitignore block. A symlink target outside the checkout is
+    //    never written through, and edits made while blocks uploaded are
+    //    caught against the scan snapshot rather than silently lost.
+    if let Ok(meta) = std::fs::symlink_metadata(&gitignore_path) {
+        if meta.file_type().is_symlink() {
+            bail!(".gitignore is a symlink; refusing to write through it");
+        }
+    }
     let new_gitignore = upsert_managed_block(&existing_gitignore, &scan.chunked_files);
     if new_gitignore != existing_gitignore {
+        let current = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+        if current != existing_gitignore {
+            bail!(
+                ".gitignore changed while blocks uploaded; re-run to publish \
+                 from a fresh scan"
+            );
+        }
         std::fs::write(&gitignore_path, &new_gitignore)?;
+    }
+
+    // 8. Stage into a dedicated index seeded from HEAD: the release commit
+    //    holds exactly the scanned set, the user's real index and anything
+    //    already staged in it are never read or rewritten, and the hashed
+    //    blobs below are the same index state the commit records. Only
+    //    paths that exist go in the first stage; the release metadata
+    //    follows after it is written below.
+    let index_path = git_dir.join("twigpine-model-index");
+    let _ = std::fs::remove_file(&index_path);
+    if git(&root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() {
+        git_index(&root, &index_path, &["read-tree", "HEAD"])?;
+    } else {
+        git_index(&root, &index_path, &["read-tree", "--empty"])?;
     }
     let pathspec_path = git_dir.join("twigpine-model-pathspec");
     {
         let mut spec = Vec::new();
-        for p in &scan.git_files {
+        for p in scan.git_files.iter().chain(&scan.deleted) {
             spec.extend_from_slice(p.as_bytes());
             spec.push(0);
         }
-        for p in [
-            ".gitignore",
-            ".twigpine/model-release.json",
-            ".twigpine/model-release.sig",
-        ] {
-            spec.extend_from_slice(p.as_bytes());
+        if gitignore_path.is_file() {
+            spec.extend_from_slice(b".gitignore");
             spec.push(0);
         }
-        std::fs::write(&pathspec_path, spec)?;
+        if spec.is_empty() {
+            let _ = std::fs::remove_file(&pathspec_path);
+        } else {
+            std::fs::write(&pathspec_path, spec)?;
+        }
     }
-    let staged = git(
-        &root,
-        &[
-            "add",
-            "-A",
-            "--pathspec-file-nul",
-            &format!("--pathspec-from-file={}", pathspec_path.display()),
-        ],
-    );
-    let _ = std::fs::remove_file(&pathspec_path);
-    staged?;
+    if pathspec_path.exists() {
+        let staged = git_index(
+            &root,
+            &index_path,
+            &[
+                "--literal-pathspecs",
+                "add",
+                "-A",
+                "--pathspec-file-nul",
+                &format!("--pathspec-from-file={}", pathspec_path.display()),
+            ],
+        );
+        let _ = std::fs::remove_file(&pathspec_path);
+        staged?;
+    }
 
-    // 8. Hash the git-stored files from the index (the exact bytes the
-    //    commit stores), then write and stage the manifest.
+    // 9. Hash the git-stored files from the release index (the exact bytes
+    //    the commit stores), then write and stage the manifest.
     for path in &scan.git_files {
-        let bytes = staged_blob(&root, path)?;
+        let bytes = staged_blob(&root, &index_path, path)?;
         files.push(ManifestFile {
             path: path.clone(),
             size: bytes.len() as u64,
@@ -909,20 +1010,26 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
             )
         ),
     )?;
-    git(
+    git_index(
         &root,
+        &index_path,
         &[
+            "--literal-pathspecs",
             "add",
             ".twigpine/model-release.json",
             ".twigpine/model-release.sig",
         ],
     )?;
 
-    // 9. Commit when the index differs, push, and claim HEAD.
-    let has_changes = git(&root, &["diff", "--cached", "--quiet"]).is_err();
+    // 10. Commit when the release index differs, push, and claim HEAD.
+    let has_changes = git_index(&root, &index_path, &["diff", "--cached", "--quiet"]).is_err();
     if has_changes {
         let n = prior_commits.len() + 1;
-        git(&root, &["commit", "-m", &format!("model release {n}")])?;
+        git_index(
+            &root,
+            &index_path,
+            &["commit", "-m", &format!("model release {n}")],
+        )?;
     } else {
         // Nothing staged: a re-publish of identical content lands here, and
         // HEAD must already be a release commit to claim.
@@ -936,6 +1043,7 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         }
         println!("no changes to commit; claiming the existing release commit");
     }
+    let _ = std::fs::remove_file(&index_path);
     let commit = git_lines(&root, &["rev-parse", "HEAD"])?
         .into_iter()
         .next()
@@ -1055,7 +1163,7 @@ mod tests {
         let once = upsert_managed_block(&base, &paths);
         assert!(once.contains("*.tmp\n"));
         assert!(once.contains(GITIGNORE_BEGIN));
-        assert!(once.contains("weights/a.bin\nb.bin\n"));
+        assert!(once.contains("/weights/a.bin\n/b.bin\n"));
         assert!(once.contains(GITIGNORE_END));
         assert_eq!(once, upsert_managed_block(&once, &paths), "idempotent");
 
@@ -1226,5 +1334,160 @@ mod tests {
             Some(("did:key:z6MkA".to_string(), "repo".to_string()))
         );
         assert_eq!(parse_remote_url("https://x/y"), None);
+    }
+
+    fn tgit(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn trepo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        tgit(dir.path(), &["init", "-q", "-b", "main"]);
+        dir
+    }
+
+    #[test]
+    fn a_push_url_naming_a_different_repo_is_rejected() {
+        let dir = trepo();
+        tgit(
+            dir.path(),
+            &["remote", "add", "origin", "twigpine://did:key:z6MkA/aaa"],
+        );
+        tgit(
+            dir.path(),
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "twigpine://did:key:z6MkB/bbb",
+            ],
+        );
+        let e = detect_remote(dir.path()).unwrap_err();
+        assert!(e.to_string().contains("pushes to"), "{e}");
+    }
+
+    #[test]
+    fn a_matching_push_url_is_accepted() {
+        let dir = trepo();
+        tgit(
+            dir.path(),
+            &["remote", "add", "origin", "twigpine://did:key:z6MkA/aaa"],
+        );
+        tgit(
+            dir.path(),
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "twigpine://did:key:z6MkA/aaa",
+            ],
+        );
+        assert_eq!(
+            detect_remote(dir.path()).unwrap(),
+            (
+                "origin".to_string(),
+                "did:key:z6MkA".to_string(),
+                "aaa".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn managed_patterns_anchor_at_root_and_escape_wildcards() {
+        assert_eq!(escape_gitignore_path("a*b?.bin"), "/a\\*b\\?.bin");
+        assert_eq!(escape_gitignore_path("weights.bin"), "/weights.bin");
+        let text = format!("{GITIGNORE_BEGIN}\n/weights.bin\n/experiments/weights.bin\n{GITIGNORE_END}\n");
+        assert_eq!(
+            managed_block_paths(&text),
+            vec!["weights.bin", "experiments/weights.bin"]
+        );
+    }
+
+    #[test]
+    fn a_literal_pathspec_filename_resolves_its_own_blob() {
+        let dir = trepo();
+        std::fs::write(dir.path().join(":(glob)weights*.txt"), b"magic").unwrap();
+        std::fs::write(dir.path().join("weights-a.txt"), b"plain").unwrap();
+        tgit(
+            dir.path(),
+            &[
+                "--literal-pathspecs",
+                "add",
+                "--",
+                ":(glob)weights*.txt",
+                "weights-a.txt",
+            ],
+        );
+        let index = dir.path().join(".git/index");
+        assert_eq!(
+            staged_blob(dir.path(), &index, ":(glob)weights*.txt").unwrap(),
+            b"magic"
+        );
+        assert_eq!(
+            staged_blob(dir.path(), &index, "weights-a.txt").unwrap(),
+            b"plain"
+        );
+    }
+
+    #[test]
+    fn the_release_index_leaves_user_staging_alone() {
+        let dir = trepo();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        tgit(dir.path(), &["add", "a.txt"]);
+        tgit(
+            dir.path(),
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        );
+        // An unrelated file staged in the real index must not ride into the
+        // release commit, and must still be staged afterwards.
+        std::fs::write(dir.path().join("unrelated.bin"), b"u").unwrap();
+        tgit(dir.path(), &["add", "unrelated.bin"]);
+        let index = dir.path().join("tmp-index");
+        git_index(dir.path(), &index, &["read-tree", "HEAD"]).unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        git_index(dir.path(), &index, &["add", "b.txt"]).unwrap();
+        git_index(
+            dir.path(),
+            &index,
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rel"],
+        )
+        .unwrap();
+        let tree = tgit(dir.path(), &["ls-tree", "--name-only", "HEAD"]);
+        assert!(!tree.contains("unrelated.bin"), "{tree}");
+        assert!(tree.contains("b.txt"), "{tree}");
+        let staged_files = tgit(
+            dir.path(),
+            &["diff", "--cached", "--name-only", "--diff-filter=A"],
+        );
+        assert_eq!(staged_files, "unrelated.bin");
+    }
+
+    #[test]
+    fn an_unstaged_tracked_deletion_is_recorded_for_staging() {
+        let dir = trepo();
+        std::fs::write(dir.path().join("gone.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("kept.txt"), b"y").unwrap();
+        tgit(dir.path(), &["add", "gone.txt", "kept.txt"]);
+        tgit(
+            dir.path(),
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        );
+        std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        let scan = scan_files(dir.path(), "", 1024).unwrap();
+        assert_eq!(scan.deleted, vec!["gone.txt"]);
+        assert!(scan.git_files.contains(&"kept.txt".to_string()));
+        assert!(!scan.git_files.contains(&"gone.txt".to_string()));
     }
 }
