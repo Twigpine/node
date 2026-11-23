@@ -19508,6 +19508,8 @@ mod tests {
             r#"{"homepage":"https://x.example","description":"y"}"#,
             r#"{"homepage":7}"#,
             "not json",
+            "[null]",
+            r#"["https://x.example"]"#,
         ];
         for bad in bad_bodies {
             let mut seen: Vec<(StatusCode, Vec<u8>)> = Vec::new();

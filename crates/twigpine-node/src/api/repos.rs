@@ -572,7 +572,14 @@ pub async fn set_homepage(
     // Parsed here rather than by the `Json` extractor, which answers a wrong
     // field type or an unknown field with 422 and a wrong content type with
     // 415; every malformed body is the same 400.
-    let req: HomepageRequest = serde_json::from_slice(&body)
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| AppError::BadRequest("body must be {\"homepage\": string | null}".into()))?;
+    if !value.is_object() {
+        return Err(AppError::BadRequest(
+            "body must be {\"homepage\": string | null}".into(),
+        ));
+    }
+    let req: HomepageRequest = serde_json::from_value(value)
         .map_err(|_| AppError::BadRequest("body must be {\"homepage\": string | null}".into()))?;
     let homepage = req.homepage.as_deref().map(validate_homepage).transpose()?;
 
