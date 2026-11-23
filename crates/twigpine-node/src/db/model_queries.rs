@@ -280,10 +280,7 @@ impl Db {
         Ok(refund)
     }
 
-    pub async fn model_release_by_digest(
-        &self,
-        digest: &str,
-    ) -> Result<Option<ModelRelease>> {
+    pub async fn model_release_by_digest(&self, digest: &str) -> Result<Option<ModelRelease>> {
         let row = sqlx::query_as::<_, ReleaseTuple>(&format!(
             "SELECT {RELEASE_COLS} FROM model_releases WHERE claim_request_digest = $1"
         ))
@@ -968,7 +965,10 @@ mod tests {
             vec![sha.clone()]
         );
         let mut tx = db.model_begin().await.unwrap();
-        assert!(db.model_tx_block_still_dead(&mut tx, &sha, 3600).await.unwrap());
+        assert!(db
+            .model_tx_block_still_dead(&mut tx, &sha, 3600)
+            .await
+            .unwrap());
         db.model_tx_delete_block_row(&mut tx, &sha).await.unwrap();
         tx.commit().await.unwrap();
     }

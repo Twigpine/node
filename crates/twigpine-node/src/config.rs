@@ -1220,8 +1220,14 @@ impl Config {
         // fails.
         for (name, value) in [
             ("TWIGPINE_MODEL_QUOTA_BYTES", Some(self.model_quota_bytes)),
-            ("TWIGPINE_MODEL_NODE_QUOTA_BYTES", Some(self.model_node_quota_bytes)),
-            ("TWIGPINE_MODEL_MAX_SESSION_BYTES", self.model_max_session_bytes),
+            (
+                "TWIGPINE_MODEL_NODE_QUOTA_BYTES",
+                Some(self.model_node_quota_bytes),
+            ),
+            (
+                "TWIGPINE_MODEL_MAX_SESSION_BYTES",
+                self.model_max_session_bytes,
+            ),
         ] {
             if let Some(v) = value {
                 if v > i64::MAX as u64 {
@@ -1729,11 +1735,7 @@ mod tests {
             "--model-node-quota-bytes",
             "--model-max-session-bytes",
         ] {
-            let mut over = Config::parse_from([
-                "twigpine-node",
-                flag,
-                "9223372036854775808",
-            ]);
+            let mut over = Config::parse_from(["twigpine-node", flag, "9223372036854775808"]);
             assert!(over.validate().is_err(), "{flag} above i64::MAX");
         }
     }

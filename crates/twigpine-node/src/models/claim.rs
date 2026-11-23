@@ -152,10 +152,7 @@ pub async fn claim_release(
     // private since the first claim must not turn the recorded row into a
     // rejection. The lookup repeats under the claim lock below, before any
     // insert, so a first claim still serializes correctly.
-    if let Some(existing) = db
-        .model_release_by_digest(&material.request_digest)
-        .await?
-    {
+    if let Some(existing) = db.model_release_by_digest(&material.request_digest).await? {
         return Ok(existing);
     }
 
