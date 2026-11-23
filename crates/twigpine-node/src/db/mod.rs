@@ -7900,13 +7900,16 @@ impl Db {
         // lands first. Normalizing instead would mean canonicalizing the stored
         // value, this comparison, and the existing trim_end_matches call sites.
         //
-        // last_ping_ok is NOT a trust signal. An unauthenticated caller can
-        // clear it by announcing a different URL. Since #248 the anonymous
-        // GET /api/v1/peers/{did}/ping endpoint is read-only (the periodic
-        // gossip loop owns this flag through mark_peer_ping and requires
-        // consecutive failures before clearing it), but the announce path
-        // still lets anyone clobber the flag. Do not build a new consumer on
-        // this flag as if it were attacker-resistant.
+        // last_ping_ok is NOT a trust signal. Since #248, the anonymous
+        // GET /api/v1/peers/{did}/ping endpoint is read-only and never writes
+        // it. An unsigned announce cannot change an existing row's http_url
+        // either: it is refused with PeerWriteDenied::UnprovenRepoint and
+        // leaves the row and last_ping_ok unchanged. Two paths clear it: a
+        // signed announce from that peer's own DID with a changed http_url
+        // clears it immediately (via the Proven CASE below), and the periodic
+        // gossip loop clears it through mark_peer_ping only after consecutive
+        // failed probes. Do not build a new consumer on this flag as if it
+        // were attacker-resistant.
         //
         // Only the federated repo fan-out in api/repos.rs gates on this flag.
         // Four consumers act on a repointed http_url regardless of it (sync.rs's
