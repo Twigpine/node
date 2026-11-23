@@ -130,7 +130,7 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
     let tree = crate::git::store::run_git_bounded(
         &state.git_bin,
         &disk_path,
-        &["ls-tree", "-r", "--name-only", &release.commit_sha],
+        &["ls-tree", "-rz", "--name-only", &release.commit_sha],
         b"",
         std::time::Duration::from_secs(30),
         "git ls-tree",
@@ -143,9 +143,11 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
         .filter(|f| f.storage == StorageKind::Git)
         .map(|f| f.path.as_str())
         .collect();
+    // -z, not line-splitting: with core.quotePath on, a non-ASCII path is
+    // printed as escaped octal and could never match a manifest path.
     for path in String::from_utf8_lossy(&tree.stdout)
-        .lines()
-        .filter(|p| !p.starts_with(".twigpine/"))
+        .split('\0')
+        .filter(|p| !p.is_empty() && !p.starts_with(".twigpine/"))
     {
         if !manifest_git_paths.contains(path) {
             return reject_release(
@@ -658,5 +660,149 @@ mod tests {
         .await
         .expect("claim after rejection is accepted");
         assert_eq!(row.state, "verifying");
+    }
+
+    /// One verifying release over a real repo holding `files`: the manifest
+    /// names `manifest_paths` of them as git-stored; any committed file the
+    /// manifest does not name is extra. Returns (state, release_id, commit).
+    async fn verify_fixture(
+        pool: &sqlx::PgPool,
+        worktree: &std::path::Path,
+        files: &[(&str, &[u8])],
+        manifest_paths: &[&str],
+    ) -> (crate::state::AppState, i64, String) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let owner_did =
+            twigpine_core::did::Did::from_verifying_key(&signing.verifying_key()).to_string();
+        git(worktree, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(worktree.join(".twigpine")).expect("mkdir");
+        let mut entries = Vec::new();
+        let mut add = vec![".twigpine".to_string()];
+        for (path, bytes) in files {
+            std::fs::write(worktree.join(path), bytes).expect("worktree file");
+            add.push(path.to_string());
+            entries.push(ManifestFile {
+                path: path.to_string(),
+                size: bytes.len() as u64,
+                sha256: twigpine_core::cid::sha256_hex(bytes),
+                format: FileFormat::Text,
+                storage: StorageKind::Git,
+            });
+        }
+        entries.retain(|f| manifest_paths.contains(&f.path.as_str()));
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_V1.to_string(),
+            repo: format!("{}/model", crate::db::canonical_did(&owner_did)),
+            publisher_did: owner_did.clone(),
+            license: "mit".to_string(),
+            parent: None,
+            files: entries,
+            reconstruction: None,
+        };
+        let manifest_bytes = manifest.to_bytes().expect("manifest bytes");
+        let sig = twigpine_core::model::manifest::sign(&signing, &manifest_bytes);
+        std::fs::write(
+            worktree.join(".twigpine/model-release.json"),
+            &manifest_bytes,
+        )
+        .expect("manifest");
+        std::fs::write(worktree.join(".twigpine/model-release.sig"), sig).expect("sig");
+        let add_refs: Vec<&str> = add.iter().map(String::as_str).collect();
+        git(worktree, &[&["add"][..], &add_refs].concat());
+        git(
+            worktree,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "r1",
+            ],
+        );
+        let commit = git(worktree, &["rev-parse", "HEAD"]);
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, is_public, default_branch,
+                                created_at, updated_at, disk_path)
+             VALUES ('r1', 'model', $1, TRUE, 'main', $2, $2, $3)",
+        )
+        .bind(&owner_did)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(worktree.to_str().expect("utf-8 path"))
+        .execute(pool)
+        .await
+        .expect("repo row");
+        let release_id: i64 = sqlx::query_scalar(
+            "INSERT INTO model_releases
+                 (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
+                  claim_signature, claim_signature_input, claim_signing_string,
+                  claim_body, claim_request_digest, created_at)
+             VALUES ('r1', $1, 'main', $2, 'verifying', $3, 's', 'i', 'ss',
+                     decode('00','hex'), 'd1', $4)
+             RETURNING id",
+        )
+        .bind(&commit)
+        .bind(&owner_did)
+        .bind(twigpine_core::cid::sha256_hex(&manifest_bytes))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(pool)
+        .await
+        .expect("release row");
+        (state, release_id, commit)
+    }
+
+    async fn release_state(pool: &sqlx::PgPool, release_id: i64) -> (String, Option<String>) {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT state, failure_reason FROM model_releases WHERE id = $1",
+        )
+        .bind(release_id)
+        .fetch_one(pool)
+        .await
+        .expect("release row")
+    }
+
+    /// A git-stored manifest file whose name needs quoting under
+    /// core.quotePath (`README-é.md`) still verifies: ls-tree -z must not
+    /// quote it into a phantom mismatch.
+    #[sqlx::test]
+    async fn a_non_ascii_git_file_verifies(pool: sqlx::PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, release_id, _commit) = verify_fixture(
+            &pool,
+            dir.path(),
+            &[("README-é.md", b"hi\n")],
+            &["README-é.md"],
+        )
+        .await;
+        verify_release(&state, release_id).await.expect("verify");
+        let (state_str, _) = release_state(&pool, release_id).await;
+        assert_eq!(state_str, "published");
+    }
+
+    /// The same committed-but-unlisted check must still fire on a non-ASCII
+    /// path the manifest does not name.
+    #[sqlx::test]
+    async fn an_unlisted_non_ascii_commit_is_still_rejected(pool: sqlx::PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, release_id, _commit) = verify_fixture(
+            &pool,
+            dir.path(),
+            &[("README-é.md", b"hi\n"), ("extra-é.bin", b"x")],
+            &["README-é.md"],
+        )
+        .await;
+        verify_release(&state, release_id)
+            .await
+            .expect("verify call");
+        let (state_str, reason) = release_state(&pool, release_id).await;
+        assert_eq!(state_str, "rejected");
+        let reason = reason.expect("failure_reason");
+        assert!(
+            reason.contains("committed but not in the manifest"),
+            "{reason}"
+        );
+        assert!(reason.contains("extra-é.bin"), "{reason}");
     }
 }
