@@ -604,6 +604,23 @@ impl Db {
         if shas.is_empty() {
             return Ok(());
         }
+        // The claimer pays for exactly the blocks model_tx_unclaimed_bytes
+        // counted as new (no live release references them); blocks a live
+        // release already carries keep their first payer. Runs before the
+        // link insert below so this release's own rows do not mask the set.
+        sqlx::query(
+            "UPDATE model_blocks b SET payer_did = $2
+             WHERE b.sha256 = ANY($1)
+               AND NOT EXISTS (
+                     SELECT 1 FROM model_release_blocks rb
+                     JOIN model_releases r ON r.id = rb.release_id
+                     WHERE rb.block_sha256 = b.sha256
+                       AND r.state IN ('verifying', 'published'))",
+        )
+        .bind(shas)
+        .bind(publisher_did)
+        .execute(&mut **tx)
+        .await?;
         sqlx::query(
             "INSERT INTO model_release_blocks (release_id, block_sha256)
              SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING",
@@ -681,40 +698,75 @@ impl Db {
         .bind(reason)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((publisher,)) = released else {
+        let Some((_publisher,)) = released else {
             tx.commit().await?;
             return Ok(());
         };
+        self.model_release_refund_tx(&mut tx, release_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Free the quota a release's blocks were charged under. Blocks no other
+    /// live release references are released; each refunds to the DID that
+    /// paid for it at claim (`model_blocks.payer_did`), falling back to this
+    /// release's publisher for rows claimed before the column existed. The
+    /// release's block links are dropped and the freed blocks' payer is
+    /// cleared so nothing refunds them twice. Callers must hold
+    /// `CLAIM_LOCK_KEY` inside the tx so the "no other live release" test
+    /// serializes with claim's "not already claimed" test.
+    pub async fn model_release_refund_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        release_id: i64,
+    ) -> Result<()> {
         // SUM over bigint returns numeric; cast back so the i64 decode holds.
-        let freed: i64 = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT COALESCE(SUM(b.size), 0)::bigint FROM model_blocks b
+        let per_payer: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT COALESCE(b.payer_did, r.publisher_did) AS payer,
+                    COALESCE(SUM(b.size), 0)::bigint AS bytes
+             FROM model_blocks b
              JOIN model_release_blocks rb ON rb.block_sha256 = b.sha256
+             JOIN model_releases r ON r.id = rb.release_id
              WHERE rb.release_id = $1
                AND NOT EXISTS (
                      SELECT 1 FROM model_release_blocks r2
-                     JOIN model_releases r ON r.id = r2.release_id
+                     JOIN model_releases r2r ON r2r.id = r2.release_id
                      WHERE r2.block_sha256 = b.sha256 AND r2.release_id <> $1
-                       AND r.state IN ('verifying', 'published'))",
+                       AND r2r.state IN ('verifying', 'published'))
+             GROUP BY COALESCE(b.payer_did, r.publisher_did)",
         )
         .bind(release_id)
-        .fetch_one(&mut *tx)
-        .await?
-        .unwrap_or(0);
+        .fetch_all(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE model_blocks b SET payer_did = NULL
+             WHERE b.payer_did IS NOT NULL
+               AND b.sha256 IN (
+                     SELECT rb.block_sha256 FROM model_release_blocks rb
+                     WHERE rb.release_id = $1)
+               AND NOT EXISTS (
+                     SELECT 1 FROM model_release_blocks r2
+                     JOIN model_releases r2r ON r2r.id = r2.release_id
+                     WHERE r2.block_sha256 = b.sha256 AND r2.release_id <> $1
+                       AND r2r.state IN ('verifying', 'published'))",
+        )
+        .bind(release_id)
+        .execute(&mut **tx)
+        .await?;
         sqlx::query("DELETE FROM model_release_blocks WHERE release_id = $1")
             .bind(release_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-        if freed > 0 {
+        for (payer, bytes) in per_payer {
             sqlx::query(
                 "UPDATE model_quota_usage SET bytes_used = GREATEST(bytes_used - $2, 0)
                  WHERE did = $1",
             )
-            .bind(&publisher)
-            .bind(freed)
-            .execute(&mut *tx)
+            .bind(&payer)
+            .bind(bytes)
+            .execute(&mut **tx)
             .await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -1301,5 +1353,163 @@ mod tests {
             .await
             .unwrap());
         tx.commit().await.unwrap();
+    }
+
+    /// Run the claim transaction's charge path against `shas` (unclaimed
+    /// bytes -> per-payer quota -> release insert -> block link/payer stamp)
+    /// and return the release id. The HTTP and git halves of claim_release
+    /// are not exercised here.
+    async fn claim_as(db: &Db, publisher: &str, commit: &str, repo: &str, shas: &[String]) -> i64 {
+        let mut tx = db.model_begin().await.unwrap();
+        db.model_tx_advisory_lock(&mut tx, crate::models::CLAIM_LOCK_KEY)
+            .await
+            .unwrap();
+        let new_bytes = db.model_tx_unclaimed_bytes(&mut tx, shas).await.unwrap();
+        db.model_tx_reserve_quota(&mut tx, publisher, new_bytes, i64::MAX)
+            .await
+            .unwrap();
+        let persist = ClaimPersist {
+            signature: "s".into(),
+            signature_input: "i".into(),
+            signing_string: "ss".into(),
+            body: vec![0],
+            request_digest: format!("{publisher}-{commit}"),
+        };
+        let row = db
+            .model_tx_insert_release(
+                &mut tx, repo, commit, "main", publisher, "m", None, &persist,
+            )
+            .await
+            .unwrap();
+        db.model_tx_link_release_blocks(&mut tx, row.id, publisher, shas)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        row.id
+    }
+
+    async fn quota_used(pool: &sqlx::PgPool, did: &str) -> i64 {
+        sqlx::query_scalar("SELECT COALESCE(bytes_used, 0) FROM model_quota_usage WHERE did = $1")
+            .bind(did)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .unwrap_or(0)
+    }
+
+    #[sqlx::test]
+    async fn rejection_refunds_the_payer_not_the_release_publisher(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        let sha = "a".repeat(64);
+        sqlx::query("INSERT INTO model_blocks (sha256, size, created_at) VALUES ($1, 100, 't')")
+            .bind(&sha)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A claims the block (pays 100); B's later claim is free.
+        let ra = claim_as(&db, "did:a", "ca", "r1", &[sha.clone()]).await;
+        let rb = claim_as(&db, "did:b", "cb", "r1", &[sha.clone()]).await;
+        assert_eq!(quota_used(&pool, "did:a").await, 100);
+        assert_eq!(quota_used(&pool, "did:b").await, 0);
+
+        // Rejecting A's release first changes nothing: the block is still
+        // carried by B's live release, so nothing is freed.
+        db.model_reject_release(ra, "x").await.unwrap();
+        assert_eq!(quota_used(&pool, "did:a").await, 100);
+        // Rejecting B's release then frees the block, and the refund goes
+        // to the payer A, never to the rejected release's publisher B (who
+        // was never charged).
+        db.model_reject_release(rb, "x").await.unwrap();
+        assert_eq!(quota_used(&pool, "did:a").await, 0);
+        assert_eq!(quota_used(&pool, "did:b").await, 0);
+        // The payer stamp was cleared: a re-claim would charge anew, not
+        // refund-into-reclaim.
+        let payer: Option<String> =
+            sqlx::query_scalar("SELECT payer_did FROM model_blocks WHERE sha256 = $1")
+                .bind(&sha)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(payer, None);
+    }
+
+    #[sqlx::test]
+    async fn free_claimer_rejection_first_keeps_the_payer_charge(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        let sha = "b".repeat(64);
+        sqlx::query("INSERT INTO model_blocks (sha256, size, created_at) VALUES ($1, 100, 't')")
+            .bind(&sha)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ra = claim_as(&db, "did:a", "ca", "r1", &[sha.clone()]).await;
+        let rb = claim_as(&db, "did:b", "cb", "r1", &[sha.clone()]).await;
+        // B rejects first: still live under A, so nothing moves.
+        db.model_reject_release(rb, "x").await.unwrap();
+        assert_eq!(quota_used(&pool, "did:a").await, 100);
+        let payer: Option<String> =
+            sqlx::query_scalar("SELECT payer_did FROM model_blocks WHERE sha256 = $1")
+                .bind(&sha)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(payer.as_deref(), Some("did:a"));
+        // Then A: freed, refunded.
+        db.model_reject_release(ra, "x").await.unwrap();
+        assert_eq!(quota_used(&pool, "did:a").await, 0);
+    }
+
+    #[sqlx::test]
+    async fn delete_repo_refunds_live_release_charges(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, is_public, default_branch,
+                                created_at, updated_at, disk_path)
+             VALUES ('r2', 'repo2', 'did:a', TRUE, 'main', 't', 't', '/r2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let sha = "c".repeat(64);
+        sqlx::query("INSERT INTO model_blocks (sha256, size, created_at) VALUES ($1, 100, 't')")
+            .bind(&sha)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A publishes the block on r2 (payer A); B free-claims it on r1.
+        let ra = claim_as(&db, "did:a", "ca", "r2", &[sha.clone()]).await;
+        sqlx::query("UPDATE model_releases SET state = 'published' WHERE id = $1")
+            .bind(ra)
+            .execute(&pool)
+            .await
+            .unwrap();
+        claim_as(&db, "did:b", "cb", "r1", &[sha.clone()]).await;
+        assert_eq!(quota_used(&pool, "did:a").await, 100);
+
+        // Deleting r1 must not touch A's charge: the block is still carried
+        // by r2's live release.
+        db.delete_repo_by_id("r1").await.unwrap();
+        assert_eq!(quota_used(&pool, "did:a").await, 100);
+        // Deleting r2 frees it: the payer is refunded even though the
+        // cascade also dropped the rows.
+        db.delete_repo_by_id("r2").await.unwrap();
+        assert_eq!(quota_used(&pool, "did:a").await, 0);
+    }
+
+    #[sqlx::test]
+    async fn rejection_refunds_the_publisher_for_a_legacy_unpayered_block(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        let sha = "d".repeat(64);
+        seed_release_with_block(&pool, "did:c", "verifying", "cl", &sha).await;
+        sqlx::query("INSERT INTO model_quota_usage (did, bytes_used) VALUES ('did:c', 100)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rid: i64 = sqlx::query_scalar("SELECT id FROM model_releases WHERE commit_sha = 'cl'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        db.model_reject_release(rid, "x").await.unwrap();
+        assert_eq!(quota_used(&pool, "did:c").await, 0);
     }
 }

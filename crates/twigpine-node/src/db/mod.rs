@@ -2855,6 +2855,18 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_model_upload_sessions_repo ON model_upload_sessions (repo_id)",
         ],
     },
+    Migration {
+        version: 52,
+        name: "model_blocks_payer_did",
+        stmts: &[
+            // The first claimer pays for a block, which is not always the
+            // release's publisher (a free claim rides another payer's
+            // bytes). Rejection and repo-deletion refunds follow this
+            // column; NULL rows fall back to the release's publisher, which
+            // is how every pre-column block was claimed.
+            "ALTER TABLE model_blocks ADD COLUMN IF NOT EXISTS payer_did TEXT",
+        ],
+    },
 ];
 
 // ── HTTP-signature replay ledger ──────────────────────────────────────────────
@@ -4010,6 +4022,26 @@ impl Db {
             .bind(&name)
             .execute(&mut *tx)
             .await?;
+        }
+
+        // Live model releases carry a quota charge keyed on the claim's
+        // payer; the cascade off `repos` would drop the release and block
+        // links without refunding it, leaking the charge (and inflating the
+        // node-wide sum). Refund each release the way a rejection does,
+        // serialized with concurrent claims on the same advisory lock.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::models::CLAIM_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
+        let release_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM model_releases
+             WHERE repo_id = $1 AND state IN ('verifying', 'published')",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for release_id in release_ids {
+            self.model_release_refund_tx(&mut tx, release_id).await?;
         }
 
         let result = sqlx::query("DELETE FROM repos WHERE id = $1")
