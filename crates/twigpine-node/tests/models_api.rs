@@ -862,9 +862,11 @@ async fn release_get_published_unknown_and_private(pool: sqlx::PgPool) {
 }
 
 /// The reconstruction GET and the claims POST hide a repo that is not fully
-/// public: every caller class gets the same 404, none reach the store or the
-/// commit lookup. The deny sweep cannot drive the hostile-only legs for the
-/// reconstruction route, so they live here.
+/// public: callers who fail the read gate (anonymous, stranger) get the same
+/// 404 and none reach the store or the commit lookup. The owner can read the
+/// repo but fails the fully-public requirement, so the claims POST answers
+/// an explicit 400. The deny sweep cannot drive the hostile-only legs for
+/// the reconstruction route, so they live here.
 #[sqlx::test]
 async fn reconstruction_and_claims_deny_on_private_repo(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
@@ -926,6 +928,26 @@ async fn reconstruction_and_claims_deny_on_private_repo(pool: sqlx::PgPool) {
         let resp = req.send().await.expect("request sends");
         assert_eq!(resp.status().as_u16(), 404, "{label}");
     }
+
+    // The owner reads their own private repo, so the read gate passes and
+    // the fully-public requirement denies with a 400 rather than a 404.
+    let owner_claim = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &claims_path(&owner_did, "model"),
+        serde_json::to_vec(&serde_json::json!({
+            "commit": commit,
+            "branch": "main",
+        }))
+        .expect("claim body"),
+        &owner,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(owner_claim.status().as_u16(), 400, "owner POST claims");
 
     node.shutdown().await;
 }
