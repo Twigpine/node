@@ -731,11 +731,17 @@ impl Db {
         .await?)
     }
 
-    pub async fn model_drop_sessions_blocks(&self, session_ids: &[String]) -> Result<()> {
-        sqlx::query("DELETE FROM model_session_blocks WHERE session_id = ANY($1)")
-            .bind(session_ids)
-            .execute(&self.pool)
-            .await?;
+    /// Drop links under every expired session, not only the ids this pass
+    /// expired: a failed DELETE must not strand links under sessions that
+    /// are never re-selected.
+    pub async fn model_drop_sessions_blocks(&self) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM model_session_blocks sb
+             USING model_upload_sessions s
+             WHERE sb.session_id = s.id AND s.state = 'expired'",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -796,6 +802,7 @@ impl Db {
         &self,
         tx: &mut Transaction<'_, Postgres>,
         sha: &str,
+        grace_secs: i64,
     ) -> Result<bool> {
         // Lock the block row first. READ COMMITTED snapshots are taken per
         // statement, so folding the liveness subqueries into the locking
@@ -810,8 +817,13 @@ impl Db {
         if !exists {
             return Ok(true);
         }
+        // The grace clock is re-checked too: a block re-marked after the
+        // stale selection ran must earn its new grace period, not die on
+        // the old one.
         Ok(sqlx::query_scalar::<_, bool>(
-            "SELECT NOT EXISTS (
+            "SELECT b.unreferenced_since IS NOT NULL
+               AND b.unreferenced_since < $2
+               AND NOT EXISTS (
                    SELECT 1 FROM model_release_blocks rb
                    JOIN model_releases r ON r.id = rb.release_id
                    WHERE rb.block_sha256 = $1
@@ -819,9 +831,11 @@ impl Db {
              AND NOT EXISTS (
                    SELECT 1 FROM model_session_blocks sb
                    JOIN model_upload_sessions s ON s.id = sb.session_id
-                   WHERE sb.block_sha256 = $1 AND s.state = 'open')",
+                   WHERE sb.block_sha256 = $1 AND s.state = 'open')
+             FROM model_blocks b WHERE b.sha256 = $1",
         )
         .bind(sha)
+        .bind(ts_from_now(-grace_secs))
         .fetch_one(&mut **tx)
         .await?)
     }
@@ -939,9 +953,7 @@ mod tests {
             db.model_expire_sessions().await.unwrap(),
             vec![s.id.clone()]
         );
-        db.model_drop_sessions_blocks(std::slice::from_ref(&s.id))
-            .await
-            .unwrap();
+        db.model_drop_sessions_blocks().await.unwrap();
 
         // The block is now unreferenced: marked, then deletable past grace.
         assert_eq!(db.model_remark_liveness().await.unwrap(), 1);
@@ -956,8 +968,39 @@ mod tests {
             vec![sha.clone()]
         );
         let mut tx = db.model_begin().await.unwrap();
-        assert!(db.model_tx_block_still_dead(&mut tx, &sha).await.unwrap());
+        assert!(db.model_tx_block_still_dead(&mut tx, &sha, 3600).await.unwrap());
         db.model_tx_delete_block_row(&mut tx, &sha).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn a_remarked_block_earns_its_new_grace_period(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        let sha = "f".repeat(64);
+        sqlx::query("INSERT INTO model_blocks (sha256, size, created_at, unreferenced_since) VALUES ($1, 1, $2, $2)")
+            .bind(&sha)
+            .bind(ts_from_now(-7200))
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Selected while stale, then re-marked moments ago (as a racing
+        // unmark/remark cycle would): the fresh stamp restarts the grace
+        // clock and the block must not be deleted on the old one.
+        let mut tx = db.model_begin().await.unwrap();
+        assert!(db
+            .model_tx_block_still_dead(&mut tx, &sha, 3600)
+            .await
+            .unwrap());
+        sqlx::query("UPDATE model_blocks SET unreferenced_since = $1 WHERE sha256 = $2")
+            .bind(ts_from_now(-10))
+            .bind(&sha)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert!(!db
+            .model_tx_block_still_dead(&mut tx, &sha, 3600)
+            .await
+            .unwrap());
         tx.commit().await.unwrap();
     }
 
@@ -1240,7 +1283,10 @@ mod tests {
         assert_eq!(db.model_remark_liveness().await.unwrap(), 0);
         assert!(db.model_stale_blocks(-1, 10).await.unwrap().is_empty());
         let mut tx = db.model_begin().await.unwrap();
-        assert!(!db.model_tx_block_still_dead(&mut tx, &sha).await.unwrap());
+        assert!(!db
+            .model_tx_block_still_dead(&mut tx, &sha, 3600)
+            .await
+            .unwrap());
         tx.commit().await.unwrap();
     }
 }

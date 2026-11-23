@@ -2846,6 +2846,15 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE model_durability_jobs DROP CONSTRAINT IF EXISTS model_durability_jobs_release_id_fkey, ADD CONSTRAINT model_durability_jobs_release_id_fkey FOREIGN KEY (release_id) REFERENCES model_releases(id) ON DELETE CASCADE",
         ],
     },
+    Migration {
+        version: 51,
+        name: "model_upload_sessions_repo_id_index",
+        stmts: &[
+            // Purging a repo cascades through its upload sessions; without
+            // this index the delete scans the whole session table.
+            "CREATE INDEX IF NOT EXISTS idx_model_upload_sessions_repo ON model_upload_sessions (repo_id)",
+        ],
+    },
 ];
 
 // ── HTTP-signature replay ledger ──────────────────────────────────────────────

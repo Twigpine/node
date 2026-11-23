@@ -34,10 +34,25 @@ pub struct Block {
     pub data: Vec<u8>,
 }
 
+/// A reader that retries `ErrorKind::Interrupted`: a signal interrupting
+/// one read must not abort the whole pack.
+struct RetryInterrupted<R>(R);
+
+impl<R: Read> Read for RetryInterrupted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.0.read(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => return other,
+            }
+        }
+    }
+}
+
 /// Stream a reader into content-defined chunks. Memory stays bounded by the
 /// maximum chunk size, never the file size.
 pub fn chunk_reader<R: Read>(reader: R) -> impl Iterator<Item = std::io::Result<Chunk>> {
-    StreamCDC::new(reader, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX).map(|r| {
+    StreamCDC::new(RetryInterrupted(reader), CHUNK_MIN, CHUNK_AVG, CHUNK_MAX).map(|r| {
         let c = r?;
         Ok(Chunk {
             sha256: sha256_hex(&c.data),
@@ -55,6 +70,39 @@ mod tests {
     use std::io::Cursor;
 
     const SEED: u64 = 0x9e3779b97f4a7c15;
+
+    /// Interrupts one read after some progress, then serves the rest of the
+    /// inner reader.
+    struct InterruptOnce {
+        inner: Cursor<Vec<u8>>,
+        left: usize,
+    }
+
+    impl std::io::Read for InterruptOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left > 0 {
+                self.left -= 1;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "interrupted",
+                ));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried() {
+        let bytes = gen_bytes(1024 * 1024, SEED);
+        let reader = InterruptOnce {
+            inner: Cursor::new(bytes.clone()),
+            left: 1,
+        };
+        let chunked: Vec<Chunk> = chunk_reader(reader).collect::<Result<_, _>>().unwrap();
+        let shas: Vec<_> = chunked.iter().map(|c| c.sha256.clone()).collect();
+        let expect: Vec<_> = chunk_all(&bytes).iter().map(|c| c.sha256.clone()).collect();
+        assert_eq!(shas, expect);
+    }
 
     fn chunk_all(bytes: &[u8]) -> Vec<Chunk> {
         chunk_reader(Cursor::new(bytes.to_vec()))

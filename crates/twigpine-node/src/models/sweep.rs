@@ -32,7 +32,7 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepStats, AppError> {
     // session no longer confers liveness.
     let expired = db.model_expire_sessions().await?;
     stats.sessions_expired = expired.len() as u64;
-    db.model_drop_sessions_blocks(&expired).await?;
+    db.model_drop_sessions_blocks().await?;
 
     // A `verifying` row that outlived its window wedges the publisher's
     // one-verifying slot; reject it (which also frees the reservation).
@@ -58,7 +58,7 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepStats, AppError> {
         // held across the store delete so a racing claim blocks rather than
         // wins a reference to an object we just removed.
         let mut tx = db.model_begin().await?;
-        if !db.model_tx_block_still_dead(&mut tx, &sha).await? {
+        if !db.model_tx_block_still_dead(&mut tx, &sha, grace).await? {
             tx.commit().await?;
             continue;
         }
