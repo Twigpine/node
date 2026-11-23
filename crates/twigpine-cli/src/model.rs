@@ -5,7 +5,9 @@
 //! large ones into content blocks with cross-release dedup, uploads the new
 //! blocks under an upload session (resuming from a `.git` state file after an
 //! interruption), commits the signed manifest, pushes, claims the release,
-//! and polls until the node's verification publishes it.
+//! and polls until the node's verification publishes or rejects it. If the
+//! release is still verifying when the poll budget expires, the command
+//! exits non-zero with the status URL to check later.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -44,7 +46,9 @@ const POLL_BUDGET: Duration = Duration::from_secs(300);
 
 #[derive(Subcommand)]
 pub enum ModelCmd {
-    /// Publish the working tree as a signed model release
+    /// Publish the working tree as a signed model release; polls until the
+    /// release publishes or is rejected, exiting non-zero when it is still
+    /// verifying after the poll budget
     Publish(PublishArgs),
 }
 
@@ -552,6 +556,15 @@ async fn upload_block(
     Ok(())
 }
 
+/// The failure `cmd_publish` returns when the release is still `verifying`
+/// at the poll budget: a non-zero exit that keeps the status URL visible.
+fn still_verifying_error(release_id: i64, budget_secs: u64, release_path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "release {release_id} is still verifying after {budget_secs}s; its status is at\n  \
+         GET {release_path}"
+    )
+}
+
 /// Without `--yes`, publishing requires an explicit "yes" on stdin. Any
 /// other answer, including EOF on a pipe, declines.
 fn confirm_publish() -> Result<bool> {
@@ -998,12 +1011,11 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
             }
             _ => {
                 if Instant::now() >= deadline {
-                    println!(
-                        "release {release_id} is still verifying after {}s; its status is at\n  \
-                         GET {release_path}",
-                        POLL_BUDGET.as_secs()
-                    );
-                    return Ok(());
+                    return Err(still_verifying_error(
+                        release_id,
+                        POLL_BUDGET.as_secs(),
+                        &release_path,
+                    ));
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
@@ -1057,6 +1069,18 @@ mod tests {
 
         let empty = upsert_managed_block("", &paths);
         assert_eq!(managed_block_paths(&empty), paths);
+    }
+
+    #[test]
+    fn a_verifying_release_past_the_budget_is_an_error() {
+        // The poll loop needs a live node, so the budget decision is kept
+        // in this pure helper: the arm it feeds must exit non-zero with the
+        // release id, the budget, and the status path.
+        let e = still_verifying_error(7, 300, "/api/v1/repos/o/r/models/releases/cc");
+        let msg = e.to_string();
+        assert!(msg.contains("7"), "{msg}");
+        assert!(msg.contains("300"), "{msg}");
+        assert!(msg.contains("/api/v1/repos/o/r/models/releases/cc"), "{msg}");
     }
 
     #[test]
