@@ -357,7 +357,7 @@ async fn ensure_release_refs_hidden(
         {
             continue;
         }
-        crate::git::store::run_git_bounded(
+        let out = crate::git::store::run_git_bounded(
             git_bin,
             disk_path,
             &["config", "--add", key, value],
@@ -367,6 +367,18 @@ async fn ensure_release_refs_hidden(
         )
         .await
         .map_err(AppError::Internal)?;
+        // A failed add (e.g. a stale config.lock) still reports Ok from
+        // run_git_bounded; without this the release ref is written to a repo
+        // that advertises it to every clone.
+        if !out.status.success() {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "git config --add {key} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(256)
+                    .collect::<String>()
+            )));
+        }
     }
     Ok(())
 }
@@ -420,6 +432,9 @@ pub async fn reject_release(
 pub async fn run_verify_worker(state: AppState) {
     let mut shutdown_rx = state.subscribe_shutdown();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    // Consecutive verify_release errors per release id, reset on success and
+    // on reject: the bound on retries a persistently broken release gets.
+    let mut failures: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {}
@@ -432,10 +447,200 @@ pub async fn run_verify_worker(state: AppState) {
                 continue;
             }
         };
-        for id in ids {
-            if let Err(e) = verify_release(&state, id).await {
-                tracing::warn!("model release {id} verification errored: {e}");
+        for id in &ids {
+            match verify_release(&state, *id).await {
+                Ok(()) => {
+                    failures.remove(id);
+                }
+                Err(e) => {
+                    tracing::warn!("model release {id} verification errored: {e}");
+                    let n = failures.entry(*id).or_insert(0);
+                    *n += 1;
+                    // A persistent internal error would otherwise hold the
+                    // publisher's one-verifying slot until the 6h stale
+                    // sweep; a bounded run of errors rejects the row sooner.
+                    if *n >= 5 {
+                        if let Err(re) = reject_release(
+                            &state,
+                            *id,
+                            &format!("verification failed repeatedly: {e}"),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "model release {id} reject after repeated failures failed: {re}"
+                            );
+                        }
+                        failures.remove(id);
+                    }
+                }
             }
         }
+        // Rows that left `verifying` by another path (publish, stale sweep)
+        // carry no counter forward.
+        failures.retain(|id, _| ids.contains(id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use twigpine_core::model::manifest::{
+        FileFormat, Manifest, ManifestFile, StorageKind, MANIFEST_SCHEMA_V1,
+    };
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A `verifying` release whose publish step fails every pass (a stale
+    /// `config.lock` refuses the hideRefs `git config --add`) is rejected by
+    /// the worker after a bounded run of errors, and the publisher's
+    /// one-verifying slot is then free for a new claim.
+    #[sqlx::test]
+    async fn a_persistently_failing_verify_is_rejected_and_frees_the_claim_slot(
+        pool: sqlx::PgPool,
+    ) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let owner_did =
+            twigpine_core::did::Did::from_verifying_key(&signing.verifying_key()).to_string();
+
+        // A real commit: a.txt rides as a git-stored manifest file, so the
+        // whole verify path runs and only the ref-pin step fails.
+        let dir = tempfile::tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(dir.path().join(".twigpine")).expect("mkdir");
+        std::fs::write(dir.path().join("a.txt"), b"hello\n").expect("a.txt");
+        let manifest = Manifest {
+            schema: MANIFEST_SCHEMA_V1.to_string(),
+            repo: format!("{}/model", crate::db::canonical_did(&owner_did)),
+            publisher_did: owner_did.clone(),
+            license: "mit".to_string(),
+            parent: None,
+            files: vec![ManifestFile {
+                path: "a.txt".to_string(),
+                size: 6,
+                sha256: twigpine_core::cid::sha256_hex(b"hello\n"),
+                format: FileFormat::Text,
+                storage: StorageKind::Git,
+            }],
+            reconstruction: None,
+        };
+        let manifest_bytes = manifest.to_bytes().expect("manifest bytes");
+        let sig = twigpine_core::model::manifest::sign(&signing, &manifest_bytes);
+        std::fs::write(
+            dir.path().join(".twigpine/model-release.json"),
+            &manifest_bytes,
+        )
+        .expect("manifest");
+        std::fs::write(dir.path().join(".twigpine/model-release.sig"), sig)
+            .expect("sig");
+        git(dir.path(), &["add", "a.txt", ".twigpine"]);
+        git(
+            dir.path(),
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "r1"],
+        );
+        let commit = git(dir.path(), &["rev-parse", "HEAD"]);
+
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, is_public, default_branch,
+                                created_at, updated_at, disk_path)
+             VALUES ('r1', 'model', $1, TRUE, 'main', $2, $2, $3)",
+        )
+        .bind(&owner_did)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(dir.path().to_str().expect("utf-8 path"))
+        .execute(&pool)
+        .await
+        .expect("repo row");
+        sqlx::query(
+            "INSERT INTO model_releases
+                 (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
+                  claim_signature, claim_signature_input, claim_signing_string,
+                  claim_body, claim_request_digest, created_at)
+             VALUES ('r1', $1, 'main', $2, 'verifying', $3, 's', 'i', 'ss',
+                     decode('00','hex'), 'd1', $4)
+             RETURNING id",
+        )
+        .bind(&commit)
+        .bind(&owner_did)
+        .bind(twigpine_core::cid::sha256_hex(&manifest_bytes))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("release row");
+
+        // A stale lock makes `git config --add` fail every pass; the pin
+        // step then errors instead of writing an advertised release ref.
+        std::fs::write(dir.path().join(".git/config.lock"), b"").expect("config.lock");
+
+        let worker = tokio::spawn(run_verify_worker(state.clone()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let state_str = loop {
+            let s: String = sqlx::query_scalar(
+                "SELECT state FROM model_releases WHERE commit_sha = $1",
+            )
+            .bind(&commit)
+            .fetch_one(&pool)
+            .await
+            .expect("release state");
+            if s != "verifying" {
+                break s;
+            }
+            assert!(std::time::Instant::now() < deadline, "release never settled");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        };
+        worker.abort();
+        assert_eq!(state_str, "rejected");
+        let reason: String = sqlx::query_scalar(
+            "SELECT failure_reason FROM model_releases WHERE commit_sha = $1",
+        )
+        .bind(&commit)
+        .fetch_one(&pool)
+        .await
+        .expect("failure_reason");
+        assert!(
+            reason.contains("verification failed repeatedly"),
+            "got: {reason}"
+        );
+
+        // The slot is free: a claim on a new commit is accepted.
+        std::fs::write(dir.path().join("a.txt"), b"hello again\n").expect("a.txt v2");
+        git(dir.path(), &["add", "a.txt"]);
+        git(
+            dir.path(),
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "r2"],
+        );
+        let commit2 = git(dir.path(), &["rev-parse", "HEAD"]);
+        let record = state
+            .db
+            .get_repo_by_id("r1")
+            .await
+            .expect("repo read")
+            .expect("repo row");
+        let material = super::super::claim::ClaimMaterial {
+            request_digest: "d2".to_string(),
+            signature: "s".to_string(),
+            signature_input: "i".to_string(),
+            signing_string: "ss".to_string(),
+            body: Vec::new(),
+        };
+        let row = super::super::claim::claim_release(
+            &state, &record, &owner_did, &commit2, "main", &material,
+        )
+        .await
+        .expect("claim after rejection is accepted");
+        assert_eq!(row.state, "verifying");
     }
 }
