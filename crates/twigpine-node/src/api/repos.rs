@@ -604,7 +604,7 @@ const MAX_COMMITS_PAGE: i64 = 100;
 /// The one message for every `before` that cannot name a position in the served
 /// history: malformed, unknown, not a commit, or a commit the head does not reach.
 const BAD_BEFORE_MESSAGE: &str =
-    "before must be the full id of a commit in the default branch history";
+    "before must be the full id of a commit in the served head's history";
 const GIT_READ_FAILED_MESSAGE: &str = "git read failed";
 /// Cap on the git-read deadline so the `Instant` addition cannot overflow.
 const MAX_GIT_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
