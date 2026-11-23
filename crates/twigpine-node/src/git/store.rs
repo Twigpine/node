@@ -404,6 +404,87 @@ pub(crate) async fn run_git_bounded(
         .map_err(|_| anyhow::anyhow!("{label} timed out"))?
 }
 
+/// [`run_git_bounded`] plus a hard cap on captured stdout: reads the pipe
+/// incrementally and kills the child the moment output exceeds
+/// `max_stdout`, so a huge blob never lands fully in memory. Other callers
+/// keep the uncapped helper above.
+pub(crate) async fn run_git_bounded_capped(
+    git_bin: &str,
+    repo_path: &Path,
+    args: &[&str],
+    stdin_bytes: &[u8],
+    timeout: std::time::Duration,
+    label: &str,
+    max_stdout: usize,
+) -> Result<std::process::Output> {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command as AsyncCommand;
+    let fut = async {
+        let mut cmd = AsyncCommand::new(git_bin);
+        cmd.kill_on_drop(true);
+        cmd.args(args).current_dir(repo_path);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        if !stdin_bytes.is_empty() {
+            cmd.stdin(std::process::Stdio::piped());
+        } else {
+            cmd.stdin(std::process::Stdio::null());
+        }
+        let mut child = cmd.spawn().context(format!("{label} spawn failed"))?;
+        if !stdin_bytes.is_empty() {
+            child
+                .stdin
+                .as_mut()
+                .context(format!("{label} stdin pipe"))?
+                .write_all(stdin_bytes)
+                .await
+                .context(format!("{label} stdin write"))?;
+        }
+        let mut stderr = child.stderr.take();
+        let err_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut e) = stderr.take() {
+                let _ = e.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let mut stdout = Vec::new();
+        let mut oversized = false;
+        if let Some(mut pipe) = child.stdout.take() {
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                match pipe.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdout.len() + n > max_stdout {
+                            oversized = true;
+                            break;
+                        }
+                        stdout.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+        }
+        if oversized {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = err_task.await;
+            anyhow::bail!("{label} output exceeded {max_stdout} bytes");
+        }
+        let stderr = err_task.await.unwrap_or_default();
+        let status = child.wait().await.context(format!("{label} wait"))?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} timed out"))?
+}
+
 /// Bounded [`list_refs`]: same listing through the configured git binary
 /// with a timeout. Used by startup reconcile, which awaits recovery before
 /// serving — an unbounded `for-each-ref` would hold startup forever past

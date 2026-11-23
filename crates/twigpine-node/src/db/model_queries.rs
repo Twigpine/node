@@ -28,7 +28,7 @@ type SessionTuple = (String, String, String, String, i64, String);
 /// Global advisory key serializing block-byte admission across sessions
 /// (see `model_admit_bytes`). Distinct from `CLAIM_LOCK_KEY` in
 /// `crate::models`, which serializes claim admission.
-const MODEL_ADMIT_LOCK: i64 = 0x6D6F64656C61646D; // "modeladm"
+pub(crate) const MODEL_ADMIT_LOCK: i64 = 0x6D6F64656C61646D; // "modeladm"
 
 const SESSION_COLS: &str = "id, owner_did, repo_id, expires_at, bytes_received, state";
 
@@ -278,6 +278,19 @@ impl Db {
         }
         tx.commit().await?;
         Ok(refund)
+    }
+
+    pub async fn model_release_by_digest(
+        &self,
+        digest: &str,
+    ) -> Result<Option<ModelRelease>> {
+        let row = sqlx::query_as::<_, ReleaseTuple>(&format!(
+            "SELECT {RELEASE_COLS} FROM model_releases WHERE claim_request_digest = $1"
+        ))
+        .bind(digest)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
     }
 
     pub async fn model_release_by_commit(

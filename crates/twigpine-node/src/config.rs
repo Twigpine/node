@@ -1215,6 +1215,24 @@ impl Config {
     /// validated.
     pub fn validate(&mut self) -> Result<(), String> {
         self.settle_default_key_paths()?;
+        // Byte caps land in an i64 quota ledger (`as i64` at claim/session
+        // admission); above i64::MAX the cast wraps negative and every admit
+        // fails.
+        for (name, value) in [
+            ("TWIGPINE_MODEL_QUOTA_BYTES", Some(self.model_quota_bytes)),
+            ("TWIGPINE_MODEL_NODE_QUOTA_BYTES", Some(self.model_node_quota_bytes)),
+            ("TWIGPINE_MODEL_MAX_SESSION_BYTES", self.model_max_session_bytes),
+        ] {
+            if let Some(v) = value {
+                if v > i64::MAX as u64 {
+                    return Err(format!(
+                        "{name} ({v}) exceeds {i64max}, the largest value the \
+                         signed quota ledger can hold",
+                        i64max = i64::MAX
+                    ));
+                }
+            }
+        }
         if self.model_unclaimed_ttl_secs <= self.model_session_ttl_secs {
             return Err(format!(
                 "TWIGPINE_MODEL_UNCLAIMED_TTL_SECS ({}) must exceed \
@@ -1690,6 +1708,34 @@ mod tests {
             over.validate().is_err(),
             "a hold bound above the git service timeout must be rejected at boot"
         );
+    }
+
+    #[test]
+    fn model_byte_caps_stop_at_the_i64_ledger_bound() {
+        let mut ok = Config::parse_from(["twigpine-node"]);
+        ok.validate().expect("defaults validate");
+        let mut at_max = Config::parse_from([
+            "twigpine-node",
+            "--model-quota-bytes",
+            "9223372036854775807",
+            "--model-node-quota-bytes",
+            "9223372036854775807",
+            "--model-max-session-bytes",
+            "9223372036854775807",
+        ]);
+        assert!(at_max.validate().is_ok(), "i64::MAX is the last valid cap");
+        for flag in [
+            "--model-quota-bytes",
+            "--model-node-quota-bytes",
+            "--model-max-session-bytes",
+        ] {
+            let mut over = Config::parse_from([
+                "twigpine-node",
+                flag,
+                "9223372036854775808",
+            ]);
+            assert!(over.validate().is_err(), "{flag} above i64::MAX");
+        }
     }
 
     #[test]

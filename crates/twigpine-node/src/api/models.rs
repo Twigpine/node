@@ -389,11 +389,16 @@ pub async fn get_model_reconstruction(
         .ok()
         .flatten()
         .ok_or_else(|| AppError::NotFound("reconstruction object not stored".into()))?;
-    let bytes = models::read_block(&store, &sha, size)
+    // Stream the object straight into the response body: buffering the whole
+    // reconstruction object per anonymous GET would be an uncapped read.
+    let id = BlockId::parse(&sha)
+        .map_err(|_| AppError::NotFound("reconstruction object not stored".into()))?;
+    let stream = store
+        .get_range(&id, 0, size)
         .await
         .map_err(|_| AppError::NotFound("reconstruction object not stored".into()))?;
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        bytes,
+        axum::body::Body::from_stream(stream),
     ))
 }

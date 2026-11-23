@@ -26,6 +26,11 @@ fn bad_request(msg: impl Into<String>) -> AppError {
     AppError::BadRequest(msg.into())
 }
 
+/// Hard cap on the bytes a `git show` of release metadata may return: a
+/// manifest listing every file of a large model is still a few hundred KiB,
+/// so 8 MiB is generous and a blob beyond it cannot be a real manifest.
+const MAX_RELEASE_METADATA_BYTES: usize = 8 * 1024 * 1024;
+
 pub(crate) async fn git_show(
     git_bin: &str,
     disk_path: &std::path::Path,
@@ -33,13 +38,14 @@ pub(crate) async fn git_show(
     path: &str,
 ) -> Result<Option<Vec<u8>>, AppError> {
     let spec = format!("{commit}:{path}");
-    let out = crate::git::store::run_git_bounded(
+    let out = crate::git::store::run_git_bounded_capped(
         git_bin,
         disk_path,
         &["show", &spec],
         b"",
         std::time::Duration::from_secs(30),
         "git show",
+        MAX_RELEASE_METADATA_BYTES,
     )
     .await
     .map_err(AppError::Internal)?;
@@ -142,6 +148,17 @@ pub async fn claim_release(
     let rec_sha = manifest.reconstruction.as_ref().map(|r| r.sha256.clone());
     let blocks = super::referenced_blocks(state, &manifest).await?;
 
+    // Exact replay resolves before the parent publicity check: a parent made
+    // private since the first claim must not turn the recorded row into a
+    // rejection. The lookup repeats under the claim lock below, before any
+    // insert, so a first claim still serializes correctly.
+    if let Some(existing) = db
+        .model_release_by_digest(&material.request_digest)
+        .await?
+    {
+        return Ok(existing);
+    }
+
     // Resolve the declared parent before the transaction: the repo lookup
     // uses its own pool connection and must not sit behind the global
     // advisory lock, where pool pressure would stall every claim.
@@ -169,6 +186,10 @@ pub async fn claim_release(
 
     let mut tx = db.model_begin().await?;
     db.model_tx_advisory_lock(&mut tx, CLAIM_LOCK_KEY).await?;
+    // The claim's node-cap check must serialize against the admission-side
+    // ledger writes the PUT path takes under MODEL_ADMIT_LOCK.
+    db.model_tx_advisory_lock(&mut tx, crate::db::model_queries::MODEL_ADMIT_LOCK)
+        .await?;
 
     // Replay by request digest, then idempotent re-claim by (repo, commit):
     // both return the original row, whatever its state. A rejected release
@@ -221,15 +242,22 @@ pub async fn claim_release(
     let parent_blocks: std::collections::HashSet<String> = match &parent {
         None => std::collections::HashSet::new(),
         Some((prepo_id, pcommit)) => {
-            let rows = db
-                .model_tx_release_blocks_at_commit(&mut tx, prepo_id, pcommit)
-                .await?;
-            if rows.is_empty() {
+            // Existence of a published parent release is the check, not its
+            // block links: an all-Git parent links no blocks yet still
+            // stands as a parent.
+            let published = db
+                .model_tx_release_by_commit(&mut tx, prepo_id, pcommit)
+                .await?
+                .is_some_and(|r| r.state == "published");
+            if !published {
                 return Err(bad_request(
                     "declared parent is not a published release on this node",
                 ));
             }
-            rows.into_iter().collect()
+            db.model_tx_release_blocks_at_commit(&mut tx, prepo_id, pcommit)
+                .await?
+                .into_iter()
+                .collect()
         }
     };
     for b in &blocks {
