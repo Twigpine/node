@@ -6601,6 +6601,10 @@ fn validate_homepage(raw: &str) -> Result<&str> {
     if !crate::api::peers::is_public_http_url(raw) {
         return Err(bad(crate::api::peers::PUBLIC_HTTP_URL_REQUIREMENT));
     }
+    let lower = raw.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return Err(bad("must be an absolute http or https URL"));
+    }
     Ok(raw)
 }
 
@@ -6634,6 +6638,9 @@ mod tests {
             "ftp://example.com",
             "//example.com",
             "example.com",
+            "https:example.com/docs",
+            "http:example.com",
+            "https:/example.com",
         ] {
             assert!(homepage_rejected(bad), "{bad}");
         }
