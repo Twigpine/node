@@ -93,6 +93,19 @@ impl From<ReleaseTuple> for ModelRelease {
     }
 }
 
+/// Result of [`Db::model_publish_if_public`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The release flipped to `published` inside the locked check.
+    Published,
+    /// The repo is gone, private, mirror-form, or now has visibility rules.
+    NoLongerPublic,
+    /// The release left `verifying` already (a concurrent verifier
+    /// published it, or it was rejected); the caller must re-read the row
+    /// before deciding what to unwind.
+    NotVerifying,
+}
+
 pub const RELEASE_COLS: &str = "id, repo_id, commit_sha, branch, publisher_did, \
      state, manifest_sha256, failure_reason, created_at, published_at, \
      claim_request_digest";
@@ -674,6 +687,56 @@ impl Db {
         .await?
         .rows_affected();
         Ok(done > 0)
+    }
+
+    /// Publish a verifying release only while its repo is still fully
+    /// public. The repo row is taken FOR UPDATE, the same lock
+    /// `set_visibility_rule` and `remove_visibility_rule` hold while they
+    /// write a rule and bump the epoch, so a rule added mid-verify (after
+    /// the handler-time publicity check) serializes: either it commits
+    /// first and this returns `NoLongerPublic`, or it waits and sees the
+    /// release already published.
+    pub async fn model_publish_if_public(
+        &self,
+        release_id: i64,
+        repo_id: &str,
+    ) -> Result<PublishOutcome> {
+        if repo_id.contains('/') {
+            return Ok(PublishOutcome::NoLongerPublic);
+        }
+        let mut tx = self.pool.begin().await?;
+        let is_public: Option<bool> =
+            sqlx::query_scalar("SELECT is_public FROM repos WHERE id = $1 FOR UPDATE")
+                .bind(repo_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(true) = is_public else {
+            return Ok(PublishOutcome::NoLongerPublic);
+        };
+        let has_rules: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM visibility_rules WHERE repo_id = $1)")
+                .bind(repo_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if has_rules {
+            return Ok(PublishOutcome::NoLongerPublic);
+        }
+        let done = sqlx::query(
+            "UPDATE model_releases
+             SET state = 'published', published_at = $2
+             WHERE id = $1 AND state = 'verifying'",
+        )
+        .bind(release_id)
+        .bind(ts_now())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(if done > 0 {
+            PublishOutcome::Published
+        } else {
+            PublishOutcome::NotVerifying
+        })
     }
 
     /// Reject: mark the release, drop its refs, and refund the publisher the
@@ -1511,5 +1574,79 @@ mod tests {
             .unwrap();
         db.model_reject_release(rid, "x").await.unwrap();
         assert_eq!(quota_used(&pool, "did:c").await, 0);
+    }
+
+    async fn seed_verifying_release(pool: &sqlx::PgPool, commit: &str) -> i64 {
+        // A distinct publisher per row: the one-verifying index is real.
+        sqlx::query_scalar(
+            "INSERT INTO model_releases
+                 (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
+                  claim_signature, claim_signature_input, claim_signing_string,
+                  claim_body, created_at)
+             VALUES ('r1', $1, 'main', 'did:' || $1, 'verifying', 'm', 's', 'i', 'ss', '\\x00', 't')
+             RETURNING id",
+        )
+        .bind(commit)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn publish_if_public_gates_on_the_locked_repo_state(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+
+        // Public repo: the verifying release publishes.
+        let rid = seed_verifying_release(&pool, "cp1").await;
+        assert_eq!(
+            db.model_publish_if_public(rid, "r1").await.unwrap(),
+            PublishOutcome::Published
+        );
+
+        // A visibility rule appearing between the handler check and publish
+        // flips the outcome to NoLongerPublic and the row stays verifying.
+        sqlx::query(
+            "INSERT INTO visibility_rules
+                 (id, repo_id, path_glob, mode, reader_dids, created_by, created_at)
+             VALUES ('v1', 'r1', '/x', 'withhold', '[]', 'did:owner', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rid2 = seed_verifying_release(&pool, "cp2").await;
+        assert_eq!(
+            db.model_publish_if_public(rid2, "r1").await.unwrap(),
+            PublishOutcome::NoLongerPublic
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM model_releases WHERE id = $1")
+            .bind(rid2)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "verifying");
+
+        // With the rule gone the repo is fully public again: a row already
+        // out of verifying is NotVerifying, not a re-publish.
+        sqlx::query("DELETE FROM visibility_rules WHERE repo_id = 'r1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rid3 = seed_verifying_release(&pool, "cp3").await;
+        sqlx::query("UPDATE model_releases SET state = 'published' WHERE id = $1")
+            .bind(rid3)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.model_publish_if_public(rid3, "r1").await.unwrap(),
+            PublishOutcome::NotVerifying
+        );
+
+        // A missing repo row is NoLongerPublic.
+        let rid4 = seed_verifying_release(&pool, "cp4").await;
+        assert_eq!(
+            db.model_publish_if_public(rid4, "gone").await.unwrap(),
+            PublishOutcome::NoLongerPublic
+        );
     }
 }

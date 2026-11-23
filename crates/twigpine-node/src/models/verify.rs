@@ -311,22 +311,46 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
     // Publish: hidden ref first, then the state flip, so a crash leaves a
     // verifying row the worker retries rather than a dangling ref.
     write_release_ref(&state.git_bin, &disk_path, &release.commit_sha).await?;
-    if !state.db.model_mark_published(release_id).await? {
-        // The stale-verify sweep rejected the row while this pass ran:
-        // drop the ref just written so it does not advertise a rejected
-        // commit.
-        let ref_name = format!("refs/gitlawb/releases/{}", release.commit_sha);
-        let _ = crate::git::store::run_git_bounded(
-            &state.git_bin,
-            &disk_path,
-            &["update-ref", "-d", &ref_name],
-            b"",
-            std::time::Duration::from_secs(30),
-            "git update-ref",
-        )
-        .await;
+    match state
+        .db
+        .model_publish_if_public(release_id, &release.repo_id)
+        .await?
+    {
+        crate::db::model_queries::PublishOutcome::Published => {}
+        crate::db::model_queries::PublishOutcome::NoLongerPublic => {
+            reject_release(state, release_id, "repository is no longer fully public").await?;
+            remove_release_ref(&state.git_bin, &disk_path, &release.commit_sha).await;
+        }
+        crate::db::model_queries::PublishOutcome::NotVerifying => {
+            // The row settled while this pass ran: a rejected release's ref
+            // must go, but a concurrently published one owns its ref.
+            let rejected = state
+                .db
+                .model_release_by_id(release_id)
+                .await?
+                .is_some_and(|r| r.state == "rejected");
+            if rejected {
+                remove_release_ref(&state.git_bin, &disk_path, &release.commit_sha).await;
+            }
+        }
     }
     Ok(())
+}
+
+/// Drop the hidden release ref written for `commit`. Best-effort like the
+/// write it undoes: a failure leaves an advertised ref, which is a
+/// leak of a commit, not a correctness wedge.
+async fn remove_release_ref(git_bin: &str, disk_path: &std::path::Path, commit: &str) {
+    let ref_name = format!("refs/gitlawb/releases/{commit}");
+    let _ = crate::git::store::run_git_bounded(
+        git_bin,
+        disk_path,
+        &["update-ref", "-d", &ref_name],
+        b"",
+        std::time::Duration::from_secs(30),
+        "git update-ref",
+    )
+    .await;
 }
 
 /// `refs/gitlawb/releases/<commit>` -> the release commit itself: reachable,
