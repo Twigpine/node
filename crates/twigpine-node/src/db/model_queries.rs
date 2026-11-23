@@ -280,6 +280,19 @@ impl Db {
         Ok(refund)
     }
 
+    /// Whether a `model_blocks` row exists for `sha`. A failed bookkeeping
+    /// cleanup deletes a stored object only when no row references it, so a
+    /// block a release or another session already carries is never removed
+    /// from under it.
+    pub async fn model_block_exists(&self, sha: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM model_blocks WHERE sha256 = $1)",
+        )
+        .bind(sha)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn model_release_by_digest(&self, digest: &str) -> Result<Option<ModelRelease>> {
         let row = sqlx::query_as::<_, ReleaseTuple>(&format!(
             "SELECT {RELEASE_COLS} FROM model_releases WHERE claim_request_digest = $1"

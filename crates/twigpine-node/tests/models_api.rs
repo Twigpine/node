@@ -15,7 +15,8 @@ use support::signing::signed_request;
 use twigpine_core::cid::sha256_hex;
 use twigpine_core::http_sig::sign_request;
 use twigpine_core::identity::Keypair;
-use twigpine_node::test_harness::{spawn_node, TestNode};
+use twigpine_node::blockstore::{BlockId, BlockStore};
+use twigpine_node::test_harness::{spawn_node, spawn_node_with_store, FailOnceSizeStore, TestNode};
 
 fn sessions_path(owner: &str, repo: &str) -> String {
     format!("/api/v1/repos/{owner}/{repo}/models/sessions")
@@ -541,6 +542,101 @@ async fn put_block_happy_path_duplicate_and_digest_mismatch(pool: sqlx::PgPool) 
     .await
     .expect("request sends");
     assert_eq!(resp.status().as_u16(), 400, "digest mismatch is a 400");
+
+    node.shutdown().await;
+}
+
+/// A bookkeeping failure on a PUT whose bytes the store already held (the
+/// put reports AlreadyPresent) must not delete the shared object or its
+/// model_blocks row, and must refund the second session's admission. The
+/// fault seam fails the `size()` call inside the second PUT's bookkeeping
+/// tail.
+#[sqlx::test]
+async fn put_block_failed_bookkeeping_keeps_shared_block(pool: sqlx::PgPool) {
+    let repos_dir = tempfile::tempdir().expect("repos dir");
+    let block_dir = tempfile::tempdir().expect("block dir");
+    let inner: std::sync::Arc<dyn BlockStore> = std::sync::Arc::new(
+        twigpine_node::blockstore::fs::FsBlockStore::new(block_dir.path().to_path_buf())
+            .expect("fs store"),
+    );
+    let failing = std::sync::Arc::new(FailOnceSizeStore::new(inner.clone()));
+    let node = spawn_node_with_store(
+        pool.clone(),
+        repos_dir.path().to_path_buf(),
+        failing.clone(),
+    )
+    .await;
+    let client = bounded_client();
+    let owner_did = Keypair::generate().did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let body = b"shared-block".to_vec();
+    let sha = sha256_hex(&body);
+    let block_id = BlockId::parse(&sha).expect("block id");
+
+    // The first PUT stores the block and books it.
+    let session1 = seed_open_session(&node, &repo_id, &owner_did).await;
+    let resp = put_block(
+        &client,
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session1),
+        body.clone(),
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // The second PUT sees the stored object (AlreadyPresent), then the
+    // injected size() failure lands in the bookkeeping tail.
+    failing.fail_next_size();
+    let session2 = "t".repeat(64);
+    node.seed_model_session(&repo_id, &session2, &owner_did)
+        .await;
+    let resp = put_block(
+        &client,
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session2),
+        body.clone(),
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 500);
+
+    // The shared object and its model_blocks row survive; the failed
+    // session's admission is refunded and it records no link.
+    assert_eq!(
+        inner.size(&block_id).await.expect("size"),
+        Some(body.len() as u64),
+        "shared block must not be deleted"
+    );
+    let block_row: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM model_blocks WHERE sha256 = $1)")
+            .bind(&sha)
+            .fetch_one(&pool)
+            .await
+            .expect("block row check");
+    assert!(block_row, "model_blocks row must remain");
+    let (received, linked): (i64, i64) = sqlx::query_as(
+        "SELECT s.bytes_received,
+                (SELECT COUNT(*) FROM model_session_blocks l
+                  WHERE l.session_id = s.id AND l.block_sha256 = $2)
+         FROM model_upload_sessions s WHERE s.id = $1",
+    )
+    .bind(&session2)
+    .bind(&sha)
+    .fetch_one(&pool)
+    .await
+    .expect("session state");
+    assert_eq!(received, 0, "admission refunded");
+    assert_eq!(linked, 0, "no session link recorded");
 
     node.shutdown().await;
 }

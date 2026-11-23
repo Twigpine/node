@@ -14,7 +14,7 @@ use serde_json::json;
 
 use crate::api::{authorize_repo_read, require_repo_owner};
 use crate::auth::{AuthenticatedDid, SignatureMaterial};
-use crate::blockstore::{BlockId, BlockStoreError};
+use crate::blockstore::{BlockId, BlockStoreError, PutOutcome};
 use crate::db::{RepoRecord, VisibilityRule};
 use crate::error::{AppError, Result};
 use crate::models;
@@ -198,58 +198,96 @@ pub async fn put_model_block(
         .into_body()
         .into_data_stream()
         .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
-    if let Err(e) = store
-        .put_verified(&block_id, Box::pin(stream), models::MAX_BLOCK_BYTES)
-        .await
-    {
-        let _ = db.model_refund_bytes(&session.id, declared as i64).await;
-        return Err(match e {
-            BlockStoreError::DigestMismatch => {
-                AppError::BadRequest(format!("block body does not hash to the named id {sha}"))
+    // The store write and its bookkeeping run in one spawned task whose
+    // JoinHandle this handler awaits: a client that disconnects after
+    // sending the body drops the handler future, and a bare await between
+    // put_verified and model_record_block would strand a stored object with
+    // no model_blocks row and no refund, which the sweep can never find
+    // (its candidate list is model_blocks rows).
+    let bookkeep_db = state.db.clone();
+    let bookkeep_session = session.id.clone();
+    let bookkeep_sha = sha.clone();
+    let bookkeeping = tokio::spawn(async move {
+        let outcome = match store
+            .put_verified(&block_id, Box::pin(stream), models::MAX_BLOCK_BYTES)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = bookkeep_db
+                    .model_refund_bytes(&bookkeep_session, declared as i64)
+                    .await;
+                return Err(match e {
+                    BlockStoreError::DigestMismatch => AppError::BadRequest(format!(
+                        "block body does not hash to the named id {bookkeep_sha}"
+                    )),
+                    BlockStoreError::TooLarge(cap) => {
+                        AppError::BadRequest(format!("block exceeds the {cap}-byte limit"))
+                    }
+                    BlockStoreError::Unknown => AppError::Conflict(
+                        "the write's outcome is unknown; check the object before retrying".into(),
+                    ),
+                    BlockStoreError::Body(e) => {
+                        AppError::BadRequest(format!("block body could not be read: {e}"))
+                    }
+                    other => {
+                        AppError::Internal(anyhow::anyhow!("block store write failed: {other}"))
+                    }
+                });
             }
-            BlockStoreError::TooLarge(cap) => {
-                AppError::BadRequest(format!("block exceeds the {cap}-byte limit"))
+        };
+        // Stored and AlreadyPresent both leave the bytes stored. On a tail
+        // failure the admission is always refunded, but the object is
+        // deleted only when this request stored it AND no model_blocks row
+        // names it now: an already-present block, or one a row carries, is
+        // shared and must survive.
+        let size = match store.size(&block_id).await {
+            Ok(Some(s)) => s,
+            r => {
+                let _ = bookkeep_db
+                    .model_refund_bytes(&bookkeep_session, declared as i64)
+                    .await;
+                if outcome == PutOutcome::Stored
+                    && !bookkeep_db
+                        .model_block_exists(&bookkeep_sha)
+                        .await
+                        .unwrap_or(true)
+                {
+                    let _ = store.delete(&block_id).await;
+                }
+                return Err(match r {
+                    Ok(None) => AppError::Internal(anyhow::anyhow!(
+                        "block {bookkeep_sha} absent immediately after write"
+                    )),
+                    Err(e) => AppError::Internal(anyhow::anyhow!("block size lookup failed: {e}")),
+                    Ok(Some(_)) => unreachable!(),
+                });
             }
-            BlockStoreError::Unknown => AppError::Conflict(
-                "the write's outcome is unknown; check the object before retrying".into(),
-            ),
-            BlockStoreError::Body(e) => {
-                AppError::BadRequest(format!("block body could not be read: {e}"))
+        };
+        match bookkeep_db
+            .model_record_block(&bookkeep_session, &bookkeep_sha, size, declared as i64)
+            .await
+        {
+            Ok(duplicate) => Ok(duplicate),
+            Err(e) => {
+                let _ = bookkeep_db
+                    .model_refund_bytes(&bookkeep_session, declared as i64)
+                    .await;
+                if outcome == PutOutcome::Stored
+                    && !bookkeep_db
+                        .model_block_exists(&bookkeep_sha)
+                        .await
+                        .unwrap_or(true)
+                {
+                    let _ = store.delete(&block_id).await;
+                }
+                Err(e.into())
             }
-            other => AppError::Internal(anyhow::anyhow!("block store write failed: {other}")),
-        });
-    }
-    // Stored and AlreadyPresent both leave the bytes stored.
-
-    // Past this point the object exists; a bookkeeping failure must refund
-    // the admission or the session's charge leaks until it expires, and
-    // must delete the store object or the sweep can never find it (its
-    // candidate list is model_blocks rows).
-    let size = match store.size(&block_id).await {
-        Ok(Some(s)) => s,
-        r => {
-            let _ = db.model_refund_bytes(&session.id, declared as i64).await;
-            let _ = store.delete(&block_id).await;
-            return Err(match r {
-                Ok(None) => AppError::Internal(anyhow::anyhow!(
-                    "block {sha} absent immediately after write"
-                )),
-                Err(e) => AppError::Internal(anyhow::anyhow!("block size lookup failed: {e}")),
-                Ok(Some(_)) => unreachable!(),
-            });
         }
-    };
-    let duplicate = match db
-        .model_record_block(&session.id, &sha, size, declared as i64)
-        .await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = db.model_refund_bytes(&session.id, declared as i64).await;
-            let _ = store.delete(&block_id).await;
-            return Err(e.into());
-        }
-    };
+    });
+    let duplicate = bookkeeping.await.map_err(|e| {
+        AppError::Internal(anyhow::anyhow!("upload bookkeeping task failed: {e}"))
+    })??;
     let fresh = db.model_load_session(&session.id).await?;
     Ok(Json(json!({
         "received": fresh.as_ref().map(|s| s.bytes_received).unwrap_or(0),
