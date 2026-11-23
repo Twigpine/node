@@ -228,11 +228,8 @@ fn detect_remote(root: &Path) -> Result<(String, String, String)> {
                 // The push must land on the repo the session and claim calls
                 // use: a push URL naming a different twigpine repo is an
                 // ambiguous destination, not a slow failure after upload.
-                let push_urls = git_lines(
-                    root,
-                    &["remote", "get-url", "--push", "--all", &name],
-                )
-                .unwrap_or_default();
+                let push_urls = git_lines(root, &["remote", "get-url", "--push", "--all", &name])
+                    .unwrap_or_default();
                 for u in &push_urls {
                     if let Some((pdid, prepo)) = parse_remote_url(u) {
                         if pdid != did || prepo != repo {
@@ -534,6 +531,39 @@ fn read_head(path: &Path, n: u64) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     f.take(n).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Point the real index's entries for the released paths back at HEAD. The
+/// release commit is built under a dedicated index, so without this the
+/// user's index still holds the old HEAD tree and every released path shows
+/// as a staged reversion the next plain commit would apply. Entries for
+/// paths not listed are untouched.
+fn sync_index_to_head(root: &Path, git_dir: &Path, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let spec_path = git_dir.join("twigpine-model-reset-pathspec");
+    {
+        let mut spec = Vec::new();
+        for p in paths {
+            spec.extend_from_slice(p.as_bytes());
+            spec.push(0);
+        }
+        std::fs::write(&spec_path, spec)?;
+    }
+    let res = git(
+        root,
+        &[
+            "--literal-pathspecs",
+            "reset",
+            "-q",
+            "HEAD",
+            &format!("--pathspec-from-file={}", spec_path.display()),
+            "--pathspec-file-nul",
+        ],
+    );
+    let _ = std::fs::remove_file(&spec_path);
+    res.map(|_| ())
 }
 
 /// Bytes of the blob staged for `path` in the dedicated release index:
@@ -1044,6 +1074,18 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         println!("no changes to commit; claiming the existing release commit");
     }
     let _ = std::fs::remove_file(&index_path);
+    // The dedicated index left the real index holding the old HEAD tree:
+    // every released path would look staged for reversion, and the next
+    // plain `git commit` would undo the release. Sync exactly the released
+    // paths back to HEAD; unrelated staged entries keep their state.
+    let mut released: Vec<String> = scan.git_files.clone();
+    released.extend(scan.deleted.iter().cloned());
+    if gitignore_path.is_file() || git(&root, &["cat-file", "-e", "HEAD:.gitignore"]).is_ok() {
+        released.push(".gitignore".to_string());
+    }
+    released.push(".twigpine/model-release.json".to_string());
+    released.push(".twigpine/model-release.sig".to_string());
+    sync_index_to_head(&root, &git_dir, &released)?;
     let commit = git_lines(&root, &["rev-parse", "HEAD"])?
         .into_iter()
         .next()
@@ -1408,7 +1450,8 @@ mod tests {
     fn managed_patterns_anchor_at_root_and_escape_wildcards() {
         assert_eq!(escape_gitignore_path("a*b?.bin"), "/a\\*b\\?.bin");
         assert_eq!(escape_gitignore_path("weights.bin"), "/weights.bin");
-        let text = format!("{GITIGNORE_BEGIN}\n/weights.bin\n/experiments/weights.bin\n{GITIGNORE_END}\n");
+        let text =
+            format!("{GITIGNORE_BEGIN}\n/weights.bin\n/experiments/weights.bin\n{GITIGNORE_END}\n");
         assert_eq!(
             managed_block_paths(&text),
             vec!["weights.bin", "experiments/weights.bin"]
@@ -1441,6 +1484,33 @@ mod tests {
         );
     }
 
+    fn tcommit(dir: &Path, index: &Path, msg: &str) {
+        git_index(
+            dir,
+            index,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                msg,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// After the release commit and the index sync, status must show only
+    /// what the user staged: no released path may linger as a staged
+    /// reversion the next plain commit would apply.
+    fn assert_only_unrelated_staged(dir: &Path) {
+        let status = tgit(dir, &["status", "--porcelain"]);
+        assert_eq!(status, "A  unrelated.bin", "status");
+        let staged = tgit(dir, &["diff", "--cached", "--name-status"]);
+        assert_eq!(staged, "A\tunrelated.bin", "diff --cached");
+    }
+
     #[test]
     fn the_release_index_leaves_user_staging_alone() {
         let dir = trepo();
@@ -1448,30 +1518,85 @@ mod tests {
         tgit(dir.path(), &["add", "a.txt"]);
         tgit(
             dir.path(),
-            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
         );
         // An unrelated file staged in the real index must not ride into the
         // release commit, and must still be staged afterwards.
         std::fs::write(dir.path().join("unrelated.bin"), b"u").unwrap();
         tgit(dir.path(), &["add", "unrelated.bin"]);
-        let index = dir.path().join("tmp-index");
+        let index = dir.path().join(".git").join("tmp-index");
         git_index(dir.path(), &index, &["read-tree", "HEAD"]).unwrap();
         std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
         git_index(dir.path(), &index, &["add", "b.txt"]).unwrap();
-        git_index(
-            dir.path(),
-            &index,
-            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rel"],
-        )
-        .unwrap();
+        tcommit(dir.path(), &index, "rel");
         let tree = tgit(dir.path(), &["ls-tree", "--name-only", "HEAD"]);
         assert!(!tree.contains("unrelated.bin"), "{tree}");
         assert!(tree.contains("b.txt"), "{tree}");
-        let staged_files = tgit(
+        sync_index_to_head(dir.path(), &dir.path().join(".git"), &["b.txt".to_string()]).unwrap();
+        assert_only_unrelated_staged(dir.path());
+    }
+
+    #[test]
+    fn the_index_sync_handles_a_deleted_tracked_path() {
+        let dir = trepo();
+        std::fs::write(dir.path().join("gone.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("kept.txt"), b"y").unwrap();
+        tgit(dir.path(), &["add", "gone.txt", "kept.txt"]);
+        tgit(
             dir.path(),
-            &["diff", "--cached", "--name-only", "--diff-filter=A"],
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
         );
-        assert_eq!(staged_files, "unrelated.bin");
+        std::fs::write(dir.path().join("unrelated.bin"), b"u").unwrap();
+        tgit(dir.path(), &["add", "unrelated.bin"]);
+        std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        let index = dir.path().join(".git").join("tmp-index");
+        git_index(dir.path(), &index, &["read-tree", "HEAD"]).unwrap();
+        git_index(dir.path(), &index, &["add", "-A", "gone.txt"]).unwrap();
+        tcommit(dir.path(), &index, "rel");
+        let tree = tgit(dir.path(), &["ls-tree", "--name-only", "HEAD"]);
+        assert!(!tree.contains("gone.txt"), "{tree}");
+        sync_index_to_head(
+            dir.path(),
+            &dir.path().join(".git"),
+            &["gone.txt".to_string()],
+        )
+        .unwrap();
+        assert_only_unrelated_staged(dir.path());
+    }
+
+    #[test]
+    fn the_index_sync_works_on_a_repos_first_commit() {
+        let dir = trepo();
+        std::fs::write(dir.path().join("unrelated.bin"), b"u").unwrap();
+        tgit(dir.path(), &["add", "unrelated.bin"]);
+        let index = dir.path().join(".git").join("tmp-index");
+        git_index(dir.path(), &index, &["read-tree", "--empty"]).unwrap();
+        std::fs::write(dir.path().join("rel.txt"), b"r").unwrap();
+        git_index(dir.path(), &index, &["add", "rel.txt"]).unwrap();
+        tcommit(dir.path(), &index, "first release");
+        sync_index_to_head(
+            dir.path(),
+            &dir.path().join(".git"),
+            &["rel.txt".to_string()],
+        )
+        .unwrap();
+        assert_only_unrelated_staged(dir.path());
     }
 
     #[test]
@@ -1482,7 +1607,15 @@ mod tests {
         tgit(dir.path(), &["add", "gone.txt", "kept.txt"]);
         tgit(
             dir.path(),
-            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
         );
         std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
         let scan = scan_files(dir.path(), "", 1024).unwrap();
