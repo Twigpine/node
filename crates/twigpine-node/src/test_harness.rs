@@ -228,6 +228,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
             16,
         ),
         git_bin: "git".to_string(),
+        block_store: None,
     }
 }
 

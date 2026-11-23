@@ -286,6 +286,24 @@ short lifetimes reissued often are safer than one long-lived grant.
 
 ---
 
+## Model hosting (experimental)
+
+Off by default and not yet usable end to end: the node ships the storage and
+schema only, with no publish or read routes mounted yet. When it lands, a model
+is a public repo whose releases are signed manifests, and weights are stored as
+content-addressed blocks outside git.
+
+- `TWIGPINE_MODEL_HOSTING_ENABLED=false` - the master switch.
+- `TWIGPINE_MODEL_QUOTA_BYTES` - per-identity quota for claimed blocks (default 256 GiB).
+- `TWIGPINE_MODEL_NODE_QUOTA_BYTES` - total model bytes this node will hold (default 1 TiB).
+- `TWIGPINE_MODEL_UNCLAIMED_TTL_SECS` - grace period before unclaimed blocks are swept (default 86400). Must exceed the session TTL; the node refuses to start otherwise.
+- `TWIGPINE_MODEL_SESSION_TTL_SECS` - base upload-session lifetime, renewed by each accepted block (default 43200).
+- `TWIGPINE_MODEL_MAX_SESSION_BYTES` - optional cap on one identity's open sessions (defaults to the quota).
+- `TWIGPINE_BLOCKSTORE_DIR` - where blocks live on disk (default `./data/model-blocks`).
+- `TWIGPINE_BLOCKSTORE_S3_BUCKET` - set to store blocks in S3 instead; reuses the same `AWS_*` endpoint and credentials as the Tigris repo backend.
+
+---
+
 ## Operational checklist
 
 | Concern | Recommendation |
