@@ -106,7 +106,7 @@ async fn release_for_rev(
     if twigpine_core::cid::is_hex_oid(rev) {
         let rel = state
             .db
-            .model_release_by_commit(&record.id, rev)
+            .model_release_by_commit(&record.id, &rev.to_ascii_lowercase())
             .await?
             .filter(|r| r.state == "published");
         return Ok(rel);
@@ -332,7 +332,7 @@ async fn tree_response(
 }
 
 /// `GET /hf/api/models/{owner}/{repo}/refs`: `main` names the newest
-/// published release's commit regardless of the repo's git default branch.
+/// published release on `main`, then on the repo's git default branch.
 /// The HF surface is defined by releases, so a repo with none answers the
 /// same RepoNotFound as every other endpoint.
 pub async fn hf_refs(

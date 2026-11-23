@@ -726,6 +726,46 @@ async fn model_info_follows_main_not_repo_wide_newest(pool: sqlx::PgPool) {
     node.shutdown().await;
 }
 
+/// A commit pin spelled in uppercase hex resolves to the same release:
+/// stored shas are lowercase, so the pin is lowercased before lookup.
+#[sqlx::test]
+async fn revision_accepts_uppercase_commit_pin(pool: sqlx::PgPool) {
+    let node = spawn_node(pool.clone()).await;
+    let client = bounded_client();
+    let (owner, signing) = owner_with_signing(28);
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "m", true).await;
+    let fx = seed_release(
+        &node,
+        &pool,
+        &owner_did,
+        &signing,
+        &repo_id,
+        "m",
+        &[("config.json", GIT_FILE)],
+        &[],
+        "main",
+    )
+    .await;
+
+    let upper = fx.commit.to_ascii_uppercase();
+    assert_ne!(upper, fx.commit, "fixture commit has no a-f letters");
+    let resp = client
+        .get(format!(
+            "{}{}",
+            node.base_url,
+            rev_path(&owner_did, "m", &upper)
+        ))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: Value = resp.json().await.expect("rev json");
+    assert_eq!(v["sha"].as_str(), Some(fx.commit.as_str()));
+
+    node.shutdown().await;
+}
+
 /// A plain git commit after the release does not move HF `main`: refs and
 /// model info still name the release commit.
 #[sqlx::test]
