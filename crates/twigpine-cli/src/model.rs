@@ -1969,11 +1969,8 @@ mod tests {
         tcommit_all(dir.path());
         // An unreadable directory makes symlink_metadata fail with
         // PermissionDenied: that is not "file deleted".
-        std::fs::set_permissions(
-            dir.path().join("sub"),
-            std::fs::Permissions::from_mode(0),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.path().join("sub"), std::fs::Permissions::from_mode(0))
+            .unwrap();
         let err = scan_files(dir.path(), "", 1024).err().expect("scan fails");
         std::fs::set_permissions(
             dir.path().join("sub"),
