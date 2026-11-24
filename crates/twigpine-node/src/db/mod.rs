@@ -2821,12 +2821,8 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
 
-    // v49 and v50 are claimed by open PRs #620 (model_hosting_schema) and #622
-    // (model_release_claim_digest_and_cascades), which have not merged. This
-    // entry takes v51 so it cannot collide with either; the runner never
-    // requires contiguity. If this lands before them, renumber it.
     Migration {
-        version: 51,
+        version: 50,
         name: "repos_homepage",
         stmts: &["ALTER TABLE repos ADD COLUMN IF NOT EXISTS homepage TEXT"],
     },
@@ -14609,11 +14605,11 @@ mod migration_tests {
         .unwrap();
     }
 
-    // ── Repo homepage (v51) ──────────────────────────────────────────────────
+    // ── Repo homepage (v50) ──────────────────────────────────────────────────
 
     /// The version this branch's migration claims; the upgrade test derives its
     /// rollback target from `MIGRATIONS` so a renumber is a one-line change.
-    const V51: i64 = 51;
+    const V50: i64 = 50;
 
     fn homepage_repo(id: &str, name: &str) -> super::RepoRecord {
         let now = chrono::Utc::now();
@@ -14636,7 +14632,7 @@ mod migration_tests {
     /// only a simulated existing node proves the column arrives through its own
     /// entry rather than an already-applied one.
     #[sqlx::test]
-    async fn migration_v51_upgrade_path_adds_nullable_homepage(pool: sqlx::PgPool) {
+    async fn migration_v50_upgrade_path_adds_nullable_homepage(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
 
@@ -14645,14 +14641,14 @@ mod migration_tests {
             .await
             .unwrap();
         sqlx::query("DELETE FROM schema_migrations WHERE version >= $1")
-            .bind(V51)
+            .bind(V50)
             .execute(&db.pool)
             .await
             .unwrap();
         let prior = MIGRATIONS
             .iter()
             .map(|m| m.version)
-            .filter(|v| *v < V51)
+            .filter(|v| *v < V50)
             .max()
             .expect("MIGRATIONS must declare a version below 51");
         let recorded_max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
@@ -14661,7 +14657,7 @@ mod migration_tests {
             .unwrap();
         assert_eq!(
             recorded_max, prior,
-            "the simulated node must sit at the highest version below {V51}"
+            "the simulated node must sit at the highest version below {V50}"
         );
 
         let legacy = homepage_repo("11111111-1111-1111-1111-111111111111", "legacy");
@@ -14689,17 +14685,17 @@ mod migration_tests {
         let recorded: (i64,) = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM schema_migrations WHERE version = $1",
         )
-        .bind(V51)
+        .bind(V50)
         .fetch_one(&db.pool)
         .await
         .map(|n| (n,))
         .unwrap();
-        assert_eq!(recorded.0, 1, "v51 must be recorded as applied once");
+        assert_eq!(recorded.0, 1, "v50 must be recorded as applied once");
 
         db.migrate().await.unwrap();
         let again: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = $1")
-                .bind(V51)
+                .bind(V50)
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
