@@ -878,13 +878,8 @@ mod tests {
     #[sqlx::test]
     async fn an_internal_read_retries_but_a_bad_signature_rejects(pool: sqlx::PgPool) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (mut state, release_id, _commit) = verify_fixture(
-            &pool,
-            dir.path(),
-            &[("a.txt", b"hi\n")],
-            &["a.txt"],
-        )
-        .await;
+        let (mut state, release_id, _commit) =
+            verify_fixture(&pool, dir.path(), &[("a.txt", b"hi\n")], &["a.txt"]).await;
 
         // Forced internal failure: the git binary cannot spawn.
         state.git_bin = "/nonexistent/git".to_string();
@@ -950,11 +945,9 @@ mod tests {
             .expect("verify call");
         let (state_str, reason) = release_state(&pool, release_id2).await;
         assert_eq!(state_str, "rejected");
-        assert!(
-            reason
-                .expect("failure_reason")
-                .contains("manifest re-check failed"),
-        );
+        assert!(reason
+            .expect("failure_reason")
+            .contains("manifest re-check failed"),);
     }
 
     /// A git-stored manifest file whose name needs quoting under
