@@ -127,7 +127,14 @@ pub async fn claim_release(
     material: &ClaimMaterial,
 ) -> Result<ReleaseRow, AppError> {
     let db = &state.db;
-    let disk_path = std::path::PathBuf::from(&record.disk_path);
+    // Git reads run against the checkout the RepoStore manages for this
+    // repo, the same path acquire() hands every other handler; the row's
+    // disk_path string is not the source of truth.
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
+        .map_err(|e| AppError::Git(e.to_string()))?;
 
     if !commit_exists(&state.git_bin, &disk_path, commit).await? {
         return Err(bad_request("commit not found in this repository"));

@@ -58,52 +58,6 @@ fn owner_with_signing(seed: u8) -> (Keypair, ed25519_dalek::SigningKey) {
     )
 }
 
-/// Build a git repo on disk containing one commit with a valid signed release
-/// manifest, returning the commit sha. The claim route's `git cat-file` /
-/// `git show` calls run against `repos.disk_path`, so the row must point here.
-fn make_release_repo(dir: &std::path::Path, manifest: &[u8], sig: &str) -> String {
-    let run = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git runs");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    run(&["init", "-q", "-b", "main"]);
-    std::fs::create_dir_all(dir.join(".twigpine")).expect("mkdir .twigpine");
-    std::fs::write(dir.join(".twigpine/model-release.json"), manifest).expect("write manifest");
-    std::fs::write(dir.join(".twigpine/model-release.sig"), sig).expect("write sig");
-    run(&["add", "-A"]);
-    run(&[
-        "-c",
-        "user.email=t@t",
-        "-c",
-        "user.name=t",
-        "commit",
-        "-q",
-        "-m",
-        "model release 1",
-    ]);
-    run(&["rev-parse", "HEAD"])
-}
-
-/// Point the seeded repo row at an on-disk git directory (seed_repo writes a
-/// placeholder disk_path the claim route cannot read).
-async fn set_disk_path(pool: &sqlx::PgPool, repo_id: &str, dir: &std::path::Path) {
-    sqlx::query("UPDATE repos SET disk_path = $1 WHERE id = $2")
-        .bind(dir.to_str().expect("utf-8 temp path"))
-        .bind(repo_id)
-        .execute(pool)
-        .await
-        .expect("update disk_path");
-}
-
 async fn seed_open_session(node: &TestNode, repo_id: &str, owner_did: &str) -> String {
     let session_id = "s".repeat(64);
     node.seed_model_session(repo_id, &session_id, owner_did)
@@ -1024,7 +978,7 @@ async fn claim_accepts_signed_manifest_and_replays_idempotently(pool: sqlx::PgPo
     let client = bounded_client();
     let (owner, signing) = owner_with_signing(7);
     let owner_did = owner.did().to_string();
-    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    node.seed_repo(&owner_did, "model", true).await;
 
     let manifest = twigpine_core::model::manifest::Manifest {
         schema: twigpine_core::model::manifest::MANIFEST_SCHEMA_V1.to_string(),
@@ -1038,9 +992,21 @@ async fn claim_accepts_signed_manifest_and_replays_idempotently(pool: sqlx::PgPo
     let manifest_bytes = manifest.to_bytes().expect("manifest bytes");
     let sig = twigpine_core::model::manifest::sign(&signing, &manifest_bytes);
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let commit = make_release_repo(dir.path(), &manifest_bytes, &sig);
-    set_disk_path(&pool, &repo_id, dir.path()).await;
+    // The claim route reads the checkout RepoStore::acquire manages, so the
+    // fixture is seeded at that path rather than a side directory.
+    let oids = node.seed_bare_repo(
+        &owner_did,
+        "model",
+        &[
+            (
+                ".twigpine/model-release.json",
+                std::str::from_utf8(&manifest_bytes).expect("manifest utf-8"),
+            ),
+            (".twigpine/model-release.sig", sig.as_str()),
+        ],
+        "sha1",
+    );
+    let commit = oids["HEAD"].clone();
 
     let path = claims_path(&owner_did, "model");
     let body =
@@ -1087,7 +1053,7 @@ async fn claim_missing_commit_is_bad_request(pool: sqlx::PgPool) {
     let client = bounded_client();
     let (owner, signing) = owner_with_signing(8);
     let owner_did = owner.did().to_string();
-    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    node.seed_repo(&owner_did, "model", true).await;
 
     // A real on-disk repo is needed for `git cat-file` to answer "missing"
     // rather than the spawn failing on a nonexistent path.
@@ -1102,9 +1068,20 @@ async fn claim_missing_commit_is_bad_request(pool: sqlx::PgPool) {
     };
     let manifest_bytes = manifest.to_bytes().expect("manifest bytes");
     let sig = twigpine_core::model::manifest::sign(&signing, &manifest_bytes);
-    let dir = tempfile::tempdir().expect("tempdir");
-    make_release_repo(dir.path(), &manifest_bytes, &sig);
-    set_disk_path(&pool, &repo_id, dir.path()).await;
+    // A real on-disk repo is needed for `git cat-file` to answer "missing"
+    // rather than the spawn failing on a nonexistent path.
+    node.seed_bare_repo(
+        &owner_did,
+        "model",
+        &[
+            (
+                ".twigpine/model-release.json",
+                std::str::from_utf8(&manifest_bytes).expect("manifest utf-8"),
+            ),
+            (".twigpine/model-release.sig", sig.as_str()),
+        ],
+        "sha1",
+    );
 
     let body = serde_json::to_vec(&json!({
         "commit": "b".repeat(40),
