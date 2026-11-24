@@ -830,13 +830,8 @@ mod tests {
     #[sqlx::test]
     async fn a_failed_ls_tree_does_not_reach_publication(pool: sqlx::PgPool) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (mut state, release_id, _commit) = verify_fixture(
-            &pool,
-            dir.path(),
-            &[("a.txt", b"hi\n")],
-            &["a.txt"],
-        )
-        .await;
+        let (mut state, release_id, _commit) =
+            verify_fixture(&pool, dir.path(), &[("a.txt", b"hi\n")], &["a.txt"]).await;
 
         // A git shim that fails only `ls-tree`; everything else execs real git.
         let real_git = std::process::Command::new("which")
@@ -859,8 +854,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         state.git_bin = shim.to_str().expect("utf-8 path").to_string();
 
