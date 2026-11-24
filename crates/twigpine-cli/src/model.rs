@@ -692,7 +692,11 @@ fn staged_gitignore_entry(root: &Path, index: &Path, scan: &Scan) -> Result<Opti
 /// filter on a normal `git add` could rewrite the signed metadata, so the
 /// blob is hashed with --no-filters and the index entry pointed at it.
 fn stage_unfiltered(root: &Path, index: &Path, path: &str) -> Result<()> {
-    let out = git_index(root, index, &["hash-object", "--no-filters", "-w", "--", path])?;
+    let out = git_index(
+        root,
+        index,
+        &["hash-object", "--no-filters", "-w", "--", path],
+    )?;
     let sha = String::from_utf8(out.stdout).context("hash-object output was not utf-8")?;
     git_index(
         root,
@@ -1190,8 +1194,7 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
         bail!("the staged manifest differs from the signed bytes");
     }
     let staged_sig = staged_blob(&root, &index_path, ".twigpine/model-release.sig")?;
-    let staged_sig =
-        String::from_utf8(staged_sig).context("staged signature was not utf-8")?;
+    let staged_sig = String::from_utf8(staged_sig).context("staged signature was not utf-8")?;
     manifest::verify(&staged_manifest, &staged_sig, &kp.did())
         .map_err(|e| anyhow::anyhow!("staged manifest signature does not verify: {e}"))?;
 
