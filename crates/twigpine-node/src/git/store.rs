@@ -4063,20 +4063,26 @@ mod tests {
         );
 
         // A path absent from the commit is a confirmed None.
-        assert!(super::run_git_blob_digest("git", work, "HEAD:nope.txt", timeout, 8)
-            .await
-            .expect("absent probe runs")
-            .is_none());
+        assert!(
+            super::run_git_blob_digest("git", work, "HEAD:nope.txt", timeout, 8)
+                .await
+                .expect("absent probe runs")
+                .is_none()
+        );
 
         // A malformed .git/config breaks git itself: the present blob must
         // be an Err, not a false None. The same failure on the absent path
         // is an Err too.
         std::fs::write(work.join(".git/config"), b"not [valid").unwrap();
-        assert!(super::run_git_blob_digest("git", work, "HEAD:f.txt", timeout, 8)
-            .await
-            .is_err());
-        assert!(super::run_git_blob_digest("git", work, "HEAD:nope.txt", timeout, 8)
-            .await
-            .is_err());
+        assert!(
+            super::run_git_blob_digest("git", work, "HEAD:f.txt", timeout, 8)
+                .await
+                .is_err()
+        );
+        assert!(
+            super::run_git_blob_digest("git", work, "HEAD:nope.txt", timeout, 8)
+                .await
+                .is_err()
+        );
     }
 }
