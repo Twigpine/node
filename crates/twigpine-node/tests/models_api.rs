@@ -1312,12 +1312,8 @@ async fn reconstruction_and_claims_deny_on_private_repo(pool: sqlx::PgPool) {
         twigpine_node::blockstore::fs::FsBlockStore::new(block_dir.path().to_path_buf())
             .expect("fs store"),
     );
-    let node = spawn_node_with_store(
-        pool.clone(),
-        repos_dir.path().to_path_buf(),
-        inner.clone(),
-    )
-    .await;
+    let node =
+        spawn_node_with_store(pool.clone(), repos_dir.path().to_path_buf(), inner.clone()).await;
     let client = bounded_client();
     let owner = Keypair::generate();
     let stranger = Keypair::generate();
