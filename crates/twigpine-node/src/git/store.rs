@@ -471,7 +471,11 @@ pub(crate) async fn run_git_bounded_capped(
             let mut chunk = [0u8; 16 * 1024];
             loop {
                 match pipe.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e)
+                            .context(format!("{label} stdout read")));
+                    }
                     Ok(n) => {
                         if stdout.len() + n > max_stdout {
                             oversized = true;
