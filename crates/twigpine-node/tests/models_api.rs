@@ -891,12 +891,8 @@ async fn put_block_understated_content_length_is_not_stored_under_small_charge(p
         twigpine_node::blockstore::fs::FsBlockStore::new(block_dir.path().to_path_buf())
             .expect("fs store"),
     );
-    let node = spawn_node_with_store(
-        pool.clone(),
-        repos_dir.path().to_path_buf(),
-        inner.clone(),
-    )
-    .await;
+    let node =
+        spawn_node_with_store(pool.clone(), repos_dir.path().to_path_buf(), inner.clone()).await;
     let owner_did = Keypair::generate().did().to_string();
     let repo_id = node.seed_repo(&owner_did, "model", true).await;
     let session_id = seed_open_session(&node, &repo_id, &owner_did).await;
