@@ -1438,14 +1438,30 @@ mod tests {
             node: "https://node.example".to_string(),
             repo: "owner/name".to_string(),
         };
-        assert!(state_resumable(&bound, "https://node.example", "owner/name"));
-        assert!(!state_resumable(&bound, "https://other.example", "owner/name"));
-        assert!(!state_resumable(&bound, "https://node.example", "owner/other"));
+        assert!(state_resumable(
+            &bound,
+            "https://node.example",
+            "owner/name"
+        ));
+        assert!(!state_resumable(
+            &bound,
+            "https://other.example",
+            "owner/name"
+        ));
+        assert!(!state_resumable(
+            &bound,
+            "https://node.example",
+            "owner/other"
+        ));
         // A state file from before the binding fields existed deserializes
         // them empty, so it is not resumable either.
         let legacy: PublishState =
             serde_json::from_str(r#"{"session_id":"abc","uploaded":[]}"#).unwrap();
-        assert!(!state_resumable(&legacy, "https://node.example", "owner/name"));
+        assert!(!state_resumable(
+            &legacy,
+            "https://node.example",
+            "owner/name"
+        ));
     }
 
     #[test]
