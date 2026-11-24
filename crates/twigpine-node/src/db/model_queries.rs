@@ -273,7 +273,7 @@ impl Db {
         let linked = if own_release_carries {
             0
         } else {
-            sqlx::query(
+            let rows = sqlx::query(
                 "INSERT INTO model_session_blocks (session_id, block_sha256)
                  VALUES ($1, $2)
                  ON CONFLICT (session_id, block_sha256) DO NOTHING",
@@ -282,7 +282,19 @@ impl Db {
             .bind(block_sha)
             .execute(&mut *tx)
             .await?
-            .rows_affected()
+            .rows_affected();
+            if rows > 0 {
+                // A live link restarts the grace clock: keeping a stale
+                // unreferenced_since would let the next sweep delete the
+                // block on the old stamp the moment the link drops again.
+                sqlx::query(
+                    "UPDATE model_blocks SET unreferenced_since = NULL WHERE sha256 = $1",
+                )
+                .bind(block_sha)
+                .execute(&mut *tx)
+                .await?;
+            }
+            rows
         };
         let refund = linked == 0;
         if refund {
@@ -680,6 +692,12 @@ impl Db {
         .bind(shas)
         .execute(&mut **tx)
         .await?;
+        // Same rule as the session-link insert: a live reference clears the
+        // stale stamp so a later drop earns a fresh grace period.
+        sqlx::query("UPDATE model_blocks SET unreferenced_since = NULL WHERE sha256 = ANY($1)")
+            .bind(shas)
+            .execute(&mut **tx)
+            .await?;
         // The release now carries these blocks, so the sessions stop being
         // charged for exactly the bytes that moved. Subtracting the moved
         // set (rather than recounting links) preserves bytes admitted but
@@ -1109,6 +1127,31 @@ mod tests {
         assert!(db.model_record_block(&s.id, &sha, 100, 100).await.unwrap());
         let s2 = db.model_load_session(&s.id).await.unwrap().unwrap();
         assert_eq!(s2.bytes_received, 100);
+    }
+
+    #[sqlx::test]
+    async fn a_relinked_block_loses_its_stale_stamp(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        let s = db
+            .model_open_session("did:owner", "r1", 3600)
+            .await
+            .unwrap();
+        let sha = "e".repeat(64);
+        sqlx::query("INSERT INTO model_blocks (sha256, size, created_at, unreferenced_since) VALUES ($1, 1, $2, $2)")
+            .bind(&sha)
+            .bind(ts_from_now(-7200))
+            .execute(&pool)
+            .await
+            .unwrap();
+        db.model_record_block(&s.id, &sha, 1, 1).await.unwrap();
+        db.model_unlink_session_block(&s.id, &sha).await.unwrap();
+        // Linked and dropped between sweeps: the old stamp is gone, so the
+        // block is not immediately stale.
+        assert!(!db
+            .model_stale_blocks(3600, 10)
+            .await
+            .unwrap()
+            .contains(&sha));
     }
 
     #[sqlx::test]
