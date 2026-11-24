@@ -37,8 +37,7 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepStats, AppError> {
     // A `verifying` row that outlived its window wedges the publisher's
     // one-verifying slot; reject it (which also frees the reservation).
     for id in db.model_stale_verifying(STALE_VERIFY_SECS).await? {
-        db.model_reject_release(id, "verification timed out")
-            .await?;
+        crate::models::verify::reject_release(state, id, "verification timed out").await?;
     }
 
     // Re-mark liveness both ways: blocks that lost every live reference get

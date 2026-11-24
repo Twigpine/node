@@ -319,7 +319,6 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
         crate::db::model_queries::PublishOutcome::Published => {}
         crate::db::model_queries::PublishOutcome::NoLongerPublic => {
             reject_release(state, release_id, "repository is no longer fully public").await?;
-            remove_release_ref(&state.git_bin, &disk_path, &release.commit_sha).await;
         }
         crate::db::model_queries::PublishOutcome::NotVerifying => {
             // The row settled while this pass ran: a rejected release's ref
@@ -450,6 +449,21 @@ pub async fn reject_release(
 ) -> Result<(), AppError> {
     state.db.model_reject_release(release_id, reason).await?;
     tracing::info!(release_id, %reason, "model release rejected");
+    // A rejected release must not keep its hidden pin: the ref may exist if
+    // a pass wrote it and then errored before the state flip. Remove it only
+    // when the row really settled as rejected, never for a published one.
+    if let Some(release) = state.db.model_release_by_id(release_id).await? {
+        if release.state == "rejected" {
+            if let Some(record) = state.db.get_repo_by_id(&release.repo_id).await? {
+                remove_release_ref(
+                    &state.git_bin,
+                    std::path::Path::new(&record.disk_path),
+                    &release.commit_sha,
+                )
+                .await;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -828,5 +842,49 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("extra-é.bin"), "{reason}");
+    }
+    async fn ref_exists(dir: &std::path::Path, commit: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["show-ref", "--verify", "-q"])
+            .arg(format!("refs/gitlawb/releases/{commit}"))
+            .current_dir(dir)
+            .status()
+            .expect("git runs")
+            .success()
+    }
+
+    /// Rejecting a release removes the hidden pin a failed pass left behind,
+    /// and leaves the ref of a release that is actually published alone.
+    #[sqlx::test]
+    async fn rejecting_a_release_drops_its_pin_but_not_a_published_ones(pool: sqlx::PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, release_id, commit) =
+            verify_fixture(&pool, dir.path(), &[("a.txt", b"hi\n")], &["a.txt"]).await;
+        write_release_ref(&state.git_bin, dir.path(), &commit)
+            .await
+            .expect("write ref");
+        assert!(ref_exists(dir.path(), &commit).await);
+        reject_release(&state, release_id, "test")
+            .await
+            .expect("reject");
+        assert_eq!(release_state(&pool, release_id).await.0, "rejected");
+        assert!(!ref_exists(dir.path(), &commit).await, "pin must be gone");
+
+        sqlx::query("UPDATE model_releases SET state = 'published' WHERE id = $1")
+            .bind(release_id)
+            .execute(&pool)
+            .await
+            .expect("publish");
+        write_release_ref(&state.git_bin, dir.path(), &commit)
+            .await
+            .expect("write ref");
+        reject_release(&state, release_id, "late")
+            .await
+            .expect("no-op reject");
+        assert_eq!(release_state(&pool, release_id).await.0, "published");
+        assert!(
+            ref_exists(dir.path(), &commit).await,
+            "published keeps its pin"
+        );
     }
 }
