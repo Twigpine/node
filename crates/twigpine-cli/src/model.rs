@@ -510,6 +510,29 @@ fn scan_files(root: &Path, gitignore: &str, threshold: u64) -> Result<Scan> {
     Ok(scan)
 }
 
+/// NUL pathspec for the release `git add -A`: the git-stored files and the
+/// real deletions. A chunked path that is also staged-deleted (`git rm
+/// --cached` on a weight) is never named: the managed .gitignore block
+/// ignores it, and git refuses an ignored path in an add pathspec. Its
+/// deletion is already carried by the seeded release index.
+fn release_pathspec(scan: &Scan, stage_gitignore: bool) -> Vec<u8> {
+    let chunked: HashSet<&str> = scan.chunked_files.iter().map(String::as_str).collect();
+    let mut spec = Vec::new();
+    for p in scan
+        .git_files
+        .iter()
+        .chain(scan.deleted.iter().filter(|p| !chunked.contains(p.as_str())))
+    {
+        spec.extend_from_slice(p.as_bytes());
+        spec.push(0);
+    }
+    if stage_gitignore {
+        spec.extend_from_slice(b".gitignore");
+        spec.push(0);
+    }
+    spec
+}
+
 // ── .gitignore managed block ────────────────────────────────────────────────
 
 /// Insert or replace the managed block so it lists exactly `paths`; an empty
@@ -1047,15 +1070,7 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     seed_release_index(&root, &index_path, &scan.chunked_files)?;
     let pathspec_path = git_dir.join("twigpine-model-pathspec");
     {
-        let mut spec = Vec::new();
-        for p in scan.git_files.iter().chain(&scan.deleted) {
-            spec.extend_from_slice(p.as_bytes());
-            spec.push(0);
-        }
-        if gitignore_path.is_file() {
-            spec.extend_from_slice(b".gitignore");
-            spec.push(0);
-        }
+        let spec = release_pathspec(&scan, gitignore_path.is_file());
         if spec.is_empty() {
             let _ = std::fs::remove_file(&pathspec_path);
         } else {
@@ -1772,11 +1787,35 @@ mod tests {
         tgit(dir.path(), &["rm", "--cached", "-q", "weights.bin"]);
         let scan = scan_files(dir.path(), "", 1024).unwrap();
         assert_eq!(scan.chunked_files, vec!["weights.bin"]);
+        assert_eq!(scan.deleted, vec!["weights.bin"]);
+        // The managed .gitignore block ignores weights.bin; it is both
+        // chunked and staged-deleted here.
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            upsert_managed_block("", &scan.chunked_files),
+        )
+        .unwrap();
         let index = dir.path().join(".git").join("twigpine-model-index");
         seed_release_index(dir.path(), &index, &scan.chunked_files).unwrap();
+        let spec = dir.path().join(".git").join("tmp-pathspec");
+        std::fs::write(&spec, release_pathspec(&scan, true)).unwrap();
+        git_index(
+            dir.path(),
+            &index,
+            &[
+                "--literal-pathspecs",
+                "add",
+                "-A",
+                "--pathspec-file-nul",
+                &format!("--pathspec-from-file={}", spec.display()),
+            ],
+        )
+        .unwrap();
+        assert!(dir.path().join("weights.bin").is_file());
         let listed = index_listing(dir.path(), &index);
         assert!(!listed.contains(&"weights.bin".to_string()));
         assert!(listed.contains(&"kept.txt".to_string()));
+        assert!(listed.contains(&".gitignore".to_string()));
     }
 
     #[test]
