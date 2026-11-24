@@ -122,6 +122,8 @@ fn git_lines(root: &Path, args: &[&str]) -> Result<Vec<String>> {
 /// `git` with `GIT_INDEX_FILE` pointed at a dedicated index, so the release
 /// commit is built from an index the user's own staging never touches.
 fn git_index(root: &Path, index: &Path, args: &[&str]) -> Result<Output> {
+    // allow-unbounded-git: client-side CLI spawn in the user's own checkout;
+    // no node admission permit or lease is held.
     let out = std::process::Command::new("git")
         .args(args)
         .current_dir(root)

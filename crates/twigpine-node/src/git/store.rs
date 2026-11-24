@@ -435,6 +435,8 @@ pub(crate) async fn run_git_bounded_capped(
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command as AsyncCommand;
     let fut = async {
+        // allow-unbounded-git: bounded by the tokio::time::timeout wrapping
+        // this future, plus kill_on_drop.
         let mut cmd = AsyncCommand::new(git_bin);
         cmd.kill_on_drop(true);
         cmd.args(args).current_dir(repo_path);
@@ -520,6 +522,8 @@ pub(crate) async fn run_git_blob_digest(
     use tokio::io::AsyncReadExt;
     use tokio::process::Command as AsyncCommand;
     let fut = async {
+        // allow-unbounded-git: bounded by the tokio::time::timeout wrapping
+        // this future, plus kill_on_drop.
         let mut cmd = AsyncCommand::new(git_bin);
         cmd.kill_on_drop(true);
         cmd.args(["cat-file", "blob", spec]).current_dir(repo_path);
