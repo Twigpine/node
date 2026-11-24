@@ -692,6 +692,24 @@ where
         }
     })?;
 
+    // The gate authorized this row, but the disk identity is owner+name only:
+    // a row deleted and recreated under the same name since then would serve a
+    // different repo on this authorization. Re-read and require the same row;
+    // anything else answers like the missing-repo case the gate produces.
+    match state.db.get_repo(&record.owner_did, &record.name).await {
+        Ok(Some(current)) if current.id == record.id => {}
+        Ok(_) => {
+            return Err(AppError::RepoNotFound(format!(
+                "{}/{}",
+                record.owner_did, record.name
+            )));
+        }
+        Err(e) => {
+            tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo row re-check failed");
+            return Err(AppError::Git(GIT_READ_FAILED_MESSAGE.into()));
+        }
+    }
+
     let git_bin = state.git_bin.clone();
     let budget = std::time::Duration::from_secs(state.config.git_service_timeout_secs)
         .min(MAX_GIT_READ_DEADLINE);
@@ -19944,6 +19962,93 @@ exit 0
             matches!(res, Err(crate::error::AppError::Git(_))),
             "a damaged ref must surface as a git error, not an empty listing"
         );
+    }
+
+    /// The record the read gate authorized is only an owner+name on disk: if the
+    /// row is deleted and recreated under that name before the acquire, serving
+    /// would hand the new row's git data out on the old row's authorization.
+    /// The helper must answer with the same opaque not-found the gate returns
+    /// for a missing repo, and the read itself must never run.
+    #[sqlx::test]
+    async fn run_repo_git_read_refuses_a_stale_record(pool: sqlx::PgPool) {
+        let owner = "did:key:zSTALEGITREADAAAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let now = chrono::Utc::now();
+        let seed = |name: &str| crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        let name = "stale";
+        let repo_dir = dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let stale = seed(name);
+        state.db.create_repo(&stale).await.unwrap();
+        // The authorized row is replaced by a new row under the same owner/name.
+        state.db.delete_repo_by_id(&stale.id).await.unwrap();
+        let fresh = seed(name);
+        state.db.create_repo(&fresh).await.unwrap();
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_inner = ran.clone();
+        let res: Result<()> = super::run_repo_git_read(
+            &state,
+            &axum::http::HeaderMap::new(),
+            None,
+            &stale,
+            "test",
+            move |_git_bin, _path, _deadline| {
+                ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "a stale record must get the missing-repo response; got {res:?}"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the read must never run on a stale record"
+        );
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_inner = ran.clone();
+        super::run_repo_git_read::<(), _>(
+            &state,
+            &axum::http::HeaderMap::new(),
+            None,
+            &fresh,
+            "test",
+            move |_git_bin, _path, _deadline| {
+                ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("the live record runs the read");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
     }
     /// #282 REPRO (RED on main): a push's write guard pins one dedicated
     /// lock-pool connection for the WHOLE op: taken at `acquire_write`, held
