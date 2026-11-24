@@ -143,6 +143,17 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
     )
     .await
     .map_err(AppError::Internal)?;
+    // A failed ls-tree must not read as an empty tree: its stdout is only
+    // trustworthy when the command succeeded.
+    if !tree.status.success() {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "git ls-tree failed: {}",
+            String::from_utf8_lossy(&tree.stderr)
+                .chars()
+                .take(256)
+                .collect::<String>()
+        )));
+    }
     let manifest_git_paths: std::collections::HashSet<&[u8]> = manifest
         .files
         .iter()
@@ -812,6 +823,53 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("release row")
+    }
+
+    /// A nonzero `git ls-tree` must not read as an empty tree and publish:
+    /// the failure propagates as Internal and the release stays `verifying`.
+    #[sqlx::test]
+    async fn a_failed_ls_tree_does_not_reach_publication(pool: sqlx::PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, release_id, _commit) = verify_fixture(
+            &pool,
+            dir.path(),
+            &[("a.txt", b"hi\n")],
+            &["a.txt"],
+        )
+        .await;
+
+        // A git shim that fails only `ls-tree`; everything else execs real git.
+        let real_git = std::process::Command::new("which")
+            .arg("git")
+            .output()
+            .expect("which git");
+        let real_git = String::from_utf8(real_git.stdout).expect("utf-8");
+        let shim = dir.path().join("fake-git");
+        // Fails only the commit-listing `ls-tree -rz --name-only`; the
+        // per-blob `ls-tree -z` probe and every other git call pass through,
+        // so only the exit-status check under test can stop publication.
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = \"--name-only\" ]; then echo boom >&2; exit 129; fi; done\nexec {} \"$@\"\n",
+                real_git.trim()
+            ),
+        )
+        .expect("shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        state.git_bin = shim.to_str().expect("utf-8 path").to_string();
+
+        let err = verify_release(&state, release_id)
+            .await
+            .expect_err("a failed ls-tree is internal, not empty");
+        assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+        let (state_str, _) = release_state(&pool, release_id).await;
+        assert_eq!(state_str, "verifying");
     }
 
     /// A transient manifest read failure (git spawn) must propagate as
