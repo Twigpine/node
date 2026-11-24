@@ -668,6 +668,28 @@ fn sync_index_to_head(root: &Path, git_dir: &Path, paths: &[String]) -> Result<(
     res.map(|_| ())
 }
 
+/// Manifest entry for a .gitignore the release commit stages but the scan
+/// did not list as a git file. The managed block is written after the scan,
+/// so a publish that creates .gitignore commits it unnamed, and the node
+/// rejects the release as "committed but not listed". `None` when there is
+/// no .gitignore to stage (a git-only release) or when the scan already
+/// lists it, so it never appears twice.
+fn staged_gitignore_entry(root: &Path, index: &Path, scan: &Scan) -> Result<Option<ManifestFile>> {
+    if !root.join(".gitignore").is_file()
+        || scan.git_files.iter().any(|p| p == ".gitignore")
+    {
+        return Ok(None);
+    }
+    let bytes = staged_blob(root, index, ".gitignore")?;
+    Ok(Some(ManifestFile {
+        path: ".gitignore".to_string(),
+        size: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+        format: detect_format(&bytes[..bytes.len().min(64)], ".gitignore"),
+        storage: StorageKind::Git,
+    }))
+}
+
 /// Bytes of the blob staged for `path` in the dedicated release index:
 /// exactly what the release commit will store, filters and symlink handling
 /// included.
@@ -1104,6 +1126,9 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
             format: detect_format(&bytes[..bytes.len().min(64)], path),
             storage: StorageKind::Git,
         });
+    }
+    if let Some(entry) = staged_gitignore_entry(&root, &index_path, &scan)? {
+        files.push(entry);
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -1816,6 +1841,58 @@ mod tests {
         assert!(!listed.contains(&"weights.bin".to_string()));
         assert!(listed.contains(&"kept.txt".to_string()));
         assert!(listed.contains(&".gitignore".to_string()));
+    }
+
+    #[test]
+    fn a_gitignore_created_mid_publish_enters_the_manifest_inventory() {
+        let dir = trepo();
+        std::fs::write(dir.path().join("kept.txt"), b"y").unwrap();
+        std::fs::write(dir.path().join("weights.bin"), vec![7u8; 4096]).unwrap();
+        tgit(dir.path(), &["add", "kept.txt"]);
+        tcommit_all(dir.path());
+        // The scan runs before the managed block is written, so a publish
+        // that creates .gitignore cannot have it in scan.git_files.
+        let scan = scan_files(dir.path(), "", 1024).unwrap();
+        assert_eq!(scan.chunked_files, vec!["weights.bin"]);
+        assert!(!scan.git_files.contains(&".gitignore".to_string()));
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            upsert_managed_block("", &scan.chunked_files),
+        )
+        .unwrap();
+        let index = dir.path().join(".git").join("tmp-index");
+        seed_release_index(dir.path(), &index, &scan.chunked_files).unwrap();
+        let spec = dir.path().join(".git").join("tmp-pathspec");
+        std::fs::write(&spec, release_pathspec(&scan, true)).unwrap();
+        git_index(
+            dir.path(),
+            &index,
+            &[
+                "--literal-pathspecs",
+                "add",
+                "-A",
+                "--pathspec-file-nul",
+                &format!("--pathspec-from-file={}", spec.display()),
+            ],
+        )
+        .unwrap();
+        let entry = staged_gitignore_entry(dir.path(), &index, &scan)
+            .unwrap()
+            .expect("a staged .gitignore yields an entry");
+        assert_eq!(entry.path, ".gitignore");
+        assert!(matches!(entry.storage, StorageKind::Git));
+
+        // A .gitignore the scan already lists is not named twice, and a
+        // git-only release with no .gitignore gets no entry.
+        let scan2 = scan_files(dir.path(), "", 1024).unwrap();
+        assert!(scan2.git_files.contains(&".gitignore".to_string()));
+        assert!(staged_gitignore_entry(dir.path(), &index, &scan2)
+            .unwrap()
+            .is_none());
+        std::fs::remove_file(dir.path().join(".gitignore")).unwrap();
+        assert!(staged_gitignore_entry(dir.path(), &index, &scan)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
