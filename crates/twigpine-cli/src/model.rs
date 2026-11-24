@@ -550,6 +550,19 @@ fn upsert_managed_block(existing: &str, paths: &[String]) -> String {
 struct PublishState {
     session_id: String,
     uploaded: Vec<String>,
+    /// Node base URL the session was opened against; empty on state files
+    /// written before this field existed.
+    #[serde(default)]
+    node: String,
+    /// `owner/name` the session was opened for.
+    #[serde(default)]
+    repo: String,
+}
+
+/// A saved session is resumable only by the same node and repo: the session
+/// id is a bearer credential, so it must never be sent anywhere else.
+fn state_resumable(state: &PublishState, node: &str, repo: &str) -> bool {
+    state.node == node && state.repo == repo
 }
 
 fn load_state(path: &Path) -> PublishState {
@@ -863,6 +876,13 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     //    model in memory.
     let state_path = git_dir.join(STATE_FILE_NAME);
     let mut state = load_state(&state_path);
+    let repo_slug = format!("{owner}/{name}");
+    // A state file bound to a different node or repo (or written before the
+    // binding existed) is not resumable: drop it before the status call so
+    // its session id is never sent to the wrong place.
+    if !state_resumable(&state, &args.node, &repo_slug) {
+        state = PublishState::default();
+    }
     if !state.session_id.is_empty() {
         let resp = client
             .get_signed(&format!("{base}/models/sessions/{}", state.session_id))
@@ -888,6 +908,8 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
             .context("session response had no session_id")?
             .to_string();
         state.uploaded.clear();
+        state.node = args.node.clone();
+        state.repo = repo_slug.clone();
         save_state(&state_path, &state)?;
     }
     let mut uploaded: HashSet<String> = state.uploaded.iter().cloned().collect();
@@ -1314,6 +1336,7 @@ mod tests {
         let state = PublishState {
             session_id: "bearer".to_string(),
             uploaded: vec![],
+            ..PublishState::default()
         };
         save_state(&path, &state).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -1332,6 +1355,8 @@ mod tests {
         let state = PublishState {
             session_id: "abc".to_string(),
             uploaded: vec!["aa".into(), "bb".into()],
+            node: "https://node.example".to_string(),
+            repo: "owner/name".to_string(),
         };
         save_state(&path, &state).unwrap();
         assert_eq!(load_state(&path), state);
@@ -1341,6 +1366,24 @@ mod tests {
         );
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(load_state(&path), PublishState::default());
+    }
+
+    #[test]
+    fn a_state_bound_elsewhere_or_unbound_is_not_resumable() {
+        let bound = PublishState {
+            session_id: "abc".to_string(),
+            uploaded: vec![],
+            node: "https://node.example".to_string(),
+            repo: "owner/name".to_string(),
+        };
+        assert!(state_resumable(&bound, "https://node.example", "owner/name"));
+        assert!(!state_resumable(&bound, "https://other.example", "owner/name"));
+        assert!(!state_resumable(&bound, "https://node.example", "owner/other"));
+        // A state file from before the binding fields existed deserializes
+        // them empty, so it is not resumable either.
+        let legacy: PublishState =
+            serde_json::from_str(r#"{"session_id":"abc","uploaded":[]}"#).unwrap();
+        assert!(!state_resumable(&legacy, "https://node.example", "owner/name"));
     }
 
     #[test]
