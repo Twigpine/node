@@ -1470,8 +1470,8 @@ mod tests {
             .await
             .unwrap();
         // A claims the block (pays 100); B's later claim is free.
-        let ra = claim_as(&db, "did:a", "ca", "r1", &[sha.clone()]).await;
-        let rb = claim_as(&db, "did:b", "cb", "r1", &[sha.clone()]).await;
+        let ra = claim_as(&db, "did:a", "ca", "r1", std::slice::from_ref(&sha)).await;
+        let rb = claim_as(&db, "did:b", "cb", "r1", std::slice::from_ref(&sha)).await;
         assert_eq!(quota_used(&pool, "did:a").await, 100);
         assert_eq!(quota_used(&pool, "did:b").await, 0);
 
@@ -1505,8 +1505,8 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let ra = claim_as(&db, "did:a", "ca", "r1", &[sha.clone()]).await;
-        let rb = claim_as(&db, "did:b", "cb", "r1", &[sha.clone()]).await;
+        let ra = claim_as(&db, "did:a", "ca", "r1", std::slice::from_ref(&sha)).await;
+        let rb = claim_as(&db, "did:b", "cb", "r1", std::slice::from_ref(&sha)).await;
         // B rejects first: still live under A, so nothing moves.
         db.model_reject_release(rb, "x").await.unwrap();
         assert_eq!(quota_used(&pool, "did:a").await, 100);
@@ -1540,13 +1540,13 @@ mod tests {
             .await
             .unwrap();
         // A publishes the block on r2 (payer A); B free-claims it on r1.
-        let ra = claim_as(&db, "did:a", "ca", "r2", &[sha.clone()]).await;
+        let ra = claim_as(&db, "did:a", "ca", "r2", std::slice::from_ref(&sha)).await;
         sqlx::query("UPDATE model_releases SET state = 'published' WHERE id = $1")
             .bind(ra)
             .execute(&pool)
             .await
             .unwrap();
-        claim_as(&db, "did:b", "cb", "r1", &[sha.clone()]).await;
+        claim_as(&db, "did:b", "cb", "r1", std::slice::from_ref(&sha)).await;
         assert_eq!(quota_used(&pool, "did:a").await, 100);
 
         // Deleting r1 must not touch A's charge: the block is still carried
