@@ -885,7 +885,18 @@ async fn put_block_vanishing_after_duplicate_keeps_the_first_link(pool: sqlx::Pg
 async fn put_block_understated_content_length_is_not_stored_under_small_charge(pool: sqlx::PgPool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let node = spawn_node(pool).await;
+    let repos_dir = tempfile::tempdir().expect("repos dir");
+    let block_dir = tempfile::tempdir().expect("block dir");
+    let inner: std::sync::Arc<dyn BlockStore> = std::sync::Arc::new(
+        twigpine_node::blockstore::fs::FsBlockStore::new(block_dir.path().to_path_buf())
+            .expect("fs store"),
+    );
+    let node = spawn_node_with_store(
+        pool.clone(),
+        repos_dir.path().to_path_buf(),
+        inner.clone(),
+    )
+    .await;
     let owner_did = Keypair::generate().did().to_string();
     let repo_id = node.seed_repo(&owner_did, "model", true).await;
     let session_id = seed_open_session(&node, &repo_id, &owner_did).await;
@@ -908,13 +919,37 @@ async fn put_block_understated_content_length_is_not_stored_under_small_charge(p
     sock.write_all(&body).await.expect("write body");
     sock.write_all(b"\r\n0\r\n\r\n").await.expect("write end");
     let mut raw = Vec::new();
-    let _ = sock.read_to_end(&mut raw).await;
-    let raw = String::from_utf8_lossy(&raw).to_string();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        sock.read_to_end(&mut raw),
+    )
+    .await;
+    let raw = match read {
+        Ok(Ok(_)) => String::from_utf8_lossy(&raw).to_string(),
+        Ok(Err(e)) => panic!("socket read failed: {e}"),
+        Err(_) => panic!("the node never closed the connection"),
+    };
     let status_line = raw.lines().next().unwrap_or("").to_string();
     eprintln!("raw response: {raw}");
     assert!(
-        !status_line.contains(" 200 "),
-        "a block larger than its declared Content-Length must not be admitted: {status_line}"
+        status_line.starts_with("HTTP/1.1 400"),
+        "the node answers a framing conflict with a 400, got: {status_line:?}"
+    );
+
+    // Whatever the socket said, nothing was stored or recorded: the digest
+    // is absent from the store and the session's charge and links are as
+    // seeded (zero).
+    let id = BlockId::parse(&sha).expect("block id");
+    assert_eq!(
+        inner.size(&id).await.expect("size"),
+        None,
+        "the oversized block must not be stored"
+    );
+    let (received, linked, rows) = session_block_state(&pool, &session_id, &sha).await;
+    assert_eq!(
+        (received, linked, rows),
+        (0, 0, 0),
+        "session charge and block links unchanged"
     );
 
     node.shutdown().await;
