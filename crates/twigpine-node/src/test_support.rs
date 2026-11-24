@@ -19508,6 +19508,10 @@ mod tests {
             r#"{"homepage":"https://x.example","description":"y"}"#,
             r#"{"homepage":7}"#,
             "not json",
+            "",
+            "null",
+            "7",
+            "\"x\"",
             "[null]",
             r#"["https://x.example"]"#,
         ];

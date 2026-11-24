@@ -532,12 +532,51 @@ pub async fn get_repo(
 
 /// Body of `PUT /api/v1/repos/:owner/:repo/homepage`. A null or absent
 /// `homepage` clears it. Unknown fields are refused, so a typo such as
-/// `homepage_url` is an error instead of a silent clear.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `homepage_url` is an error instead of a silent clear. The impl is written
+/// by hand because a derived `Deserialize` also accepts a JSON array through
+/// `visit_seq`, so `[null]` would read as a clear.
+#[derive(Debug)]
 pub struct HomepageRequest {
-    #[serde(default)]
     homepage: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for HomepageRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HomepageVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HomepageVisitor {
+            type Value = HomepageRequest;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object with a \"homepage\" string or null")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut homepage = None;
+                let mut seen_homepage = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "homepage" {
+                        if seen_homepage {
+                            return Err(serde::de::Error::duplicate_field("homepage"));
+                        }
+                        seen_homepage = true;
+                        homepage = map.next_value()?;
+                    } else {
+                        return Err(serde::de::Error::unknown_field(&key, &["homepage"]));
+                    }
+                }
+                Ok(HomepageRequest { homepage })
+            }
+        }
+
+        deserializer.deserialize_map(HomepageVisitor)
+    }
 }
 
 /// Write the homepage for an already-gated repo. Zero rows matched means the
@@ -572,14 +611,7 @@ pub async fn set_homepage(
     // Parsed here rather than by the `Json` extractor, which answers a wrong
     // field type or an unknown field with 422 and a wrong content type with
     // 415; every malformed body is the same 400.
-    let value: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|_| AppError::BadRequest("body must be {\"homepage\": string | null}".into()))?;
-    if !value.is_object() {
-        return Err(AppError::BadRequest(
-            "body must be {\"homepage\": string | null}".into(),
-        ));
-    }
-    let req: HomepageRequest = serde_json::from_value(value)
+    let req: HomepageRequest = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("body must be {\"homepage\": string | null}".into()))?;
     let homepage = req.homepage.as_deref().map(validate_homepage).transpose()?;
 
