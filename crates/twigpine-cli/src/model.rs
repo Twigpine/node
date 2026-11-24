@@ -487,7 +487,14 @@ fn scan_files(root: &Path, gitignore: &str, threshold: u64) -> Result<Scan> {
     if git(root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() {
         let staged = git_nul(
             root,
-            &["diff", "--cached", "--name-only", "--diff-filter=D", "-z"],
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "--diff-filter=D",
+                "--no-renames",
+                "-z",
+            ],
         )?;
         for p in staged {
             if !p.starts_with(".twigpine/") && !tracked.contains(&p) {
@@ -1727,6 +1734,17 @@ mod tests {
         let listed = index_listing(dir.path(), &index);
         assert!(!listed.contains(&"weights.bin".to_string()));
         assert!(listed.contains(&"kept.txt".to_string()));
+    }
+
+    #[test]
+    fn a_staged_rename_records_the_old_path_as_deleted() {
+        let dir = trepo();
+        std::fs::write(dir.path().join("old.txt"), b"x").unwrap();
+        tgit(dir.path(), &["add", "."]);
+        tcommit_all(dir.path());
+        tgit(dir.path(), &["mv", "old.txt", "new.txt"]);
+        let scan = scan_files(dir.path(), "", 1024).unwrap();
+        assert_eq!(scan.deleted, vec!["old.txt"]);
     }
 
     #[test]
