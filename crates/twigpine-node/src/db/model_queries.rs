@@ -1170,7 +1170,8 @@ mod tests {
             .await
             .unwrap();
         let mut handle = tokio::spawn(async move {
-            db2.model_record_block(&sid, &"c".repeat(64), 100, 100).await
+            db2.model_record_block(&sid, &"c".repeat(64), 100, 100)
+                .await
         });
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
