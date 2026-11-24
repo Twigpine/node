@@ -1307,17 +1307,75 @@ async fn reconstruction_store_failure_is_500_not_404(pool: sqlx::PgPool) {
 /// the reconstruction route, so they live here.
 #[sqlx::test]
 async fn reconstruction_and_claims_deny_on_private_repo(pool: sqlx::PgPool) {
-    let node = spawn_node(pool).await;
+    let repos_dir = tempfile::tempdir().expect("repos dir");
+    let block_dir = tempfile::tempdir().expect("block dir");
+    let inner: std::sync::Arc<dyn BlockStore> = std::sync::Arc::new(
+        twigpine_node::blockstore::fs::FsBlockStore::new(block_dir.path().to_path_buf())
+            .expect("fs store"),
+    );
+    let node = spawn_node_with_store(
+        pool.clone(),
+        repos_dir.path().to_path_buf(),
+        inner.clone(),
+    )
+    .await;
     let client = bounded_client();
     let owner = Keypair::generate();
     let stranger = Keypair::generate();
     let owner_did = owner.did().to_string();
-    node.seed_repo(&owner_did, "model", false).await;
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
     let commit = "c".repeat(40);
     let rec_path = format!(
         "{}/reconstruction",
         release_path(&owner_did, "model", &commit)
     );
+
+    // A published release with a real reconstruction object behind it: the
+    // owner's GET must reach the object while the repo is public, so the
+    // 404 below is the publicity check firing, not a missing release.
+    node.seed_model_release(&repo_id, &commit, &owner_did).await;
+    let rec_body = b"reconstruction-bytes".to_vec();
+    let rec_sha = sha256_hex(&rec_body);
+    let rec_id = BlockId::parse(&rec_sha).expect("block id");
+    inner
+        .put_verified(
+            &rec_id,
+            Box::pin(futures::stream::once(async move {
+                Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(rec_body))
+            })),
+            1024,
+        )
+        .await
+        .expect("store reconstruction object");
+    sqlx::query("UPDATE model_releases SET reconstruction_sha256 = $1 WHERE repo_id = $2")
+        .bind(&rec_sha)
+        .bind(&repo_id)
+        .execute(&pool)
+        .await
+        .expect("set reconstruction sha");
+
+    let resp = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &rec_path,
+        Vec::new(),
+        &owner,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "owner reads the reconstruction while the repo is public"
+    );
+
+    sqlx::query("UPDATE repos SET is_public = FALSE WHERE id = $1")
+        .bind(&repo_id)
+        .execute(&pool)
+        .await
+        .expect("make repo private");
 
     for (label, req) in [
         (
