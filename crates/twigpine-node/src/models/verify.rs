@@ -575,17 +575,32 @@ mod tests {
     async fn a_persistently_failing_verify_is_rejected_and_frees_the_claim_slot(
         pool: sqlx::PgPool,
     ) {
-        let state = crate::test_support::test_state(pool.clone()).await;
+        let mut state = crate::test_support::test_state(pool.clone()).await;
         let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let owner_did =
             twigpine_core::did::Did::from_verifying_key(&signing.verifying_key()).to_string();
 
+        // The claim at the end reads the repo through `repo_store.acquire`,
+        // so the tree must sit at the store's managed path, not any tempdir.
+        let repos_root = tempfile::tempdir().expect("repos root");
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_root.path().to_path_buf(),
+            pool.clone(),
+        );
+        let dir = crate::git::repo_store::validated_repo_disk_path(
+            repos_root.path(),
+            &owner_did,
+            "model",
+        )
+        .expect("repo path")
+        .into_path_buf();
+        std::fs::create_dir_all(&dir).expect("repo dir");
+
         // A real commit: a.txt rides as a git-stored manifest file, so the
         // whole verify path runs and only the ref-pin step fails.
-        let dir = tempfile::tempdir().expect("tempdir");
-        git(dir.path(), &["init", "-q", "-b", "main"]);
-        std::fs::create_dir_all(dir.path().join(".twigpine")).expect("mkdir");
-        std::fs::write(dir.path().join("a.txt"), b"hello\n").expect("a.txt");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(dir.join(".twigpine")).expect("mkdir");
+        std::fs::write(dir.join("a.txt"), b"hello\n").expect("a.txt");
         let manifest = Manifest {
             schema: MANIFEST_SCHEMA_V1.to_string(),
             repo: format!("{}/model", crate::db::canonical_did(&owner_did)),
@@ -603,15 +618,12 @@ mod tests {
         };
         let manifest_bytes = manifest.to_bytes().expect("manifest bytes");
         let sig = twigpine_core::model::manifest::sign(&signing, &manifest_bytes);
-        std::fs::write(
-            dir.path().join(".twigpine/model-release.json"),
-            &manifest_bytes,
-        )
-        .expect("manifest");
-        std::fs::write(dir.path().join(".twigpine/model-release.sig"), sig).expect("sig");
-        git(dir.path(), &["add", "a.txt", ".twigpine"]);
+        std::fs::write(dir.join(".twigpine/model-release.json"), &manifest_bytes)
+            .expect("manifest");
+        std::fs::write(dir.join(".twigpine/model-release.sig"), sig).expect("sig");
+        git(&dir, &["add", "a.txt", ".twigpine"]);
         git(
-            dir.path(),
+            &dir,
             &[
                 "-c",
                 "user.email=t@t",
@@ -622,7 +634,7 @@ mod tests {
                 "r1",
             ],
         );
-        let commit = git(dir.path(), &["rev-parse", "HEAD"]);
+        let commit = git(&dir, &["rev-parse", "HEAD"]);
 
         sqlx::query(
             "INSERT INTO repos (id, name, owner_did, is_public, default_branch,
@@ -631,7 +643,7 @@ mod tests {
         )
         .bind(&owner_did)
         .bind(chrono::Utc::now().to_rfc3339())
-        .bind(dir.path().to_str().expect("utf-8 path"))
+        .bind(dir.to_str().expect("utf-8 path"))
         .execute(&pool)
         .await
         .expect("repo row");
@@ -654,7 +666,7 @@ mod tests {
 
         // A stale lock makes `git config --add` fail every pass; the pin
         // step then errors instead of writing an advertised release ref.
-        std::fs::write(dir.path().join(".git/config.lock"), b"").expect("config.lock");
+        std::fs::write(dir.join(".git/config.lock"), b"").expect("config.lock");
 
         let worker = tokio::spawn(run_verify_worker(state.clone()));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -688,10 +700,10 @@ mod tests {
         );
 
         // The slot is free: a claim on a new commit is accepted.
-        std::fs::write(dir.path().join("a.txt"), b"hello again\n").expect("a.txt v2");
-        git(dir.path(), &["add", "a.txt"]);
+        std::fs::write(dir.join("a.txt"), b"hello again\n").expect("a.txt v2");
+        git(&dir, &["add", "a.txt"]);
         git(
-            dir.path(),
+            &dir,
             &[
                 "-c",
                 "user.email=t@t",
@@ -702,7 +714,7 @@ mod tests {
                 "r2",
             ],
         );
-        let commit2 = git(dir.path(), &["rev-parse", "HEAD"]);
+        let commit2 = git(&dir, &["rev-parse", "HEAD"]);
         let record = state
             .db
             .get_repo_by_id("r1")
