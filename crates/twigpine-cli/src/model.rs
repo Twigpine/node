@@ -1666,7 +1666,7 @@ async fn verify_candidate(
         ));
     }
     if let Some(want) = revision {
-        if anchor.release_commit != want {
+        if !anchor.release_commit.eq_ignore_ascii_case(want) {
             return skip(format!(
                 "anchor names commit {}, expected {want}",
                 anchor.release_commit

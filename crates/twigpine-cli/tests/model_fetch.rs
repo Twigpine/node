@@ -287,6 +287,23 @@ async fn fetch_rebuilds_git_and_chunked_files_byte_identically() {
 }
 
 #[tokio::test]
+async fn fetch_revision_pin_is_case_insensitive() {
+    let owner = Keypair::generate();
+    let release = build_release(&owner);
+    let rec_sha = sha256_hex(&release.rec_bytes);
+    let anchor = anchor_json(&release, &release.did, &release.signing, &rec_sha);
+    let server = serve(&[("tx-good", anchor)], &release.objects).await;
+
+    let out = TempDir::new().unwrap();
+    let mut a = args(&server.url(), &release.did, &out);
+    a.revision = Some(COMMIT.to_uppercase());
+    let report = fetch_model(&a).await.unwrap();
+
+    assert_eq!(report.release_commit, COMMIT);
+    assert_eq!(report.anchor_tx, "tx-good");
+}
+
+#[tokio::test]
 async fn anchor_naming_a_different_owner_did_is_skipped() {
     let owner = Keypair::generate();
     let attacker = Keypair::generate();
