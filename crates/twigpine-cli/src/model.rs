@@ -690,6 +690,25 @@ fn staged_gitignore_entry(root: &Path, index: &Path, scan: &Scan) -> Result<Opti
     }))
 }
 
+/// Stage `path` in the release index as the exact bytes on disk: a clean
+/// filter on a normal `git add` could rewrite the signed metadata, so the
+/// blob is hashed with --no-filters and the index entry pointed at it.
+fn stage_unfiltered(root: &Path, index: &Path, path: &str) -> Result<()> {
+    let out = git_index(root, index, &["hash-object", "--no-filters", "-w", "--", path])?;
+    let sha = String::from_utf8(out.stdout).context("hash-object output was not utf-8")?;
+    git_index(
+        root,
+        index,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{},{}", sha.trim(), path),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Bytes of the blob staged for `path` in the dedicated release index:
 /// exactly what the release commit will store, filters and symlink handling
 /// included.
@@ -1164,16 +1183,19 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
             )
         ),
     )?;
-    git_index(
-        &root,
-        &index_path,
-        &[
-            "--literal-pathspecs",
-            "add",
-            ".twigpine/model-release.json",
-            ".twigpine/model-release.sig",
-        ],
-    )?;
+    stage_unfiltered(&root, &index_path, ".twigpine/model-release.json")?;
+    stage_unfiltered(&root, &index_path, ".twigpine/model-release.sig")?;
+    // What the commit stores must be the signed bytes: re-read the staged
+    // blobs and prove both the manifest and its signature before pushing.
+    let staged_manifest = staged_blob(&root, &index_path, ".twigpine/model-release.json")?;
+    if staged_manifest != manifest_bytes {
+        bail!("the staged manifest differs from the signed bytes");
+    }
+    let staged_sig = staged_blob(&root, &index_path, ".twigpine/model-release.sig")?;
+    let staged_sig =
+        String::from_utf8(staged_sig).context("staged signature was not utf-8")?;
+    manifest::verify(&staged_manifest, &staged_sig, &kp.did())
+        .map_err(|e| anyhow::anyhow!("staged manifest signature does not verify: {e}"))?;
 
     // 10. Commit when the release index differs, push, and claim HEAD.
     let has_changes = git_index(&root, &index_path, &["diff", "--cached", "--quiet"]).is_err();
@@ -1841,6 +1863,36 @@ mod tests {
         assert!(!listed.contains(&"weights.bin".to_string()));
         assert!(listed.contains(&"kept.txt".to_string()));
         assert!(listed.contains(&".gitignore".to_string()));
+    }
+
+    #[test]
+    fn metadata_stages_around_a_clean_filter() {
+        let dir = trepo();
+        // A clean filter rewriting JSON bytes: a plain `git add` stores the
+        // filtered text, stage_unfiltered must store the disk bytes.
+        tgit(
+            dir.path(),
+            &["config", "filter.rewrite.clean", "sed s/signed/rewritten/"],
+        );
+        std::fs::write(dir.path().join(".gitattributes"), "*.json filter=rewrite\n").unwrap();
+        tgit(dir.path(), &["add", ".gitattributes"]);
+        tcommit_all(dir.path());
+        std::fs::create_dir_all(dir.path().join(".twigpine")).unwrap();
+        std::fs::write(dir.path().join(".twigpine/model-release.json"), b"signed").unwrap();
+        std::fs::write(dir.path().join(".twigpine/control.json"), b"signed").unwrap();
+        let index = dir.path().join(".git").join("tmp-index");
+        git_index(dir.path(), &index, &["read-tree", "--empty"]).unwrap();
+        stage_unfiltered(dir.path(), &index, ".twigpine/model-release.json").unwrap();
+        assert_eq!(
+            staged_blob(dir.path(), &index, ".twigpine/model-release.json").unwrap(),
+            b"signed"
+        );
+        // Control: the same bytes through a filtered add are rewritten.
+        git_index(dir.path(), &index, &["add", ".twigpine/control.json"]).unwrap();
+        assert_eq!(
+            staged_blob(dir.path(), &index, ".twigpine/control.json").unwrap(),
+            b"rewritten"
+        );
     }
 
     #[test]
