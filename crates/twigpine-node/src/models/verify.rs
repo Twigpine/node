@@ -137,23 +137,29 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
     )
     .await
     .map_err(AppError::Internal)?;
-    let manifest_git_paths: std::collections::HashSet<&str> = manifest
+    let manifest_git_paths: std::collections::HashSet<&[u8]> = manifest
         .files
         .iter()
         .filter(|f| f.storage == StorageKind::Git)
-        .map(|f| f.path.as_str())
+        .map(|f| f.path.as_bytes())
         .collect();
     // -z, not line-splitting: with core.quotePath on, a non-ASCII path is
     // printed as escaped octal and could never match a manifest path.
-    for path in String::from_utf8_lossy(&tree.stdout)
-        .split('\0')
-        .filter(|p| !p.is_empty() && !p.starts_with(".twigpine/"))
+    // Raw bytes: a lossy decode would let an invalid-UTF-8 name match a
+    // manifest entry spelled with U+FFFD and skip the read and hash.
+    for path in tree
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty() && !p.starts_with(b".twigpine/"))
     {
         if !manifest_git_paths.contains(path) {
             return reject_release(
                 state,
                 release_id,
-                &format!("{path} is committed but not in the manifest"),
+                &format!(
+                    "{} is committed but not in the manifest",
+                    String::from_utf8_lossy(path)
+                ),
             )
             .await;
         }
@@ -263,17 +269,19 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                 }
             }
             StorageKind::Git => {
-                match super::claim::git_show(
+                let spec = format!("{}:{}", release.commit_sha, file.path);
+                match crate::git::store::run_git_blob_digest(
                     &state.git_bin,
                     &disk_path,
-                    &release.commit_sha,
-                    &file.path,
+                    &spec,
+                    std::time::Duration::from_secs(120),
+                    64,
                 )
                 .await
+                .map_err(AppError::Internal)?
                 {
-                    Ok(Some(bytes)) => {
-                        let got = twigpine_core::cid::sha256_hex(&bytes);
-                        if got != file.sha256 || bytes.len() as u64 != file.size {
+                    Some(blob) => {
+                        if blob.sha256_hex != file.sha256 || blob.size != file.size {
                             return reject_release(
                                 state,
                                 release_id,
@@ -281,7 +289,7 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                             )
                             .await;
                         }
-                        let detected = detect_format(&bytes[..bytes.len().min(64)], &file.path);
+                        let detected = detect_format(&blob.head, &file.path);
                         if detected != file.format {
                             return reject_release(
                                 state,
@@ -294,7 +302,7 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                             .await;
                         }
                     }
-                    Ok(None) => {
+                    None => {
                         return reject_release(
                             state,
                             release_id,
@@ -302,7 +310,6 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
                         )
                         .await;
                     }
-                    Err(e) => return Err(e),
                 }
             }
         }
@@ -886,5 +893,118 @@ mod tests {
             ref_exists(dir.path(), &commit).await,
             "published keeps its pin"
         );
+    }
+
+    /// A git-stored file past the metadata read cap still verifies: the
+    /// blob is hashed as a stream, never held whole.
+    #[sqlx::test]
+    async fn a_9_mib_git_file_verifies(pool: sqlx::PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = vec![b'a'; 9 * 1024 * 1024];
+        let (state, release_id, _commit) =
+            verify_fixture(&pool, dir.path(), &[("big.txt", &big)], &["big.txt"]).await;
+        verify_release(&state, release_id).await.expect("verify");
+        let (state_str, reason) = release_state(&pool, release_id).await;
+        assert_eq!(state_str, "published", "{reason:?}");
+    }
+
+    #[sqlx::test]
+    async fn a_9_mib_git_file_with_a_wrong_hash_is_rejected(pool: sqlx::PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = vec![b'a'; 9 * 1024 * 1024];
+        let (state, release_id, _commit) =
+            verify_fixture(&pool, dir.path(), &[("big.txt", &big)], &["big.txt"]).await;
+        // Rewrite the manifest with a wrong sha256 for the same file.
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let raw = std::fs::read(dir.path().join(".twigpine/model-release.json")).expect("read");
+        let mut manifest: Manifest = serde_json::from_slice(&raw).expect("manifest");
+        manifest.files[0].sha256 = twigpine_core::cid::sha256_hex(b"other");
+        let bytes = manifest.to_bytes().expect("bytes");
+        let sig = twigpine_core::model::manifest::sign(&signing, &bytes);
+        std::fs::write(dir.path().join(".twigpine/model-release.json"), &bytes).expect("m");
+        std::fs::write(dir.path().join(".twigpine/model-release.sig"), sig).expect("s");
+        git(dir.path(), &["add", ".twigpine"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--amend",
+                "-m",
+                "r1",
+            ],
+        );
+        let commit = git(dir.path(), &["rev-parse", "HEAD"]);
+        sqlx::query("UPDATE model_releases SET commit_sha = $1 WHERE id = $2")
+            .bind(&commit)
+            .bind(release_id)
+            .execute(&pool)
+            .await
+            .expect("update");
+        sqlx::query("UPDATE model_releases SET manifest_sha256 = $1 WHERE id = $2")
+            .bind(twigpine_core::cid::sha256_hex(&bytes))
+            .bind(release_id)
+            .execute(&pool)
+            .await
+            .expect("update");
+        verify_release(&state, release_id)
+            .await
+            .expect("verify call");
+        let (state_str, reason) = release_state(&pool, release_id).await;
+        assert_eq!(state_str, "rejected", "{reason:?}");
+        assert!(reason
+            .expect("reason")
+            .contains("git blob does not match the manifest"));
+    }
+
+    /// Distinct invalid-UTF-8 names must not collapse onto a manifest entry
+    /// named with U+FFFD: the committed-subset check compares raw bytes.
+    #[sqlx::test]
+    async fn an_invalid_utf8_name_does_not_match_a_replacement_char_name(pool: sqlx::PgPool) {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, release_id, _commit) = verify_fixture(
+            &pool,
+            dir.path(),
+            &[("\u{FFFD}.bin", b"x")],
+            &["\u{FFFD}.bin"],
+        )
+        .await;
+        let bad = std::ffi::OsStr::from_bytes(b"\xFF.bin");
+        std::fs::write(dir.path().join(bad), b"smuggled").expect("bad name");
+        git(dir.path(), &["add", "-A"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--amend",
+                "-m",
+                "r1",
+            ],
+        );
+        let commit = git(dir.path(), &["rev-parse", "HEAD"]);
+        sqlx::query("UPDATE model_releases SET commit_sha = $1 WHERE id = $2")
+            .bind(&commit)
+            .bind(release_id)
+            .execute(&pool)
+            .await
+            .expect("update");
+        verify_release(&state, release_id)
+            .await
+            .expect("verify call");
+        let (state_str, reason) = release_state(&pool, release_id).await;
+        assert_eq!(state_str, "rejected", "{reason:?}");
+        assert!(reason
+            .expect("reason")
+            .contains("committed but not in the manifest"));
     }
 }

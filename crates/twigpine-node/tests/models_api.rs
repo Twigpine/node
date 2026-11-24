@@ -641,6 +641,240 @@ async fn put_block_failed_bookkeeping_keeps_shared_block(pool: sqlx::PgPool) {
     node.shutdown().await;
 }
 
+/// Fault wrapper: `put_unknown` makes put_verified return Unknown (after the
+/// real write when `Some(true)`); `size_err` fails every size(); `vanish`
+/// deletes the object from the inner store on the first size() per digest
+/// (the sweep winning between the pre-record check and the link commit).
+#[derive(Default)]
+struct FaultStore {
+    inner: Option<std::sync::Arc<dyn BlockStore>>,
+    put_unknown: Option<bool>,
+    size_err: bool,
+    vanish: bool,
+    sized: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl FaultStore {
+    fn inner(&self) -> &std::sync::Arc<dyn BlockStore> {
+        self.inner.as_ref().expect("inner")
+    }
+}
+
+#[async_trait::async_trait]
+impl BlockStore for FaultStore {
+    async fn put_verified(
+        &self,
+        id: &BlockId,
+        body: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>,
+        max_len: u64,
+    ) -> Result<twigpine_node::blockstore::PutOutcome, twigpine_node::blockstore::BlockStoreError>
+    {
+        match self.put_unknown {
+            None => self.inner().put_verified(id, body, max_len).await,
+            Some(write) => {
+                if write {
+                    self.inner().put_verified(id, body, max_len).await?;
+                }
+                Err(twigpine_node::blockstore::BlockStoreError::Unknown)
+            }
+        }
+    }
+
+    async fn get_range(
+        &self,
+        id: &BlockId,
+        start: u64,
+        end_exclusive: u64,
+    ) -> Result<
+        futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>,
+        twigpine_node::blockstore::BlockStoreError,
+    > {
+        self.inner().get_range(id, start, end_exclusive).await
+    }
+
+    async fn size(
+        &self,
+        id: &BlockId,
+    ) -> Result<Option<u64>, twigpine_node::blockstore::BlockStoreError> {
+        if self.size_err {
+            return Err(twigpine_node::blockstore::BlockStoreError::Backend(
+                "injected size failure".into(),
+            ));
+        }
+        let real = self.inner().size(id).await?;
+        if self.vanish && self.sized.lock().unwrap().insert(id.as_str().to_string()) {
+            self.inner().delete(id).await?;
+        }
+        Ok(real)
+    }
+
+    async fn delete(&self, id: &BlockId) -> Result<(), twigpine_node::blockstore::BlockStoreError> {
+        self.inner().delete(id).await
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "fault"
+    }
+}
+
+/// Spawn a node over a FaultStore, seed repo and session; returns what the
+/// fault tests need.
+async fn fault_node(
+    pool: &sqlx::PgPool,
+    fault: impl FnOnce(&mut FaultStore),
+) -> (
+    TestNode,
+    std::sync::Arc<dyn BlockStore>,
+    String,
+    String,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let repos_dir = tempfile::tempdir().expect("repos dir");
+    let block_dir = tempfile::tempdir().expect("block dir");
+    let inner: std::sync::Arc<dyn BlockStore> = std::sync::Arc::new(
+        twigpine_node::blockstore::fs::FsBlockStore::new(block_dir.path().to_path_buf())
+            .expect("fs store"),
+    );
+    let mut store = FaultStore {
+        inner: Some(inner.clone()),
+        ..Default::default()
+    };
+    fault(&mut store);
+    let node = spawn_node_with_store(
+        pool.clone(),
+        repos_dir.path().to_path_buf(),
+        std::sync::Arc::new(store),
+    )
+    .await;
+    let owner_did = Keypair::generate().did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let session = seed_open_session(&node, &repo_id, &owner_did).await;
+    (node, inner, owner_did, session, repos_dir, block_dir)
+}
+
+/// (bytes_received, link count, block row count) for a session and sha.
+async fn session_block_state(pool: &sqlx::PgPool, session: &str, sha: &str) -> (i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT s.bytes_received,
+                (SELECT COUNT(*) FROM model_session_blocks l
+                  WHERE l.session_id = s.id AND l.block_sha256 = $2),
+                (SELECT COUNT(*) FROM model_blocks b WHERE b.sha256 = $2)
+         FROM model_upload_sessions s WHERE s.id = $1",
+    )
+    .bind(session)
+    .bind(sha)
+    .fetch_one(pool)
+    .await
+    .expect("session state")
+}
+
+/// Unknown write outcome, the probe finds the object: the PUT succeeds as if
+/// stored, linked and still charged.
+#[sqlx::test]
+async fn put_block_unknown_outcome_object_present_succeeds(pool: sqlx::PgPool) {
+    let (node, _inner, owner_did, session, _r, _b) =
+        fault_node(&pool, |s| s.put_unknown = Some(true)).await;
+    let body = b"unknown-present".to_vec();
+    let sha = sha256_hex(&body);
+    let resp = put_block(
+        &bounded_client(),
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session),
+        body.clone(),
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
+    let (received, linked, rows) = session_block_state(&pool, &session, &sha).await;
+    assert_eq!(received, body.len() as i64, "admission stays charged");
+    assert_eq!((linked, rows), (1, 1));
+    node.shutdown().await;
+}
+
+/// Unknown write outcome, the probe says absent: refund, 409, no row.
+#[sqlx::test]
+async fn put_block_unknown_outcome_object_absent_refunds(pool: sqlx::PgPool) {
+    let (node, _inner, owner_did, session, _r, _b) =
+        fault_node(&pool, |s| s.put_unknown = Some(false)).await;
+    let body = b"unknown-absent".to_vec();
+    let sha = sha256_hex(&body);
+    let resp = put_block(
+        &bounded_client(),
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session),
+        body,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 409);
+    let (received, linked, rows) = session_block_state(&pool, &session, &sha).await;
+    assert_eq!((received, linked, rows), (0, 0, 0));
+    node.shutdown().await;
+}
+
+/// Unknown write outcome and the probe also errors: quarantine with an
+/// unlinked row for the sweep, no refund, 409.
+#[sqlx::test]
+async fn put_block_unknown_outcome_probe_fails_quarantines(pool: sqlx::PgPool) {
+    let (node, _inner, owner_did, session, _r, _b) = fault_node(&pool, |s| {
+        s.put_unknown = Some(true);
+        s.size_err = true;
+    })
+    .await;
+    let body = b"unknown-quarantine".to_vec();
+    let sha = sha256_hex(&body);
+    let resp = put_block(
+        &bounded_client(),
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session),
+        body.clone(),
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 409);
+    let (received, linked, rows) = session_block_state(&pool, &session, &sha).await;
+    assert_eq!(received, body.len() as i64, "charge kept until expiry");
+    assert_eq!((linked, rows), (0, 1));
+    node.shutdown().await;
+}
+
+/// The object vanishes between the pre-record size() and the link commit
+/// (the sweep winning): the PUT fails closed, unlinks and refunds.
+#[sqlx::test]
+async fn put_block_object_vanishing_before_link_fails_closed(pool: sqlx::PgPool) {
+    let (node, inner, owner_did, session, _r, _b) = fault_node(&pool, |s| s.vanish = true).await;
+    let body = b"vanishing-block".to_vec();
+    let sha = sha256_hex(&body);
+    let resp = put_block(
+        &bounded_client(),
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session),
+        body,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 409);
+    let (received, linked, _rows) = session_block_state(&pool, &session, &sha).await;
+    assert_eq!((received, linked), (0, 0));
+    let id = BlockId::parse(&sha).expect("block id");
+    assert_eq!(inner.size(&id).await.expect("size"), None);
+    node.shutdown().await;
+}
+
 /// A session bearer that declares a small Content-Length but streams a larger
 /// valid block must not get the larger block stored under the small charge.
 /// Both framing headers are sent so the body is read to EOF by chunked

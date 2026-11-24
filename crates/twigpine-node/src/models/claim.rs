@@ -48,7 +48,15 @@ pub(crate) async fn git_show(
         MAX_RELEASE_METADATA_BYTES,
     )
     .await
-    .map_err(AppError::Internal)?;
+    .map_err(
+        |e| match e.downcast_ref::<crate::git::store::OutputTooLarge>() {
+            Some(big) => bad_request(format!(
+                "{path} exceeds the {} byte limit for release metadata",
+                big.limit
+            )),
+            None => AppError::Internal(e),
+        },
+    )?;
     if out.status.success() {
         return Ok(Some(out.stdout));
     }
@@ -242,6 +250,13 @@ pub async fn claim_release(
             // Existence of a published parent release is the check, not its
             // block links: an all-Git parent links no blocks yet still
             // stands as a parent.
+            // The pre-transaction check can go stale: a rule committed since
+            // then must not let the claim admit parent-only blocks.
+            if !db.model_tx_parent_still_public(&mut tx, prepo_id).await? {
+                return Err(bad_request(
+                    "declared parent's repo is no longer fully public",
+                ));
+            }
             let published = db
                 .model_tx_release_by_commit(&mut tx, prepo_id, pcommit)
                 .await?
@@ -339,4 +354,52 @@ pub async fn claim_release(
         tracing::warn!(%commit, "release ref write at claim failed: {e}");
     }
     Ok(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_metadata_blob_is_a_bad_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(dir.path().join(".twigpine")).expect("mkdir");
+        std::fs::write(
+            dir.path().join(".twigpine/model-release.json"),
+            vec![b' '; 9 * 1024 * 1024],
+        )
+        .expect("write");
+        git(dir.path(), &["add", "."]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "c",
+            ],
+        );
+        let out = git_show("git", dir.path(), "HEAD", ".twigpine/model-release.json").await;
+        assert!(matches!(out, Err(AppError::BadRequest(_))), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_git_binary_stays_internal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = git_show("/nonexistent/git", dir.path(), "HEAD", "x").await;
+        assert!(matches!(out, Err(AppError::Internal(_))), "{out:?}");
+    }
 }

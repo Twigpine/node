@@ -293,6 +293,37 @@ impl Db {
         Ok(refund)
     }
 
+    /// Register a block row with no session link and no refund, so the sweep
+    /// can reclaim an object whose write outcome is unknown once the grace
+    /// period passes. Same insert as `model_record_block`.
+    pub async fn model_register_unlinked_block(&self, sha: &str, size: u64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO model_blocks (sha256, size, created_at, unreferenced_since)
+             VALUES ($1, $2, $3, $3)
+             ON CONFLICT (sha256) DO NOTHING",
+        )
+        .bind(sha)
+        .bind(size as i64)
+        .bind(ts_now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove one session link; `true` when a link row was deleted. The
+    /// model_blocks row stays: the sweep tolerates a missing object.
+    pub async fn model_unlink_session_block(&self, session_id: &str, sha: &str) -> Result<bool> {
+        Ok(sqlx::query(
+            "DELETE FROM model_session_blocks WHERE session_id = $1 AND block_sha256 = $2",
+        )
+        .bind(session_id)
+        .bind(sha)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            > 0)
+    }
+
     /// Whether a `model_blocks` row exists for `sha`. A failed bookkeeping
     /// cleanup deletes a stored object only when no row references it, so a
     /// block a release or another session already carries is never removed
@@ -687,6 +718,33 @@ impl Db {
         .await?
         .rows_affected();
         Ok(done > 0)
+    }
+
+    /// Inside a claim transaction: the declared parent's repo is still fully
+    /// public, taken FOR UPDATE so a visibility rule cannot commit between
+    /// this check and the claim's commit.
+    pub async fn model_tx_parent_still_public(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        repo_id: &str,
+    ) -> Result<bool> {
+        if repo_id.contains('/') {
+            return Ok(false);
+        }
+        let is_public: Option<bool> =
+            sqlx::query_scalar("SELECT is_public FROM repos WHERE id = $1 FOR UPDATE")
+                .bind(repo_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if is_public != Some(true) {
+            return Ok(false);
+        }
+        let has_rules: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM visibility_rules WHERE repo_id = $1)")
+                .bind(repo_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        Ok(!has_rules)
     }
 
     /// Publish a verifying release only while its repo is still fully
@@ -1648,5 +1706,54 @@ mod tests {
             db.model_publish_if_public(rid4, "gone").await.unwrap(),
             PublishOutcome::NoLongerPublic
         );
+    }
+
+    #[sqlx::test]
+    async fn parent_still_public_tracks_publicity_and_rules(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        let mut tx = pool.begin().await.unwrap();
+        assert!(db
+            .model_tx_parent_still_public(&mut tx, "r1")
+            .await
+            .unwrap());
+        assert!(!db
+            .model_tx_parent_still_public(&mut tx, "gone")
+            .await
+            .unwrap());
+        assert!(!db
+            .model_tx_parent_still_public(&mut tx, "a/b")
+            .await
+            .unwrap());
+        tx.rollback().await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO visibility_rules (id, repo_id, path_glob, mode, reader_dids,
+                                           created_by, created_at)
+             VALUES ('v1', 'r1', 'x/**', 'deny', '[]', 'did:owner', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(!db
+            .model_tx_parent_still_public(&mut tx, "r1")
+            .await
+            .unwrap());
+        tx.rollback().await.unwrap();
+
+        sqlx::query("DELETE FROM visibility_rules WHERE repo_id = 'r1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE repos SET is_public = FALSE WHERE id = 'r1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(!db
+            .model_tx_parent_still_public(&mut tx, "r1")
+            .await
+            .unwrap());
+        tx.rollback().await.unwrap();
     }
 }

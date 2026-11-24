@@ -213,6 +213,29 @@ pub async fn put_model_block(
             .await
         {
             Ok(o) => o,
+            // Unknown outcome: probe once. Present continues as stored,
+            // absent refunds, a failed probe quarantines (an unlinked row
+            // so the sweep reclaims the object; the charge stays until the
+            // session expires).
+            Err(BlockStoreError::Unknown) => match store.size(&block_id).await {
+                Ok(Some(_)) => PutOutcome::AlreadyPresent,
+                Ok(None) => {
+                    let _ = bookkeep_db
+                        .model_refund_bytes(&bookkeep_session, declared as i64)
+                        .await;
+                    return Err(AppError::Conflict(
+                        "the block was not stored; re-send it".into(),
+                    ));
+                }
+                Err(_) => {
+                    let _ = bookkeep_db
+                        .model_register_unlinked_block(&bookkeep_sha, declared)
+                        .await;
+                    return Err(AppError::Conflict(
+                        "the write's outcome is unknown; re-send the block".into(),
+                    ));
+                }
+            },
             Err(e) => {
                 let _ = bookkeep_db
                     .model_refund_bytes(&bookkeep_session, declared as i64)
@@ -224,9 +247,6 @@ pub async fn put_model_block(
                     BlockStoreError::TooLarge(cap) => {
                         AppError::BadRequest(format!("block exceeds the {cap}-byte limit"))
                     }
-                    BlockStoreError::Unknown => AppError::Conflict(
-                        "the write's outcome is unknown; check the object before retrying".into(),
-                    ),
                     BlockStoreError::Body(e) => {
                         AppError::BadRequest(format!("block body could not be read: {e}"))
                     }
@@ -268,7 +288,26 @@ pub async fn put_model_block(
             .model_record_block(&bookkeep_session, &bookkeep_sha, size, declared as i64)
             .await
         {
-            Ok(duplicate) => Ok(duplicate),
+            // The committed link now shields the block from the sweep, so
+            // this recheck cannot race it: if the object is gone (or
+            // unverifiable) undo this request's link and fail closed.
+            Ok(duplicate) => match store.size(&block_id).await {
+                Ok(Some(_)) => Ok(duplicate),
+                _ => {
+                    let unlinked = bookkeep_db
+                        .model_unlink_session_block(&bookkeep_session, &bookkeep_sha)
+                        .await
+                        .unwrap_or(false);
+                    if unlinked && !duplicate {
+                        let _ = bookkeep_db
+                            .model_refund_bytes(&bookkeep_session, declared as i64)
+                            .await;
+                    }
+                    Err(AppError::Conflict(
+                        "the block disappeared before it could be linked; re-send it".into(),
+                    ))
+                }
+            },
             Err(e) => {
                 let _ = bookkeep_db
                     .model_refund_bytes(&bookkeep_session, declared as i64)

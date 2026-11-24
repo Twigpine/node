@@ -373,6 +373,44 @@ fn managed_block_paths(gitignore: &str) -> Vec<String> {
     out
 }
 
+/// Hold one exclusive lock for the whole publish run: the dedicated index,
+/// pathspec file and session state live at fixed names in the git dir.
+fn acquire_publish_lock(git_dir: &Path) -> Result<std::fs::File> {
+    let path = git_dir.join("twigpine-model-publish.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("another twigpine model publish is running in this checkout")
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e).context("failed to lock the publish lock"),
+    }
+}
+
+/// Seed the dedicated release index from HEAD. Chunked paths are dropped from
+/// it (index only), so a weight file still in HEAD never rides in the commit.
+fn seed_release_index(root: &Path, index_path: &Path, chunked: &[String]) -> Result<()> {
+    let _ = std::fs::remove_file(index_path);
+    if git(root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() {
+        git_index(root, index_path, &["read-tree", "HEAD"])?;
+    } else {
+        git_index(root, index_path, &["read-tree", "--empty"])?;
+    }
+    for p in chunked {
+        git_index(
+            root,
+            index_path,
+            &["update-index", "--force-remove", "--", p],
+        )?;
+    }
+    Ok(())
+}
+
 fn scan_files(root: &Path, gitignore: &str, threshold: u64) -> Result<Scan> {
     let tracked = tracked_paths(root)?;
     let others = git_nul(root, &["ls-files", "--others", "-z"])?;
@@ -435,6 +473,19 @@ fn scan_files(root: &Path, gitignore: &str, threshold: u64) -> Result<Scan> {
             continue;
         }
         consider(p, false);
+    }
+    // A deletion already staged (`git rm`) is gone from the index, so the
+    // loop above never sees it; the seeded release index would restore it.
+    if git(root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() {
+        let staged = git_nul(
+            root,
+            &["diff", "--cached", "--name-only", "--diff-filter=D", "-z"],
+        )?;
+        for p in staged {
+            if !p.starts_with(".twigpine/") && !tracked.contains(&p) {
+                scan.deleted.push(p);
+            }
+        }
     }
     scan.git_files.sort();
     scan.chunked_files.sort();
@@ -677,6 +728,7 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     let kp = load_keypair_from_dir(args.dir.as_deref())?;
     let root = repo_root()?;
     let git_dir = git_dir(&root)?;
+    let _publish_lock = acquire_publish_lock(&git_dir)?;
     let (remote_name, owner, name) = detect_remote(&root)?;
     let branch = match &args.branch {
         Some(b) => b.clone(),
@@ -955,12 +1007,7 @@ async fn cmd_publish(args: PublishArgs) -> Result<()> {
     //    paths that exist go in the first stage; the release metadata
     //    follows after it is written below.
     let index_path = git_dir.join("twigpine-model-index");
-    let _ = std::fs::remove_file(&index_path);
-    if git(&root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() {
-        git_index(&root, &index_path, &["read-tree", "HEAD"])?;
-    } else {
-        git_index(&root, &index_path, &["read-tree", "--empty"])?;
-    }
+    seed_release_index(&root, &index_path, &scan.chunked_files)?;
     let pathspec_path = git_dir.join("twigpine-model-pathspec");
     {
         let mut spec = Vec::new();
@@ -1622,5 +1669,91 @@ mod tests {
         assert_eq!(scan.deleted, vec!["gone.txt"]);
         assert!(scan.git_files.contains(&"kept.txt".to_string()));
         assert!(!scan.git_files.contains(&"gone.txt".to_string()));
+    }
+
+    fn tcommit_all(root: &Path) {
+        tgit(
+            root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+    }
+
+    fn index_listing(root: &Path, index: &Path) -> Vec<String> {
+        let out = git_index(root, index, &["ls-files"]).unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_publish_lock_is_exclusive_while_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_publish_lock(dir.path()).unwrap();
+        assert!(acquire_publish_lock(dir.path()).is_err());
+        drop(first);
+        assert!(acquire_publish_lock(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn a_head_weight_file_made_chunked_leaves_the_release_index() {
+        let dir = trepo();
+        std::fs::write(dir.path().join("weights.bin"), vec![7u8; 4096]).unwrap();
+        std::fs::write(dir.path().join("kept.txt"), b"y").unwrap();
+        tgit(dir.path(), &["add", "weights.bin", "kept.txt"]);
+        tcommit_all(dir.path());
+        tgit(dir.path(), &["rm", "--cached", "-q", "weights.bin"]);
+        let scan = scan_files(dir.path(), "", 1024).unwrap();
+        assert_eq!(scan.chunked_files, vec!["weights.bin"]);
+        let index = dir.path().join(".git").join("twigpine-model-index");
+        seed_release_index(dir.path(), &index, &scan.chunked_files).unwrap();
+        let listed = index_listing(dir.path(), &index);
+        assert!(!listed.contains(&"weights.bin".to_string()));
+        assert!(listed.contains(&"kept.txt".to_string()));
+    }
+
+    #[test]
+    fn a_staged_deletion_is_recorded_and_dropped_from_the_release_index() {
+        let dir = trepo();
+        std::fs::write(dir.path().join("gone.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("kept.txt"), b"y").unwrap();
+        tgit(dir.path(), &["add", "gone.txt", "kept.txt"]);
+        tcommit_all(dir.path());
+        tgit(dir.path(), &["rm", "-q", "gone.txt"]);
+        let scan = scan_files(dir.path(), "", 1024).unwrap();
+        assert_eq!(scan.deleted, vec!["gone.txt"]);
+        let index = dir.path().join(".git").join("twigpine-model-index");
+        seed_release_index(dir.path(), &index, &scan.chunked_files).unwrap();
+        let spec = dir.path().join(".git").join("tmp-pathspec");
+        let mut bytes = Vec::new();
+        for p in scan.git_files.iter().chain(&scan.deleted) {
+            bytes.extend_from_slice(p.as_bytes());
+            bytes.push(0);
+        }
+        std::fs::write(&spec, bytes).unwrap();
+        git_index(
+            dir.path(),
+            &index,
+            &[
+                "--literal-pathspecs",
+                "add",
+                "-A",
+                "--pathspec-file-nul",
+                &format!("--pathspec-from-file={}", spec.display()),
+            ],
+        )
+        .unwrap();
+        let listed = index_listing(dir.path(), &index);
+        assert!(!listed.contains(&"gone.txt".to_string()));
+        assert!(listed.contains(&"kept.txt".to_string()));
     }
 }

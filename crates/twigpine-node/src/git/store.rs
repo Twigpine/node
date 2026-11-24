@@ -404,6 +404,20 @@ pub(crate) async fn run_git_bounded(
         .map_err(|_| anyhow::anyhow!("{label} timed out"))?
 }
 
+/// Captured git output passed the cap given to [`run_git_bounded_capped`].
+#[derive(Debug)]
+pub(crate) struct OutputTooLarge {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for OutputTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "git output exceeded {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for OutputTooLarge {}
+
 /// [`run_git_bounded`] plus a hard cap on captured stdout: reads the pipe
 /// incrementally and kills the child the moment output exceeds
 /// `max_stdout`, so a huge blob never lands fully in memory. Other callers
@@ -470,7 +484,7 @@ pub(crate) async fn run_git_bounded_capped(
             let _ = child.kill().await;
             let _ = child.wait().await;
             let _ = err_task.await;
-            anyhow::bail!("{label} output exceeded {max_stdout} bytes");
+            return Err(anyhow::Error::new(OutputTooLarge { limit: max_stdout }));
         }
         let stderr = err_task.await.unwrap_or_default();
         let status = child.wait().await.context(format!("{label} wait"))?;
@@ -483,6 +497,87 @@ pub(crate) async fn run_git_bounded_capped(
     tokio::time::timeout(timeout, fut)
         .await
         .map_err(|_| anyhow::anyhow!("{label} timed out"))?
+}
+
+/// Digest of a blob streamed out of `git cat-file blob`.
+pub(crate) struct BlobDigest {
+    pub sha256_hex: String,
+    pub size: u64,
+    pub head: Vec<u8>,
+}
+
+/// Streams a git blob through SHA-256, keeping only the first `head_len`
+/// bytes, so a blob of any size is verified without being held whole.
+/// `None` when the path is missing inside a real commit (exit 128).
+pub(crate) async fn run_git_blob_digest(
+    git_bin: &str,
+    repo_path: &Path,
+    spec: &str,
+    timeout: std::time::Duration,
+    head_len: usize,
+) -> Result<Option<BlobDigest>> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command as AsyncCommand;
+    let fut = async {
+        let mut cmd = AsyncCommand::new(git_bin);
+        cmd.kill_on_drop(true);
+        cmd.args(["cat-file", "blob", spec]).current_dir(repo_path);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
+        let mut child = cmd.spawn().context("git cat-file spawn failed")?;
+        let mut stderr = child.stderr.take();
+        let err_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut e) = stderr.take() {
+                let _ = e.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        let mut head = Vec::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                match pipe.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        hasher.update(&chunk[..n]);
+                        size += n as u64;
+                        if head.len() < head_len {
+                            let take = (head_len - head.len()).min(n);
+                            head.extend_from_slice(&chunk[..take]);
+                        }
+                    }
+                    Err(e) => return Err(anyhow::Error::new(e).context("git cat-file read")),
+                }
+            }
+        }
+        let stderr = err_task.await.unwrap_or_default();
+        let status = child.wait().await.context("git cat-file wait")?;
+        if status.success() {
+            return Ok(Some(BlobDigest {
+                sha256_hex: hex::encode(hasher.finalize()),
+                size,
+                head,
+            }));
+        }
+        match status.code() {
+            Some(128) => Ok(None),
+            _ => bail!(
+                "git cat-file blob {spec} failed: {}",
+                String::from_utf8_lossy(&stderr)
+                    .chars()
+                    .take(256)
+                    .collect::<String>()
+            ),
+        }
+    };
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("git cat-file timed out"))?
 }
 
 /// Bounded [`list_refs`]: same listing through the configured git binary
