@@ -518,11 +518,11 @@ fn scan_files(root: &Path, gitignore: &str, threshold: u64) -> Result<Scan> {
 fn release_pathspec(scan: &Scan, stage_gitignore: bool) -> Vec<u8> {
     let chunked: HashSet<&str> = scan.chunked_files.iter().map(String::as_str).collect();
     let mut spec = Vec::new();
-    for p in scan
-        .git_files
-        .iter()
-        .chain(scan.deleted.iter().filter(|p| !chunked.contains(p.as_str())))
-    {
+    for p in scan.git_files.iter().chain(
+        scan.deleted
+            .iter()
+            .filter(|p| !chunked.contains(p.as_str())),
+    ) {
         spec.extend_from_slice(p.as_bytes());
         spec.push(0);
     }
