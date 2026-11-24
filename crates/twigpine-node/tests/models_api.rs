@@ -1288,7 +1288,10 @@ async fn reconstruction_store_failure_is_500_not_404(pool: sqlx::PgPool) {
         &bounded_client(),
         reqwest::Method::GET,
         &node.base_url,
-        &format!("{}/reconstruction", release_path(&owner_did, "model", &commit)),
+        &format!(
+            "{}/reconstruction",
+            release_path(&owner_did, "model", &commit)
+        ),
         Vec::new(),
         &owner,
     )

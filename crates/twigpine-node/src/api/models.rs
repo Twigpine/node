@@ -469,7 +469,9 @@ pub async fn get_model_reconstruction(
     let size = match store.size(&id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return Err(AppError::NotFound("reconstruction object not stored".into()));
+            return Err(AppError::NotFound(
+                "reconstruction object not stored".into(),
+            ));
         }
         Err(e) => {
             return Err(AppError::Internal(anyhow::anyhow!(
@@ -480,9 +482,7 @@ pub async fn get_model_reconstruction(
     // Stream the object straight into the response body: buffering the whole
     // reconstruction object per anonymous GET would be an uncapped read.
     let stream = store.get_range(&id, 0, size).await.map_err(|e| match e {
-        BlockStoreError::NotFound => {
-            AppError::NotFound("reconstruction object not stored".into())
-        }
+        BlockStoreError::NotFound => AppError::NotFound("reconstruction object not stored".into()),
         other => AppError::Internal(anyhow::anyhow!("reconstruction read failed: {other}")),
     })?;
     Ok((
