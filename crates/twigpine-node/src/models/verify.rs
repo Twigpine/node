@@ -69,6 +69,12 @@ pub async fn verify_release(state: &AppState, release_id: i64) -> Result<(), App
     {
         Ok(v) => v,
         Err(e) => {
+            // An internal failure (git spawn, IO) is transient: propagate so
+            // the worker's bounded retry applies. Deterministic errors (a
+            // bad signature, a missing file, malformed input) settle here.
+            if matches!(e, AppError::Internal(_)) {
+                return Err(e);
+            }
             return reject_release(state, release_id, &format!("manifest re-check failed: {e}"))
                 .await;
         }
@@ -806,6 +812,91 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("release row")
+    }
+
+    /// A transient manifest read failure (git spawn) must propagate as
+    /// Internal so the worker retries, leaving the release `verifying`; a
+    /// deterministic failure like a rejected signature still rejects.
+    #[sqlx::test]
+    async fn an_internal_read_retries_but_a_bad_signature_rejects(pool: sqlx::PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, release_id, _commit) = verify_fixture(
+            &pool,
+            dir.path(),
+            &[("a.txt", b"hi\n")],
+            &["a.txt"],
+        )
+        .await;
+
+        // Forced internal failure: the git binary cannot spawn.
+        state.git_bin = "/nonexistent/git".to_string();
+        let err = verify_release(&state, release_id)
+            .await
+            .expect_err("an internal read failure propagates");
+        assert!(matches!(err, AppError::Internal(_)), "{err:?}");
+        let (state_str, _) = release_state(&pool, release_id).await;
+        assert_eq!(
+            state_str, "verifying",
+            "a retryable failure must not settle the row"
+        );
+
+        // A deterministic failure still rejects: a second commit carrying
+        // a signature that does not verify. The first row stays `verifying`
+        // (that is the point of the leg above), but the one-verifying-per-
+        // publisher index admits no second row until it settles.
+        sqlx::query("UPDATE model_releases SET state = 'rejected' WHERE id = $1")
+            .bind(release_id)
+            .execute(&pool)
+            .await
+            .expect("settle first row for leg two");
+        state.git_bin = "git".to_string();
+        std::fs::write(dir.path().join(".twigpine/model-release.sig"), "AAAA").expect("bad sig");
+        git(dir.path(), &["add", ".twigpine/model-release.sig"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "r2",
+            ],
+        );
+        let commit2 = git(dir.path(), &["rev-parse", "HEAD"]);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let owner_did =
+            twigpine_core::did::Did::from_verifying_key(&signing.verifying_key()).to_string();
+        let manifest_sha = twigpine_core::cid::sha256_hex(
+            &std::fs::read(dir.path().join(".twigpine/model-release.json")).expect("manifest"),
+        );
+        let release_id2: i64 = sqlx::query_scalar(
+            "INSERT INTO model_releases
+                 (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
+                  claim_signature, claim_signature_input, claim_signing_string,
+                  claim_body, claim_request_digest, created_at)
+             VALUES ('r1', $1, 'main', $2, 'verifying', $3, 's', 'i', 'ss',
+                     decode('00','hex'), 'd2', $4)
+             RETURNING id",
+        )
+        .bind(&commit2)
+        .bind(&owner_did)
+        .bind(manifest_sha)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&pool)
+        .await
+        .expect("release row");
+        verify_release(&state, release_id2)
+            .await
+            .expect("verify call");
+        let (state_str, reason) = release_state(&pool, release_id2).await;
+        assert_eq!(state_str, "rejected");
+        assert!(
+            reason
+                .expect("failure_reason")
+                .contains("manifest re-check failed"),
+        );
     }
 
     /// A git-stored manifest file whose name needs quoting under
