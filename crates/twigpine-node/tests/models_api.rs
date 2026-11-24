@@ -1239,6 +1239,54 @@ async fn release_get_published_unknown_and_private(pool: sqlx::PgPool) {
     node.shutdown().await;
 }
 
+/// A block-store failure on the reconstruction GET is a 500: collapsing it
+/// to 404 both hides a live release and reports an outage as absence.
+#[sqlx::test]
+async fn reconstruction_store_failure_is_500_not_404(pool: sqlx::PgPool) {
+    let repos_dir = tempfile::tempdir().expect("repos dir");
+    let block_dir = tempfile::tempdir().expect("block dir");
+    let inner: std::sync::Arc<dyn BlockStore> = std::sync::Arc::new(
+        twigpine_node::blockstore::fs::FsBlockStore::new(block_dir.path().to_path_buf())
+            .expect("fs store"),
+    );
+    let store = FaultStore {
+        inner: Some(inner),
+        size_err: true,
+        ..Default::default()
+    };
+    let node = spawn_node_with_store(
+        pool.clone(),
+        repos_dir.path().to_path_buf(),
+        std::sync::Arc::new(store),
+    )
+    .await;
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let repo_id = node.seed_repo(&owner_did, "model", true).await;
+    let commit = "e".repeat(40);
+    node.seed_model_release(&repo_id, &commit, &owner_did).await;
+    sqlx::query("UPDATE model_releases SET reconstruction_sha256 = $1 WHERE repo_id = $2")
+        .bind(sha256_hex(b"reconstruction"))
+        .bind(&repo_id)
+        .execute(&pool)
+        .await
+        .expect("set reconstruction sha");
+
+    let resp = signed_request(
+        &bounded_client(),
+        reqwest::Method::GET,
+        &node.base_url,
+        &format!("{}/reconstruction", release_path(&owner_did, "model", &commit)),
+        Vec::new(),
+        &owner,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 500);
+    node.shutdown().await;
+}
+
 /// The reconstruction GET and the claims POST hide a repo that is not fully
 /// public: callers who fail the read gate (anonymous, stranger) get the same
 /// 404 and none reach the store or the commit lookup. The owner can read the

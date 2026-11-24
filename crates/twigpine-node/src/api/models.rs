@@ -461,23 +461,30 @@ pub async fn get_model_reconstruction(
         ));
     };
     let store = state.block_store.clone().expect("checked above");
-    let size = store
-        .size(
-            &BlockId::parse(&sha)
-                .map_err(|_| AppError::NotFound("reconstruction object not stored".into()))?,
-        )
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| AppError::NotFound("reconstruction object not stored".into()))?;
-    // Stream the object straight into the response body: buffering the whole
-    // reconstruction object per anonymous GET would be an uncapped read.
+    // Only confirmed absence is a 404: an unparsable id, a proven-empty
+    // size lookup, or the store's own NotFound. A backend failure is a
+    // 500, never an existence-hiding 404.
     let id = BlockId::parse(&sha)
         .map_err(|_| AppError::NotFound("reconstruction object not stored".into()))?;
-    let stream = store
-        .get_range(&id, 0, size)
-        .await
-        .map_err(|_| AppError::NotFound("reconstruction object not stored".into()))?;
+    let size = match store.size(&id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err(AppError::NotFound("reconstruction object not stored".into()));
+        }
+        Err(e) => {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "reconstruction size lookup failed: {e}"
+            )));
+        }
+    };
+    // Stream the object straight into the response body: buffering the whole
+    // reconstruction object per anonymous GET would be an uncapped read.
+    let stream = store.get_range(&id, 0, size).await.map_err(|e| match e {
+        BlockStoreError::NotFound => {
+            AppError::NotFound("reconstruction object not stored".into())
+        }
+        other => AppError::Internal(anyhow::anyhow!("reconstruction read failed: {other}")),
+    })?;
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         axum::body::Body::from_stream(stream),
