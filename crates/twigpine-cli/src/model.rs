@@ -675,9 +675,7 @@ fn sync_index_to_head(root: &Path, git_dir: &Path, paths: &[String]) -> Result<(
 /// no .gitignore to stage (a git-only release) or when the scan already
 /// lists it, so it never appears twice.
 fn staged_gitignore_entry(root: &Path, index: &Path, scan: &Scan) -> Result<Option<ManifestFile>> {
-    if !root.join(".gitignore").is_file()
-        || scan.git_files.iter().any(|p| p == ".gitignore")
-    {
+    if !root.join(".gitignore").is_file() || scan.git_files.iter().any(|p| p == ".gitignore") {
         return Ok(None);
     }
     let bytes = staged_blob(root, index, ".gitignore")?;
