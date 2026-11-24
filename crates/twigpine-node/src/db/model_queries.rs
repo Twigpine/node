@@ -287,12 +287,10 @@ impl Db {
                 // A live link restarts the grace clock: keeping a stale
                 // unreferenced_since would let the next sweep delete the
                 // block on the old stamp the moment the link drops again.
-                sqlx::query(
-                    "UPDATE model_blocks SET unreferenced_since = NULL WHERE sha256 = $1",
-                )
-                .bind(block_sha)
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query("UPDATE model_blocks SET unreferenced_since = NULL WHERE sha256 = $1")
+                    .bind(block_sha)
+                    .execute(&mut *tx)
+                    .await?;
             }
             rows
         };
