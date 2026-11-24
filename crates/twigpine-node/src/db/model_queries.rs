@@ -241,6 +241,13 @@ impl Db {
         admitted: i64,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
+        // The own_release_carries read and the link insert must serialize
+        // with claim's release-link insert: a repeat PUT that reads false
+        // just before a claim moves the block would keep its charge and
+        // double-count it. Same order as claim_release (advisory first,
+        // then rows), so no deadlock is introduced.
+        self.model_tx_advisory_lock(&mut tx, crate::models::CLAIM_LOCK_KEY)
+            .await?;
         sqlx::query(
             "INSERT INTO model_blocks (sha256, size, created_at, unreferenced_since)
              VALUES ($1, $2, $3, $3)
@@ -1102,6 +1109,37 @@ mod tests {
         assert!(db.model_record_block(&s.id, &sha, 100, 100).await.unwrap());
         let s2 = db.model_load_session(&s.id).await.unwrap().unwrap();
         assert_eq!(s2.bytes_received, 100);
+    }
+
+    #[sqlx::test]
+    async fn record_block_serializes_with_the_claim_lock(pool: sqlx::PgPool) {
+        let db = migrated(pool.clone()).await;
+        let s = db
+            .model_open_session("did:owner", "r1", 3600)
+            .await
+            .unwrap();
+        // A second Db over the same pool gets its own connection for the
+        // blocked call.
+        let db2 = Db::for_testing(pool.clone());
+        let sid = s.id.clone();
+        let mut tx = db.model_begin().await.unwrap();
+        db.model_tx_advisory_lock(&mut tx, crate::models::CLAIM_LOCK_KEY)
+            .await
+            .unwrap();
+        let mut handle = tokio::spawn(async move {
+            db2.model_record_block(&sid, &"c".repeat(64), 100, 100).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
+                .await
+                .is_err(),
+            "model_record_block must wait for the claim lock"
+        );
+        tx.commit().await.unwrap();
+        handle
+            .await
+            .expect("task joins")
+            .expect("record_block completes");
     }
 
     #[sqlx::test]
