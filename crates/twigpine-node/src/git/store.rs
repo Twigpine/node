@@ -514,7 +514,8 @@ pub(crate) struct BlobDigest {
 
 /// Streams a git blob through SHA-256, keeping only the first `head_len`
 /// bytes, so a blob of any size is verified without being held whole.
-/// `None` when the path is missing inside a real commit (exit 128).
+/// `None` only when `ls-tree` proves the path absent from a valid commit;
+/// every other failure (including a cat-file exit 128) is an `Err`.
 pub(crate) async fn run_git_blob_digest(
     git_bin: &str,
     repo_path: &Path,
@@ -526,6 +527,34 @@ pub(crate) async fn run_git_blob_digest(
     use tokio::io::AsyncReadExt;
     use tokio::process::Command as AsyncCommand;
     let fut = async {
+        // Membership probe first: exit 128 from cat-file also covers
+        // invalid git config and other failures, so absence must be proven
+        // by an empty ls-tree, not inferred from the cat-file exit code.
+        // A failed probe is an Err so the verifier's retry applies.
+        let (rev, path) = spec
+            .split_once(':')
+            .context("blob spec must be <rev>:<path>")?;
+        let tree = run_git_bounded(
+            git_bin,
+            repo_path,
+            &["ls-tree", "-z", rev, "--", path],
+            b"",
+            timeout,
+            "git ls-tree",
+        )
+        .await?;
+        if !tree.status.success() {
+            bail!(
+                "git ls-tree {rev} -- {path} failed: {}",
+                String::from_utf8_lossy(&tree.stderr)
+                    .chars()
+                    .take(256)
+                    .collect::<String>()
+            );
+        }
+        if tree.stdout.is_empty() {
+            return Ok(None);
+        }
         // allow-unbounded-git: bounded by the tokio::time::timeout wrapping
         // this future, plus kill_on_drop.
         let mut cmd = AsyncCommand::new(git_bin);
@@ -572,16 +601,15 @@ pub(crate) async fn run_git_blob_digest(
                 head,
             }));
         }
-        match status.code() {
-            Some(128) => Ok(None),
-            _ => bail!(
-                "git cat-file blob {spec} failed: {}",
-                String::from_utf8_lossy(&stderr)
-                    .chars()
-                    .take(256)
-                    .collect::<String>()
-            ),
-        }
+        // ls-tree already confirmed the blob exists in the commit, so any
+        // cat-file failure (including 128) is an error, not absence.
+        bail!(
+            "git cat-file blob {spec} failed: {}",
+            String::from_utf8_lossy(&stderr)
+                .chars()
+                .take(256)
+                .collect::<String>()
+        )
     };
     tokio::time::timeout(timeout, fut)
         .await
@@ -4000,5 +4028,56 @@ mod tests {
             super::log(&not_a_repo, "HEAD", 10).is_err(),
             "a rev-parse probe failure must not read as an empty repo"
         );
+    }
+
+    /// `run_git_blob_digest` answers `None` only for a proven-absent path:
+    /// a missing name inside a valid commit. A real blob with git broken
+    /// underneath it is an `Err`, so the verifier's retry sees a failure,
+    /// not a false absence.
+    #[tokio::test]
+    async fn blob_digest_none_only_for_confirmed_absence() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work: &Path = td.path();
+        let g = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap()
+                .success());
+        };
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(work.join("f.txt"), b"blob-bytes\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+
+        let timeout = std::time::Duration::from_secs(30);
+        let digest = super::run_git_blob_digest("git", work, "HEAD:f.txt", timeout, 8)
+            .await
+            .expect("digest runs")
+            .expect("present blob digests");
+        assert_eq!(
+            digest.sha256_hex,
+            twigpine_core::cid::sha256_hex(b"blob-bytes\n")
+        );
+
+        // A path absent from the commit is a confirmed None.
+        assert!(super::run_git_blob_digest("git", work, "HEAD:nope.txt", timeout, 8)
+            .await
+            .expect("absent probe runs")
+            .is_none());
+
+        // A malformed .git/config breaks git itself: the present blob must
+        // be an Err, not a false None. The same failure on the absent path
+        // is an Err too.
+        std::fs::write(work.join(".git/config"), b"not [valid").unwrap();
+        assert!(super::run_git_blob_digest("git", work, "HEAD:f.txt", timeout, 8)
+            .await
+            .is_err());
+        assert!(super::run_git_blob_digest("git", work, "HEAD:nope.txt", timeout, 8)
+            .await
+            .is_err());
     }
 }
