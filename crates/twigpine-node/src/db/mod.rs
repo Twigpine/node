@@ -14650,7 +14650,7 @@ mod migration_tests {
             .map(|m| m.version)
             .filter(|v| *v < V50)
             .max()
-            .expect("MIGRATIONS must declare a version below 51");
+            .expect("MIGRATIONS must declare a version below 50");
         let recorded_max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
             .fetch_one(&db.pool)
             .await
