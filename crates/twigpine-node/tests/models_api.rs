@@ -875,6 +875,54 @@ async fn put_block_object_vanishing_before_link_fails_closed(pool: sqlx::PgPool)
     node.shutdown().await;
 }
 
+/// The object vanishes after a DUPLICATE record: this request linked and
+/// charged nothing, so the failure arm must leave the earlier link and the
+/// session's charge alone.
+#[sqlx::test]
+async fn put_block_vanishing_after_duplicate_keeps_the_first_link(pool: sqlx::PgPool) {
+    let (node, _inner, owner_did, session, _r, _b) = fault_node(&pool, |s| s.vanish = true).await;
+    let body = b"duplicate-vanishing".to_vec();
+    let sha = sha256_hex(&body);
+    // Seed the state a first successful PUT would leave: block row, link,
+    // and the charge.
+    sqlx::query("INSERT INTO model_blocks (sha256, size, created_at) VALUES ($1, $2, 't')")
+        .bind(&sha)
+        .bind(body.len() as i64)
+        .execute(&pool)
+        .await
+        .expect("seed block row");
+    sqlx::query("INSERT INTO model_session_blocks (session_id, block_sha256) VALUES ($1, $2)")
+        .bind(&session)
+        .bind(&sha)
+        .execute(&pool)
+        .await
+        .expect("seed session link");
+    sqlx::query("UPDATE model_upload_sessions SET bytes_received = $2 WHERE id = $1")
+        .bind(&session)
+        .bind(body.len() as i64)
+        .execute(&pool)
+        .await
+        .expect("seed charge");
+    let resp = put_block(
+        &bounded_client(),
+        &node.base_url,
+        &blocks_path(&owner_did, "model", &sha),
+        Some(&session),
+        body.clone(),
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 409);
+    let (received, linked, rows) = session_block_state(&pool, &session, &sha).await;
+    assert_eq!(
+        (received, linked, rows),
+        (body.len() as i64, 1, 1),
+        "the first PUT's link and charge are not this request's to undo"
+    );
+    node.shutdown().await;
+}
+
 /// A session bearer that declares a small Content-Length but streams a larger
 /// valid block must not get the larger block stored under the small charge.
 /// Both framing headers are sent so the body is read to EOF by chunked

@@ -294,14 +294,18 @@ pub async fn put_model_block(
             Ok(duplicate) => match store.size(&block_id).await {
                 Ok(Some(_)) => Ok(duplicate),
                 _ => {
-                    let unlinked = bookkeep_db
-                        .model_unlink_session_block(&bookkeep_session, &bookkeep_sha)
-                        .await
-                        .unwrap_or(false);
-                    if unlinked && !duplicate {
-                        let _ = bookkeep_db
-                            .model_refund_bytes(&bookkeep_session, declared as i64)
-                            .await;
+                    // A duplicate request created no link: there is nothing
+                    // of this request's to unlink or refund.
+                    if !duplicate {
+                        let unlinked = bookkeep_db
+                            .model_unlink_session_block(&bookkeep_session, &bookkeep_sha)
+                            .await
+                            .unwrap_or(false);
+                        if unlinked {
+                            let _ = bookkeep_db
+                                .model_refund_bytes(&bookkeep_session, declared as i64)
+                                .await;
+                        }
                     }
                     Err(AppError::Conflict(
                         "the block disappeared before it could be linked; re-send it".into(),
