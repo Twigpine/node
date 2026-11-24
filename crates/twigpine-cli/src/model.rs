@@ -429,24 +429,29 @@ fn scan_files(root: &Path, gitignore: &str, threshold: u64) -> Result<Scan> {
         skipped_ignored: Vec::new(),
         deleted: Vec::new(),
     };
-    let mut consider = |path: &str, is_tracked: bool| {
+    let mut consider = |path: &str, is_tracked: bool| -> Result<()> {
         if path.starts_with(".twigpine/") {
-            return; // release metadata is never a manifest file
+            return Ok(()); // release metadata is never a manifest file
         }
         // A path that vanished between listing and stat is not publishable;
         // a tracked one records an unstaged deletion the commit must carry
-        // so the released tree drops the file too.
+        // so the released tree drops the file too. Only NotFound is absence:
+        // anything else (a permission denial, a dangling loop) fails the scan
+        // rather than publishing a silent deletion.
         let meta = match std::fs::symlink_metadata(root.join(path)) {
             Ok(m) => m,
-            Err(_) => {
-                if is_tracked {
-                    scan.deleted.push(path.to_string());
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    if is_tracked {
+                        scan.deleted.push(path.to_string());
+                    }
+                    return Ok(());
                 }
-                return;
+                bail!("cannot stat {}", root.join(path).display());
             }
         };
         if !meta.is_file() && !meta.file_type().is_symlink() {
-            return;
+            return Ok(());
         }
         let ignored = !is_tracked && !unignored.contains(path);
         match classify(
@@ -465,16 +470,17 @@ fn scan_files(root: &Path, gitignore: &str, threshold: u64) -> Result<Scan> {
                 }
             }
         }
+        Ok(())
     };
 
     for p in &tracked {
-        consider(p, true);
+        consider(p, true)?;
     }
     for p in &others {
         if tracked.contains(p) {
             continue;
         }
-        consider(p, false);
+        consider(p, false)?;
     }
     // A deletion already staged (`git rm`) is gone from the index, so the
     // loop above never sees it; the seeded release index would restore it.
@@ -1721,6 +1727,31 @@ mod tests {
         let listed = index_listing(dir.path(), &index);
         assert!(!listed.contains(&"weights.bin".to_string()));
         assert!(listed.contains(&"kept.txt".to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stat_error_other_than_absence_fails_the_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = trepo();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/kept.txt"), b"y").unwrap();
+        tgit(dir.path(), &["add", "."]);
+        tcommit_all(dir.path());
+        // An unreadable directory makes symlink_metadata fail with
+        // PermissionDenied: that is not "file deleted".
+        std::fs::set_permissions(
+            dir.path().join("sub"),
+            std::fs::Permissions::from_mode(0),
+        )
+        .unwrap();
+        let err = scan_files(dir.path(), "", 1024).err().expect("scan fails");
+        std::fs::set_permissions(
+            dir.path().join("sub"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(err.to_string().contains("sub/kept.txt"), "{err}");
     }
 
     #[test]
