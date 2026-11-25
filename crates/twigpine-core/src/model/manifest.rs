@@ -203,7 +203,13 @@ pub fn detect_format(first_bytes: &[u8], path: &str) -> FileFormat {
         return FileFormat::Pickle;
     }
     let lower = path.to_ascii_lowercase();
-    let ext = lower.rsplit('.').next().unwrap_or("");
+    // Only a '.' in the final path component makes an extension: an
+    // extensionless file named `bin` or `json` must not type itself.
+    let ext = lower
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.').map(|(_, e)| e))
+        .unwrap_or("");
     // Torch/HF checkpoints are zip archives containing pickled tensors.
     if first_bytes.starts_with(b"PK\x03\x04") && matches!(ext, "bin" | "pt" | "pth" | "ckpt") {
         return FileFormat::Pickle;
@@ -394,6 +400,13 @@ mod tests {
             detect_format(b"\x00\x01\x02", "blob.weird"),
             FileFormat::Other
         );
+        // An extensionless final component has no extension, even when the
+        // name itself spells one.
+        assert_eq!(detect_format(b"PK\x03\x04z", "bin"), FileFormat::Other);
+        assert_eq!(detect_format(b"{\"a\":1}", "json"), FileFormat::Other);
+        assert_eq!(detect_format(b"PK\x03\x04z", "m.bin"), FileFormat::Pickle);
+        assert_eq!(detect_format(b"(dp0\n.", "m.pkl"), FileFormat::Pickle);
+        assert_eq!(detect_format(b"{\"a\":1}", "m.json"), FileFormat::Text);
     }
 
     /// Regenerate the frozen fixture (run once, deliberately):

@@ -1056,6 +1056,86 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             id_source: IdSource::FailableTaskId,
             anon_read: AnonRead::Deny404,
         },
+        // ── Model hosting (U5/U6). Session open and release claim are signed
+        //    owner-gated writes behind the shared read gate; the session-status
+        //    GET is doubly gated like list_webhooks (OwnerGate + ReadGate rows).
+        //    The unsigned block PUT's bearer session is its credential, and the
+        //    release/reconstruction reads are plain read-gated 404-deny GETs.
+        Row {
+            method: "POST",
+            path: "/api/v1/repos/{owner}/{repo}/models/sessions",
+            gate: GateClass::OwnerGate,
+            handler: "models::open_model_session",
+            // Option<Json<OpenSessionBody>> accepts an empty object; the owner
+            // twin then creates a session (201, Not403).
+            body: Some(r#"{}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/repos/{owner}/{repo}/models/claims",
+            gate: GateClass::OwnerGate,
+            handler: "models::claim_model_release",
+            // A well-formed claim body; the owner twin passes the owner gate and
+            // fails the commit lookup (the seeded placeholder disk_path makes
+            // it a 500 today, a real on-disk repo would make it 400), which is
+            // still a Not403 twin.
+            body: Some(r#"{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branch":"main"}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // Session status: a signed stranger on the PUBLIC repo passes the read
+        // gate and hits require_repo_owner (403); the owner gets a 404 on the
+        // absent session (Not403). The read layer is the ReadGate row below.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/models/sessions/{id}",
+            gate: GateClass::OwnerGate,
+            handler: "models::get_model_session",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // Same path, READ layer: anon gets 401 (the route requires a signature),
+        // a signed non-reader of the private repo gets the existence-hiding 404,
+        // and the owner reads the session the fixture seeded as id "1".
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/models/sessions/{id}",
+            gate: GateClass::ReadGate,
+            handler: "models::get_model_session",
+            body: None,
+            needs: &["model_session"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny401,
+        },
+        // Release status: optional-signature read. The fixture seeds a published
+        // release on the private repo under commit 40 a's (the {sha} fill), so
+        // anon/stranger get the existence-hiding 404 and the owner gets a 200.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/models/releases/{sha}",
+            gate: GateClass::ReadGate,
+            handler: "models::get_model_release",
+            body: None,
+            needs: &["model_release"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
         // The read-gate handlers NOT driven here (deferred GET reads, read-gating
         // mutations, git smart-HTTP reads, the content-addressed read, and the
         // global list-filters) are no longer tracked by free-text prose: they are

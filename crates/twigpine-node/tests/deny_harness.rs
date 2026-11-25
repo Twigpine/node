@@ -1430,6 +1430,24 @@ mod completeness {
         ("git_upload_pack", NotDrivenReason::GitSmartHttpRead),
         // Global list-FILTER: 200 with unreadable rows removed, never a 404.
         ("list_all_bounties", NotDrivenReason::GlobalListFilter),
+        // Model hosting writes: the session open, claim, and unsigned block
+        // PUT all read-gate the repo before their own credential checks. None
+        // is a 404-deny GET; the owner-gate rows drive the signed writes, and
+        // the bearer-session PUT's denies are covered by the models unit
+        // tests (a session row cannot be seeded through the public API for
+        // the stranger leg).
+        ("open_model_session", NotDrivenReason::ReadGatingMutation),
+        ("claim_model_release", NotDrivenReason::ReadGatingMutation),
+        ("put_model_block", NotDrivenReason::ReadGatingMutation),
+        // get_model_reconstruction's owner-2xx twin needs a completed claim:
+        // a signed manifest commit in git plus a real reconstruction object
+        // in the block store, substrate the fixture cannot seed through the
+        // public API. Its hostile 404 is still what a caller sees; only the
+        // twin lacks a drivable 2xx.
+        (
+            "get_model_reconstruction",
+            NotDrivenReason::ExternalDependencyUnavailable,
+        ),
     ];
 
     /// Every `.route("<path>", <method>(<handler>)…)` mount in `src`, as

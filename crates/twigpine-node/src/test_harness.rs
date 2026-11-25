@@ -156,7 +156,12 @@ fn unique_repos_dir() -> PathBuf {
 /// Build an [`AppState`] over the given migrated pool, mirroring
 /// `test_support::build_state` but with a real on-disk repository directory so
 /// git smart-HTTP routes can serve. P2P is always disabled.
-fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppState {
+fn build_state(
+    db: Arc<crate::db::Db>,
+    pool: PgPool,
+    repos_dir: PathBuf,
+    block_store: Arc<dyn crate::blockstore::BlockStore>,
+) -> AppState {
     let keypair = Keypair::generate();
     let scan_token_key = crate::state::AppState::derive_scan_token_key(&keypair);
     let webhook_secret_key = crate::state::AppState::derive_webhook_secret_key(&keypair);
@@ -176,6 +181,11 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
         task_tx.clone(),
         task_cursor_key.clone(),
     ));
+    // Model hosting is ON for the harness node: a filesystem block store in a
+    // temp dir mounts the model routes so the deny sweep can drive their
+    // gates for real. Writes land inside the node's per-test repos dir and
+    // are removed with it.
+    let block_store: Option<Arc<dyn crate::blockstore::BlockStore>> = Some(block_store);
     AppState {
         config: Arc::new(Config::parse_from(["twigpine-node"])),
         db,
@@ -228,7 +238,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
             16,
         ),
         git_bin: "git".to_string(),
-        block_store: None,
+        block_store,
     }
 }
 
@@ -238,15 +248,99 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppS
 /// connect-info so per-IP layers key on the real peer. Returns once the socket
 /// is bound and accepting connections.
 pub async fn spawn_node(pool: PgPool) -> TestNode {
+    let repos_dir = unique_repos_dir();
+    std::fs::create_dir_all(&repos_dir).expect("create temp repos dir");
+    let block_dir = repos_dir.join("model-blocks");
+    std::fs::create_dir_all(&block_dir).expect("create temp block dir");
+    let block_store: Arc<dyn crate::blockstore::BlockStore> =
+        Arc::new(crate::blockstore::fs::FsBlockStore::new(block_dir).expect("fs block store"));
+    spawn_node_with_store(pool, repos_dir, block_store).await
+}
+
+/// A [`crate::blockstore::BlockStore`] wrapper that fails the next `size()`
+/// call once with a backend error, then delegates everything. The upload
+/// handler's post-put failure tails are unreachable without a fault seam, so
+/// the harness provides this one instead of a mock framework.
+pub struct FailOnceSizeStore {
+    inner: Arc<dyn crate::blockstore::BlockStore>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl FailOnceSizeStore {
+    pub fn new(inner: Arc<dyn crate::blockstore::BlockStore>) -> Self {
+        Self {
+            inner,
+            fail: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Make the next `size()` call fail once.
+    pub fn fail_next_size(&self) {
+        self.fail.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::blockstore::BlockStore for FailOnceSizeStore {
+    async fn put_verified(
+        &self,
+        id: &crate::blockstore::BlockId,
+        body: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>,
+        max_len: u64,
+    ) -> Result<crate::blockstore::PutOutcome, crate::blockstore::BlockStoreError> {
+        self.inner.put_verified(id, body, max_len).await
+    }
+
+    async fn get_range(
+        &self,
+        id: &crate::blockstore::BlockId,
+        start: u64,
+        end_exclusive: u64,
+    ) -> Result<
+        futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>,
+        crate::blockstore::BlockStoreError,
+    > {
+        self.inner.get_range(id, start, end_exclusive).await
+    }
+
+    async fn size(
+        &self,
+        id: &crate::blockstore::BlockId,
+    ) -> Result<Option<u64>, crate::blockstore::BlockStoreError> {
+        if self.fail.swap(false, Ordering::SeqCst) {
+            return Err(crate::blockstore::BlockStoreError::Backend(
+                "injected size failure".into(),
+            ));
+        }
+        self.inner.size(id).await
+    }
+
+    async fn delete(
+        &self,
+        id: &crate::blockstore::BlockId,
+    ) -> Result<(), crate::blockstore::BlockStoreError> {
+        self.inner.delete(id).await
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "fail-once-size"
+    }
+}
+
+/// Same as [`spawn_node`] but with a caller-supplied block store, so a test
+/// can wrap the filesystem backend with fault injection (e.g. a `size()`
+/// that fails once) to drive the upload handler's failure tails.
+pub async fn spawn_node_with_store(
+    pool: PgPool,
+    repos_dir: PathBuf,
+    block_store: Arc<dyn crate::blockstore::BlockStore>,
+) -> TestNode {
     let db = Arc::new(crate::db::Db::for_testing(pool.clone()));
     db.run_migrations()
         .await
         .expect("test schema migrations should apply");
 
-    let repos_dir = unique_repos_dir();
-    std::fs::create_dir_all(&repos_dir).expect("create temp repos dir");
-
-    let state = build_state(db.clone(), pool.clone(), repos_dir.clone());
+    let state = build_state(db.clone(), pool.clone(), repos_dir.clone(), block_store);
     let node_did = state.node_did.to_string();
     let shutdown_tx = state.shutdown_tx.clone();
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -371,9 +465,50 @@ impl TestNode {
         record.id
     }
 
+    /// Seed a published model release row directly, bypassing the claim
+    /// pipeline: deny fixtures need a real row behind the read gate, not the
+    /// full upload-and-verify path.
+    pub async fn seed_model_release(&self, repo_id: &str, commit_sha: &str, publisher_did: &str) {
+        sqlx::query(
+            "INSERT INTO model_releases
+                 (repo_id, commit_sha, branch, publisher_did, state, manifest_sha256,
+                  claim_signature, claim_signature_input, claim_signing_string,
+                  claim_body, created_at)
+             VALUES ($1,$2,'main',$3,'published',$4,'sig','input','signing',\
+                     decode('00','hex'),$5)",
+        )
+        .bind(repo_id)
+        .bind(commit_sha)
+        .bind(publisher_did)
+        .bind(format!("{commit_sha:0>64}"))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(self.db.pool())
+        .await
+        .expect("seed model release");
+    }
+
+    /// Seed an open model upload session row directly (see
+    /// [`Self::seed_model_release`]): the session-status read row's owner
+    /// twin needs a real session behind the gate.
+    pub async fn seed_model_session(&self, repo_id: &str, session_id: &str, owner_did: &str) {
+        sqlx::query(
+            "INSERT INTO model_upload_sessions
+                 (id, owner_did, repo_id, created_at, expires_at, bytes_received, state)
+             VALUES ($1,$2,$3,$4,$5,0,'open')",
+        )
+        .bind(session_id)
+        .bind(owner_did)
+        .bind(repo_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind((chrono::Utc::now() + chrono::Duration::hours(12)).to_rfc3339())
+        .execute(self.db.pool())
+        .await
+        .expect("seed model session");
+    }
+
     /// Mark `branch` as protected on `repo_id`, so a non-owner push to it is
     /// rejected by the branch-protection gate (used by the deny-prober's
-    /// protected-push probe — #195, F3).
+    /// protected-push probe, #195 F3).
     pub async fn seed_protected_branch(&self, repo_id: &str, branch: &str, created_by: &str) {
         self.db
             .protect_branch(repo_id, branch, created_by)

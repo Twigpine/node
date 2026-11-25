@@ -1,6 +1,16 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
+/// Ref namespaces clients must never see: `refs/gitlawb/requests/*` is
+/// internal bookkeeping, and `refs/gitlawb/releases/*` pins published model
+/// releases so gc never prunes them. One shared list keeps the
+/// repo-config writers in lockstep.
+pub(crate) const HIDDEN_REFS: &[(&str, &str)] = &[
+    ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
+    ("transfer.hideRefs", "refs/gitlawb/requests/"),
+    ("uploadpack.hideRefs", "refs/gitlawb/releases/"),
+    ("transfer.hideRefs", "refs/gitlawb/releases/"),
+];
 
 /// Initialize a new bare git repository with SHA-1 object format (default).
 ///
@@ -88,14 +98,11 @@ pub fn init_bare(path: &Path) -> Result<()> {
         Ok(_) => {}
     }
 
-    // Hide the internal marker namespace from clone/fetch
-    // advertisement. `refs/gitlawb/requests/*` carries request UUIDs
-    // and would otherwise leak per-push metadata to every client and
-    // grow advertisement cost with push count.
-    for (key, value) in [
-        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
-        ("transfer.hideRefs", "refs/gitlawb/requests/"),
-    ] {
+    // Hide the internal marker namespaces from clone/fetch
+    // advertisement: `refs/gitlawb/requests/*` would leak per-push
+    // metadata to every client and grow advertisement cost with push
+    // count.
+    for &(key, value) in HIDDEN_REFS {
         // allow-unbounded-git: same init-time local `git config` as above.
         let out = Command::new("git")
             .args(["config", "--add", key, value])
@@ -126,10 +133,7 @@ pub fn ensure_marker_hidden(repo_path: &Path) {
 }
 
 pub fn ensure_marker_hidden_checked(repo_path: &Path) -> Result<()> {
-    for (key, value) in [
-        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
-        ("transfer.hideRefs", "refs/gitlawb/requests/"),
-    ] {
+    for &(key, value) in HIDDEN_REFS {
         // allow-unbounded-git: reached only through the #[allow(dead_code)]
         // ensure_marker_hidden wrapper; the push path runs this config through
         // verify_recovery_prereqs_bounded's timeout runner.
@@ -220,10 +224,7 @@ pub async fn verify_recovery_prereqs_bounded(
             );
         }
     }
-    for (key, value) in [
-        ("uploadpack.hideRefs", "refs/gitlawb/requests/"),
-        ("transfer.hideRefs", "refs/gitlawb/requests/"),
-    ] {
+    for &(key, value) in HIDDEN_REFS {
         let current = run_git(git_bin, repo_path, &["config", "--get-all", key], deadline).await?;
         let already = String::from_utf8_lossy(&current.stdout)
             .lines()
@@ -356,7 +357,7 @@ pub async fn delete_marker_bounded(
 /// serving) or a live push's admission permits, lease, and write lock.
 /// `kill_on_drop(true)` makes the timeout real for these plumbing commands
 /// (no helper processes to reparent, unlike receive-pack's pack-objects).
-async fn run_git_bounded(
+pub(crate) async fn run_git_bounded(
     git_bin: &str,
     repo_path: &Path,
     args: &[&str],
@@ -401,6 +402,217 @@ async fn run_git_bounded(
     tokio::time::timeout(timeout, fut)
         .await
         .map_err(|_| anyhow::anyhow!("{label} timed out"))?
+}
+
+/// Captured git output passed the cap given to [`run_git_bounded_capped`].
+#[derive(Debug)]
+pub(crate) struct OutputTooLarge {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for OutputTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "git output exceeded {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for OutputTooLarge {}
+
+/// [`run_git_bounded`] plus a hard cap on captured stdout: reads the pipe
+/// incrementally and kills the child the moment output exceeds
+/// `max_stdout`, so a huge blob never lands fully in memory. Other callers
+/// keep the uncapped helper above.
+pub(crate) async fn run_git_bounded_capped(
+    git_bin: &str,
+    repo_path: &Path,
+    args: &[&str],
+    stdin_bytes: &[u8],
+    timeout: std::time::Duration,
+    label: &str,
+    max_stdout: usize,
+) -> Result<std::process::Output> {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command as AsyncCommand;
+    let fut = async {
+        // allow-unbounded-git: bounded by the tokio::time::timeout wrapping
+        // this future, plus kill_on_drop.
+        let mut cmd = AsyncCommand::new(git_bin);
+        cmd.kill_on_drop(true);
+        cmd.args(args).current_dir(repo_path);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        if !stdin_bytes.is_empty() {
+            cmd.stdin(std::process::Stdio::piped());
+        } else {
+            cmd.stdin(std::process::Stdio::null());
+        }
+        let mut child = cmd.spawn().context(format!("{label} spawn failed"))?;
+        if !stdin_bytes.is_empty() {
+            child
+                .stdin
+                .as_mut()
+                .context(format!("{label} stdin pipe"))?
+                .write_all(stdin_bytes)
+                .await
+                .context(format!("{label} stdin write"))?;
+        }
+        let mut stderr = child.stderr.take();
+        let err_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut e) = stderr.take() {
+                let _ = e.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let mut stdout = Vec::new();
+        let mut oversized = false;
+        if let Some(mut pipe) = child.stdout.take() {
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                match pipe.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e).context(format!("{label} stdout read")));
+                    }
+                    Ok(n) => {
+                        if stdout.len() + n > max_stdout {
+                            oversized = true;
+                            break;
+                        }
+                        stdout.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+        }
+        if oversized {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = err_task.await;
+            return Err(anyhow::Error::new(OutputTooLarge { limit: max_stdout }));
+        }
+        let stderr = err_task.await.unwrap_or_default();
+        let status = child.wait().await.context(format!("{label} wait"))?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} timed out"))?
+}
+
+/// Digest of a blob streamed out of `git cat-file blob`.
+pub(crate) struct BlobDigest {
+    pub sha256_hex: String,
+    pub size: u64,
+    pub head: Vec<u8>,
+}
+
+/// Streams a git blob through SHA-256, keeping only the first `head_len`
+/// bytes, so a blob of any size is verified without being held whole.
+/// `None` only when `ls-tree` proves the path absent from a valid commit;
+/// every other failure (including a cat-file exit 128) is an `Err`.
+pub(crate) async fn run_git_blob_digest(
+    git_bin: &str,
+    repo_path: &Path,
+    spec: &str,
+    timeout: std::time::Duration,
+    head_len: usize,
+) -> Result<Option<BlobDigest>> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command as AsyncCommand;
+    let fut = async {
+        // Membership probe first: exit 128 from cat-file also covers
+        // invalid git config and other failures, so absence must be proven
+        // by an empty ls-tree, not inferred from the cat-file exit code.
+        // A failed probe is an Err so the verifier's retry applies.
+        let (rev, path) = spec
+            .split_once(':')
+            .context("blob spec must be <rev>:<path>")?;
+        let tree = run_git_bounded(
+            git_bin,
+            repo_path,
+            &["ls-tree", "-z", rev, "--", path],
+            b"",
+            timeout,
+            "git ls-tree",
+        )
+        .await?;
+        if !tree.status.success() {
+            bail!(
+                "git ls-tree {rev} -- {path} failed: {}",
+                String::from_utf8_lossy(&tree.stderr)
+                    .chars()
+                    .take(256)
+                    .collect::<String>()
+            );
+        }
+        if tree.stdout.is_empty() {
+            return Ok(None);
+        }
+        // allow-unbounded-git: bounded by the tokio::time::timeout wrapping
+        // this future, plus kill_on_drop.
+        let mut cmd = AsyncCommand::new(git_bin);
+        cmd.kill_on_drop(true);
+        cmd.args(["cat-file", "blob", spec]).current_dir(repo_path);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
+        let mut child = cmd.spawn().context("git cat-file spawn failed")?;
+        let mut stderr = child.stderr.take();
+        let err_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut e) = stderr.take() {
+                let _ = e.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        let mut head = Vec::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                match pipe.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        hasher.update(&chunk[..n]);
+                        size += n as u64;
+                        if head.len() < head_len {
+                            let take = (head_len - head.len()).min(n);
+                            head.extend_from_slice(&chunk[..take]);
+                        }
+                    }
+                    Err(e) => return Err(anyhow::Error::new(e).context("git cat-file read")),
+                }
+            }
+        }
+        let stderr = err_task.await.unwrap_or_default();
+        let status = child.wait().await.context("git cat-file wait")?;
+        if status.success() {
+            return Ok(Some(BlobDigest {
+                sha256_hex: hex::encode(hasher.finalize()),
+                size,
+                head,
+            }));
+        }
+        // ls-tree already confirmed the blob exists in the commit, so any
+        // cat-file failure (including 128) is an error, not absence.
+        bail!(
+            "git cat-file blob {spec} failed: {}",
+            String::from_utf8_lossy(&stderr)
+                .chars()
+                .take(256)
+                .collect::<String>()
+        )
+    };
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("git cat-file timed out"))?
 }
 
 /// Bounded [`list_refs`]: same listing through the configured git binary
@@ -4624,5 +4836,62 @@ mod tests {
         let mut scan = super::PositionScan::new(b"bbb");
         assert!(!scan.feed(b"bbbb\nbbb\n").unwrap());
         assert_eq!(scan.found(), Some(1));
+    }
+
+    /// `run_git_blob_digest` answers `None` only for a proven-absent path:
+    /// a missing name inside a valid commit. A real blob with git broken
+    /// underneath it is an `Err`, so the verifier's retry sees a failure,
+    /// not a false absence.
+    #[tokio::test]
+    async fn blob_digest_none_only_for_confirmed_absence() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work: &Path = td.path();
+        let g = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap()
+                .success());
+        };
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(work.join("f.txt"), b"blob-bytes\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "c1"]);
+
+        let timeout = std::time::Duration::from_secs(30);
+        let digest = super::run_git_blob_digest("git", work, "HEAD:f.txt", timeout, 8)
+            .await
+            .expect("digest runs")
+            .expect("present blob digests");
+        assert_eq!(
+            digest.sha256_hex,
+            twigpine_core::cid::sha256_hex(b"blob-bytes\n")
+        );
+
+        // A path absent from the commit is a confirmed None.
+        assert!(
+            super::run_git_blob_digest("git", work, "HEAD:nope.txt", timeout, 8)
+                .await
+                .expect("absent probe runs")
+                .is_none()
+        );
+
+        // A malformed .git/config breaks git itself: the present blob must
+        // be an Err, not a false None. The same failure on the absent path
+        // is an Err too.
+        std::fs::write(work.join(".git/config"), b"not [valid").unwrap();
+        assert!(
+            super::run_git_blob_digest("git", work, "HEAD:f.txt", timeout, 8)
+                .await
+                .is_err()
+        );
+        assert!(
+            super::run_git_blob_digest("git", work, "HEAD:nope.txt", timeout, 8)
+                .await
+                .is_err()
+        );
     }
 }

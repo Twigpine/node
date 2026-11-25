@@ -256,6 +256,21 @@ impl Fixture {
         let priv_bounty_id =
             seed_private_bounty(node, &owner, &owner_did, priv_repo, &bounty_marker).await;
 
+        // Model hosting is mounted on the harness node (an fs block store in
+        // the per-test repos dir). The model-release read row fills `{sha}`
+        // with 40 a's, so seed that commit as a published release on the
+        // private repo: anon/stranger get the existence-hiding 404, the owner
+        // twin gets a 200 proving the gate.
+        node.seed_model_release(
+            &private_repo_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &owner_did,
+        )
+        .await;
+        // The session-status read row fills `{id}` with the fixed "1".
+        node.seed_model_session(&private_repo_id, "1", &owner_did)
+            .await;
+
         let priv_markers = vec![issue_marker, pr_marker, pr_diff_marker, bounty_marker];
 
         // #195 (F3): seed the caller-self task entities through the real task write

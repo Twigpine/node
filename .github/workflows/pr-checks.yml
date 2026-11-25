@@ -236,7 +236,7 @@ jobs:
       - name: cargo test (real-node deny harness)
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/gitlawb_test
-        run: cargo test --locked -p twigpine-node --features test-harness --lib --test deny_harness
+        run: cargo test --locked -p twigpine-node --features test-harness --lib --test deny_harness --test models_api
 
   build-release:
     name: build --release

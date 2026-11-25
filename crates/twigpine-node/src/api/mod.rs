@@ -13,6 +13,7 @@ pub mod events;
 pub mod ipfs;
 pub mod issues;
 pub mod labels;
+pub mod models;
 pub mod peers;
 pub mod profiles;
 pub mod protect;
@@ -219,6 +220,7 @@ mod authz_guard {
         let repos = include_str!("repos.rs");
         let register = include_str!("register.rs");
         let ipfs = include_str!("ipfs.rs");
+        let models = include_str!("models.rs");
 
         // (source, handler, expected gate marker)
         let rows: &[(&str, &str, &str)] = &[
@@ -325,6 +327,14 @@ mod authz_guard {
             (visibility, "remove_visibility", "require_owner("),
             (visibility, "list_visibility", "authorize_repo_read("),
             (visibility, "list_visibility", "require_owner("),
+            // Model hosting writes: session open and claim are owner-only
+            // behind the shared read gate; the unsigned block PUT read-gates
+            // as the session's owner.
+            (models, "open_model_session", "authorize_repo_read("),
+            (models, "open_model_session", "require_repo_owner("),
+            (models, "claim_model_release", "authorize_repo_read("),
+            (models, "claim_model_release", "require_repo_owner("),
+            (models, "put_model_block", "authorize_repo_read("),
         ];
 
         // Rows above prove each visibility handler calls authorize_repo_read and
@@ -355,6 +365,8 @@ mod authz_guard {
             (issues, "close_issue", "did_matches("),
             (protect, "protect_branch", "did_matches("),
             (protect, "unprotect_branch", "did_matches("),
+            (models, "open_model_session", "require_repo_owner("),
+            (models, "claim_model_release", "require_repo_owner("),
         ] {
             let body = fn_body(src, func);
             let gate = body.find("authorize_repo_read(").expect("gate marker");
@@ -1197,6 +1209,7 @@ mod tests { async fn t() { let _ = did_matches(x, y); } }
             (include_str!("events.rs"), "events.rs"),
             (include_str!("issues.rs"), "issues.rs"),
             (include_str!("labels.rs"), "labels.rs"),
+            (include_str!("models.rs"), "models.rs"),
             (include_str!("protect.rs"), "protect.rs"),
             (include_str!("pulls.rs"), "pulls.rs"),
             (include_str!("replicas.rs"), "replicas.rs"),
