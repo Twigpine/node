@@ -98,6 +98,15 @@ pub fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Whether `s` has the shape of a git object id in either object format this
+/// node supports: 40 lowercase hex (sha1) or 64 lowercase hex (sha256).
+/// Accepts upper-case hex too, matching the other commit-shape gates.
+/// Commit-shaped validation anywhere in the tree must use this rather than a
+/// bare 40-length check, which silently rejects sha256-format repos.
+pub fn is_hex_oid(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Parse a 64-character hex SHA-256 string into raw bytes.
 pub fn sha256_hex_to_bytes(hex_str: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hex_str).map_err(|e| Error::InvalidCid(format!("invalid hex: {e}")))?;
@@ -133,6 +142,23 @@ mod tests {
     fn sha256_hex_len() {
         let h = sha256_hex(b"test");
         assert_eq!(h.len(), 64);
+    }
+
+    #[test]
+    fn is_hex_oid_accepts_both_object_formats() {
+        let sha1 = "a".repeat(40);
+        let sha256 = "b".repeat(64);
+        assert!(is_hex_oid(&sha1));
+        assert!(is_hex_oid(&sha256));
+        for bad in [
+            "",
+            "a/../escape",
+            &"a".repeat(39),
+            &"a".repeat(41),
+            &"z".repeat(40),
+        ] {
+            assert!(!is_hex_oid(bad), "{bad:?} must not pass the oid gate");
+        }
     }
 
     #[test]

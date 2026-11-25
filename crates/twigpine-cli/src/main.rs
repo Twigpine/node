@@ -3,40 +3,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-mod agent;
-mod bounty;
-mod cert;
-mod changelog;
-mod clone;
-mod doctor;
-mod http;
-mod identity;
-mod init;
-mod ipfs_cmd;
-mod issue;
-mod mcp;
-mod mirror;
-mod model;
-mod name;
-mod node;
-mod node_stake;
-mod peer;
-mod pr;
-mod profile;
-mod protect;
-mod quickstart;
-mod register;
-mod repo;
-mod secret_file;
-mod star;
-mod status;
-mod sync;
-mod task;
-mod text;
-mod ucan_cmd;
-mod visibility;
-mod webhook;
-mod whoami;
+use twigpine_cli::{
+    agent, bounty, cert, changelog, clone, doctor, identity, init, ipfs_cmd, issue, mcp, mirror,
+    model, name, node, peer, pr, profile, protect, quickstart, register, repo, star, status, sync,
+    task, ucan_cmd, visibility, webhook, whoami,
+};
 
 #[derive(Parser)]
 #[command(
@@ -142,7 +113,7 @@ enum Commands {
     /// Print your current identity (DID) and optional node info
     Whoami(whoami::WhoamiArgs),
 
-    /// Publish open-weight model releases
+    /// Publish and fetch open-weight model releases
     Model {
         #[command(subcommand)]
         cmd: model::ModelCmd,
