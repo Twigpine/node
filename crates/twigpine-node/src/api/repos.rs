@@ -840,7 +840,8 @@ const MAX_TAGS: usize = 500;
 /// `{"tags": [{name, target, target_type, annotated}], "truncated": bool}`, newest
 /// version first by name and capped at 500. An annotated tag reports the object
 /// its tag object names (one level: a tag of a tag reports the inner tag object
-/// with `target_type` `tag`). Same read gate and admission as the commits listing.
+/// with `target_type` `tag`). Same read gate and admission as the commits listing,
+/// and the same unborn-head rule: no head commit means no tags.
 pub async fn list_tags(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
@@ -852,6 +853,7 @@ pub async fn list_tags(
     let (record, rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
+    let default_branch = record.default_branch.clone();
     let repo = record.name.clone();
     let (mut tags, truncated) = run_repo_git_read(
         &state,
@@ -860,8 +862,16 @@ pub async fn list_tags(
         &record,
         "tags",
         move |git_bin, path, deadline| {
-            store::list_tags_bounded(git_bin, path, MAX_TAGS, deadline)
-                .map_err(|e| git_read_app_error(&e, &repo))
+            let fail = |e: anyhow::Error| git_read_app_error(&e, &repo);
+            // A read failure is not an empty list (#400): only an unborn head
+            // is empty, and tag refs on disk cannot resurrect it.
+            if store::resolve_head_id_bounded(git_bin, path, &default_branch, deadline)
+                .map_err(fail)?
+                .is_none()
+            {
+                return Ok((Vec::new(), false));
+            }
+            store::list_tags_bounded(git_bin, path, MAX_TAGS, deadline).map_err(fail)
         },
     )
     .await?;
@@ -21439,6 +21449,44 @@ mod commits_tags_tests {
             *tag_row(&v, "outer"),
             serde_json::json!({"name": "outer", "target": inner_object, "target_type": "tag", "annotated": true})
         );
+    }
+
+    /// An unborn head means no served history, so the tag listing is empty even
+    /// though tag refs on disk still resolve, matching the commits listing.
+    #[sqlx::test]
+    async fn tags_on_an_unborn_head_list_nothing_even_with_tags_present(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        git_at(&dir, &["tag", "-a", "-m", "v1", "v1", &c], T0 + 10);
+        // HEAD now names a branch that does not exist and main goes away, so
+        // head resolution answers None while refs/tags/v1 still resolves.
+        git_at(
+            &dir,
+            &["symbolic-ref", "HEAD", "refs/heads/unborn-main"],
+            T0,
+        );
+        git_at(&dir, &["branch", "-D", "main"], T0);
+        assert_eq!(
+            git_at(&dir, &["rev-parse", "--verify", "refs/tags/v1"], T0).len(),
+            40,
+            "fixture: the tag ref itself still resolves"
+        );
+        let v = tags_ok(&fx, "t").await;
+        assert_eq!(v, serde_json::json!({"tags": [], "truncated": false}));
+    }
+
+    /// A head ref that exists but does not resolve is a read failure (#400),
+    /// never the same empty 200 an unborn head gets.
+    #[sqlx::test]
+    async fn tags_on_a_damaged_head_ref_is_an_error_not_an_empty_list(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        git_at(&dir, &["tag", "v1", &c], T0);
+        std::fs::write(dir.join(".git/refs/heads/main"), b"garbage\n").unwrap();
+        let (status, _, body) = tags(&fx, "t").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     }
 
     #[sqlx::test]
