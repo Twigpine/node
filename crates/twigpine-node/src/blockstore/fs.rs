@@ -35,27 +35,32 @@ pub struct FsBlockStore {
     root: PathBuf,
 }
 
+/// Directories to fsync after `create_dir_all(dir)`, deepest first: the
+/// parent of every ancestor. A relative root's chain ends at an empty
+/// parent, whose entry lives in the current directory.
+fn ancestor_parents(dir: &Path) -> Vec<PathBuf> {
+    dir.ancestors()
+        .map_while(|d| d.parent())
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                p.to_path_buf()
+            }
+        })
+        .collect()
+}
+
 impl FsBlockStore {
     pub fn new(root: PathBuf) -> io::Result<Self> {
         let tmp = root.join("tmp");
-        // Every directory this call creates, deepest first. Creating them
-        // adds an entry to each one's parent, and an entry that is not
-        // fsynced is lost on a crash together with every block under it.
-        let created: Vec<PathBuf> = tmp
-            .ancestors()
-            .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
-            .map(Path::to_path_buf)
-            .collect();
         std::fs::create_dir_all(&tmp)?;
-        for dir in &created {
-            if let Some(parent) = dir.parent() {
-                let parent = if parent.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    parent
-                };
-                fsync_dir_blocking(parent)?;
-            }
+        // An existing directory proves nothing about durability: sync the
+        // parent of every directory in the chain, deepest first. A retry
+        // after a crash mid-init finds every dir present and must still
+        // persist the names create_dir_all made the first time.
+        for parent in ancestor_parents(&tmp) {
+            fsync_dir_blocking(&parent)?;
         }
         Ok(Self { root })
     }
@@ -142,17 +147,27 @@ impl BlockStore for FsBlockStore {
         }
 
         let tmp = self.temp_path();
-        // Declared before `file`, so the handle closes before the removal.
-        let _staged = StagedFile(tmp.clone());
-        let mut file = match tokio::fs::File::create(&tmp).await {
-            Ok(f) => f,
-            Err(e) => return Err(e.into()),
+        // Create the file and arm its guard inside the blocking task: a
+        // caller cancelled while the open is in flight still removes the
+        // file when the blocking op lands.
+        let (mut file, _staged) = match tokio::task::spawn_blocking({
+            let tmp = tmp.clone();
+            move || {
+                let staged = StagedFile(tmp);
+                std::fs::File::create(&staged.0).map(|f| (f, staged))
+            }
+        })
+        .await
+        {
+            Ok(Ok((f, staged))) => (tokio::fs::File::from_std(f), staged),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(e) => return Err(io::Error::other(e.to_string()).into()),
         };
         let mut hasher = Sha256::new();
         let mut len: u64 = 0;
         let result: Result<(), BlockStoreError> = async {
             while let Some(chunk) = body.next().await {
-                let chunk = chunk?;
+                let chunk = chunk.map_err(BlockStoreError::Body)?;
                 len = len.saturating_add(chunk.len() as u64);
                 if len > max_len {
                     return Err(BlockStoreError::TooLarge(max_len));
@@ -179,8 +194,15 @@ impl BlockStore for FsBlockStore {
             Self::cleanup(&tmp).await;
             return Err(BlockStoreError::EmptyBlock);
         }
-        // Flush before the link: a crash between link and write-back would
-        // leave a truncated object under a valid id.
+        // Flush first: tokio buffers the tail of a file write and only a
+        // flush or a following op surfaces its error. Then fsync before the
+        // link: a crash between link and write-back would leave a truncated
+        // object under a valid id.
+        if let Err(e) = file.flush().await {
+            drop(file);
+            Self::cleanup(&tmp).await;
+            return Err(e.into());
+        }
         if let Err(e) = file.sync_all().await {
             drop(file);
             Self::cleanup(&tmp).await;
@@ -204,9 +226,12 @@ impl BlockStore for FsBlockStore {
         // makes a same-content race benign rather than a torn write.
         match tokio::fs::hard_link(&tmp, &dest).await {
             Ok(()) => {
-                if let Err(e) = fsync_dir(dir).await {
+                if fsync_dir(dir).await.is_err() {
                     Self::cleanup(&tmp).await;
-                    return Err(e.into());
+                    // The link landed; whether it is durable is unknown, so
+                    // the write's outcome is too. The destination object is
+                    // left for a reconciling size() check.
+                    return Err(BlockStoreError::Unknown);
                 }
                 Self::cleanup(&tmp).await;
                 Ok(PutOutcome::Stored)
@@ -255,7 +280,16 @@ impl BlockStore for FsBlockStore {
     }
 
     async fn delete(&self, id: &BlockId) -> Result<(), BlockStoreError> {
-        match tokio::fs::remove_file(self.content_path(id)).await {
+        let path = self.content_path(id);
+        let dir = path.parent().expect("content path has two levels");
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        // Persist the removal: the sweep commits the row delete right after,
+        // and a crash in between can otherwise resurrect the object.
+        match fsync_dir(dir).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
@@ -294,6 +328,31 @@ mod tests {
 
     fn store(dir: &tempfile::TempDir) -> FsBlockStore {
         FsBlockStore::new(dir.path().join("blocks")).unwrap()
+    }
+
+    #[test]
+    fn ancestor_parents_maps_a_relative_roots_top_to_the_cwd() {
+        // A relative root's ancestor chain ends at a path with an empty
+        // parent: fsyncing "" is ENOENT, so the chain must name "." there.
+        let parents = ancestor_parents(Path::new("data/blocks/tmp"));
+        assert_eq!(
+            parents,
+            vec![
+                PathBuf::from("data/blocks"),
+                PathBuf::from("data"),
+                PathBuf::from("."),
+            ]
+        );
+        assert!(!parents.iter().any(|p| p.as_os_str().is_empty()));
+        let abs = ancestor_parents(Path::new("/a/b/c"));
+        assert_eq!(
+            abs,
+            vec![
+                PathBuf::from("/a/b"),
+                PathBuf::from("/a"),
+                PathBuf::from("/")
+            ]
+        );
     }
 
     #[tokio::test]

@@ -288,10 +288,22 @@ short lifetimes reissued often are safer than one long-lived grant.
 
 ## Model hosting (experimental)
 
-Off by default and not yet usable end to end: the node ships the storage and
-schema only, with no publish or read routes mounted yet. When it lands, a model
-is a public repo whose releases are signed manifests, and weights are stored as
+Off by default: keep it off unless you intend to serve models, since it adds
+storage, quota, and a background sweep to the node. When it is on, a model is
+a public repo whose releases are signed manifests, and weights are stored as
 content-addressed blocks outside git.
+
+The model routes mount only when hosting is enabled and a block store
+initialized (the filesystem dir above, or the S3 bucket). They are the upload
+session and block PUT endpoints, the release claim endpoint, and the release
+status and reconstruction reads under
+`/api/v1/repos/{owner}/{repo}/models/...`; with hosting off or no store they
+answer as though the routes did not exist.
+
+For S3 operators: the multipart writer leaves incomplete uploads behind when
+an abort cannot be confirmed. Give the `model-blocks/` prefix an
+`AbortIncompleteMultipartUpload` lifecycle rule so abandoned parts do not
+bill forever.
 
 - `TWIGPINE_MODEL_HOSTING_ENABLED=false` - the master switch.
 - `TWIGPINE_MODEL_QUOTA_BYTES` - per-identity quota for claimed blocks (default 256 GiB).

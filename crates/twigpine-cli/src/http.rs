@@ -314,6 +314,25 @@ impl NodeClient {
         self.send_signed("PUT", path, body).await
     }
 
+    /// PUT raw bytes with no signature and caller-supplied extra headers.
+    /// Used only for the model block upload, where the session id IS the
+    /// bearer credential and the body is too large to buffer for signing.
+    /// Content-Length is set by reqwest from the body, which the route
+    /// requires. Every other write goes through `put`/`post`/`delete`.
+    pub async fn put_unsigned(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}{}", self.node_url, path);
+        let mut req = self.inner.put(&url).body(body);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        req.send().await.with_context(|| format!("PUT {url}"))
+    }
+
     /// DELETE with RFC 9421 signing + transparent iCaptcha solve/retry.
     pub async fn delete(&self, path: &str, body: &[u8]) -> Result<reqwest::Response> {
         self.send_signed("DELETE", path, body).await
