@@ -186,7 +186,7 @@ impl Default for Reconstruction {
 /// Chunk-sha lookup over prior reconstruction objects, the dedup surface:
 /// a chunk whose hash a prior release already stored can be referenced by
 /// term instead of re-uploaded.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct DedupIndex {
     /// chunk sha256 -> (block sha256, chunk index inside that block)
     by_chunk: HashMap<String, (String, u32)>,
@@ -209,7 +209,13 @@ impl DedupIndex {
     }
 
     pub fn add(&mut self, rec: &Reconstruction) {
-        for block in &rec.blocks {
+        self.add_block_entries(&rec.blocks);
+    }
+
+    /// Index only `entries`: callers packing several files can add each
+    /// file's fresh block table instead of re-scanning every prior entry.
+    pub fn add_block_entries(&mut self, entries: &[BlockEntry]) {
+        for block in entries {
             if self.layouts.contains_key(&block.sha256) {
                 continue;
             }

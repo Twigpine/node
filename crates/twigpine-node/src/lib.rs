@@ -22,6 +22,7 @@ mod graphql;
 mod icaptcha;
 mod ipfs_pin;
 mod metrics;
+pub mod models;
 mod operator;
 mod p2p;
 mod pinata;
@@ -918,6 +919,16 @@ pub async fn run() -> Result<()> {
     // the note at the other spawns above): its first tick must not interleave
     // with the one-shot reconcile/drain on backlog rows.
     let _due_request_worker = spawn_due_request_worker(&state);
+
+    // Model hosting workers (verify + sweep) only run while the operator
+    // flag is on; the block store is the flag's live form.
+    let mut model_workers = Vec::new();
+    if state.block_store.is_some() {
+        model_workers.push(tokio::spawn(models::verify::run_verify_worker(
+            state.clone(),
+        )));
+        model_workers.push(tokio::spawn(models::sweep::run_sweep_worker(state.clone())));
+    }
 
     // `into_make_service_with_connect_info` exposes the socket peer address as
     // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client

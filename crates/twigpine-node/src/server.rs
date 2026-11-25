@@ -14,8 +14,9 @@ use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use crate::api::{
-    agents, arweave, bounties, certs, changelog, events, ipfs, issues, labels, peers, profiles,
-    protect, pulls, register, replicas, repos, resolve, stars, status, tasks, visibility, webhooks,
+    agents, arweave, bounties, certs, changelog, events, ipfs, issues, labels, models, peers,
+    profiles, protect, pulls, register, replicas, repos, resolve, stars, status, tasks, visibility,
+    webhooks,
 };
 use crate::auth;
 use crate::rate_limit;
@@ -762,6 +763,72 @@ pub fn build_router(state: AppState) -> Router {
             auth::optional_signature,
         ));
 
+    // ── Model hosting routes ─────────────────────────────────────────────
+    // Mounted only when the operator enabled the feature (`block_store` is
+    // the flag's live form). Three surfaces with three different auth
+    // shapes:
+    //  - session open + session status: signed, owner-only.
+    //  - claims: signed, persists the request material and owns its replay
+    //    defense exactly like status claims.
+    //  - block PUT: unsigned by design — the session id is the bearer
+    //    credential and a signed 128 MiB body would have to be buffered
+    //    whole to verify. Default body limit off, explicit block cap, same
+    //    per-IP write brake as the other write surfaces.
+    let model_routes = if state.block_store.is_some() {
+        let signed = add_auth_layers(
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/models/sessions",
+                    post(models::open_model_session),
+                )
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/models/sessions/{id}",
+                    get(models::get_model_session),
+                ),
+            state.clone(),
+            SIGNED_BODY_LIMIT,
+        )
+        .write_braked(&write_ip_limiter);
+        let claims = add_auth_layers(
+            Router::new().route(
+                "/api/v1/repos/{owner}/{repo}/models/claims",
+                post(models::claim_model_release),
+            ),
+            state.clone(),
+            SIGNED_BODY_LIMIT,
+        )
+        .layer(RequestBodyLimitLayer::new(status::MAX_REQUEST_BODY_BYTES))
+        .layer(axum::Extension(auth::PersistsSignedBody))
+        .layer(axum::Extension(auth::OwnsReplayDefense))
+        .write_braked(&write_ip_limiter);
+        let blocks = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/models/blocks/{sha256}",
+                axum::routing::put(models::put_model_block),
+            )
+            .layer(DefaultBodyLimit::disable())
+            .layer(RequestBodyLimitLayer::new(
+                crate::models::MAX_BLOCK_BYTES as usize,
+            ))
+            .write_braked(&write_ip_limiter);
+        let reads = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/models/releases/{sha}",
+                get(models::get_model_release),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/models/releases/{sha}/reconstruction",
+                get(models::get_model_reconstruction),
+            )
+            .layer(middleware::from_fn_with_state(
+                auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+                auth::optional_signature,
+            ));
+        signed.merge(claims).merge(blocks).merge(reads)
+    } else {
+        Router::new()
+    };
+
     // ── Meta ──────────────────────────────────────────────────────────────
     let meta_routes = Router::new()
         .route("/", get(node_info))
@@ -791,6 +858,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(sync_trigger_routes)
         .merge(ipfs_routes)
         .merge(arweave_routes)
+        .merge(model_routes)
         .merge(meta_routes)
         .layer(
             TraceLayer::new_for_http()

@@ -108,9 +108,19 @@ impl S3BlockStore {
     /// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_ENDPOINT_URL_S3
     /// environment the Tigris repo backend reads.
     pub async fn new(bucket: &str) -> anyhow::Result<Self> {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        // The SDK sets no default operation timeout: without one a wedged
+        // endpoint hangs the caller (including the sweep, which holds a row
+        // lock across delete) indefinitely.
+        let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = aws_sdk_s3::config::Builder::from(&sdk)
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .operation_timeout(std::time::Duration::from_secs(60))
+                    .build(),
+            )
+            .build();
         Ok(Self {
-            s3: S3Client::new(&config),
+            s3: S3Client::from_conf(config),
             bucket: bucket.to_string(),
         })
     }
@@ -264,7 +274,7 @@ impl BlockStore for S3BlockStore {
         // ever resident, never the whole body.
         let result: Result<(), BlockStoreError> = async {
             while let Some(chunk) = body.next().await {
-                let chunk = chunk?;
+                let chunk = chunk.map_err(BlockStoreError::Body)?;
                 len = len.saturating_add(chunk.len() as u64);
                 if len > max_len {
                     return Err(BlockStoreError::TooLarge(max_len));
