@@ -498,28 +498,22 @@ pub fn close_issue(repo_path: &Path, issue_id: &str) -> Result<Option<String>> {
     Ok(Some(updated))
 }
 
-/// Deadline-bounded variant of [`close_issue`], for the under-lock close path:
-/// the same resolve, read and status flip, with every git child on the bounded
-/// runner so a hung git cannot pin the lock-pool slot past the hold deadline.
+/// Deadline-bounded close for the under-lock path: flips the status of an
+/// issue the caller already read (see [`get_issue_with_id_bounded`]) and writes
+/// it back to `full_id`. It resolves and reads nothing itself, so the ref it
+/// mutates is the one the caller authorized and snapshotted, and every git
+/// child runs on the bounded runner so a hung git cannot pin the lock-pool slot
+/// past the hold deadline. Returns the updated JSON.
 pub fn close_issue_bounded(
     git_bin: &str,
     repo_path: &Path,
-    issue_id: &str,
+    full_id: &str,
+    raw: &str,
     deadline: std::time::Instant,
-) -> Result<Option<String>> {
-    let full_id = match resolve_issue_id_bounded(git_bin, repo_path, issue_id, deadline)? {
-        Some(id) => id,
-        None => return Ok(None),
-    };
-
-    let raw = match get_issue_bounded(git_bin, repo_path, &full_id, deadline)? {
-        Some(raw) => raw,
-        None => return Ok(None),
-    };
-
-    let updated = closed_issue_json(&raw)?;
-    create_issue_bounded(git_bin, repo_path, &full_id, &updated, deadline)?;
-    Ok(Some(updated))
+) -> Result<String> {
+    let updated = closed_issue_json(raw)?;
+    create_issue_bounded(git_bin, repo_path, full_id, &updated, deadline)?;
+    Ok(updated)
 }
 
 /// Get a single issue by ID or 8-char prefix.
@@ -534,20 +528,23 @@ pub fn get_issue(repo_path: &Path, issue_id: &str) -> Result<Option<String>> {
 }
 
 /// Deadline-bounded variant of [`get_issue`], for reads that run under the
-/// write guard and must not outlive its lock-hold deadline.
-pub fn get_issue_bounded(
+/// write guard and must not outlive its lock-hold deadline. Returns the full
+/// issue id (the one git's own ref name carries, so a prefix argument comes
+/// back canonical) together with the raw JSON, so a caller can authorize,
+/// snapshot and mutate the same ref from one read.
+pub fn get_issue_with_id_bounded(
     git_bin: &str,
     repo_path: &Path,
-    issue_id: &str,
+    id_or_prefix: &str,
     deadline: std::time::Instant,
-) -> Result<Option<String>> {
-    let full_id = match resolve_issue_id_bounded(git_bin, repo_path, issue_id, deadline)? {
+) -> Result<Option<(String, String)>> {
+    let full_id = match resolve_issue_id_bounded(git_bin, repo_path, id_or_prefix, deadline)? {
         Some(id) => id,
         None => return Ok(None),
     };
 
     let ref_name = format!("refs/gitlawb/issues/{full_id}");
-    read_issue_blob_bounded(git_bin, repo_path, &ref_name, deadline)
+    Ok(read_issue_blob_bounded(git_bin, repo_path, &ref_name, deadline)?.map(|raw| (full_id, raw)))
 }
 
 #[cfg(test)]
@@ -891,7 +888,7 @@ mod tests {
                 "{crafted:?}"
             );
             assert_eq!(
-                get_issue_bounded("git", dir.path(), crafted, bounded_deadline()).unwrap(),
+                get_issue_with_id_bounded("git", dir.path(), crafted, bounded_deadline()).unwrap(),
                 None,
                 "{crafted:?}"
             );
@@ -899,15 +896,11 @@ mod tests {
     }
 
     #[test]
-    fn test_bounded_get_and_close_missing_issue_return_none() {
+    fn test_bounded_get_missing_issue_returns_none() {
         let dir = TempDir::new().unwrap();
         init_repo(&dir);
         assert_eq!(
-            get_issue_bounded("git", dir.path(), "nosuch00", bounded_deadline()).unwrap(),
-            None
-        );
-        assert_eq!(
-            close_issue_bounded("git", dir.path(), "nosuch00", bounded_deadline()).unwrap(),
+            get_issue_with_id_bounded("git", dir.path(), "nosuch00", bounded_deadline()).unwrap(),
             None
         );
     }
@@ -924,11 +917,23 @@ mod tests {
         )
         .unwrap();
 
-        let updated = close_issue_bounded("git", dir.path(), "def99999", bounded_deadline())
-            .unwrap()
-            .unwrap();
+        let (resolved, raw) =
+            get_issue_with_id_bounded("git", dir.path(), "def99999", bounded_deadline())
+                .unwrap()
+                .unwrap();
+        assert_eq!(resolved, full_id, "a prefix must come back as the full id");
+
+        let updated =
+            close_issue_bounded("git", dir.path(), &resolved, &raw, bounded_deadline()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&updated).unwrap();
         assert_eq!(v["status"], "closed");
+
+        let (_, persisted) =
+            get_issue_with_id_bounded("git", dir.path(), full_id, bounded_deadline())
+                .unwrap()
+                .unwrap();
+        let p: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(p["status"], "closed", "the closed status must be persisted");
     }
 
     // A deadline already spent must not let a git child run out its own clock:
