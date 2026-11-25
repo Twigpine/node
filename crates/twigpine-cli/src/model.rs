@@ -2461,6 +2461,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_literal_pathspec_filename_resolves_its_own_blob() {
         let dir = trepo();
