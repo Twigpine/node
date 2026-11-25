@@ -1379,6 +1379,7 @@ pub fn commit_position_bounded(
         git_bin,
         &["rev-list", head_id],
         repo_path,
+        b"",
         deadline,
         &mut |chunk| match scan.feed(chunk) {
             Ok(keep_reading) => keep_reading,
@@ -1439,9 +1440,9 @@ pub fn log_bounded(
 }
 
 /// One row of a tag listing. `target` and `target_type` are what the tag points
-/// at: for an annotated tag, the object the tag object names (one level, as
-/// `for-each-ref` peels it, so a tag of a tag reports the inner tag object with
-/// type `tag`), not the tag object itself.
+/// at: for an annotated tag, the object the tag object names (one level, read
+/// from the tag object's own header, so a tag of a tag reports the inner tag
+/// object with type `tag`), not the tag object itself.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TagInfo {
     pub name: String,
@@ -1450,13 +1451,145 @@ pub struct TagInfo {
     pub annotated: bool,
 }
 
+/// Streaming parser for `cat-file --batch` output over tag objects. Each record
+/// is `"<oid> <type> <size>\n"` followed by `size` content bytes and a newline.
+/// Only the leading content bytes are kept (enough for the tag's `object` and
+/// `type` header lines), so an oversized tag message crosses the pipe without
+/// being retained.
+struct TagTargetsScan {
+    line: Vec<u8>,
+    content_left: usize,
+    capture: Vec<u8>,
+    after_content: bool,
+    targets: Vec<(String, String)>,
+}
+
+/// Bytes of an object's content the scan retains. A valid tag object's `object`
+/// and `type` lines sit in its first two lines, far under this.
+const TAG_HEADER_CAPTURE: usize = 512;
+
+impl TagTargetsScan {
+    fn new() -> Self {
+        Self {
+            line: Vec::new(),
+            content_left: 0,
+            capture: Vec::new(),
+            after_content: false,
+            targets: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Result<bool> {
+        let mut i = 0;
+        while i < chunk.len() {
+            if self.after_content {
+                if chunk[i] != b'\n' {
+                    bail!("cat-file --batch record missing its trailing newline");
+                }
+                self.after_content = false;
+                i += 1;
+                continue;
+            }
+            if self.content_left > 0 {
+                let take = self.content_left.min(chunk.len() - i);
+                let room = TAG_HEADER_CAPTURE.saturating_sub(self.capture.len());
+                self.capture
+                    .extend_from_slice(&chunk[i..i + take.min(room)]);
+                self.content_left -= take;
+                i += take;
+                if self.content_left == 0 {
+                    self.after_content = true;
+                    self.targets.push(parse_tag_header(&self.capture)?);
+                }
+                continue;
+            }
+            match chunk[i..].iter().position(|b| *b == b'\n') {
+                Some(j) => {
+                    self.line.extend_from_slice(&chunk[i..i + j]);
+                    i += j + 1;
+                    let line = std::mem::take(&mut self.line);
+                    self.content_left = parse_batch_header(&line)?;
+                    self.capture.clear();
+                }
+                None => {
+                    self.line.extend_from_slice(&chunk[i..]);
+                    i = chunk.len();
+                    if self.line.len() > 256 {
+                        bail!("cat-file --batch printed an oversized record header");
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// The stream must end at a record boundary: mid-line or mid-content is a
+    /// truncated answer, not a partial listing.
+    fn finish(self) -> Result<Vec<(String, String)>> {
+        if self.after_content || self.content_left > 0 || !self.line.is_empty() {
+            bail!("cat-file --batch output ended mid-record");
+        }
+        Ok(self.targets)
+    }
+}
+
+/// The `"<oid> <type> <size>"` line opening a `cat-file --batch` record; the
+/// `"<oid> missing"` form is an error, matching the missing-object rule.
+fn parse_batch_header(line: &[u8]) -> Result<usize> {
+    if line.ends_with(b" missing") {
+        bail!(
+            "cat-file --batch reported a missing object: {}",
+            String::from_utf8_lossy(line)
+        );
+    }
+    let size = line
+        .rsplit(|b| *b == b' ')
+        .next()
+        .and_then(|s| std::str::from_utf8(s).ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .context("cat-file --batch printed a malformed record header")?;
+    Ok(size)
+}
+
+/// The first two lines of a tag object are always `object <oid>` and `type
+/// <kind>`; that pair is the one-level target.
+fn parse_tag_header(bytes: &[u8]) -> Result<(String, String)> {
+    let mut lines = bytes.split(|b| *b == b'\n');
+    let object = lines
+        .next()
+        .filter(|l| l.starts_with(b"object "))
+        .map(|l| &l[b"object ".len()..]);
+    let kind = lines
+        .next()
+        .filter(|l| l.starts_with(b"type "))
+        .map(|l| &l[b"type ".len()..]);
+    let (Some(object), Some(kind)) = (object, kind) else {
+        bail!("cat-file --batch printed a malformed tag object");
+    };
+    let object = std::str::from_utf8(object).context("tag header object is not utf-8")?;
+    let kind = std::str::from_utf8(kind).context("tag header type is not utf-8")?;
+    if !matches!(object.len(), 40 | 64) || !object.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("tag header object is not an object id");
+    }
+    if kind.is_empty() || !kind.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        bail!("tag header type is malformed");
+    }
+    Ok((object.to_string(), kind.to_string()))
+}
+
 /// List up to `max` tags, newest version first by tag name, and whether more
-/// exist. One bounded `for-each-ref` child; it is asked for `max + 1` rows so the
+/// exist. The bounded `for-each-ref` child is asked for `max + 1` rows so the
 /// extra one only sets the flag. `version:refname` sorts on names alone, so the
 /// cost does not grow with tag-object reads. Tags on trees and blobs are listed
 /// with their type and never dereferenced. A name that is not UTF-8 cannot be
-/// carried in JSON and is left out. A ref whose object is missing makes git fail,
-/// which is an error here rather than a listing without that tag.
+/// carried in JSON and is left out. A ref whose object is missing makes git
+/// fail, which is an error here rather than a listing without that tag.
+///
+/// `%(*objectname)`/`%(*objecttype)` are not used: their peel depth changed
+/// with the git version (2.43 stops one level, 2.56 peels to the first non-tag),
+/// while the contract is exactly one level. Instead a row whose object type is
+/// `tag` is resolved by one `cat-file --batch` child (all such oids fed on its
+/// stdin) and the tag object's own `object`/`type` header lines are the target.
 pub fn list_tags_bounded(
     git_bin: &str,
     repo_path: &Path,
@@ -1469,7 +1602,7 @@ pub fn list_tags_bounded(
             "for-each-ref",
             "--sort=-version:refname",
             &format!("--count={}", max + 1),
-            "--format=%(refname:strip=2)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)",
+            "--format=%(refname:strip=2)%00%(objectname)%00%(objecttype)",
             "refs/tags",
         ],
         repo_path,
@@ -1482,27 +1615,87 @@ pub fn list_tags_bounded(
         .collect();
     let truncated = records.len() > max;
     records.truncate(max);
-    let mut tags = Vec::with_capacity(records.len());
+    let mut rows = Vec::with_capacity(records.len());
     for record in records {
         let fields: Vec<&[u8]> = record.split(|b| *b == 0).collect();
-        let [name, object, object_type, peeled, peeled_type] = fields[..] else {
+        let [name, object, object_type] = fields[..] else {
             bail!("git for-each-ref printed an unexpected tag record");
         };
+        rows.push((name, object, object_type));
+    }
+
+    // One-level targets for the annotated rows, filled by the batch child below.
+    let mut targets: Vec<Option<(String, String)>> = Vec::with_capacity(rows.len());
+    let mut tag_oids: Vec<String> = Vec::new();
+    for (_, object, object_type) in &rows {
+        if *object_type == b"tag" {
+            let oid = std::str::from_utf8(object)
+                .context("git for-each-ref printed a non-utf-8 object id")?;
+            tag_oids.push(oid.to_string());
+            targets.push(None);
+        } else {
+            targets.push(Some((
+                String::from_utf8_lossy(object).into_owned(),
+                String::from_utf8_lossy(object_type).into_owned(),
+            )));
+        }
+    }
+
+    if !tag_oids.is_empty() {
+        let mut scan = TagTargetsScan::new();
+        let mut scan_error = None;
+        let mut stdin = tag_oids.join("\n");
+        stdin.push('\n');
+        let (status, err, _stopped) = crate::git::visibility_pack::run_bounded_git_streaming(
+            git_bin,
+            &["cat-file", "--batch"],
+            repo_path,
+            stdin.as_bytes(),
+            deadline,
+            &mut |chunk| match scan.feed(chunk) {
+                Ok(keep_reading) => keep_reading,
+                Err(e) => {
+                    scan_error = Some(e);
+                    false
+                }
+            },
+        )?;
+        if let Some(e) = scan_error {
+            return Err(e);
+        }
+        if !status.success() {
+            bail!(
+                "git cat-file failed: {}",
+                String::from_utf8_lossy(&err).trim()
+            );
+        }
+        let resolved = scan.finish()?;
+        if resolved.len() != tag_oids.len() {
+            bail!(
+                "git cat-file answered {} of {} tag objects",
+                resolved.len(),
+                tag_oids.len()
+            );
+        }
+        let mut resolved = resolved.into_iter();
+        for slot in &mut targets {
+            if slot.is_none() {
+                *slot = Some(resolved.next().expect("counted above"));
+            }
+        }
+    }
+
+    let mut tags = Vec::with_capacity(rows.len());
+    for ((name, _, object_type), target) in rows.into_iter().zip(targets) {
         let Ok(name) = std::str::from_utf8(name) else {
             continue;
         };
-        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-        let annotated = !peeled.is_empty();
-        let (target, target_type) = if annotated {
-            (text(peeled), text(peeled_type))
-        } else {
-            (text(object), text(object_type))
-        };
+        let (target, target_type) = target.expect("every row has a target");
         tags.push(TagInfo {
             name: name.to_string(),
             target,
             target_type,
-            annotated,
+            annotated: object_type == b"tag",
         });
     }
     Ok((tags, truncated))
@@ -4893,5 +5086,64 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Fake git that delegates to real git but reports `%(*objectname)` /
+    /// `%(*objecttype)` the way git 2.56 does (peeled to the first non-tag)
+    /// where the installed git peels only one level. The listing must report a
+    /// tag of a tag at one level under either report.
+    #[cfg(unix)]
+    fn fully_peeling_git(dir: &Path) -> String {
+        let p = dir.join("peelgit");
+        write_fake_git(
+            &p,
+            "#!/usr/bin/env bash\n\
+             set -euo pipefail\n\
+             if [ \"$1\" != \"for-each-ref\" ]; then exec git \"$@\"; fi\n\
+             git \"$@\" | tr '\\0' '\\t' | while IFS= read -r line; do\n\
+             \x20 peeled=$(cut -f4 <<< \"$line\")\n\
+             \x20 if [ -n \"$peeled\" ]; then\n\
+             \x20   peeled=$(git rev-parse \"$peeled^{}\")\n\
+             \x20   line=$(cut -f1-3 <<< \"$line\")$'\\t'\"$peeled\"$'\\t'\"$(git cat-file -t \"$peeled\")\"\n\
+             \x20 fi\n\
+             \x20 echo \"$line\"\n\
+             done | tr '\\t' '\\0'\n",
+        );
+        p.to_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tag_of_a_tag_reports_one_level_deep_whatever_git_peels() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let c = commit_at(&work, "c1", T0 + 100);
+        git_at(&work, &["tag", "-a", "-m", "inner", "inner", &c], T0 + 110);
+        let inner = git_at(&work, &["rev-parse", "refs/tags/inner"], T0);
+        git_at(
+            &work,
+            &["tag", "-a", "-m", "outer", "outer", &inner],
+            T0 + 120,
+        );
+        git_at(&work, &["tag", "light", &c], T0);
+        let git_dir = work.join(".git");
+
+        let fake = fully_peeling_git(td.path());
+        let (tags, truncated) =
+            super::list_tags_bounded(&fake, &git_dir, 100, far_deadline()).unwrap();
+        assert!(!truncated);
+        let row = |name: &str| tags.iter().find(|t| t.name == name).unwrap();
+
+        // The contract is one level: `outer` reports the inner tag object with
+        // type `tag`, never the commit a full peel would reach.
+        let outer = row("outer");
+        assert_eq!(outer.target, inner, "outer must name the inner tag object");
+        assert_eq!(outer.target_type, "tag");
+        assert!(outer.annotated);
+        assert_eq!(row("inner").target, c);
+        assert_eq!(row("inner").target_type, "commit");
+        assert_eq!(row("light").target, c);
+        assert!(!row("light").annotated);
     }
 }

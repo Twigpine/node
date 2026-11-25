@@ -328,6 +328,7 @@ pub(crate) fn run_bounded_git_streaming(
     git_bin: &str,
     args: &[&str],
     repo_path: &Path,
+    stdin_bytes: &[u8],
     deadline: Instant,
     on_chunk: &mut dyn FnMut(&[u8]) -> bool,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, bool)> {
@@ -335,7 +336,7 @@ pub(crate) fn run_bounded_git_streaming(
         git_bin,
         args,
         repo_path,
-        b"",
+        stdin_bytes,
         deadline,
         false,
         &[],
@@ -350,10 +351,11 @@ pub(crate) fn run_bounded_git_streaming(
     git_bin: &str,
     args: &[&str],
     repo_path: &Path,
+    stdin_bytes: &[u8],
     deadline: Instant,
     on_chunk: &mut dyn FnMut(&[u8]) -> bool,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, bool)> {
-    let (status, out, err) = run_bounded_git_raw(git_bin, args, repo_path, b"", deadline)?;
+    let (status, out, err) = run_bounded_git_raw(git_bin, args, repo_path, stdin_bytes, deadline)?;
     let stopped = !on_chunk(&out);
     Ok((status, err, stopped))
 }
@@ -6696,6 +6698,7 @@ esac\n";
             &git_bin,
             &["rev-list"],
             tmp.path(),
+            b"",
             Instant::now() + SH_STARTUP_HEADROOM,
             &mut |chunk| {
                 got.extend_from_slice(chunk);
@@ -6734,6 +6737,7 @@ exec yes abcdefgh\n";
             &git_bin,
             &["rev-list"],
             tmp.path(),
+            b"",
             Instant::now() + Duration::from_secs(30),
             &mut |chunk| {
                 seen += chunk.len();
@@ -6788,6 +6792,7 @@ exec yes abcdefgh\n";
             &git_bin,
             &["rev-list"],
             tmp.path(),
+            b"",
             Instant::now() + SH_STARTUP_HEADROOM,
             &mut |_| true,
         )
