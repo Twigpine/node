@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.9.0](https://github.com/Twigpine/node/compare/v0.8.1...v0.9.0) (2026-11-25)
+
+
+### Features
+
+* **cli:** npm twigpine cli ([#615](https://github.com/Twigpine/node/issues/615)) ([17395b4](https://github.com/Twigpine/node/commit/17395b4f83ac280a2e7a6ec17f4d3b86947bb2a3))
+* **node:** add model hosting storage and format foundation ([#620](https://github.com/Twigpine/node/issues/620)) ([55b2c9e](https://github.com/Twigpine/node/commit/55b2c9e2f1b5eda4db44478615d53f41d92a8236))
+* **node:** add the HF read surface, release durability, and model fetch ([#623](https://github.com/Twigpine/node/issues/623)) ([c6211b1](https://github.com/Twigpine/node/commit/c6211b1002a1d527db0168877b95030e9fa6f18a))
+* **node:** model release publishing and ingest ([#631](https://github.com/Twigpine/node/issues/631)) ([ec99a17](https://github.com/Twigpine/node/commit/ec99a1712ba6a23ff68d1d82d83b996b4b8e1c11))
+
+
+### Bug Fixes
+
+* **deps:** bump url to 2.5.9 for RUSTSEC-2026-0592 ([#630](https://github.com/Twigpine/node/issues/630)) ([6872d77](https://github.com/Twigpine/node/commit/6872d77b93b085780e9f73be7a8ce062e0adda17))
+* **node:** bound the write guard's lock-pool hold with a lock-hold deadline ([#613](https://github.com/Twigpine/node/issues/613)) ([721429a](https://github.com/Twigpine/node/commit/721429a8b09fd997cc20d74df806613bd1e9e135))
+* **node:** do not replicate from mirror rows whose visibility rules were never synced ([#633](https://github.com/Twigpine/node/issues/633)) ([14c0946](https://github.com/Twigpine/node/commit/14c0946c2020d9761289d421679a2dc195eab90a))
+* **node:** refuse non-public resolved addresses on outbound clients ([#612](https://github.com/Twigpine/node/issues/612)) ([7544cbd](https://github.com/Twigpine/node/commit/7544cbd6972cb7af2a5977e41361883076ec7e14))
+
 ## [0.8.1](https://github.com/Twigpine/node/compare/v0.8.0...v0.8.1) (2026-11-18)
 
 
