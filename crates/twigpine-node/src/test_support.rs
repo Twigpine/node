@@ -5769,7 +5769,7 @@ mod tests {
                 repo: format!("{keypart}/evt-priv"),
                 ref_name: "refs/heads/embargo-gossip".to_string(),
                 old_sha: "0".repeat(40),
-                new_sha: "gossipSEKRET".to_string(),
+                new_sha: "5ec1e7".repeat(6) + "5ec1",
                 timestamp: Utc::now().to_rfc3339(),
                 cert_id: None,
                 received_at: Utc::now().to_rfc3339(),
@@ -5832,7 +5832,7 @@ mod tests {
             .unwrap();
         let body = String::from_utf8_lossy(&bytes).to_string();
         assert!(
-            !body.contains("gossipSEKRET"),
+            !body.contains("5ec1e75ec1e7"),
             "fail-closed response must not leak the gossip secret"
         );
     }

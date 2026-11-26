@@ -8,6 +8,8 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use twigpine_core::cid::is_hex_oid;
+
 use crate::webhook_secret::WebhookSecret;
 
 /// A migration version this build defines is already recorded in the database
@@ -51,6 +53,15 @@ pub(crate) const MAX_VISIBLE_REPO_PAGE_SIZE: usize = 200;
 /// always parse back (#465 4th round). 100 bytes keeps the longest possible
 /// cursor an order of magnitude under the parse limit.
 pub(crate) const MAX_REPO_NAME_LEN: usize = 100;
+
+/// Wire/persistence bounds for peer-supplied ref-update fields. These are
+/// byte bounds, not character counts: the amplification being bounded is the
+/// row size a peer can make this node store and later serialize.
+const MAX_REF_UPDATE_REF_NAME_LEN: usize = 1024;
+const MAX_REF_UPDATE_DID_LEN: usize = 256;
+const MAX_REF_UPDATE_TIMESTAMP_LEN: usize = 64;
+const MAX_REF_UPDATE_CERT_ID_LEN: usize = 128;
+const MAX_REF_UPDATE_CID_LEN: usize = 128;
 
 /// Maximum agent tasks returned per query. Shared by the GraphQL `tasks`
 /// complexity meter and the resolver clamp so they can't drift.
@@ -865,6 +876,232 @@ pub struct ReceivedRefUpdate {
     /// Full owner DID — populated by new peers; None for events from older
     /// peers that predate the wire-format change (#144).
     pub owner_did: Option<String>,
+}
+
+/// The peer-supplied fields one ref-update notification carries before either
+/// transport writes anything. References rather than clones: validation runs
+/// before storage precisely so an oversized field never gets copied into a row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RefUpdateTransportFields<'a> {
+    pub repo: &'a str,
+    pub node_did: &'a str,
+    pub pusher_did: &'a str,
+    pub owner_did: Option<&'a str>,
+    pub ref_name: &'a str,
+    pub old_sha: &'a str,
+    pub new_sha: &'a str,
+    pub timestamp: &'a str,
+    pub cert_id: Option<&'a str>,
+    pub lag_origin: Option<&'a str>,
+    pub cid: Option<&'a str>,
+}
+
+fn validate_sha(field: &str, value: &str, allow_empty: bool) -> Result<(), String> {
+    if value.is_empty() && allow_empty {
+        return Ok(());
+    }
+    if is_hex_oid(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{field} must be a 40- or 64-character hexadecimal object id"
+        ))
+    }
+}
+
+fn validate_rfc3339(field: &str, value: &str) -> Result<(), String> {
+    if value.len() > MAX_REF_UPDATE_TIMESTAMP_LEN {
+        return Err(format!(
+            "{field} exceeds {MAX_REF_UPDATE_TIMESTAMP_LEN} bytes"
+        ));
+    }
+    DateTime::parse_from_rfc3339(value)
+        .map(|_| ())
+        .map_err(|_| format!("{field} must be an RFC 3339 timestamp"))
+}
+
+fn validate_did_shape(field: &str, value: &str, allow_empty: bool) -> Result<(), String> {
+    if value.is_empty() {
+        return if allow_empty {
+            Ok(())
+        } else {
+            Err(format!("{field} must not be empty"))
+        };
+    }
+    if value.len() > MAX_REF_UPDATE_DID_LEN {
+        return Err(format!("{field} exceeds {MAX_REF_UPDATE_DID_LEN} bytes"));
+    }
+    let mut parts = value.splitn(3, ':');
+    let scheme = parts.next().unwrap_or_default();
+    let method = parts.next().unwrap_or_default();
+    let method_id = parts.next().unwrap_or_default();
+    if scheme != "did" || method_id.is_empty() {
+        return Err(format!("{field} must be a DID"));
+    }
+    if !matches!(method, "key" | "web" | "gitlawb") {
+        return Err(format!("{field} uses an unsupported DID method"));
+    }
+    // DID Core method-specific-id: colon-separated portions of idchars, with
+    // at least one final idchar. `%` is not itself an idchar; it is legal only
+    // as the introducer of a two-hex-digit percent escape.
+    let bytes = method_id.as_bytes();
+    let mut i = 0;
+    let mut ends_in_idchar = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'-' | b'_' => {
+                ends_in_idchar = true;
+                i += 1;
+            }
+            b':' => {
+                ends_in_idchar = false;
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit() =>
+            {
+                ends_in_idchar = true;
+                i += 3;
+            }
+            _ => return Err(format!("{field} contains a non-DID character")),
+        }
+    }
+    if !ends_in_idchar {
+        return Err(format!("{field} must end in a DID id character"));
+    }
+    Ok(())
+}
+
+/// Whether `ref_name` is a full git ref under `refs/` and follows the rules of
+/// `git check-ref-format`. Unicode scalar values above ASCII remain allowed,
+/// matching git; ASCII control bytes, ASCII space, and git's punctuation
+/// exclusions do not. The byte cap is the amplification bound git itself does
+/// not provide.
+fn validate_ref_name(ref_name: &str) -> Result<(), String> {
+    if ref_name.is_empty() {
+        return Err("ref_name must not be empty".to_string());
+    }
+    if ref_name.len() > MAX_REF_UPDATE_REF_NAME_LEN {
+        return Err(format!(
+            "ref_name exceeds {MAX_REF_UPDATE_REF_NAME_LEN} bytes"
+        ));
+    }
+    if !ref_name.starts_with("refs/") {
+        return Err("ref_name must be a full ref under refs/".to_string());
+    }
+    if ref_name == "@"
+        || ref_name.contains("@{")
+        || ref_name.contains("..")
+        || ref_name.starts_with('/')
+        || ref_name.ends_with('/')
+        || ref_name.ends_with('.')
+        || ref_name.contains("//")
+    {
+        return Err("ref_name is not a valid git ref".to_string());
+    }
+    for ch in ref_name.chars() {
+        let ascii_control = ch.is_ascii_control();
+        if ascii_control || ch == ' ' || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
+            return Err("ref_name contains a character git refuses".to_string());
+        }
+    }
+    for component in ref_name.split('/') {
+        if component.is_empty() || component.starts_with('.') || component.ends_with(".lock") {
+            return Err("ref_name contains an invalid git ref component".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_capped(field: &str, value: Option<&str>, cap: usize) -> Result<(), String> {
+    if let Some(value) = value {
+        if value.is_empty() {
+            return Err(format!("{field} must not be empty when present"));
+        }
+        if value.len() > cap {
+            return Err(format!("{field} exceeds {cap} bytes"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_stored_ref_update_fields(fields: &RefUpdateTransportFields<'_>) -> Result<(), String> {
+    crate::git::repo_store::validate_repo_slug(fields.repo)
+        .map_err(|e| format!("invalid repo field: {e}"))?;
+    validate_did_shape("node_did", fields.node_did, false)?;
+    // Empty is the legacy HTTP omission sentinel for pusher_did/old_sha, not a
+    // peer-supplied DID or object id. Present values must still be well formed.
+    validate_did_shape("pusher_did", fields.pusher_did, true)?;
+    if let Some(owner) = fields.owner_did {
+        validate_did_shape("owner_did", owner, false)?;
+    }
+    validate_ref_name(fields.ref_name)?;
+    validate_sha("old_sha", fields.old_sha, true)?;
+    validate_sha("new_sha", fields.new_sha, false)?;
+    validate_rfc3339("timestamp", fields.timestamp)?;
+    validate_optional_capped("cert_id", fields.cert_id, MAX_REF_UPDATE_CERT_ID_LEN)?;
+    Ok(())
+}
+
+/// Validate the wire fields before either transport pays for authentication,
+/// database work, or a write. `lag_origin` and `cid` are included here because
+/// they do not land in `received_ref_updates`; they land in `sync_queue`, and
+/// leaving them free-form would preserve the same oversized-storage bypass.
+pub(crate) fn validate_ref_update_transport_fields(
+    fields: &RefUpdateTransportFields<'_>,
+) -> Result<(), String> {
+    validate_stored_ref_update_fields(fields)?;
+    if let Some(lag_origin) = fields.lag_origin {
+        validate_rfc3339("lag_origin", lag_origin)?;
+    }
+    validate_optional_capped("cid", fields.cid, MAX_REF_UPDATE_CID_LEN)?;
+    Ok(())
+}
+
+/// Defense in depth at the row insert. Every transport is expected to validate
+/// before side effects; this second check is what keeps a future caller from
+/// bypassing that boundary and persisting an oversized or malformed row.
+pub(crate) fn validate_received_ref_update(update: &ReceivedRefUpdate) -> Result<(), String> {
+    let fields = RefUpdateTransportFields {
+        repo: &update.repo,
+        node_did: &update.node_did,
+        pusher_did: &update.pusher_did,
+        owner_did: update.owner_did.as_deref(),
+        ref_name: &update.ref_name,
+        old_sha: &update.old_sha,
+        new_sha: &update.new_sha,
+        timestamp: &update.timestamp,
+        cert_id: update.cert_id.as_deref(),
+        lag_origin: None,
+        cid: None,
+    };
+    validate_stored_ref_update_fields(&fields)?;
+    validate_rfc3339("received_at", &update.received_at)?;
+    Ok(())
+}
+
+/// Defense in depth for the queue half of the same ingest. The row feed and
+/// the queue are separate writes, so validating only `insert_ref_update` would
+/// leave a future caller able to store the same attacker-controlled bytes here.
+pub(crate) fn validate_sync_queue_write(
+    repo: &str,
+    node_did: &str,
+    ref_name: &str,
+    new_sha: &str,
+    cid: Option<&str>,
+    origin_timestamp: Option<&str>,
+) -> Result<(), String> {
+    crate::git::repo_store::validate_repo_slug(repo)
+        .map_err(|e| format!("invalid repo field: {e}"))?;
+    validate_did_shape("node_did", node_did, false)?;
+    validate_ref_name(ref_name)?;
+    validate_sha("new_sha", new_sha, false)?;
+    if let Some(origin) = origin_timestamp {
+        validate_rfc3339("origin_timestamp", origin)?;
+    }
+    validate_optional_capped("cid", cid, MAX_REF_UPDATE_CID_LEN)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2878,6 +3115,16 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE model_blocks ADD COLUMN IF NOT EXISTS payer_did TEXT",
         ],
     },
+    Migration {
+        version: 53,
+        name: "ref_updates_received_at_keyset",
+        stmts: &[
+            // Feed pagination orders on the server-stamped receipt column, not
+            // the event's self-asserted timestamp. This composite index is the
+            // row-value keyset order the collector walks.
+            "CREATE INDEX IF NOT EXISTS idx_ref_updates_received_keyset ON received_ref_updates(received_at DESC, id DESC)",
+        ],
+    },
 ];
 
 // ── HTTP-signature replay ledger ──────────────────────────────────────────────
@@ -4541,6 +4788,8 @@ impl Db {
         cid: Option<&str>,
         origin_timestamp: Option<&str>,
     ) -> Result<()> {
+        validate_sync_queue_write(repo, node_did, ref_name, new_sha, cid, origin_timestamp)
+            .map_err(|e| anyhow::anyhow!(e))?;
         // `sync_queue` is slug-scoped and cascaded by `delete_repo_by_id`; take the
         // shared advisory lock on the same normalized slug so an enqueue cannot
         // interleave with the purge's sibling-check-then-cascade (same shape and
@@ -9801,6 +10050,7 @@ fn row_to_repo_push_event(r: sqlx::postgres::PgRow) -> RepoPushEvent {
 
 impl Db {
     pub async fn insert_ref_update(&self, update: &ReceivedRefUpdate) -> Result<()> {
+        validate_received_ref_update(update).map_err(|e| anyhow::anyhow!(e))?;
         // `received_ref_updates` is slug-scoped and cascaded by `delete_repo_by_id`;
         // take the shared advisory lock on the same normalized slug so a peer-fed
         // insert cannot land inside the purge's sibling-check-then-cascade window
@@ -9960,20 +10210,15 @@ impl Db {
         Ok(results)
     }
 
-    /// One page of ref updates (newest first), optionally scoped to one repo.
-    /// The `(timestamp DESC, id DESC)` order gives a stable tiebreak so offset
-    /// paging does not skip or duplicate rows when timestamps collide. Used by
-    /// the visibility-gated feed collector, which pages past dropped private rows
-    /// so a small limit still returns the latest visible events (#114).
     /// One page of ref updates for the visibility collector, ordered
-    /// `timestamp DESC, id DESC`, using a **keyset** cursor rather than
+    /// `received_at DESC, id DESC`, using a **keyset** cursor rather than
     /// `LIMIT/OFFSET`.
     ///
-    /// `after` is the `(timestamp, id)` of the last row of the previous page;
+    /// `after` is the `(received_at, id)` of the last row of the previous page;
     /// the next page reads rows strictly older than it via the row-value
-    /// predicate `(timestamp, id) < (after_ts, after_id)`, which matches the
+    /// predicate `(received_at, id) < (after_ts, after_id)`, which matches the
     /// `ORDER BY` exactly (same id tie-break). Because a concurrently inserted
-    /// row is newer (larger `timestamp`) and so sorts to the front, it lands
+    /// row is newer (larger `received_at`) and so sorts to the front, it lands
     /// *above* the window we are paging through and cannot shift it. That keeps
     /// a single multi-page scan free of the duplicate/skip that OFFSET paging
     /// suffers when `received_ref_updates` is written between page reads.
@@ -9996,7 +10241,7 @@ impl Db {
         if after.is_some() {
             let (a, b) = (n + 1, n + 2);
             n += 2;
-            conds.push(format!("(timestamp, id) < (${a}, ${b})"));
+            conds.push(format!("(received_at, id) < (${a}, ${b})"));
         }
         let where_clause = if conds.is_empty() {
             String::new()
@@ -10005,7 +10250,7 @@ impl Db {
         };
         let sql = format!(
             "SELECT {COLS} FROM received_ref_updates{where_clause} \
-             ORDER BY timestamp DESC, id DESC LIMIT ${}",
+             ORDER BY received_at DESC, id DESC LIMIT ${}",
             n + 1
         );
 
@@ -13667,6 +13912,26 @@ mod migration_tests {
         );
 
         db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn migration_v53_creates_ref_update_received_at_keyset_index(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'received_ref_updates'
+                  AND indexname = 'idx_ref_updates_received_keyset'
+            )",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            exists,
+            "idx_ref_updates_received_keyset must exist after migration v53"
+        );
     }
 
     #[sqlx::test]
@@ -17700,6 +17965,191 @@ mod icaptcha_quarantine_tests {
 }
 
 #[cfg(test)]
+mod ref_update_validation_tests {
+    use super::{
+        validate_received_ref_update, validate_ref_name, validate_ref_update_transport_fields, Db,
+        ReceivedRefUpdate, RefUpdateTransportFields,
+    };
+    use sqlx::PgPool;
+
+    fn valid_update() -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: "r1".into(),
+            node_did: "did:key:zNode".into(),
+            pusher_did: "did:key:zPusher".into(),
+            repo: "zOwner/myrepo".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".repeat(40),
+            new_sha: "a".repeat(40),
+            timestamp: "2026-07-02T12:00:00Z".into(),
+            cert_id: None,
+            received_at: "2026-07-02T12:00:01Z".into(),
+            from_peer: "peer".into(),
+            owner_did: None,
+        }
+    }
+
+    #[test]
+    fn ref_name_validation_matches_git_edges_and_bounds() {
+        let at_cap = format!("refs/heads/{}", "x".repeat(1013));
+        assert_eq!(at_cap.len(), 1024);
+        assert!(validate_ref_name(&at_cap).is_ok());
+        assert!(validate_ref_name("refs/heads/féat").is_ok());
+        assert!(validate_ref_name("refs/heads/x./y").is_ok());
+        assert!(validate_ref_name(&format!("refs/heads/{}", "x".repeat(1014))).is_err());
+
+        for bad in [
+            "heads/main",
+            "refs/heads/a b",
+            "refs/heads/a..b",
+            "refs/heads/.x",
+            "refs/heads/x.lock",
+            "refs/heads/x.",
+            "refs/heads/x@{y",
+            "refs/heads//x",
+            "refs/heads/x/",
+            "refs/heads/a\\b",
+            "refs/heads/a*b",
+            "refs/heads/a?b",
+            "refs/heads/a[b",
+            "refs/heads/a:b",
+            "refs/heads/a^b",
+            "refs/heads/a~b",
+        ] {
+            assert!(validate_ref_name(bad).is_err(), "{bad:?} must reject");
+        }
+    }
+
+    #[test]
+    fn stored_ref_update_validation_accepts_valid_and_legacy_empty_fields() {
+        let valid = valid_update();
+        assert!(validate_received_ref_update(&valid).is_ok());
+
+        let mut sha256_format = valid_update();
+        sha256_format.old_sha = "0".repeat(64);
+        sha256_format.new_sha = "a".repeat(64);
+        assert!(validate_received_ref_update(&sha256_format).is_ok());
+
+        let mut escaped_did = valid_update();
+        escaped_did.node_did = "did:key:z%41abc".into();
+        assert!(validate_received_ref_update(&escaped_did).is_ok());
+
+        let mut legacy = valid_update();
+        legacy.pusher_did.clear();
+        legacy.old_sha.clear();
+        assert!(
+            validate_received_ref_update(&legacy).is_ok(),
+            "omitted legacy HTTP provenance may remain empty because it is bounded"
+        );
+    }
+
+    #[test]
+    fn stored_ref_update_validation_rejects_malformed_or_oversized_fields() {
+        fn expect_invalid(edit: impl Fn(&mut ReceivedRefUpdate)) {
+            let mut update = valid_update();
+            edit(&mut update);
+            assert!(validate_received_ref_update(&update).is_err());
+        }
+
+        expect_invalid(|u| u.repo = "../x".into());
+        expect_invalid(|u| u.node_did = "not-a-did".into());
+        expect_invalid(|u| u.pusher_did = format!("did:key:{}", "z".repeat(300)));
+        expect_invalid(|u| u.owner_did = Some("did:unsupported:x".into()));
+        expect_invalid(|u| u.ref_name = format!("refs/heads/{}", "x".repeat(2000)));
+        expect_invalid(|u| u.old_sha = "not-a-sha".into());
+        expect_invalid(|u| u.new_sha = "z".repeat(40));
+        expect_invalid(|u| u.node_did = "did:key:z%".into());
+        expect_invalid(|u| u.node_did = "did:key:z%1".into());
+        expect_invalid(|u| u.node_did = "did:key:z:".into());
+        expect_invalid(|u| u.timestamp = "not-a-time".into());
+        expect_invalid(|u| u.timestamp = format!("2026-07-02T12:00:00.{}Z", "1".repeat(80)));
+        expect_invalid(|u| u.cert_id = Some("c".repeat(129)));
+        expect_invalid(|u| u.received_at = "yesterday".into());
+    }
+
+    #[test]
+    fn transport_validation_covers_sync_queue_only_fields() {
+        let update = valid_update();
+        let fields = RefUpdateTransportFields {
+            repo: &update.repo,
+            node_did: &update.node_did,
+            pusher_did: &update.pusher_did,
+            owner_did: update.owner_did.as_deref(),
+            ref_name: &update.ref_name,
+            old_sha: &update.old_sha,
+            new_sha: &update.new_sha,
+            timestamp: &update.timestamp,
+            cert_id: update.cert_id.as_deref(),
+            lag_origin: Some("2026-07-02T11:59:59Z"),
+            cid: Some("bafycid"),
+        };
+        assert!(validate_ref_update_transport_fields(&fields).is_ok());
+
+        let mut bad_lag = fields;
+        bad_lag.lag_origin = Some("not-a-time");
+        assert!(validate_ref_update_transport_fields(&bad_lag).is_err());
+
+        let mut bad_cid = fields;
+        let oversized_cid = "c".repeat(129);
+        bad_cid.cid = Some(&oversized_cid);
+        assert!(validate_ref_update_transport_fields(&bad_cid).is_err());
+    }
+
+    #[sqlx::test]
+    async fn insert_ref_update_is_a_validating_choke_point(pool: PgPool) {
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        db.insert_ref_update(&valid_update()).await.unwrap();
+
+        let mut bad = valid_update();
+        bad.id = "oversized".into();
+        bad.ref_name = format!("refs/heads/{}", "x".repeat(2000));
+        assert!(
+            db.insert_ref_update(&bad).await.is_err(),
+            "oversized ref_name must reject"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM received_ref_updates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "only the valid control row may land");
+    }
+
+    #[sqlx::test]
+    async fn enqueue_sync_is_a_validating_choke_point(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        assert!(
+            db.enqueue_sync(
+                "zOwner/myrepo",
+                "did:key:zNode",
+                "refs/heads/main",
+                &"a".repeat(40),
+                Some(&"c".repeat(129)),
+                None,
+            )
+            .await
+            .is_err(),
+            "oversized cid must reject"
+        );
+        assert!(
+            db.enqueue_sync(
+                "zOwner/myrepo",
+                "did:key:zNode",
+                "refs/heads/main",
+                &"a".repeat(40),
+                None,
+                Some("not-a-time"),
+            )
+            .await
+            .is_err(),
+            "malformed origin timestamp must reject"
+        );
+        assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod ref_update_keyset_paging_tests {
     use super::{Db, ReceivedRefUpdate};
     use sqlx::PgPool;
@@ -17711,8 +18161,8 @@ mod ref_update_keyset_paging_tests {
             pusher_did: "did:key:zP".into(),
             repo: "z6MkOwner/openrepo".into(),
             ref_name: "refs/heads/main".into(),
-            old_sha: "0".into(),
-            new_sha: "1".into(),
+            old_sha: "0".repeat(40),
+            new_sha: "1".repeat(40),
             timestamp: ts.into(),
             cert_id: None,
             received_at: ts.into(),
@@ -17745,7 +18195,7 @@ mod ref_update_keyset_paging_tests {
             async move {
                 sqlx::query_scalar::<_, String>(
                     "SELECT id FROM received_ref_updates \
-                     ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2",
+                     ORDER BY received_at DESC, id DESC LIMIT $1 OFFSET $2",
                 )
                 .bind(limit)
                 .bind(offset)
@@ -17768,7 +18218,28 @@ mod ref_update_keyset_paging_tests {
         );
     }
 
-    // The fix: keyset paging on (timestamp, id) reads strictly older rows each
+    #[sqlx::test]
+    async fn keyset_order_follows_received_at_not_attacker_timestamp(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let mut older_receipt = rru("older-receipt", "2026-07-01T10:00:01+00:00");
+        older_receipt.timestamp = "2026-07-01T12:00:00+00:00".into();
+        let mut newer_receipt = rru("newer-receipt", "2026-07-01T10:00:02+00:00");
+        newer_receipt.timestamp = "2026-07-01T09:00:00+00:00".into();
+        db.insert_ref_update(&older_receipt).await.unwrap();
+        db.insert_ref_update(&newer_receipt).await.unwrap();
+
+        let rows = db.list_ref_updates_keyset(None, 10, None).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["newer-receipt", "older-receipt"],
+            "feed ordering must follow server receipt order even when the wire timestamps invert it"
+        );
+    }
+
+    // The fix: keyset paging on (received_at, id) reads strictly older rows each
     // page, so a concurrent newer insert cannot duplicate or skip a row.
     #[sqlx::test]
     async fn keyset_paging_is_stable_under_concurrent_insert(pool: PgPool) {
@@ -17780,7 +18251,7 @@ mod ref_update_keyset_paging_tests {
         let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
         assert_eq!(p1_ids, vec!["r4", "r3"], "keyset page 1");
         let last = p1.last().unwrap();
-        let cursor = (last.timestamp.clone(), last.id.clone());
+        let cursor = (last.received_at.clone(), last.id.clone());
 
         // concurrent insert of a newer row between page reads
         db.insert_ref_update(&rru("r5", "2026-07-01T10:00:09+00:00"))
@@ -17820,8 +18291,8 @@ mod ref_update_keyset_repo_filtered_tests {
             pusher_did: "did:key:zP".into(),
             repo: repo.into(),
             ref_name: "refs/heads/main".into(),
-            old_sha: "0".into(),
-            new_sha: "1".into(),
+            old_sha: "0".repeat(40),
+            new_sha: "1".repeat(40),
             timestamp: ts.into(),
             cert_id: None,
             received_at: ts.into(),
@@ -17831,7 +18302,7 @@ mod ref_update_keyset_repo_filtered_tests {
     }
 
     // Exercises the (Some(repo), Some(after)) keyset branch: a repo-filtered
-    // multi-page continuation that emits `WHERE repo=$1 AND (timestamp,id)<($2,$3)`
+    // multi-page continuation that emits `WHERE repo=$1 AND (received_at,id)<($2,$3)`
     // with four binds. Also confirms the repo filter holds across pages, noise
     // rows are excluded, and a concurrent insert does not duplicate or skip.
     #[sqlx::test]
@@ -17878,7 +18349,7 @@ mod ref_update_keyset_repo_filtered_tests {
             "no noise rows on page 1"
         );
         let last = p1.last().unwrap();
-        let cursor = (last.timestamp.clone(), last.id.clone());
+        let cursor = (last.received_at.clone(), last.id.clone());
 
         // concurrent insert of a newer TARGET row between page reads
         db.insert_ref_update(&rru_repo("T4", "2026-07-01T10:00:06+00:00", target))
@@ -17927,8 +18398,8 @@ mod ref_update_keyset_same_timestamp_tests {
             pusher_did: "did:key:zP".into(),
             repo: "z6MkOwner/openrepo".into(),
             ref_name: "refs/heads/main".into(),
-            old_sha: "0".into(),
-            new_sha: "1".into(),
+            old_sha: "0".repeat(40),
+            new_sha: "1".repeat(40),
             timestamp: ts.into(),
             cert_id: None,
             received_at: ts.into(),
@@ -17937,12 +18408,12 @@ mod ref_update_keyset_same_timestamp_tests {
         }
     }
 
-    // Load-bearing for the `id` half of the (timestamp, id) keyset cursor: all
-    // rows share ONE timestamp, so ordering and the page boundary fall entirely
-    // on `id DESC`. A timestamp-only cursor would return nothing for page 2 and
-    // silently skip b and a; the (timestamp, id) tie-break must advance instead.
+    // Load-bearing for the `id` half of the (received_at, id) keyset cursor: all
+    // rows share ONE receipt timestamp, so ordering and the page boundary fall
+    // entirely on `id DESC`. A cursor without the id half would return nothing
+    // for page 2 and silently skip b and a; the tie-break must advance instead.
     #[sqlx::test]
-    async fn keyset_advances_within_an_equal_timestamp_run(pool: PgPool) {
+    async fn keyset_advances_within_an_equal_received_at_run(pool: PgPool) {
         let db = Db::for_testing(pool);
         db.run_migrations().await.unwrap();
         let ts = "2026-07-01T10:00:00+00:00";
@@ -17950,22 +18421,22 @@ mod ref_update_keyset_same_timestamp_tests {
             db.insert_ref_update(&row(id, ts)).await.unwrap();
         }
 
-        // id DESC over equal timestamps: d, c, b, a
+        // id DESC over equal receipt timestamps: d, c, b, a
         let p1 = db.list_ref_updates_keyset(None, 2, None).await.unwrap();
         let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
         assert_eq!(p1_ids, vec!["d", "c"], "page 1 by id DESC");
         let last = p1.last().unwrap();
 
-        // page boundary lands INSIDE the equal-timestamp group (cursor = (ts, "c"))
+        // page boundary lands INSIDE the equal-receipt group (cursor = (ts, "c"))
         let p2 = db
-            .list_ref_updates_keyset(None, 2, Some((last.timestamp.as_str(), last.id.as_str())))
+            .list_ref_updates_keyset(None, 2, Some((last.received_at.as_str(), last.id.as_str())))
             .await
             .unwrap();
         let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
         assert_eq!(
             p2_ids,
             vec!["b", "a"],
-            "keyset must advance by id within an equal-timestamp run (a timestamp-only cursor would skip these)"
+            "keyset must advance by id within an equal-receipt run (a cursor without the id half would skip these)"
         );
 
         let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
@@ -17973,7 +18444,7 @@ mod ref_update_keyset_same_timestamp_tests {
         assert_eq!(
             uniq.len(),
             4,
-            "no dup or skip across a same-timestamp page boundary"
+            "no dup or skip across a same-receipt page boundary"
         );
     }
 }
@@ -18950,8 +19421,8 @@ mod ref_certificate_tests {
             "dup-feat-z",
             &r1,
             "refs/heads/feature",
-            "cccc",
-            "dddd",
+            &"c".repeat(40),
+            &"d".repeat(40),
             "2026-07-01T10:00:00Z"
         );
 
@@ -18968,8 +19439,8 @@ mod ref_certificate_tests {
             "dup-b-new",
             &r2,
             "refs/heads/main",
-            "eeee",
-            "ffff",
+            &"e".repeat(40),
+            &"f".repeat(40),
             "2026-07-02T10:00:00Z"
         );
 
@@ -19121,7 +19592,7 @@ mod ref_update_db_tests {
             "zOwner/myrepo",
             Some("did:key:zOwner"),
             "refs/heads/main",
-            "aaaa",
+            &"a".repeat(40),
         ))
         .await
         .unwrap();
@@ -19140,7 +19611,7 @@ mod ref_update_db_tests {
             "zOwner/myrepo",
             None,
             "refs/heads/main",
-            "bbbb",
+            &"b".repeat(40),
         ))
         .await
         .unwrap();
@@ -19158,7 +19629,7 @@ mod ref_update_db_tests {
             "alice/repo1",
             Some("did:key:zAlice"),
             "refs/heads/main",
-            "cccc",
+            &"c".repeat(40),
         ))
         .await
         .unwrap();
@@ -19167,7 +19638,7 @@ mod ref_update_db_tests {
             "bob/repo2",
             Some("did:key:zBob"),
             "refs/heads/feat",
-            "dddd",
+            &"d".repeat(40),
         ))
         .await
         .unwrap();
@@ -19203,7 +19674,7 @@ mod ref_update_db_tests {
             "ownerA/proj",
             Some("did:key:zA"),
             "refs/heads/main",
-            "eeee",
+            &"e".repeat(40),
         ))
         .await
         .unwrap();
@@ -19212,7 +19683,7 @@ mod ref_update_db_tests {
             "ownerB/proj",
             Some("did:web:host:zB"),
             "refs/heads/main",
-            "ffff",
+            &"f".repeat(40),
         ))
         .await
         .unwrap();
@@ -19236,14 +19707,14 @@ mod ref_update_db_tests {
             "repo/x",
             Some("did:key:zX"),
             "refs/heads/main",
-            "gggg",
+            &"g".repeat(40),
         );
         db.insert_ref_update(&u).await.unwrap();
         db.insert_ref_update(&u).await.unwrap();
 
         let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].new_sha, "gggg");
+        assert_eq!(all[0].new_sha, "g".repeat(40));
     }
 }
 

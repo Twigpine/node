@@ -508,6 +508,41 @@ pub async fn notify_sync(
         );
     }
 
+    // Validate every peer-supplied stored field, including the repo slug whose
+    // traversal shape is the #272 guard, before the peer lookup and
+    // before either write. The effective row values are what get validated:
+    // omitted legacy provenance stays empty, while an omitted timestamp is the
+    // server-stamped fallback the row will actually carry. An explicitly empty
+    // optional string is malformed input, not legacy omission.
+    for (field, value) in [
+        ("pusher_did", req.pusher_did.as_deref()),
+        ("old_sha", req.old_sha.as_deref()),
+    ] {
+        if matches!(value, Some("")) {
+            return Err(AppError::BadRequest(format!(
+                "{field} must not be empty when present"
+            )));
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let effective_timestamp = req.timestamp.as_deref().unwrap_or(now.as_str());
+    let wire = crate::db::RefUpdateTransportFields {
+        repo: &req.repo,
+        node_did: &req.node_did,
+        pusher_did: req.pusher_did.as_deref().unwrap_or(""),
+        owner_did: req.owner_did.as_deref(),
+        ref_name: &req.ref_name,
+        old_sha: req.old_sha.as_deref().unwrap_or(""),
+        new_sha: &req.new_sha,
+        timestamp: effective_timestamp,
+        cert_id: req.cert_id.as_deref(),
+        lag_origin: req.lag_origin.as_deref(),
+        cid: None,
+    };
+    if let Err(e) = crate::db::validate_ref_update_transport_fields(&wire) {
+        return Err(AppError::BadRequest(e));
+    }
+
     // Only accept notifications from known peers
     let peers = state.db.list_peers().await?;
     let known = peers.iter().any(|p| p.did == req.node_did);
@@ -516,14 +551,6 @@ pub async fn notify_sync(
             "unknown peer DID: {}",
             req.node_did
         )));
-    }
-
-    // #272: the slug reaches a PathBuf::join in the sync worker, where an extra
-    // separator or a traversal segment places the mirror outside repos_dir. Reject
-    // it here, before the queue row and the ref-update row are written. The message
-    // names the field and nothing about where repos live on disk.
-    if let Err(e) = crate::git::repo_store::validate_repo_slug(&req.repo) {
-        return Err(AppError::BadRequest(format!("invalid repo field: {e}")));
     }
 
     state
@@ -541,7 +568,6 @@ pub async fn notify_sync(
     // Mirror the gossipsub-receive handler: insert the same record we'd
     // get from the libp2p path, so /api/v1/events/ref-updates reflects
     // pushes that arrive over either transport.
-    let now = chrono::Utc::now().to_rfc3339();
     let update = crate::db::ReceivedRefUpdate {
         id: uuid::Uuid::new_v4().to_string(),
         node_did: req.node_did.clone(),
@@ -551,7 +577,7 @@ pub async fn notify_sync(
         ref_name: req.ref_name.clone(),
         old_sha: req.old_sha.clone().unwrap_or_default(),
         new_sha: req.new_sha.clone(),
-        timestamp: req.timestamp.clone().unwrap_or_else(|| now.clone()),
+        timestamp: effective_timestamp.to_string(),
         cert_id: req.cert_id.clone(),
         received_at: now,
         from_peer: format!("http:{}", req.node_did),
@@ -1386,9 +1412,11 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn sync_notify_unknown_peer_wins_over_malformed_slug(pool: PgPool) {
-        // Ordering: the slug check sits after the peer gate, so an unknown peer
-        // still gets the unknown-peer message rather than a slug complaint.
+    async fn sync_notify_field_validation_precedes_the_peer_lookup(pool: PgPool) {
+        // Ordering: wire-field validation is deliberately cheaper than the peer
+        // database lookup, so malformed input is refused before the known-peer
+        // decision even when the DID is unknown. Both answers are the same 400
+        // class; this test pins only which validation owns the reason.
         let state = test_state(pool).await;
         let stranger = Keypair::generate().did().to_string();
         let router = crate::server::build_router(state);
@@ -1406,8 +1434,127 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(
-            body.contains("unknown peer DID"),
-            "peer gate must still fire first: {body}"
+            body.contains("repo"),
+            "structural validation must fire before the peer lookup: {body}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_rejects_malformed_or_oversized_ref_update_fields(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        let oversized_ref = format!("refs/heads/{}", "x".repeat(2_000));
+        let oversized_did = format!("did:key:{}", "z".repeat(300));
+        let oversized_cert = "c".repeat(129);
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "oversized ref_name",
+                serde_json::json!({ "ref_name": oversized_ref }),
+            ),
+            (
+                "malformed ref_name",
+                serde_json::json!({ "ref_name": "refs/heads/a..b" }),
+            ),
+            (
+                "malformed new_sha",
+                serde_json::json!({ "new_sha": "not-a-sha" }),
+            ),
+            ("malformed old_sha", serde_json::json!({ "old_sha": "0" })),
+            ("empty old_sha", serde_json::json!({ "old_sha": "" })),
+            ("empty pusher_did", serde_json::json!({ "pusher_did": "" })),
+            (
+                "oversized pusher_did",
+                serde_json::json!({ "pusher_did": oversized_did }),
+            ),
+            (
+                "unsupported owner_did",
+                serde_json::json!({ "owner_did": "did:unsupported:x" }),
+            ),
+            (
+                "malformed timestamp",
+                serde_json::json!({ "timestamp": "not-a-time" }),
+            ),
+            (
+                "malformed lag_origin",
+                serde_json::json!({ "lag_origin": "not-a-time" }),
+            ),
+            (
+                "oversized cert_id",
+                serde_json::json!({ "cert_id": oversized_cert }),
+            ),
+        ];
+
+        for (i, (label, patch)) in cases.iter().enumerate() {
+            let mut body = serde_json::json!({
+                "repo": "z6Mkfoo/hello",
+                "ref_name": "refs/heads/main",
+                "new_sha": "0000000000000000000000000000000000000000",
+                "node_did": peer_did,
+            });
+            let object = body.as_object_mut().expect("notify body object");
+            for (key, value) in patch.as_object().expect("patch object") {
+                object.insert(key.clone(), value.clone());
+            }
+            let ip = format!("198.51.100.{}:5000", 60 + i);
+            let resp = router
+                .clone()
+                .oneshot(unsigned_post("/api/v1/sync/notify", &body.to_string(), &ip))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{label} must reject before either write"
+            );
+        }
+
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let feed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM received_ref_updates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0, "malformed input must not enqueue sync work");
+        assert_eq!(feed, 0, "malformed input must not seed the ref-update feed");
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_accepts_sha256_object_ids_and_omitted_legacy_fields(pool: PgPool) {
+        let state = test_state(pool).await;
+        let db = state.db.clone();
+        let peer_did = seed_peer(&state).await;
+        let body = serde_json::json!({
+            "repo": "z6Mkfoo/sha256repo",
+            "ref_name": "refs/heads/main",
+            "new_sha": "a".repeat(64),
+            "node_did": peer_did,
+        })
+        .to_string();
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &body,
+                "198.51.100.80:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let queued = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(queued.len(), 1, "the sha256 object id must queue");
+        let feed = db
+            .list_ref_updates_keyset(Some("z6Mkfoo/sha256repo"), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(feed.len(), 1);
+        assert_eq!(feed[0].new_sha.len(), 64);
+        assert_eq!(feed[0].old_sha, "", "omitted legacy old_sha stays empty");
+        assert_eq!(
+            feed[0].pusher_did, "",
+            "omitted legacy pusher_did stays empty"
         );
     }
 

@@ -1228,19 +1228,33 @@ pub(crate) async fn ingest_ref_update(
         return IngestOutcome::Rejected(reason);
     }
 
-    // #272: the slug reaches a `PathBuf::join` in the sync worker, so it is
-    // rejected here, before the ref-update row and the queue row.
-    //
-    // It sits this high on purpose, above the signature verify and above the
-    // `peer_exists` round trip, not merely above the budgets. It depends on
-    // nothing but the parsed struct, so hoisting it costs nothing and removes
-    // the work entirely: a structurally invalid event now buys no Ed25519
-    // verify and no database query. Placing it below either of those would buy
-    // the fairness property (a malformed event charges nobody) while leaving
-    // the cost in place, charged only to the pre-parse brake that `PeerId`
-    // rotation defeats.
-    if let Err(e) = crate::git::repo_store::validate_repo_slug(&event.repo) {
-        return IngestOutcome::Rejected(format!("invalid repo field: {e}"));
+    // Size and format validation, including the #272 slug guard, sits this high
+    // on purpose: above the signature verify, the `peer_exists` round trip, and
+    // every budget debit. It depends on nothing but the parsed struct, so a
+    // structurally invalid event buys no Ed25519 verify and no database query.
+    // Letting an oversized field reach either insert would make the parse the
+    // first half of durable storage amplification rather than a rejection.
+    // Unlike the HTTP compatibility path, gossip's pusher_did and old_sha are
+    // required wire fields, so empty is malformed here rather than legacy
+    // omission.
+    if event.pusher_did.is_empty() || event.old_sha.is_empty() {
+        return IngestOutcome::Rejected("pusher_did and old_sha must not be empty".to_string());
+    }
+    let wire = crate::db::RefUpdateTransportFields {
+        repo: &event.repo,
+        node_did: &event.node_did,
+        pusher_did: &event.pusher_did,
+        owner_did: event.owner_did.as_deref(),
+        ref_name: &event.ref_name,
+        old_sha: &event.old_sha,
+        new_sha: &event.new_sha,
+        timestamp: &event.timestamp,
+        cert_id: event.cert_id.as_deref(),
+        lag_origin: event.lag_origin.as_deref(),
+        cid: event.cid.as_deref(),
+    };
+    if let Err(e) = crate::db::validate_ref_update_transport_fields(&wire) {
+        return IngestOutcome::Rejected(format!("invalid ref-update event fields: {e}"));
     }
 
     // Whether `node_did` was PROVEN by a signature on this event, as opposed to
@@ -8180,6 +8194,168 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
 
         assert_rejected_in_both_modes(&db, &pool, &bytes_of(&event), "traversal slug", None).await;
+    }
+
+    /// Peer-controlled size and shape validation, before either durable sink.
+    /// Every witness is correctly signed and comes from a seeded peer so the
+    /// malformed field is the only rule that can reject it.
+    #[sqlx::test]
+    async fn malformed_or_oversized_fields_are_rejected_before_any_write(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let cases: Vec<(&str, fn(&mut RefUpdateEvent), &str)> = vec![
+            (
+                "oversized ref_name",
+                |e| {
+                    e.ref_name = format!("refs/heads/{}", "x".repeat(2_000));
+                },
+                "invalid ref-update event fields: ref_name exceeds 1024 bytes",
+            ),
+            (
+                "malformed ref_name",
+                |e| {
+                    e.ref_name = "refs/heads/a..b".into();
+                },
+                "invalid ref-update event fields: ref_name is not a valid git ref",
+            ),
+            (
+                "malformed new_sha",
+                |e| {
+                    e.new_sha = "not-a-sha".into();
+                },
+                "invalid ref-update event fields: new_sha must be a 40- or 64-character hexadecimal object id",
+            ),
+            (
+                "malformed old_sha",
+                |e| {
+                    e.old_sha = "0".into();
+                },
+                "invalid ref-update event fields: old_sha must be a 40- or 64-character hexadecimal object id",
+            ),
+            (
+                "empty old_sha",
+                |e| {
+                    e.old_sha.clear();
+                },
+                "pusher_did and old_sha must not be empty",
+            ),
+            (
+                "empty pusher_did",
+                |e| {
+                    e.pusher_did.clear();
+                },
+                "pusher_did and old_sha must not be empty",
+            ),
+            (
+                "oversized pusher_did",
+                |e| {
+                    e.pusher_did = format!("did:key:{}", "z".repeat(300));
+                },
+                "invalid ref-update event fields: pusher_did exceeds 256 bytes",
+            ),
+            (
+                "unsupported owner_did",
+                |e| {
+                    e.owner_did = Some("did:unsupported:x".into());
+                },
+                "invalid ref-update event fields: owner_did uses an unsupported DID method",
+            ),
+            (
+                "malformed timestamp",
+                |e| {
+                    e.timestamp = "not-a-time".into();
+                },
+                "invalid ref-update event fields: timestamp must be an RFC 3339 timestamp",
+            ),
+            (
+                "malformed lag_origin",
+                |e| {
+                    e.lag_origin = Some("not-a-time".into());
+                },
+                "invalid ref-update event fields: lag_origin must be an RFC 3339 timestamp",
+            ),
+            (
+                "oversized cert_id",
+                |e| {
+                    e.cert_id = Some("c".repeat(129));
+                },
+                "invalid ref-update event fields: cert_id exceeds 128 bytes",
+            ),
+            (
+                "oversized cid",
+                |e| {
+                    e.cid = Some("c".repeat(129));
+                },
+                "invalid ref-update event fields: cid exceeds 128 bytes",
+            ),
+        ];
+
+        for (label, mutate, expected) in cases {
+            let keypair = Keypair::generate();
+            let mut event = event_for(&keypair);
+            mutate(&mut event);
+            sign_ref_update(&keypair, &mut event).unwrap();
+            seed_peer(&pool, &event.node_did).await;
+            assert_rejected_in_both_modes(
+                &db,
+                &pool,
+                &bytes_of(&event),
+                label,
+                Some((expected, "the wire-field guard must own the rejection")),
+            )
+            .await;
+        }
+    }
+
+    #[sqlx::test]
+    async fn malformed_fields_are_rejected_before_signature_and_peer_lookup(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        event.ref_name = format!("refs/heads/{}", "x".repeat(2_000));
+        sign_ref_update(&keypair, &mut event).unwrap();
+        event.sig = Some("not-a-valid-signature".into());
+
+        reset_peer_exists_calls();
+        let outcome =
+            ingest_with_fresh_limiter(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
+        assert_eq!(
+            rejection_reason(outcome, "malformed field with a forged signature"),
+            "invalid ref-update event fields: ref_name exceeds 1024 bytes",
+            "the field guard must own the rejection before signature verification"
+        );
+        assert_eq!(
+            peer_exists_calls(),
+            0,
+            "the field guard must also precede the peer lookup"
+        );
+    }
+
+    /// Sha256-format repositories carry 64-character object ids. They must pass
+    /// the same boundary as the 40-character sha1 control, or the shape rule
+    /// becomes a silent object-format refusal.
+    #[sqlx::test]
+    async fn a_signed_sha256_ref_update_is_accepted(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        event.old_sha = "0".repeat(64);
+        event.new_sha = "a".repeat(64);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        let outcome =
+            ingest_with_fresh_limiter(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "sha256 object ids must ingest, got {outcome:?}"
+        );
+        let stored: (String, String) =
+            sqlx::query_as("SELECT old_sha, new_sha FROM received_ref_updates")
+                .fetch_one(&pool)
+                .await
+                .expect("sha256 ref-update row");
+        assert_eq!(stored.0.len(), 64);
+        assert_eq!(stored.1.len(), 64);
     }
 
     /// R6: the acceptance path, which is what keeps federation alive. A guard
