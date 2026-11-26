@@ -2209,8 +2209,7 @@ exec git "$@"
         let stored: serde_json::Value =
             serde_json::from_str(&raw).expect("stored issue ref must be valid JSON");
         assert_eq!(
-            stored["status"],
-            "closed",
+            stored["status"], "closed",
             "on a local-only node, the committed close remains the durable copy"
         );
         assert!(
