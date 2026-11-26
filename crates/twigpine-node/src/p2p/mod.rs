@@ -4493,6 +4493,8 @@ pub async fn start(
 mod tests {
     use super::*;
 
+    type RefUpdateMutationCase = (&'static str, fn(&mut RefUpdateEvent), &'static str);
+
     fn identify_address(peer_id: PeerId, octet: u8, port: u16) -> Multiaddr {
         format!("/ip4/192.0.2.{octet}/udp/{port}/quic-v1")
             .parse::<Multiaddr>()
@@ -8254,7 +8256,7 @@ mod tests {
     #[sqlx::test]
     async fn malformed_or_oversized_fields_are_rejected_before_any_write(pool: PgPool) {
         let db = ingest_db(&pool).await;
-        let cases: Vec<(&str, fn(&mut RefUpdateEvent), &str)> = vec![
+        let cases: Vec<RefUpdateMutationCase> = vec![
             (
                 "oversized ref_name",
                 |e| {
