@@ -43,7 +43,7 @@ pub(crate) async fn collect_visible_ref_updates(
     caller: Option<&str>,
 ) -> Result<Vec<crate::db::ReceivedRefUpdate>> {
     // 128 rows per DB round-trip. The page size is a parameter on the inner fn
-    // only so tests can force multi-page offset paging over a small dataset.
+    // only so tests can force a multi-page keyset walk over a small dataset.
     collect_visible_ref_updates_inner(db, repo, limit, caller, 128).await
 }
 
