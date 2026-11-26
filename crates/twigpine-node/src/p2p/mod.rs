@@ -1234,12 +1234,11 @@ pub(crate) async fn ingest_ref_update(
     // structurally invalid event buys no Ed25519 verify and no database query.
     // Letting an oversized field reach either insert would make the parse the
     // first half of durable storage amplification rather than a rejection.
-    // Unlike the HTTP compatibility path, gossip's pusher_did and old_sha are
-    // required wire fields, so empty is malformed here rather than legacy
-    // omission.
-    if event.pusher_did.is_empty() || event.old_sha.is_empty() {
-        return IngestOutcome::Rejected("pusher_did and old_sha must not be empty".to_string());
-    }
+    // Empty pusher_did and old_sha stay admissible here for the same reason as
+    // on HTTP: pre-announcement publishers emitted them as bounded omission
+    // sentinels, and rejecting them would cut off replication from those peers
+    // during a rolling upgrade without reducing the storage amplification this
+    // guard exists to bound.
     let wire = crate::db::RefUpdateTransportFields {
         repo: &event.repo,
         node_did: &event.node_did,
@@ -8232,20 +8231,6 @@ mod tests {
                 "invalid ref-update event fields: old_sha must be a 40- or 64-character hexadecimal object id",
             ),
             (
-                "empty old_sha",
-                |e| {
-                    e.old_sha.clear();
-                },
-                "pusher_did and old_sha must not be empty",
-            ),
-            (
-                "empty pusher_did",
-                |e| {
-                    e.pusher_did.clear();
-                },
-                "pusher_did and old_sha must not be empty",
-            ),
-            (
                 "oversized pusher_did",
                 |e| {
                     e.pusher_did = format!("did:key:{}", "z".repeat(300));
@@ -8304,6 +8289,53 @@ mod tests {
             )
             .await;
         }
+    }
+
+    /// Older publishers emitted empty `pusher_did` and `old_sha` before those
+    /// fields carried values. Both are bounded omission sentinels rather than
+    /// amplification input, so a versionless unsigned event carrying them must
+    /// still replicate in rolling-upgrade mode. The JSON is written directly
+    /// rather than serialized from `RefUpdateEvent` so the wire shape really is
+    /// the pre-version one an un-upgraded publisher emits.
+    #[sqlx::test]
+    async fn an_unsigned_legacy_empty_pusher_and_old_sha_event_is_accepted(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let node_did = keypair.did().to_string();
+        let legacy = serde_json::json!({
+            "node_did": node_did,
+            "pusher_did": "",
+            "repo": "zOwner/myrepo",
+            "ref_name": "refs/heads/main",
+            "old_sha": "",
+            "new_sha": "a".repeat(40),
+            "timestamp": ingest_now().to_rfc3339(),
+        });
+        seed_peer(&pool, &node_did).await;
+
+        let outcome = ingest_with_fresh_limiter(
+            &db,
+            false,
+            true,
+            &serde_json::to_vec(&legacy).unwrap(),
+            &PeerId::random(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::UnsignedAdmitted),
+            "a legacy empty-identity event from a known peer must replicate, got {outcome:?}"
+        );
+        let stored: (String, String) =
+            sqlx::query_as("SELECT pusher_did, old_sha FROM received_ref_updates")
+                .fetch_one(&pool)
+                .await
+                .expect("legacy ref-update row");
+        assert_eq!(stored, (String::new(), String::new()));
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            1,
+            "the legacy event must still enqueue replication"
+        );
     }
 
     #[sqlx::test]

@@ -3120,9 +3120,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "ref_updates_received_at_keyset",
         stmts: &[
             // Feed pagination orders on the server-stamped receipt column, not
-            // the event's self-asserted timestamp. This composite index is the
-            // row-value keyset order the collector walks.
+            // the event's self-asserted timestamp. These composite indexes are
+            // the row-value keyset orders the unfiltered and repo-filtered
+            // collectors walk.
             "CREATE INDEX IF NOT EXISTS idx_ref_updates_received_keyset ON received_ref_updates(received_at DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ref_updates_repo_received_keyset ON received_ref_updates(repo, received_at DESC, id DESC)",
+            // No read orders on the attacker-supplied event timestamp any
+            // longer; keeping the index would tax every write for a scan shape
+            // the feed deliberately no longer uses.
+            "DROP INDEX IF EXISTS idx_ref_updates_ts",
         ],
     },
 ];
@@ -13915,22 +13921,76 @@ mod migration_tests {
     }
 
     #[sqlx::test]
-    async fn migration_v53_creates_ref_update_received_at_keyset_index(pool: sqlx::PgPool) {
+    async fn migration_v53_creates_ref_update_received_at_keyset_indexes(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
-        let exists = sqlx::query_scalar::<_, bool>(
+        assert_ref_update_v53_index_shape(&db.pool).await;
+    }
+
+    /// The fresh-database assertion above does not exercise the upgrade path:
+    /// v53 must also replace the pre-keyset timestamp ordering on a node that
+    /// already carries the old index. Recreate that shape, roll the migration
+    /// record back, and apply v53 again.
+    #[sqlx::test]
+    async fn migration_v53_replaces_timestamp_ordering_on_upgrade(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        for index in [
+            "idx_ref_updates_received_keyset",
+            "idx_ref_updates_repo_received_keyset",
+        ] {
+            sqlx::query(&format!("DROP INDEX IF EXISTS {index}"))
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_ref_updates_ts ON received_ref_updates(timestamp DESC)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 53")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        assert_ref_update_v53_index_shape(&db.pool).await;
+    }
+
+    async fn assert_ref_update_v53_index_shape(pool: &sqlx::PgPool) {
+        for index in [
+            "idx_ref_updates_received_keyset",
+            "idx_ref_updates_repo_received_keyset",
+        ] {
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_indexes
+                    WHERE tablename = 'received_ref_updates'
+                      AND indexname = $1
+                )",
+            )
+            .bind(index)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert!(exists, "{index} must exist after migration v53");
+        }
+        let timestamp_index_exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
                 SELECT 1 FROM pg_indexes
                 WHERE tablename = 'received_ref_updates'
-                  AND indexname = 'idx_ref_updates_received_keyset'
+                  AND indexname = 'idx_ref_updates_ts'
             )",
         )
-        .fetch_one(&db.pool)
+        .fetch_one(pool)
         .await
         .unwrap();
         assert!(
-            exists,
-            "idx_ref_updates_received_keyset must exist after migration v53"
+            !timestamp_index_exists,
+            "migration v53 must retire the attacker-controlled timestamp ordering"
         );
     }
 
