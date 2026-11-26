@@ -495,17 +495,13 @@ pub async fn notify_sync(
     auth: Option<Extension<AuthenticatedDid>>,
     Json(req): Json<NotifyRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    let unsigned = auth.is_none();
     if let Some(Extension(auth)) = auth {
         if auth.0 != req.node_did {
             return Err(AppError::BadRequest(
                 "Signature keyid must match notification node_did".into(),
             ));
         }
-    } else {
-        tracing::warn!(
-            did = %req.node_did,
-            "accepted unsigned sync notify; set TWIGPINE_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
-        );
     }
 
     // Validate every peer-supplied stored field, including the repo slug whose
@@ -541,6 +537,12 @@ pub async fn notify_sync(
     };
     if let Err(e) = crate::db::validate_ref_update_transport_fields(&wire) {
         return Err(AppError::BadRequest(e));
+    }
+    if unsigned {
+        tracing::warn!(
+            did = %req.node_did,
+            "accepted unsigned sync notify; set TWIGPINE_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
+        );
     }
 
     // Only accept notifications from known peers
