@@ -18338,6 +18338,45 @@ mod ref_update_validation_tests {
             .is_err(),
             "malformed origin timestamp must reject"
         );
+        assert!(
+            db.enqueue_sync(
+                "../x",
+                "did:key:zNode",
+                "refs/heads/main",
+                &"a".repeat(40),
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "traversal repo must reject"
+        );
+        assert!(
+            db.enqueue_sync(
+                "zOwner/myrepo",
+                "did:key:zNode",
+                "refs/heads/a..b",
+                &"a".repeat(40),
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "malformed ref_name must reject"
+        );
+        assert!(
+            db.enqueue_sync(
+                "zOwner/myrepo",
+                "did:key:zNode",
+                "refs/heads/main",
+                "not-a-sha",
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "malformed new_sha must reject"
+        );
         assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
     }
 }
