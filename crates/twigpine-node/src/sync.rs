@@ -2245,6 +2245,25 @@ mod tests {
             .unwrap();
     }
 
+    /// Insert a queue row without the write-side validation choke point. The
+    /// malformed-slug worker tests use this to model rows written before the
+    /// choke point existed; current writers must keep going through `enqueue`.
+    async fn enqueue_raw(pool: &PgPool, repo: &str, did: &str) {
+        sqlx::query(
+            "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at)
+             VALUES ($1, $2, $3, $4, $5, NULL, 'pending', $6)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(repo)
+        .bind(did)
+        .bind("refs/heads/main")
+        .bind("0".repeat(40))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn sync_lag_uses_origin_timestamp_only_when_it_is_in_the_past() {
         let visible_at = chrono::DateTime::parse_from_rfc3339("2026-08-16T00:00:12Z")
@@ -2491,7 +2510,7 @@ mod tests {
 
         let did = "did:key:z6MkAttacker";
         seed_local_peer(&pool, did, &peer_url).await;
-        enqueue(&state.db, &slug, did).await;
+        enqueue_raw(&pool, &slug, did).await;
 
         run_batch(&state, &repos_dir).await;
 
@@ -2541,7 +2560,7 @@ mod tests {
         let did = "did:key:z6MkAttacker";
         seed_local_peer(&pool, did, &peer_url).await;
         for slug in slugs {
-            enqueue(&state.db, slug, did).await;
+            enqueue_raw(&pool, slug, did).await;
         }
 
         run_batch(&state, &repos_dir).await;
@@ -3104,7 +3123,7 @@ mod tests {
         let (_remote, peer_url) = rooted_remote(&["../hello"]);
         let did = "did:key:z6MkAttacker";
         seed_local_peer(&pool, did, &peer_url).await;
-        enqueue(&state.db, "../hello", did).await;
+        enqueue_raw(&pool, "../hello", did).await;
 
         run_batch(&state, &repos_dir).await;
         assert_eq!(sync_status(&pool, "../hello").await, "failed");
@@ -3120,10 +3139,9 @@ mod tests {
     #[sqlx::test]
     async fn queued_escape_slug_cannot_plant_a_mirror_outside_repos_dir(pool: PgPool) {
         // The worker half of #272, committed in its attack form. The row goes
-        // into sync_queue directly rather than through notify, because that is
-        // the case the boundary check cannot cover: rows queued before the fix
-        // existed, plus the gossip and trigger writers, which also enqueue a
-        // peer-controlled slug. `a/<abs>/gitlawb-probe` used to reach
+        // into sync_queue directly because current writers validate before
+        // enqueueing; the fixture models rows written before that choke point
+        // existed. `a/<abs>/gitlawb-probe` used to reach
         // PathBuf::join, whose absolute second component discards repos_dir and
         // puts the mirror at /<abs>/gitlawb-probe.git.
         let state = crate::test_support::test_state(pool.clone()).await;
@@ -3149,7 +3167,7 @@ mod tests {
         let (_remote, peer_url) = rooted_remote(&[&rel]);
         let did = "did:key:z6MkAttacker";
         seed_local_peer(&pool, did, &peer_url).await;
-        enqueue(&state.db, &slug, did).await;
+        enqueue_raw(&pool, &slug, did).await;
 
         run_batch(&state, &repos_dir).await;
 

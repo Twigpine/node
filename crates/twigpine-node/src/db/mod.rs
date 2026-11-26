@@ -19933,14 +19933,14 @@ mod ref_update_db_tests {
             "repo/x",
             Some("did:key:zX"),
             "refs/heads/main",
-            &"g".repeat(40),
+            &"f".repeat(40),
         );
         db.insert_ref_update(&u).await.unwrap();
         db.insert_ref_update(&u).await.unwrap();
 
         let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].new_sha, "g".repeat(40));
+        assert_eq!(all[0].new_sha, "f".repeat(40));
     }
 }
 
