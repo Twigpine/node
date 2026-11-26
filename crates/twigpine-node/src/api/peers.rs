@@ -1524,6 +1524,42 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn sync_notify_rejects_a_padded_body_before_json_parse(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let peer_did = seed_peer(&state).await;
+        let body = serde_json::json!({
+            "repo": "z6Mkfoo/hello",
+            "ref_name": "refs/heads/main",
+            "new_sha": "0000000000000000000000000000000000000000",
+            "node_did": peer_did,
+            "padding": "x".repeat(crate::db::MAX_REF_UPDATE_WIRE_BYTES),
+        })
+        .to_string();
+        assert!(body.len() > crate::db::MAX_REF_UPDATE_WIRE_BYTES);
+        let router = crate::server::build_router(state);
+
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &body,
+                "198.51.100.81:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let feed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM received_ref_updates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0, "a padded frame must not enqueue sync work");
+        assert_eq!(feed, 0, "a padded frame must not seed the ref-update feed");
+    }
+
+    #[sqlx::test]
     async fn sync_notify_accepts_sha256_object_ids_and_omitted_legacy_fields(pool: PgPool) {
         let state = test_state(pool).await;
         let db = state.db.clone();

@@ -62,6 +62,10 @@ const MAX_REF_UPDATE_DID_LEN: usize = 256;
 const MAX_REF_UPDATE_TIMESTAMP_LEN: usize = 64;
 const MAX_REF_UPDATE_CERT_ID_LEN: usize = 128;
 const MAX_REF_UPDATE_CID_LEN: usize = 128;
+/// Ceiling for one encoded ref-update notification. Every legitimate field
+/// sums to only a few KiB; this leaves generous JSON overhead without letting
+/// padding force multi-megabyte parse and signature-verification work.
+pub(crate) const MAX_REF_UPDATE_WIRE_BYTES: usize = 16 * 1024;
 
 /// Maximum agent tasks returned per query. Shared by the GraphQL `tasks`
 /// complexity meter and the resolver clamp so they can't drift.
@@ -3119,6 +3123,30 @@ const MIGRATIONS: &[Migration] = &[
         version: 53,
         name: "ref_updates_received_at_keyset",
         stmts: &[
+            // Rows written before ingest validation do not become harmless at
+            // upgrade. Delete the rows whose byte widths violate the storage
+            // contract; exact small malformed rows are bounded and no longer
+            // control ordering, while oversized rows are the durable
+            // amplification this migration must retire. The legacy empty
+            // pusher_did and old_sha sentinels are inside these bounds.
+            "DELETE FROM received_ref_updates
+             WHERE octet_length(repo) > 356
+                OR octet_length(node_did) > 256
+                OR octet_length(pusher_did) > 256
+                OR COALESCE(octet_length(owner_did), 0) > 256
+                OR octet_length(ref_name) > 1024
+                OR octet_length(old_sha) > 64
+                OR octet_length(new_sha) > 64
+                OR octet_length(timestamp) > 64
+                OR COALESCE(octet_length(cert_id), 0) > 128
+                OR octet_length(received_at) > 64",
+            "DELETE FROM sync_queue
+             WHERE octet_length(repo) > 356
+                OR octet_length(node_did) > 256
+                OR octet_length(ref_name) > 1024
+                OR octet_length(new_sha) > 64
+                OR COALESCE(octet_length(cid), 0) > 128
+                OR COALESCE(octet_length(origin_timestamp), 0) > 64",
             // Feed pagination orders on the server-stamped receipt column, not
             // the event's self-asserted timestamp. These composite indexes are
             // the row-value keyset orders the unfiltered and repo-filtered
@@ -3127,8 +3155,10 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_ref_updates_repo_received_keyset ON received_ref_updates(repo, received_at DESC, id DESC)",
             // No read orders on the attacker-supplied event timestamp any
             // longer; keeping the index would tax every write for a scan shape
-            // the feed deliberately no longer uses.
+            // the feed deliberately no longer uses. The composite repo keyset
+            // index also covers the old repo-only equality lookups.
             "DROP INDEX IF EXISTS idx_ref_updates_ts",
+            "DROP INDEX IF EXISTS idx_ref_updates_repo",
         ],
     },
 ];
@@ -13960,6 +13990,95 @@ mod migration_tests {
         assert_ref_update_v53_index_shape(&db.pool).await;
     }
 
+    /// Rows already present when a node upgrades must not carry the pre-fix
+    /// byte amplification forward. Seed raw rows because the validating insert
+    /// choke point would correctly refuse the bad ones now.
+    #[sqlx::test]
+    async fn migration_v53_deletes_oversized_preexisting_ref_update_rows(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        async fn raw_ref_update(db: &super::Db, id: &str, ref_name: &str, cert_id: Option<String>) {
+            sqlx::query(
+                "INSERT INTO received_ref_updates
+                 (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha,
+                  timestamp, cert_id, received_at, from_peer, owner_did)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+            )
+            .bind(id)
+            .bind("did:key:z6MkgAnvkP45uNxwCKeNdt6wrYkEjpYX4f7Nrd8MQqFL8Fbn")
+            .bind("")
+            .bind("z6Mkfoo/hello")
+            .bind(ref_name)
+            .bind("")
+            .bind("a".repeat(64))
+            .bind("2026-07-01T12:00:00Z")
+            .bind(cert_id)
+            .bind("2026-07-01T12:00:01Z")
+            .bind("12D3KooWPeer")
+            .bind::<Option<String>>(None)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        raw_ref_update(&db, "valid", "refs/heads/main", None).await;
+        raw_ref_update(&db, "oversized-ref", &"r".repeat(1025), None).await;
+        raw_ref_update(
+            &db,
+            "oversized-cert",
+            "refs/heads/main",
+            Some("c".repeat(129)),
+        )
+        .await;
+        for (id, cid) in [
+            ("valid-queue", None),
+            ("oversized-queue", Some("c".repeat(129))),
+        ] {
+            sqlx::query(
+                "INSERT INTO sync_queue
+                 (id, repo, node_did, ref_name, new_sha, cid, origin_timestamp, status, enqueued_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8)",
+            )
+            .bind(id)
+            .bind("z6Mkfoo/hello")
+            .bind("did:key:z6MkgAnvkP45uNxwCKeNdt6wrYkEjpYX4f7Nrd8MQqFL8Fbn")
+            .bind("refs/heads/main")
+            .bind("a".repeat(64))
+            .bind(cid)
+            .bind(Some("2026-07-01T12:00:00Z"))
+            .bind("2026-07-01T12:00:01Z")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 53")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+
+        let ref_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM received_ref_updates ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            ref_ids,
+            vec!["valid".to_string()],
+            "oversized pre-upgrade rows must be deleted while the bounded legacy row survives"
+        );
+        let queue_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM sync_queue ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            queue_ids,
+            vec!["valid-queue".to_string()],
+            "oversized pre-upgrade queue rows must be deleted while bounded work survives"
+        );
+    }
+
     async fn assert_ref_update_v53_index_shape(pool: &sqlx::PgPool) {
         for index in [
             "idx_ref_updates_received_keyset",
@@ -13991,6 +14110,20 @@ mod migration_tests {
         assert!(
             !timestamp_index_exists,
             "migration v53 must retire the attacker-controlled timestamp ordering"
+        );
+        let repo_index_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'received_ref_updates'
+                  AND indexname = 'idx_ref_updates_repo'
+            )",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(
+            !repo_index_exists,
+            "migration v53 must retire the redundant repo-only index"
         );
     }
 

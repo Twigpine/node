@@ -615,7 +615,14 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::Extension(rate_limit::IpRateLimiter {
             limiter: state.peer_write_rate_limiter.clone(),
             trust: state.push_limiter_trust,
-        }));
+        }))
+        // Announce and notify payloads are both small even at every field cap.
+        // Keep unknown-member padding from turning the pre-validation parse
+        // into a multi-megabyte allocation; the JSON schema caps below remain
+        // the exact field contract.
+        .layer(RequestBodyLimitLayer::new(
+            crate::db::MAX_REF_UPDATE_WIRE_BYTES,
+        ));
 
     // ── Read routes — open for public repos ───────────────────────────────
     let read_routes = Router::new()

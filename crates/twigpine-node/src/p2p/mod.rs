@@ -500,6 +500,11 @@ fn verify_ref_update(event: &RefUpdateEvent) -> Result<(), String> {
         .as_deref()
         .ok_or_else(|| "event carries no signature".to_string())?;
 
+    // A 64-byte Ed25519 signature is exactly 86 unpadded base64url characters.
+    // Check that before allocating and decoding whatever length the wire sent.
+    if sig_b64.len() != 86 {
+        return Err("signature is not the base64url form of 64 bytes".to_string());
+    }
     let sig_bytes: [u8; 64] = URL_SAFE_NO_PAD
         .decode(sig_b64)
         .map_err(|_| "signature is not valid base64url".to_string())?
@@ -1168,6 +1173,13 @@ pub(crate) async fn ingest_ref_update(
     // and verified traffic on the author the signature proved.
     if !limiters.source.check(&propagation_source.to_string()).await {
         return IngestOutcome::SourceRateLimited;
+    }
+
+    if data.len() > crate::db::MAX_REF_UPDATE_WIRE_BYTES {
+        return IngestOutcome::Rejected(format!(
+            "ref-update event exceeds {} encoded bytes",
+            crate::db::MAX_REF_UPDATE_WIRE_BYTES
+        ));
     }
 
     let event = match serde_json::from_slice::<RefUpdateEvent>(data) {
@@ -7685,6 +7697,19 @@ mod tests {
         assert_eq!(received.node_did, keypair.did().to_string());
     }
 
+    #[test]
+    fn an_oversized_signature_encoding_is_rejected_before_decode() {
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        event.sig = Some("A".repeat(17_000));
+
+        assert_eq!(
+            verify_ref_update(&event).expect_err("an oversized sig must not decode"),
+            "signature is not the base64url form of 64 bytes"
+        );
+    }
+
     /// A cryptographically valid signature that does not bind the claimed
     /// identity. This is the RUSTSEC-2022-0009 shape: libp2p-core accepted a
     /// valid signature without checking it derived the claimed peer id, so the
@@ -8193,6 +8218,34 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
 
         assert_rejected_in_both_modes(&db, &pool, &bytes_of(&event), "traversal slug", None).await;
+    }
+
+    /// Unknown JSON members are ignored by serde, so padding is not part of
+    /// the field validator's answer. The frame cap must reject it before the
+    /// parse; without that guard this otherwise valid signed event is accepted.
+    #[sqlx::test]
+    async fn an_oversized_frame_is_rejected_before_json_parse(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+        let mut value = serde_json::to_value(&event).unwrap();
+        value["padding"] = serde_json::json!("x".repeat(crate::db::MAX_REF_UPDATE_WIRE_BYTES));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(bytes.len() > crate::db::MAX_REF_UPDATE_WIRE_BYTES);
+
+        assert_rejected_in_both_modes(
+            &db,
+            &pool,
+            &bytes,
+            "oversized frame",
+            Some((
+                "ref-update event exceeds 16384 encoded bytes",
+                "the encoded-frame cap must own the rejection",
+            )),
+        )
+        .await;
     }
 
     /// Peer-controlled size and shape validation, before either durable sink.
@@ -11314,12 +11367,11 @@ mod tests {
         .await;
         assert_eq!(
             outcome.metric_label(),
-            "stale_timestamp",
-            "an unparseable stamp must count under the same label as its two siblings; a publisher \
-             emitting non-RFC-3339 is a freshness violation an operator reads off one series"
+            "rejected",
+            "wire-format validation now owns a non-RFC-3339 stamp before the freshness window"
         );
         assert!(
-            matches!(outcome, IngestOutcome::StaleTimestamp(_)),
+            matches!(outcome, IngestOutcome::Rejected(_)),
             "a timestamp that cannot be parsed cannot be freshness-checked, so it must be refused \
              rather than admitted, got {outcome:?}"
         );
