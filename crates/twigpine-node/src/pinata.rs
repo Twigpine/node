@@ -28,15 +28,46 @@ pub async fn pin_object(
     if jwt.is_empty() {
         return Ok(String::new());
     }
+    upload(client, upload_url, jwt, &format!("git-{sha}"), data).await
+}
 
-    let filename = format!("git-{}.bin", &sha[..sha.len().min(8)]);
+/// Pin one model content object's bytes on Pinata (v3 API).
+///
+/// Same upload path as [`pin_object`] with a `model-` pin name so the
+/// warm-tier copy is distinguishable from git objects in the Pinata
+/// console. Returns the provider CID on success, `Ok("")` when
+/// `jwt` is empty (Pinata not configured). The CID is metadata recorded
+/// alongside the sha256 resolver key, never in place of it.
+pub async fn pin_model_object(
+    client: &reqwest::Client,
+    upload_url: &str,
+    jwt: &str,
+    sha: &str,
+    data: &[u8],
+) -> Result<String> {
+    if jwt.is_empty() {
+        return Ok(String::new());
+    }
+    upload(client, upload_url, jwt, &format!("model-{sha}"), data).await
+}
+
+/// The shared v3 multipart upload. `name` is the pin name Pinata records;
+/// the returned `data.cid` is the provider CID.
+async fn upload(
+    client: &reqwest::Client,
+    upload_url: &str,
+    jwt: &str,
+    name: &str,
+    data: &[u8],
+) -> Result<String> {
+    let filename = format!("{}.bin", &name[..name.len().min(16)]);
     let part = reqwest::multipart::Part::bytes(data.to_vec())
         .file_name(filename)
         .mime_str("application/octet-stream")?;
     let form = reqwest::multipart::Form::new()
         .part("file", part)
         .text("network", "public")
-        .text("name", format!("git-{sha}"));
+        .text("name", name.to_string());
 
     let resp = client
         .post(upload_url)
@@ -63,7 +94,7 @@ pub async fn pin_object(
         .ok_or_else(|| anyhow::anyhow!("no 'data.cid' in Pinata response: {json}"))?
         .to_string();
 
-    tracing::debug!(sha = %sha, %cid, "pinned git object to Pinata");
+    tracing::debug!(name = %name, %cid, "pinned object to Pinata");
     Ok(cid)
 }
 

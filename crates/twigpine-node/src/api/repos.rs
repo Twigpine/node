@@ -1400,6 +1400,17 @@ async fn resolve_drain_object_list(
     // pending slot and no sweep re-derives it). The rules come back from the same
     // refresh, read against the FRESH record.id, never the spawn-time ctx.repo_id.
     let (record, rules_opt) = match drain_refresh_state(ctx).await {
+        // A mirror row's rules were never synced, so its empty snapshot means
+        // "undetermined", not "nothing withheld": the drain fails closed the
+        // same way the push tail does (#294).
+        DrainRefresh::State { record, .. } if record.is_mirror_row() => {
+            tracing::info!(
+                repo = %record.id,
+                "coalesced drain: repo is a mirror row whose visibility rules \
+                 were never synced; pinning nothing (fail closed)"
+            );
+            (*record, None)
+        }
         DrainRefresh::State { record, rules } => (*record, Some(rules)),
         DrainRefresh::Gone => {
             tracing::warn!(
@@ -4330,7 +4341,22 @@ pub(crate) async fn post_receive_replication_tail(
     // objects (which withheld_blob_oids never lists) stay local. Fail closed: a
     // private or undetermined repo never leaks. The announce decision that gates
     // the network-facing sends is taken separately, below.
-    let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
+    //
+    // A mirror row's rules were never synced: `upsert_mirror_repo` writes the row
+    // with `is_public = true` and no visibility rules, so an empty snapshot here
+    // means "undetermined", not "nothing withheld". Treat it as `None` (the same
+    // fail-closed answer an unreadable ruleset gives) or the mirror publishes
+    // blobs the origin withholds (#294).
+    let rules_opt = if record.is_mirror_row() {
+        tracing::info!(
+            repo = %record.id,
+            "skipping replication rules snapshot for a mirror row: \
+             its visibility rules were never synced (fail closed)"
+        );
+        None
+    } else {
+        state.db.list_visibility_rules(&record.id).await.ok()
+    };
 
     // #174 F2a: take the per-repo coalescing key BEFORE the walk, not after it.
     // `replication_withheld_set` decides announceability from the rules snapshot
@@ -13050,6 +13076,35 @@ mod tests {
         );
     }
 
+    /// A canonical repo row (UUID id, `is_public = true`) for tests that exercise
+    /// the replication paths. Mirror rows (`upsert_mirror_repo`, slash id) are not
+    /// announceable by construction (#294): the tail takes no rules snapshot for
+    /// them and the drain fails closed, so a test whose push or drain must
+    /// replicate cannot use one as its fixture. Returns the inserted record.
+    async fn seed_canonical_repo(
+        db: &crate::db::Db,
+        owner: &str,
+        name: &str,
+        disk_path: &str,
+    ) -> crate::db::RepoRecord {
+        let now = Utc::now();
+        let rec = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: format!("did:key:{owner}"),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: disk_path.to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        db.create_repo(&rec).await.unwrap();
+        rec
+    }
+
     /// Shared fixture for the F4 handler-layer tests: a state whose repo_store and
     /// git_bin point at the given tempdir/fake-git, plus a seeded on-disk repo,
     /// optionally with a path-scoped rule (so the post-receive walks actually run).
@@ -13068,12 +13123,8 @@ mod tests {
         state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
         state.git_bin = git_bin.to_string();
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
-        state
-            .db
-            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        let rec =
+            seed_canonical_repo(&state.db, owner, name, &format!("/unused-{owner}-{name}")).await;
         state
             .repo_store
             .init(&rec.owner_did, &rec.name)
@@ -13690,17 +13741,8 @@ mod tests {
         let mut state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f4burst1", "b1", true).await;
         // Second path-scoped repo on the same state/store.
-        state
-            .db
-            .upsert_mirror_repo("z6f4burst2", "b2", "/unused-z6f4burst2-b2", None, false)
-            .await
-            .unwrap();
-        let rec2 = state
-            .db
-            .get_repo("z6f4burst2", "b2")
-            .await
-            .unwrap()
-            .unwrap();
+        let rec2 =
+            seed_canonical_repo(&state.db, "z6f4burst2", "b2", "/unused-z6f4burst2-b2").await;
         state
             .repo_store
             .init(&rec2.owner_did, &rec2.name)
@@ -14468,12 +14510,7 @@ mod tests {
         u5_init_repo(tmp.path());
         let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
         let c2 = u5_commit_file(tmp.path(), "b.txt", "two\n");
-        state
-            .db
-            .upsert_mirror_repo("z6u5delta", "d", "/unused", None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo("z6u5delta", "d").await.unwrap().unwrap();
+        let rec = seed_canonical_repo(&state.db, "z6u5delta", "d", "/unused").await;
         let ctx = u5_ctx(
             &state,
             &rec,
@@ -14513,12 +14550,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         u5_init_repo(tmp.path());
         let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
-        state
-            .db
-            .upsert_mirror_repo("z6u5full", "f", "/unused", None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo("z6u5full", "f").await.unwrap().unwrap();
+        let rec = seed_canonical_repo(&state.db, "z6u5full", "f", "/unused").await;
         let ctx = u5_ctx(
             &state,
             &rec,
@@ -14555,12 +14587,7 @@ mod tests {
         u5_init_repo(tmp.path());
         u5_commit_file(tmp.path(), "pub.txt", "public\n");
         let c2 = u5_commit_file(tmp.path(), "secret/hidden.txt", "sealed\n");
-        state
-            .db
-            .upsert_mirror_repo("z6u5tight", "t", "/unused", None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo("z6u5tight", "t").await.unwrap().unwrap();
+        let rec = seed_canonical_repo(&state.db, "z6u5tight", "t", "/unused").await;
         let ctx = u5_ctx(
             &state,
             &rec,
@@ -14760,12 +14787,7 @@ mod tests {
         u5_init_repo(tmp.path());
         u5_commit_file(tmp.path(), "pub.txt", "public\n");
         let c2 = u5_commit_file(tmp.path(), "secret/hidden.txt", "sealed\n");
-        state
-            .db
-            .upsert_mirror_repo("z6u5hot", "h", "/unused", None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo("z6u5hot", "h").await.unwrap().unwrap();
+        let rec = seed_canonical_repo(&state.db, "z6u5hot", "h", "/unused").await;
         // A path-scoped rule so every gated walk actually runs (withheld walk on
         // the drain, recipients walk on both iterations). READER_DID carries no
         // resolvable key, so the encrypt stage plans no seal and stays offline.
@@ -14824,12 +14846,7 @@ mod tests {
             marker.display()
         );
         let git_bin = write_fake_git(tmp.path(), &body);
-        state
-            .db
-            .upsert_mirror_repo("z6u5loop", "l", "/unused", None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo("z6u5loop", "l").await.unwrap().unwrap();
+        let rec = seed_canonical_repo(&state.db, "z6u5loop", "l", "/unused").await;
         let ctx = u5_ctx(
             &state,
             &rec,
@@ -15514,11 +15531,9 @@ mod tests {
         let (git_bin, a_inpack, _later_ran) = f1_hanging_first_git(tmp.path());
         let state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6u2key", "k1", false).await;
-        // Rotate the row to a UUID id first. f4_state_with_repo creates the repo
-        // through the mirror path, whose id is literally `owner_short/name` and so
-        // coincides with the identity key — which would leave this test unable to
-        // tell the two keys apart. A UUID id is also the real shape of the bug: an
-        // API-created repo, or any repo whose row was recreated under the same slug.
+        // Rotate the row to a fresh UUID id first: the point is that the lease key
+        // is not the row id, and a rotate proves it. A rotated id is also the real
+        // shape of the bug: any repo whose row was recreated under the same slug.
         let seeded = state.db.get_repo("z6u2key", "k1").await.unwrap().unwrap();
         let rotated_id = Uuid::new_v4().to_string();
         sqlx::query("UPDATE repos SET id = $1 WHERE id = $2")
@@ -16140,12 +16155,7 @@ mod tests {
     ) -> (AppState, crate::db::RepoRecord) {
         let mut state = crate::test_support::test_state(pool).await;
         state.git_bin = git_bin.to_string();
-        state
-            .db
-            .upsert_mirror_repo(owner, name, "/unused", None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        let rec = seed_canonical_repo(&state.db, owner, name, "/unused").await;
         if path_scoped {
             state
                 .db
@@ -16743,12 +16753,8 @@ mod tests {
         // client disconnect can hit.
         state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone())
             .with_pre_unlock_gate(std::sync::Arc::new(tokio::sync::Notify::new()));
-        state
-            .db
-            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        let rec =
+            seed_canonical_repo(&state.db, owner, name, &format!("/unused-{owner}-{name}")).await;
         state
             .db
             .set_visibility_rule(
@@ -16835,12 +16841,8 @@ mod tests {
         state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
         let owner = "z6ocommit";
         let name = "t1";
-        state
-            .db
-            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        let rec =
+            seed_canonical_repo(&state.db, owner, name, &format!("/unused-{owner}-{name}")).await;
         state
             .repo_store
             .init(&rec.owner_did, &rec.name)
@@ -17152,12 +17154,8 @@ mod tests {
             pool.clone(),
             std::time::Duration::from_secs(300),
         );
-        state
-            .db
-            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
-            .await
-            .unwrap();
-        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        let rec =
+            seed_canonical_repo(&state.db, owner, name, &format!("/unused-{owner}-{name}")).await;
         state
             .db
             .set_visibility_rule(
@@ -17896,6 +17894,166 @@ exit 0
             f2a_log(&log),
             "",
             "and it must spawn no git: no walk, no candidate scan, no re-derivation"
+        );
+    }
+
+    // ---- #294: a mirror row's rules were never synced, so a push into it must
+    // replicate and announce nothing (fail closed) ----
+    //
+    // `upsert_mirror_repo` writes a slash-form id, `is_public = true`, and no
+    // visibility rules. An unsynced ruleset must not read as "nothing withheld":
+    // the same empty snapshot on a canonical row means "no path is restricted",
+    // which is only true once the origin's rules have arrived.
+
+    /// A mirror row over a real repo publishes nothing: the tail takes no
+    /// coalescing key, spawns no git, pins nothing and sends no announce, even
+    /// though the row is `is_public` and carries no withholding rules. RED before
+    /// the #294 guard: the empty ruleset resolves announceable and the whole
+    /// publish pipeline runs.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn mirror_row_tail_publishes_nothing(pool: sqlx::PgPool) {
+        let repo = tempfile::TempDir::new().unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        u5_init_repo(repo.path());
+        u5_commit_file(repo.path(), "a.txt", "one\n");
+        let c2 = u5_commit_file(repo.path(), "secret/s.txt", "two\n");
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_bin = git_bin.clone();
+        state
+            .db
+            .upsert_mirror_repo("z6f2amirr", "m1", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6f2amirr", "m1").await.unwrap().unwrap();
+        assert!(
+            rec.id.contains('/'),
+            "the fixture really is a mirror row, not a canonical one"
+        );
+        let mut updates = state.ref_update_tx.subscribe();
+
+        post_receive_replication_tail(
+            state.clone(),
+            rec.clone(),
+            f2a_update("refs/heads/main", &c2),
+            repo.path().to_path_buf(),
+            F2A_PUSHER.to_string(),
+            None,
+            None,
+        )
+        .await;
+        // The pre-fix pipeline runs detached spawns; give them a settle window so
+        // a missing assertion is a real pass, not a race the publish lost.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            state.encrypt_inflight.is_empty(),
+            "a mirror row must not take the coalescing key"
+        );
+        assert_eq!(
+            f2a_log(&log),
+            "",
+            "a mirror row must spawn no replication git; log:\n{}",
+            f2a_log(&log)
+        );
+        assert!(
+            matches!(
+                updates.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a mirror row must not broadcast a ref update"
+        );
+        assert!(
+            state
+                .db
+                .list_branch_cids(&f2a_slug(&rec))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a mirror row must pin nothing and map no CID"
+        );
+    }
+
+    /// Positive control on the same disk and refs: a CANONICAL row (UUID id)
+    /// over the very same repository still replicates, so the mirror assertions
+    /// above cannot pass because replication is broken wholesale.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn canonical_row_tail_still_replicates(pool: sqlx::PgPool) {
+        let repo = tempfile::TempDir::new().unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        u5_init_repo(repo.path());
+        u5_commit_file(repo.path(), "a.txt", "one\n");
+        let c2 = u5_commit_file(repo.path(), "secret/s.txt", "two\n");
+        let log = bin.path().join("git.log");
+        let git_bin = f2a_logging_git(bin.path(), &log);
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_bin = git_bin.clone();
+        let rec = seed_canonical_repo(&state.db, "z6f2acanon", "c1", "/unused").await;
+        assert!(
+            !rec.id.contains('/'),
+            "the fixture really is a canonical row, not a mirror one"
+        );
+        let mut updates = state.ref_update_tx.subscribe();
+
+        post_receive_replication_tail(
+            state.clone(),
+            rec.clone(),
+            f2a_update("refs/heads/main", &c2),
+            repo.path().to_path_buf(),
+            F2A_PUSHER.to_string(),
+            None,
+            None,
+        )
+        .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), updates.recv())
+            .await
+            .expect("a canonical row over the same disk still announces its push")
+            .expect("the broadcast channel is open");
+        assert_ne!(
+            f2a_log(&log),
+            "",
+            "and it runs replication git; log:\n{}",
+            f2a_log(&log)
+        );
+    }
+
+    /// The coalesced drain fails closed on a mirror record the same way:
+    /// `resolve_drain_object_list` re-fetches the row, sees the slash id, and
+    /// returns None instead of pinning a ruleset it never received.
+    #[sqlx::test]
+    async fn drain_over_a_mirror_record_resolves_nothing(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
+        state
+            .db
+            .upsert_mirror_repo("z6u5mirr", "m", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5mirr", "m").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &rec,
+            tmp.path().to_path_buf(),
+            "git",
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+
+        assert!(
+            resolve_drain_object_list(
+                &ctx,
+                crate::state::PendingWork::Tips(vec![(ZERO_SHA.to_string(), c1)]),
+            )
+            .await
+            .is_none(),
+            "a coalesced drain over a mirror row must resolve nothing (fail closed)"
         );
     }
 
