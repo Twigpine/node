@@ -1572,9 +1572,6 @@ mod ref_updates_feed_tests {
         );
     }
 
-    // A peer-controlled publish timestamp must not pin a gossip row above rows
-    // the server actually received later. The merged repo feed orders gossip by
-    // server receipt time; `timestamp` remains display data.
     #[sqlx::test]
     async fn repo_events_order_gossip_by_received_at_not_wire_timestamp(pool: PgPool) {
         let state = test_state(pool).await;

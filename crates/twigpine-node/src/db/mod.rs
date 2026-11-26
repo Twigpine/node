@@ -1066,7 +1066,7 @@ pub(crate) fn validate_ref_update_transport_fields(
 /// Defense in depth at the row insert. Every transport is expected to validate
 /// before side effects; this second check is what keeps a future caller from
 /// bypassing that boundary and persisting an oversized or malformed row.
-pub(crate) fn validate_received_ref_update(update: &ReceivedRefUpdate) -> Result<(), String> {
+fn validate_received_ref_update(update: &ReceivedRefUpdate) -> Result<(), String> {
     let fields = RefUpdateTransportFields {
         repo: &update.repo,
         node_did: &update.node_did,
@@ -1088,7 +1088,7 @@ pub(crate) fn validate_received_ref_update(update: &ReceivedRefUpdate) -> Result
 /// Defense in depth for the queue half of the same ingest. The row feed and
 /// the queue are separate writes, so validating only `insert_ref_update` would
 /// leave a future caller able to store the same attacker-controlled bytes here.
-pub(crate) fn validate_sync_queue_write(
+fn validate_sync_queue_write(
     repo: &str,
     node_did: &str,
     ref_name: &str,
@@ -18432,8 +18432,6 @@ mod ref_update_keyset_paging_tests {
         );
     }
 
-    // The fix: keyset paging on (received_at, id) reads strictly older rows each
-    // page, so a concurrent newer insert cannot duplicate or skip a row.
     #[sqlx::test]
     async fn keyset_paging_is_stable_under_concurrent_insert(pool: PgPool) {
         let db = Db::for_testing(pool);
@@ -18494,10 +18492,6 @@ mod ref_update_keyset_repo_filtered_tests {
         }
     }
 
-    // Exercises the (Some(repo), Some(after)) keyset branch: a repo-filtered
-    // multi-page continuation that emits `WHERE repo=$1 AND (received_at,id)<($2,$3)`
-    // with four binds. Also confirms the repo filter holds across pages, noise
-    // rows are excluded, and a concurrent insert does not duplicate or skip.
     #[sqlx::test]
     async fn keyset_repo_filtered_multipage_stable_under_concurrent_insert(pool: PgPool) {
         let db = Db::for_testing(pool);
