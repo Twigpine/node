@@ -43,7 +43,7 @@ pub(crate) async fn collect_visible_ref_updates(
     caller: Option<&str>,
 ) -> Result<Vec<crate::db::ReceivedRefUpdate>> {
     // 128 rows per DB round-trip. The page size is a parameter on the inner fn
-    // only so tests can force multi-page offset paging over a small dataset.
+    // only so tests can force a multi-page keyset walk over a small dataset.
     collect_visible_ref_updates_inner(db, repo, limit, caller, 128).await
 }
 
@@ -85,7 +85,7 @@ async fn collect_visible_ref_updates_inner(
     // force an unbounded scan. The cap only fails safe (may return fewer).
     let max_scan = bounded_limit.max(2_048);
     let mut scanned: i64 = 0;
-    // Keyset cursor: the (timestamp, id) of the last row fetched so far. Paging
+    // Keyset cursor: the (received_at, id) of the last row fetched so far. Paging
     // by this instead of OFFSET keeps one multi-page scan stable when
     // received_ref_updates is written concurrently (a newer row sorts above the
     // window and cannot shift it, so no page duplicates or skips a row). It is
@@ -107,7 +107,7 @@ async fn collect_visible_ref_updates_inner(
         // Advance the cursor to the last row of this page BEFORE the filter loop
         // consumes `rows`.
         if let Some(last) = rows.last() {
-            after = Some((last.timestamp.clone(), last.id.clone()));
+            after = Some((last.received_at.clone(), last.id.clone()));
         }
         for u in rows {
             // Quarantine denies unconditionally, before the visibility gate, so
@@ -324,12 +324,18 @@ pub async fn list_repo_events(
     let mut all_events: Vec<serde_json::Value> = cert_events;
     all_events.extend(gossip_events);
 
-    // Sort by timestamp descending
-    all_events.sort_by(|a, b| {
-        let ts_a = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-        let ts_b = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-        ts_b.cmp(ts_a)
-    });
+    // Sort on server-stamped time descending. A gossip row's `timestamp` is
+    // peer-supplied even when well formed, so its server-stamped `received_at`
+    // is the ordering key; a local cert has no receipt column, but its
+    // `timestamp` is this node's own `issued_at`.
+    fn sort_ts(event: &serde_json::Value) -> &str {
+        event
+            .get("received_at")
+            .and_then(|v| v.as_str())
+            .or_else(|| event.get("timestamp").and_then(|v| v.as_str()))
+            .unwrap_or("")
+    }
+    all_events.sort_by(|a, b| sort_ts(b).cmp(sort_ts(a)));
 
     // Apply limit
     all_events.truncate(limit as usize);
@@ -997,7 +1003,7 @@ mod ref_updates_feed_tests {
 
     // Scenario 8b — the collector's repo-filtered path across a page boundary:
     // repo=Some AND a keyset continuation (after=Some) in one collect, exercising
-    // the four-bind `WHERE repo=$1 AND (timestamp,id)<($2,$3)` query end to end
+    // the four-bind `WHERE repo=$1 AND (received_at,id)<($2,$3)` query end to end
     // through the collector, not just the DB primitive.
     #[sqlx::test]
     async fn collect_visible_repo_filtered_pages_across_boundary(pool: PgPool) {
@@ -1563,6 +1569,43 @@ mod ref_updates_feed_tests {
         assert!(
             sources.contains(&"gossipsub"),
             "did:web owner's own gossip must be served, got {sources:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn repo_events_order_gossip_by_received_at_not_wire_timestamp(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+
+        let mut pinned = ref_row("pinned", "z6MkOwner/openrepo");
+        pinned.timestamp = "2030-01-01T00:00:00Z".into();
+        pinned.received_at = "2026-07-01T10:00:01Z".into();
+        let mut recent = ref_row("recent", "z6MkOwner/openrepo");
+        recent.timestamp = "2020-01-01T00:00:00Z".into();
+        recent.received_at = "2026-07-01T10:00:02Z".into();
+        state.db.insert_ref_update(&pinned).await.unwrap();
+        state.db.insert_ref_update(&recent).await.unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("z6MkOwner", "openrepo"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let ids: Vec<&str> = body["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .filter_map(|e| e["id"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["recent", "pinned"],
+            "server receipt order must beat the attacker-chosen wire timestamps"
         );
     }
 

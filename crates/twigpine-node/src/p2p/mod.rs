@@ -500,6 +500,11 @@ fn verify_ref_update(event: &RefUpdateEvent) -> Result<(), String> {
         .as_deref()
         .ok_or_else(|| "event carries no signature".to_string())?;
 
+    // A 64-byte Ed25519 signature is exactly 86 unpadded base64url characters.
+    // Check that before allocating and decoding whatever length the wire sent.
+    if sig_b64.len() != 86 {
+        return Err("signature is not the base64url form of 64 bytes".to_string());
+    }
     let sig_bytes: [u8; 64] = URL_SAFE_NO_PAD
         .decode(sig_b64)
         .map_err(|_| "signature is not valid base64url".to_string())?
@@ -1170,6 +1175,13 @@ pub(crate) async fn ingest_ref_update(
         return IngestOutcome::SourceRateLimited;
     }
 
+    if data.len() > crate::db::MAX_REF_UPDATE_WIRE_BYTES {
+        return IngestOutcome::Rejected(format!(
+            "ref-update event exceeds {} encoded bytes",
+            crate::db::MAX_REF_UPDATE_WIRE_BYTES
+        ));
+    }
+
     let event = match serde_json::from_slice::<RefUpdateEvent>(data) {
         Ok(event) => event,
         Err(e) => return IngestOutcome::Rejected(format!("malformed ref-update event: {e}")),
@@ -1228,19 +1240,32 @@ pub(crate) async fn ingest_ref_update(
         return IngestOutcome::Rejected(reason);
     }
 
-    // #272: the slug reaches a `PathBuf::join` in the sync worker, so it is
-    // rejected here, before the ref-update row and the queue row.
-    //
-    // It sits this high on purpose, above the signature verify and above the
-    // `peer_exists` round trip, not merely above the budgets. It depends on
-    // nothing but the parsed struct, so hoisting it costs nothing and removes
-    // the work entirely: a structurally invalid event now buys no Ed25519
-    // verify and no database query. Placing it below either of those would buy
-    // the fairness property (a malformed event charges nobody) while leaving
-    // the cost in place, charged only to the pre-parse brake that `PeerId`
-    // rotation defeats.
-    if let Err(e) = crate::git::repo_store::validate_repo_slug(&event.repo) {
-        return IngestOutcome::Rejected(format!("invalid repo field: {e}"));
+    // Size and format validation, including the #272 slug guard, sits this high
+    // on purpose: above the signature verify, the `peer_exists` round trip, and
+    // every budget debit. It depends on nothing but the parsed struct, so a
+    // structurally invalid event buys no Ed25519 verify and no database query.
+    // Letting an oversized field reach either insert would make the parse the
+    // first half of durable storage amplification rather than a rejection.
+    // Empty pusher_did and old_sha stay admissible here for the same reason as
+    // on HTTP: pre-announcement publishers emitted them as bounded omission
+    // sentinels, and rejecting them would cut off replication from those peers
+    // during a rolling upgrade without reducing the storage amplification this
+    // guard exists to bound.
+    let wire = crate::db::RefUpdateTransportFields {
+        repo: &event.repo,
+        node_did: &event.node_did,
+        pusher_did: &event.pusher_did,
+        owner_did: event.owner_did.as_deref(),
+        ref_name: &event.ref_name,
+        old_sha: &event.old_sha,
+        new_sha: &event.new_sha,
+        timestamp: &event.timestamp,
+        cert_id: event.cert_id.as_deref(),
+        lag_origin: event.lag_origin.as_deref(),
+        cid: event.cid.as_deref(),
+    };
+    if let Err(e) = crate::db::validate_ref_update_transport_fields(&wire) {
+        return IngestOutcome::Rejected(format!("invalid ref-update event fields: {e}"));
     }
 
     // Whether `node_did` was PROVEN by a signature on this event, as opposed to
@@ -4468,6 +4493,8 @@ pub async fn start(
 mod tests {
     use super::*;
 
+    type RefUpdateMutationCase = (&'static str, fn(&mut RefUpdateEvent), &'static str);
+
     fn identify_address(peer_id: PeerId, octet: u8, port: u16) -> Multiaddr {
         format!("/ip4/192.0.2.{octet}/udp/{port}/quic-v1")
             .parse::<Multiaddr>()
@@ -7672,6 +7699,19 @@ mod tests {
         assert_eq!(received.node_did, keypair.did().to_string());
     }
 
+    #[test]
+    fn an_oversized_signature_encoding_is_rejected_before_decode() {
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        event.sig = Some("A".repeat(17_000));
+
+        assert_eq!(
+            verify_ref_update(&event).expect_err("an oversized sig must not decode"),
+            "signature is not the base64url form of 64 bytes"
+        );
+    }
+
     /// A cryptographically valid signature that does not bind the claimed
     /// identity. This is the RUSTSEC-2022-0009 shape: libp2p-core accepted a
     /// valid signature without checking it derived the claimed peer id, so the
@@ -8180,6 +8220,229 @@ mod tests {
         seed_peer(&pool, &event.node_did).await;
 
         assert_rejected_in_both_modes(&db, &pool, &bytes_of(&event), "traversal slug", None).await;
+    }
+
+    /// Unknown JSON members are ignored by serde, so padding is not part of
+    /// the field validator's answer. The frame cap must reject it before the
+    /// parse; without that guard this otherwise valid signed event is accepted.
+    #[sqlx::test]
+    async fn an_oversized_frame_is_rejected_before_json_parse(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+        let mut value = serde_json::to_value(&event).unwrap();
+        value["padding"] = serde_json::json!("x".repeat(crate::db::MAX_REF_UPDATE_WIRE_BYTES));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(bytes.len() > crate::db::MAX_REF_UPDATE_WIRE_BYTES);
+
+        assert_rejected_in_both_modes(
+            &db,
+            &pool,
+            &bytes,
+            "oversized frame",
+            Some((
+                "ref-update event exceeds 16384 encoded bytes",
+                "the encoded-frame cap must own the rejection",
+            )),
+        )
+        .await;
+    }
+
+    /// Peer-controlled size and shape validation, before either durable sink.
+    /// Every witness is correctly signed and comes from a seeded peer so the
+    /// malformed field is the only rule that can reject it.
+    #[sqlx::test]
+    async fn malformed_or_oversized_fields_are_rejected_before_any_write(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let cases: Vec<RefUpdateMutationCase> = vec![
+            (
+                "oversized ref_name",
+                |e| {
+                    e.ref_name = format!("refs/heads/{}", "x".repeat(2_000));
+                },
+                "invalid ref-update event fields: ref_name exceeds 1024 bytes",
+            ),
+            (
+                "malformed ref_name",
+                |e| {
+                    e.ref_name = "refs/heads/a..b".into();
+                },
+                "invalid ref-update event fields: ref_name is not a valid git ref",
+            ),
+            (
+                "malformed new_sha",
+                |e| {
+                    e.new_sha = "not-a-sha".into();
+                },
+                "invalid ref-update event fields: new_sha must be a 40- or 64-character hexadecimal object id",
+            ),
+            (
+                "malformed old_sha",
+                |e| {
+                    e.old_sha = "0".into();
+                },
+                "invalid ref-update event fields: old_sha must be a 40- or 64-character hexadecimal object id",
+            ),
+            (
+                "oversized pusher_did",
+                |e| {
+                    e.pusher_did = format!("did:key:{}", "z".repeat(300));
+                },
+                "invalid ref-update event fields: pusher_did exceeds 256 bytes",
+            ),
+            (
+                "unsupported owner_did",
+                |e| {
+                    e.owner_did = Some("did:unsupported:x".into());
+                },
+                "invalid ref-update event fields: owner_did uses an unsupported DID method",
+            ),
+            (
+                "malformed timestamp",
+                |e| {
+                    e.timestamp = "not-a-time".into();
+                },
+                "invalid ref-update event fields: timestamp must be an RFC 3339 timestamp",
+            ),
+            (
+                "malformed lag_origin",
+                |e| {
+                    e.lag_origin = Some("not-a-time".into());
+                },
+                "invalid ref-update event fields: lag_origin must be an RFC 3339 timestamp",
+            ),
+            (
+                "oversized cert_id",
+                |e| {
+                    e.cert_id = Some("c".repeat(129));
+                },
+                "invalid ref-update event fields: cert_id exceeds 128 bytes",
+            ),
+            (
+                "oversized cid",
+                |e| {
+                    e.cid = Some("c".repeat(129));
+                },
+                "invalid ref-update event fields: cid exceeds 128 bytes",
+            ),
+        ];
+
+        for (label, mutate, expected) in cases {
+            let keypair = Keypair::generate();
+            let mut event = event_for(&keypair);
+            mutate(&mut event);
+            sign_ref_update(&keypair, &mut event).unwrap();
+            seed_peer(&pool, &event.node_did).await;
+            assert_rejected_in_both_modes(
+                &db,
+                &pool,
+                &bytes_of(&event),
+                label,
+                Some((expected, "the wire-field guard must own the rejection")),
+            )
+            .await;
+        }
+    }
+
+    /// Older publishers emitted empty `pusher_did` and `old_sha` before those
+    /// fields carried values. Both are bounded omission sentinels rather than
+    /// amplification input, so a versionless unsigned event carrying them must
+    /// still replicate in rolling-upgrade mode. The JSON is written directly
+    /// rather than serialized from `RefUpdateEvent` so the wire shape really is
+    /// the pre-version one an un-upgraded publisher emits.
+    #[sqlx::test]
+    async fn an_unsigned_legacy_empty_pusher_and_old_sha_event_is_accepted(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let node_did = keypair.did().to_string();
+        let legacy = serde_json::json!({
+            "node_did": node_did,
+            "pusher_did": "",
+            "repo": "zOwner/myrepo",
+            "ref_name": "refs/heads/main",
+            "old_sha": "",
+            "new_sha": "a".repeat(40),
+            "timestamp": ingest_now().to_rfc3339(),
+        });
+        seed_peer(&pool, &node_did).await;
+
+        let outcome = ingest_with_fresh_limiter(
+            &db,
+            false,
+            true,
+            &serde_json::to_vec(&legacy).unwrap(),
+            &PeerId::random(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::UnsignedAdmitted),
+            "a legacy empty-identity event from a known peer must replicate, got {outcome:?}"
+        );
+        let stored: (String, String) =
+            sqlx::query_as("SELECT pusher_did, old_sha FROM received_ref_updates")
+                .fetch_one(&pool)
+                .await
+                .expect("legacy ref-update row");
+        assert_eq!(stored, (String::new(), String::new()));
+        assert_eq!(
+            count(&pool, "sync_queue").await,
+            1,
+            "the legacy event must still enqueue replication"
+        );
+    }
+
+    #[sqlx::test]
+    async fn malformed_fields_are_rejected_before_signature_and_peer_lookup(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        event.ref_name = format!("refs/heads/{}", "x".repeat(2_000));
+        sign_ref_update(&keypair, &mut event).unwrap();
+        event.sig = Some("not-a-valid-signature".into());
+
+        reset_peer_exists_calls();
+        let outcome =
+            ingest_with_fresh_limiter(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
+        assert_eq!(
+            rejection_reason(outcome, "malformed field with a forged signature"),
+            "invalid ref-update event fields: ref_name exceeds 1024 bytes",
+            "the field guard must own the rejection before signature verification"
+        );
+        assert_eq!(
+            peer_exists_calls(),
+            0,
+            "the field guard must also precede the peer lookup"
+        );
+    }
+
+    /// Sha256-format repositories carry 64-character object ids. They must pass
+    /// the same boundary as the 40-character sha1 control, or the shape rule
+    /// becomes a silent object-format refusal.
+    #[sqlx::test]
+    async fn a_signed_sha256_ref_update_is_accepted(pool: PgPool) {
+        let db = ingest_db(&pool).await;
+        let keypair = Keypair::generate();
+        let mut event = event_for(&keypair);
+        event.old_sha = "0".repeat(64);
+        event.new_sha = "a".repeat(64);
+        sign_ref_update(&keypair, &mut event).unwrap();
+        seed_peer(&pool, &event.node_did).await;
+
+        let outcome =
+            ingest_with_fresh_limiter(&db, true, true, &bytes_of(&event), &PeerId::random()).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Accepted),
+            "sha256 object ids must ingest, got {outcome:?}"
+        );
+        let stored: (String, String) =
+            sqlx::query_as("SELECT old_sha, new_sha FROM received_ref_updates")
+                .fetch_one(&pool)
+                .await
+                .expect("sha256 ref-update row");
+        assert_eq!(stored.0.len(), 64);
+        assert_eq!(stored.1.len(), 64);
     }
 
     /// R6: the acceptance path, which is what keeps federation alive. A guard
@@ -11106,12 +11369,11 @@ mod tests {
         .await;
         assert_eq!(
             outcome.metric_label(),
-            "stale_timestamp",
-            "an unparseable stamp must count under the same label as its two siblings; a publisher \
-             emitting non-RFC-3339 is a freshness violation an operator reads off one series"
+            "rejected",
+            "wire-format validation now owns a non-RFC-3339 stamp before the freshness window"
         );
         assert!(
-            matches!(outcome, IngestOutcome::StaleTimestamp(_)),
+            matches!(outcome, IngestOutcome::Rejected(_)),
             "a timestamp that cannot be parsed cannot be freshness-checked, so it must be refused \
              rather than admitted, got {outcome:?}"
         );
