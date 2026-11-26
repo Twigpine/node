@@ -1546,7 +1546,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "padded body must be refused before JSON parsing"
+        );
         let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue")
             .fetch_one(&pool)
             .await
