@@ -871,6 +871,7 @@ mod tests {
             .layer(Extension(IpRateLimiter {
                 limiter: RateLimiter::new(60, Duration::from_secs(3600)),
                 trust: TrustedProxy::None,
+                trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
             }))
             .with_state(state);
         let mut req =
@@ -919,6 +920,7 @@ mod tests {
             .layer(Extension(IpRateLimiter {
                 limiter: RateLimiter::new(1, Duration::from_secs(3600)),
                 trust: TrustedProxy::None,
+                trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
             }))
             .with_state(state);
         let peer = "203.0.113.5:5000".parse::<SocketAddr>().unwrap();

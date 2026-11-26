@@ -764,15 +764,12 @@ pub async fn git_info_refs(
     // fresh-acquire reachable unauthenticated and unlimited. Applied before the
     // acquire so a rejected request does no Tigris work. Same per-IP limiter and
     // trusted-proxy policy as the POST middleware (shared buckets).
-    if service == "git-receive-pack" {
-        if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
-            if !state.push_rate_limiter.check(&key).await {
-                tracing::warn!(repo = %name, key = %key, "receive-pack advertisement rate limited");
-                return Err(AppError::TooManyRequests(
-                    "push rate limit exceeded — try again later".into(),
-                ));
-            }
-        }
+    let caller_key = state.client_key(&headers, peer);
+    if service == "git-receive-pack" && !state.push_rate_limiter.check(&caller_key).await {
+        tracing::warn!(repo = %name, key = %caller_key, "receive-pack advertisement rate limited");
+        return Err(AppError::TooManyRequests(
+            "push rate limit exceeded, try again later".into(),
+        ));
     }
 
     // Per-source concurrency sub-cap (#174), keyed on the resolved source IP and
@@ -785,21 +782,15 @@ pub async fn git_info_refs(
     // multi-source flood of push-handshake advertisements could hold every advert-pool
     // slot across acquire_fresh and shed other sources' advertisements, since the
     // per-IP push rate limiter caps rate, not concurrency (#174 review fix).
-    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
     let _caller_permit = if service == "git-receive-pack" {
         acquire_read_caller_permit(
             &state.git_push_advert_per_caller,
-            caller_key.as_deref(),
+            &caller_key,
             name,
             "receive-pack advert",
         )?
     } else {
-        acquire_read_caller_permit(
-            &state.git_read_per_caller,
-            caller_key.as_deref(),
-            name,
-            "info/refs",
-        )?
+        acquire_read_caller_permit(&state.git_read_per_caller, &caller_key, name, "info/refs")?
     };
 
     // Shed with a 503 before spawning git when the concurrency cap is saturated;
@@ -926,44 +917,23 @@ fn git_permit(
     })
 }
 
-/// Resolve the per-caller key for the read sub-cap (#174): always the resolved
-/// source IP (`client_key`), never the signed DID. Public read routes accept any
-/// valid `did:key` via `optional_signature` with no admission step, so keying on
-/// the DID would let one host mint disposable DIDs to multiply its per-source
-/// budget; the push path already throttles on the resolved source IP for exactly
-/// this DID-farm reason (`rate_limit.rs`, `IpRateLimiter`). `None` when no key
-/// resolves (no trusted header and no peer): such a request is bounded by the
-/// global read pool only, never a 500. The per-source-IP key is only as granular
-/// as `trust`; see the `max_concurrent_reads_per_caller` config doc.
-fn read_caller_key(
-    headers: &axum::http::HeaderMap,
-    peer: Option<std::net::SocketAddr>,
-    trust: crate::rate_limit::TrustedProxy,
-) -> Option<String> {
-    crate::rate_limit::client_key(headers, peer, trust)
-}
-
-/// Acquire the per-caller read sub-cap permit (#174), or shed with a 503. `key` is
-/// `None` when no caller key resolves — that request is bounded by the global read
-/// pool only and is never shed here (returns `Ok(None)`). `handler` labels the shed
-/// log line. Shared by both read handlers so the two acquire sites cannot drift.
+/// Acquire the per-caller read sub-cap permit (#174), or shed with a 503.
+/// `handler` labels the shed log line. Shared by both read handlers so the two
+/// acquire sites cannot drift.
 fn acquire_read_caller_permit(
     limiter: &crate::rate_limit::PerCallerConcurrency,
-    key: Option<&str>,
+    key: &str,
     repo: &str,
     handler: &str,
-) -> Result<Option<crate::rate_limit::PerCallerPermit>> {
-    match key {
-        Some(k) => match limiter.try_acquire(k) {
-            Some(p) => Ok(Some(p)),
-            None => {
-                tracing::warn!(repo = %repo, caller = %k, handler, "per-caller cap reached; shedding with 503");
-                Err(AppError::Overloaded(
-                    "git service at capacity for this caller, retry shortly".into(),
-                ))
-            }
-        },
-        None => Ok(None),
+) -> Result<crate::rate_limit::PerCallerPermit> {
+    match limiter.try_acquire(key) {
+        Some(p) => Ok(p),
+        None => {
+            tracing::warn!(repo = %repo, caller = %key, handler, "per-caller cap reached; shedding with 503");
+            Err(AppError::Overloaded(
+                "git service at capacity for this caller, retry shortly".into(),
+            ))
+        }
     }
 }
 
@@ -1888,15 +1858,11 @@ pub async fn git_upload_pack(
 
     // Per-caller read sub-cap (#174): after the visibility gate (KTD7) so a
     // visibility-denied caller never consumes a scarce read slot. Keyed on the
-    // resolved source IP (never the signed DID, #174 U1); no resolvable key ->
-    // global read pool only.
-    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
-    let _caller_permit = acquire_read_caller_permit(
-        &state.git_read_per_caller,
-        caller_key.as_deref(),
-        name,
-        "upload-pack",
-    )?;
+    // resolved source IP (never the signed DID, #174 U1); no verifiable peer uses
+    // the reserved unknown-peer bucket.
+    let caller_key = state.client_key(&headers, peer);
+    let _caller_permit =
+        acquire_read_caller_permit(&state.git_read_per_caller, &caller_key, name, "upload-pack")?;
 
     // Shed with a 503 before spawning git when the concurrency cap is saturated;
     // held for the whole op (incl. the smart_http call), released on return. Taken
@@ -2931,13 +2897,13 @@ pub async fn git_receive_pack(
     // off for a rolling upgrade, and even with it on a single owner can open many
     // concurrent slow pushes to their own repo.
     // Keyed on the resolved source IP, NEVER the signed DID (a DID farm defeats
-    // a DID key); no resolvable key -> global write pool only. Then the global write permit:
+    // a DID key); no verifiable peer uses the reserved unknown-peer bucket. Then the global write permit:
     // pushes draw from the dedicated WRITE pool, separate from reads, and it is held for the
     // whole op (moved into the AdmissionGuard below).
-    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
+    let caller_key = state.client_key(&headers, peer);
     let _caller_permit = match acquire_read_caller_permit(
         &state.git_write_per_caller,
-        caller_key.as_deref(),
+        &caller_key,
         name,
         "receive-pack",
     ) {
@@ -11586,14 +11552,11 @@ mod tests {
         );
     }
 
-    /// #174 U1 (P1-a): the `None`-key arm — a request with no resolvable source key
-    /// (no trusted-proxy header, no peer) is bounded by the GLOBAL read pool only, never
-    /// a per-source cap. With the global read pool exhausted such a request still sheds
-    /// 503, proving the plain path admits/sheds on the global pool for the `None` arm
-    /// (the counterpart to the `Some(ip)` arm above). Complements the resolver-arm rule:
-    /// neither arm is vacuous.
+    /// #174 U1 (P1-a): with the global read pool exhausted, a request whose peer
+    /// cannot be verified still sheds 503 even though the per-source cap is permissive.
+    /// The unknown-peer bucket is bounded by both caps; this test isolates the global one.
     #[tokio::test]
-    async fn upload_pack_plain_none_key_arm_sheds_on_global_pool() {
+    async fn upload_pack_plain_unknown_peer_sheds_on_global_pool() {
         use axum::body::Body;
         use axum::http::{Method, Request, StatusCode};
         use axum::Router;
@@ -11603,7 +11566,7 @@ mod tests {
 
         let mut state = crate::test_support::test_state_lazy();
         // Global read pool exhausted; per-source cap permissive so only the global pool
-        // can shed. No ConnectInfo + no trusted header -> read_caller_key resolves None.
+        // can shed. No ConnectInfo means the reserved unknown-peer key.
         state.git_read_semaphore = Arc::new(Semaphore::new(0));
         state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
@@ -11614,7 +11577,7 @@ mod tests {
                 axum::routing::post(crate::api::repos::git_upload_pack),
             )
             .with_state(state);
-        // No ConnectInfo extension and no XFF header: the caller key is None.
+        // No ConnectInfo extension: the caller key is the reserved unknown-peer bucket.
         let req = Request::builder()
             .method(Method::POST)
             .uri("/alice/repo.git/git-upload-pack")
@@ -11624,7 +11587,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "a None-key request must still shed 503 on the exhausted GLOBAL read pool"
+            "an unknown-peer request must still shed 503 on the exhausted GLOBAL read pool"
         );
     }
 
@@ -14888,7 +14851,7 @@ mod tests {
     /// multiply its budget. Fill the source IP's single read slot, then drive two
     /// requests signed under DIFFERENT DIDs from that SAME IP: both must shed 503
     /// (keyed by the saturated IP, not their own free DID slots). A signed request
-    /// from a DIFFERENT source IP keeps its own budget. Revert `read_caller_key` to
+    /// from a DIFFERENT source IP keeps its own budget. Revert the caller key to
     /// prefer the DID and the same-IP assertions go green-not-503 (each fresh DID
     /// gets a free slot) -- the farm-defeat mutation probe.
     #[sqlx::test]
@@ -14969,12 +14932,11 @@ mod tests {
         );
     }
 
-    /// #174 SC2 (None-key): a request with no resolvable caller key (no ConnectInfo,
-    /// no trusted header) must NOT be shed by the per-caller cap even when another
-    /// caller's budget is full — it is bounded by the global read pool only. A None
-    /// key never keys into the map, so it never 503s from the per-caller sub-cap.
+    /// #174 SC2 (unknown peer): a request with no `ConnectInfo` cannot prove a
+    /// socket peer, so it shares the reserved unknown-peer concurrency bucket
+    /// rather than bypassing the per-caller cap.
     #[sqlx::test]
-    async fn info_refs_none_key_bypasses_per_caller_cap(pool: sqlx::PgPool) {
+    async fn info_refs_unknown_peer_shares_per_caller_cap(pool: sqlx::PgPool) {
         use axum::body::Body;
         use axum::http::{Method, Request, StatusCode};
         use tower::ServiceExt;
@@ -14987,24 +14949,21 @@ mod tests {
             .upsert_mirror_repo("z6pcnone", "pc", "/tmp/pc-nonexistent", None, false)
             .await
             .unwrap();
-        // Saturate an unrelated caller's budget; the None-key request must be
-        // unaffected because it never keys into the per-caller map.
         let _slot = state
             .git_read_per_caller
-            .try_acquire("203.0.113.99")
-            .expect("hold an unrelated caller's slot");
+            .try_acquire(crate::rate_limit::UNKNOWN_PEER_KEY)
+            .expect("hold the unknown-peer slot");
 
-        // No ConnectInfo inserted -> PeerAddr is None -> no per-caller key.
         let router = crate::server::build_router(state.clone());
         let req = Request::builder()
             .method(Method::GET)
             .uri("/z6pcnone/pc/info/refs?service=git-upload-pack")
             .body(Body::empty())
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             router.oneshot(req).await.unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "a request with no resolvable caller key must not be shed by the per-caller cap"
+            "a request without a verifiable peer must share the capped unknown-peer bucket"
         );
     }
 
@@ -15999,8 +15958,7 @@ mod tests {
             );
         }
         let r = push(other, "k2").await;
-        // Positive, for the same reason as `f1_write_cap_is_inert_without_a_resolvable
-        // _source_key`: `!matches!(.., Overloaded)` is satisfied by a Forbidden, so a
+        // Positive: `!matches!(.., Overloaded)` is satisfied by a Forbidden, so a
         // gate that started rejecting this pusher would leave the test green and inert.
         assert!(
             matches!(r, Err(AppError::Git(_))),
@@ -16009,12 +15967,11 @@ mod tests {
         );
     }
 
-    /// #174 F1 (U1) fallback: a caller with no resolvable source key (no trusted
-    /// header, no peer address) takes no per-caller permit and is bounded by the global
-    /// write pool only, exactly as before the move. `acquire_read_caller_permit`
-    /// returns `Ok(None)` for a `None` key, so it must never 503 here.
+    /// #174 F1 (U1) unknown-peer fallback: a caller with no socket peer cannot
+    /// prove a source, so it shares the reserved unknown-peer write-cap bucket
+    /// instead of bypassing the per-caller cap.
     #[sqlx::test]
-    async fn f1_write_cap_is_inert_without_a_resolvable_source_key(pool: sqlx::PgPool) {
+    async fn f1_write_cap_bounds_unknown_peer_bucket(pool: sqlx::PgPool) {
         use axum::extract::{Path, State};
         use axum::Extension;
         use std::sync::Arc;
@@ -16022,19 +15979,17 @@ mod tests {
 
         let mut state = crate::test_support::test_state(pool).await;
         state.git_write_semaphore = Arc::new(Semaphore::new(4));
-        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 1);
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
         state
             .db
             .upsert_mirror_repo("z6f1none", "n1", "/tmp/f1-none-nonexistent", None, false)
             .await
             .unwrap();
-        // Saturate the limiter's only key slot as well, so a request that DID resolve a
-        // key would be shed. The keyless request must still pass.
         let _slot = state
             .git_write_per_caller
-            .try_acquire("203.0.113.67")
-            .expect("occupy the limiter's single key slot");
+            .try_acquire(crate::rate_limit::UNKNOWN_PEER_KEY)
+            .expect("hold the unknown-peer write slot");
 
         let r = git_receive_pack(
             State(state.clone()),
@@ -16048,15 +16003,9 @@ mod tests {
             axum::body::Bytes::from_static(b"0000"),
         )
         .await;
-        // Assert the POSITIVE outcome, not the absence of one error. Reaching git on
-        // the missing on-disk repo is proof the request cleared BOTH the owner gate
-        // and the per-caller cap. The previous shape — `!matches!(r, Overloaded)` —
-        // was satisfied by any other error, so when owner-only push began rejecting
-        // this pusher the test kept reporting ok while measuring nothing.
         assert!(
-            matches!(r, Err(AppError::Git(_))),
-            "a caller with no resolvable source key must fall back to the global write \
-             pool only, never shed on the per-caller cap, and must reach git; got {r:?}"
+            matches!(r, Err(AppError::Overloaded(_))),
+            "a caller with no verifiable peer must share the capped unknown-peer write bucket; got {r:?}"
         );
     }
 

@@ -32,7 +32,7 @@ pub struct AdmissionGuard {
     // guard only needs to hold them and drop them, never inspect them. `Send +
     // 'static` so the guard can move into the detached reaper task.
     _global: Option<Box<dyn Send + 'static>>,
-    _caller: Option<Box<dyn Send + 'static>>,
+    _caller: Box<dyn Send + 'static>,
     // Any further work-scoped hold that must outlive the process group; see `with_hold`.
     _hold: Option<Box<dyn Send + 'static>>,
     // Per-repo write lease (#174 U2/F3), `Some` ONLY on the receive-pack write path
@@ -48,14 +48,14 @@ pub struct AdmissionGuard {
 }
 
 impl AdmissionGuard {
-    /// Take ownership of the global permit and an optional per-caller permit. Both are
-    /// erased to `Box<dyn Send>` — the guard's only job is to hold them until it drops.
+    /// Take ownership of the global and per-caller permits. Both are erased to
+    /// `Box<dyn Send>`; the guard's only job is to hold them until it drops.
     /// No lease is attached here; the receive-pack write path adds one via
     /// [`with_lease`](Self::with_lease), so every other call site is lease-free.
-    pub fn new(global: impl Send + 'static, caller: Option<impl Send + 'static>) -> Self {
+    pub fn new(global: impl Send + 'static, caller: impl Send + 'static) -> Self {
         Self {
             _global: Some(Box::new(global)),
-            _caller: caller.map(|c| Box::new(c) as Box<dyn Send + 'static>),
+            _caller: Box::new(caller),
             _hold: None,
             _lease: None,
         }
@@ -2414,7 +2414,7 @@ mod tests {
                 let sem = Arc::new(Semaphore::new(4));
                 let g = sem.clone().try_acquire_owned().unwrap();
                 let c = sem.clone().try_acquire_owned().unwrap();
-                let admission = AdmissionGuard::new(g, Some(c));
+                let admission = AdmissionGuard::new(g, c);
                 let mut fut = Box::pin(build_filtered_pack(
                     git_bin.to_str().unwrap(),
                     tmp.path(),
@@ -2538,7 +2538,7 @@ mod tests {
         );
         let git_bin = write_fake_git(tmp.path(), &body);
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+        let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), ());
         let withheld = HashSet::new();
 
         let mut fut = Box::pin(build_filtered_pack(
@@ -2611,7 +2611,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let (_work, bare, secret_oid, _public_oid) = fixture_with_secret(&td);
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+        let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), ());
         let withheld = HashSet::from([secret_oid]);
         let (resp, _served_pack) = upload_pack_excluding(
             "git",
@@ -2645,7 +2645,7 @@ mod tests {
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
 
         for i in 0..FAKE_GIT_RETRY_ATTEMPTS {
-            let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+            let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), ());
             let result = build_filtered_pack(
                 git_bin.to_str().unwrap(),
                 tmp.path(),
@@ -2695,7 +2695,7 @@ mod tests {
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
 
         for i in 0..FAKE_GIT_RETRY_ATTEMPTS {
-            let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+            let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), ());
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
                 build_filtered_pack(
@@ -2750,7 +2750,7 @@ mod tests {
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
 
         for i in 0..FAKE_GIT_RETRY_ATTEMPTS {
-            let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+            let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), ());
             let mut command = tokio::process::Command::new(git_bin.to_str().unwrap());
             command
                 .args(["pack-objects", "--stdout"])

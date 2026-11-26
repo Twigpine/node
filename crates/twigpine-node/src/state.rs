@@ -218,9 +218,12 @@ pub struct AppState {
     /// A field for the same test-seam reason as the sibling caps.
     pub ipfs_max_served_object_bytes: u64,
     /// Which forwarded header (if any) the edge is trusted to set, for
-    /// resolving the push limiter's client-IP key. See `TWIGPINE_TRUSTED_PROXY`.
+    /// resolving client-IP keys. Honored only for peers in `push_limiter_trusted_peers`.
     /// Node-wide; also keys the two peer-sync limiters below.
     pub push_limiter_trust: crate::rate_limit::TrustedProxy,
+    /// Socket peers allowed to assert the forwarded header selected by
+    /// `push_limiter_trust`. Empty trusts no proxy and therefore keys on peers.
+    pub push_limiter_trusted_peers: crate::rate_limit::TrustedProxyPeers,
     /// Per-client-IP limiter for `POST /api/v1/sync/trigger` (tight). The route
     /// requires a signature, but a signature does not cap cost (a did:key farm
     /// self-registers), and its per-call cost is an O(peers) fan-out, so the IP
@@ -405,6 +408,24 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Resolve the rate-limit key for a request under this node's verified
+    /// trusted-proxy policy: the configured forwarded header only when the socket
+    /// peer is a configured proxy, else the socket peer, else the reserved
+    /// unknown-peer bucket. Single entry point so no call site can pass a trust
+    /// mode without its peer allowlist.
+    pub fn client_key(
+        &self,
+        headers: &axum::http::HeaderMap,
+        peer: Option<std::net::SocketAddr>,
+    ) -> String {
+        crate::rate_limit::client_key(
+            headers,
+            peer,
+            self.push_limiter_trust,
+            &self.push_limiter_trusted_peers,
+        )
+    }
+
     /// Subscribe to the shutdown signal. Returns a fresh receiver whose
     /// initial value matches the current state.
     pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {

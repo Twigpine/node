@@ -45,7 +45,7 @@ async fn graphql_handler(
     // and not signature verification.
     inner = inner.data(rate_limit::TaskReadBrake {
         limiter: state.task_read_rate_limiter.clone(),
-        key: rate_limit::client_key(&headers, peer, state.push_limiter_trust),
+        key: state.client_key(&headers, peer),
         request_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
     state.graphql_schema.execute(inner).await.into()
@@ -65,7 +65,7 @@ async fn graphql_ws_handler(
     }
     data.insert(rate_limit::TaskReadBrake {
         limiter: state.task_read_rate_limiter.clone(),
-        key: rate_limit::client_key(&headers, peer, state.push_limiter_trust),
+        key: state.client_key(&headers, peer),
         request_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
     let schema = state.graphql_ws_schema.as_ref().clone();
@@ -167,6 +167,7 @@ pub fn build_router(state: AppState) -> Router {
     let write_ip_limiter = rate_limit::IpRateLimiter {
         limiter: state.write_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        trusted_peers: state.push_limiter_trusted_peers.clone(),
     };
 
     let graphql_http = Router::new()
@@ -217,6 +218,7 @@ pub fn build_router(state: AppState) -> Router {
     let task_read_limiter = rate_limit::IpRateLimiter {
         limiter: state.task_read_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        trusted_peers: state.push_limiter_trusted_peers.clone(),
         // Braking reads is this limiter's job; no write-only exemption.
     };
     let task_read_routes = Router::new()
@@ -241,6 +243,7 @@ pub fn build_router(state: AppState) -> Router {
     let create_ip_limiter = rate_limit::IpRateLimiter {
         limiter: state.create_ip_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        trusted_peers: state.push_limiter_trusted_peers.clone(),
     };
     let creation_routes = add_auth_layers(
         Router::new()
@@ -385,6 +388,7 @@ pub fn build_router(state: AppState) -> Router {
     .layer(axum::Extension(rate_limit::IpRateLimiter {
         limiter: state.create_ip_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        trusted_peers: state.push_limiter_trusted_peers.clone(),
     }));
 
     // ── Status claim reads — open, behind `optional_signature` so the handler
@@ -418,6 +422,7 @@ pub fn build_router(state: AppState) -> Router {
     let push_limiter = rate_limit::IpRateLimiter {
         limiter: state.push_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        trusted_peers: state.push_limiter_trusted_peers.clone(),
     };
     let git_write_routes = add_auth_layers(
         Router::new()
@@ -460,6 +465,7 @@ pub fn build_router(state: AppState) -> Router {
     let ipfs_limiter = rate_limit::IpRateLimiter {
         limiter: state.ipfs_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        trusted_peers: state.push_limiter_trusted_peers.clone(),
     };
     let ipfs_cid_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
@@ -592,6 +598,7 @@ pub fn build_router(state: AppState) -> Router {
     .layer(axum::Extension(rate_limit::IpRateLimiter {
         limiter: state.sync_trigger_rate_limiter.clone(),
         trust: state.push_limiter_trust,
+        trusted_peers: state.push_limiter_trusted_peers.clone(),
     }));
 
     // announce + notify keep their rolling-upgrade signature behavior (unsigned
@@ -615,6 +622,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::Extension(rate_limit::IpRateLimiter {
             limiter: state.peer_write_rate_limiter.clone(),
             trust: state.push_limiter_trust,
+            trusted_peers: state.push_limiter_trusted_peers.clone(),
         }));
 
     // ── Read routes — open for public repos ───────────────────────────────
@@ -627,6 +635,7 @@ pub fn build_router(state: AppState) -> Router {
                 .route_layer(axum::Extension(rate_limit::IpRateLimiter {
                     limiter: state.federated_rate_limiter.clone(),
                     trust: state.push_limiter_trust,
+                    trusted_peers: state.push_limiter_trusted_peers.clone(),
                     // Braking reads is this limiter's job; no write-only exemption.
                 })),
         )
@@ -832,6 +841,7 @@ pub fn build_router(state: AppState) -> Router {
         let hf_limiter = rate_limit::IpRateLimiter {
             limiter: state.hf_read_rate_limiter.clone(),
             trust: state.push_limiter_trust,
+            trusted_peers: state.push_limiter_trusted_peers.clone(),
         };
         let hf = Router::new()
             .route("/hf/api/models/{owner}/{repo}", get(hf::hf_model_info))

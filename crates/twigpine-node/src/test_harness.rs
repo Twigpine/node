@@ -227,6 +227,7 @@ fn build_state(
         webhook_secret_key: Arc::new(webhook_secret_key),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust: TrustedProxy::None,
+        push_limiter_trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         shutdown_tx: watch::channel(false).0,
