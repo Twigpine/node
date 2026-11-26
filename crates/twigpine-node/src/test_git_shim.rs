@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 /// The fixture delays or hangs in its own process, so the production watchdog
 /// can terminate it without depending on a shell or descendant process support.
 #[allow(dead_code)]
-pub(super) enum Behavior<'a> {
+pub(crate) enum Behavior<'a> {
     Delay(u64),
     Hang,
     HangOid(&'a str),
@@ -19,7 +19,7 @@ pub(super) enum Behavior<'a> {
 }
 
 #[allow(dead_code)]
-pub(super) struct GitShim {
+pub(crate) struct GitShim {
     _directory: tempfile::TempDir,
     executable: PathBuf,
 }
@@ -33,7 +33,7 @@ impl Deref for GitShim {
 }
 
 #[allow(dead_code)]
-pub(super) fn create(name: &str, behavior: Behavior<'_>) -> GitShim {
+pub(crate) fn create(name: &str, behavior: Behavior<'_>) -> GitShim {
     static COMPILED: OnceLock<tempfile::TempDir> = OnceLock::new();
     let compiled = COMPILED.get_or_init(|| {
         let directory = tempfile::tempdir().expect("native Git fixture directory");
