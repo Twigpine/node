@@ -474,9 +474,11 @@ pub async fn close_issue(
     // ONE lock-hold deadline funds every git child under the guard: the
     // re-authorize read (which also supplies the rollback snapshot), the close
     // itself and the failed-close or publish-refusal rollback. An expired
-    // deadline refuses before anything runs; a child killed at it surfaces as
-    // GitServiceTimeout, which the arms below map to the retryable 503 rather
-    // than a 500 git_error.
+    // deadline at lock-take refuses before anything runs; if it expires during
+    // the guarded re-read, the close child is not re-checked first and is
+    // reaped by the watchdog (bounded by its 1-second term grace). A child
+    // killed at the deadline surfaces as GitServiceTimeout, which the arms
+    // below map to the retryable 503 rather than a 500 git_error.
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     let Some(hold_deadline) = guard.hold_deadline(git_timeout) else {
         let _ = guard.release(false).await;
@@ -552,9 +554,10 @@ pub async fn close_issue(
 
     // Always release the advisory lock, even on error; upload to Tigris only on
     // success. Same short-circuit as create_issue, and before the 200 body
-    // below. The pre-close snapshot is always in hand, so a failed upload
-    // rewrites the ref back to the pre-close content instead of leaving the
-    // local repo closed while the client saw 5xx.
+    // below. On a definite publish refusal, `release_compensating` first
+    // invalidates (removes) the local cache so the next read re-downloads from
+    // object storage; the compensator rewrites the pre-close ref as a fallback
+    // only if removing the live tree fails.
     let release_result = if close_result.is_ok() {
         guard
             .release_compensating(true, move |path| {
@@ -574,12 +577,16 @@ pub async fn close_issue(
             .await
             .into_result()
     } else {
-        // A bounded close that erred may have committed its update-ref
-        // before the kill, the same uncertainty create's cleanup covers.
-        // Rewrite the pre-close JSON on the guard's remaining hold budget,
-        // never a fresh git timeout, before releasing; when the hold is spent
-        // or the rewrite fails, drop the guard unreleased so the tree
-        // quarantines rather than serve or publish an unacknowledged close.
+        // A bounded close that erred may have committed its update-ref before
+        // failing. Rewrite the pre-close JSON on the guard's remaining hold
+        // budget, never a fresh git timeout, before releasing: that restore
+        // runs only for failures before the deadline (under boot-valid config
+        // where hold <= git_timeout, a child killed at the deadline leaves no
+        // remaining budget). When the hold is spent or the rewrite fails, drop
+        // the guard unreleased: on an object-store node this quarantines the
+        // live tree; on a local-only node (`NoBackend`) the committed close is
+        // the durable copy and the 503 means the outcome is unknown (a retry
+        // resolves it).
         let restored = guard.hold_deadline(git_timeout).is_some_and(|deadline| {
             git_issues::create_issue_bounded(
                 &git_bin,
@@ -1967,9 +1974,11 @@ mod lock_pool_shed_tests {
     }
 
     /// Fixture for the failed-close restore tests: a repo with one open issue
-    /// and a git wrapper whose FIRST ref write commits and then never returns
-    /// (the bounded runner kills it), the state a killed child leaves behind.
-    /// Every later git call, the restore included, passes through to real git.
+    /// and a git wrapper whose FIRST ref write commits and then runs
+    /// `after_commit` (for example `"exit 1"` for a pre-deadline non-timeout
+    /// failure, or `"exec sleep 30"` so the bounded runner kills it at the
+    /// deadline). Every later git call, the restore included, passes through to
+    /// real git.
     #[cfg(unix)]
     async fn failed_close_fixture(
         pool: &PgPool,
@@ -1978,6 +1987,7 @@ mod lock_pool_shed_tests {
         hold: std::time::Duration,
         git_timeout_secs: u64,
         tigris: Option<crate::git::tigris::TigrisClient>,
+        after_commit: &str,
     ) -> (
         AppState,
         std::path::PathBuf,
@@ -2028,37 +2038,46 @@ mod lock_pool_shed_tests {
 
         let bin_dir = tempfile::TempDir::new().unwrap();
         let wrapper = bin_dir.path().join("git-wrapper");
-        let script = r#"#!/bin/sh
+        let script = format!(
+            r#"#!/bin/sh
 dir=$(dirname "$0")
 if [ "$1" = "update-ref" ] && [ "$2" != "-d" ] && [ ! -e "$dir/seen" ]; then
   git "$@" || exit 1
   : > "$dir/seen"
-  exec sleep 30
+  {after_commit}
 fi
 exec git "$@"
-"#;
+"#
+        );
         std::fs::write(&wrapper, script).unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         state.git_bin = wrapper.to_str().unwrap().to_string();
         (state, live.to_path_buf(), full_id, open_json, disk, bin_dir)
     }
 
-    /// #282: a close whose update-ref committed and was then killed at the git
-    /// timeout is rewritten back to the pre-close JSON on the guard's remaining
-    /// hold budget (the hold is generous, only the git timeout was spent), and
-    /// the tree is released clean rather than quarantined.
+    /// #282: under a boot-valid config pair (`hold <= git_timeout`), a close
+    /// whose update-ref committed and then failed before the hold deadline is
+    /// rewritten back to the pre-close JSON on the guard's remaining hold
+    /// budget, returning 500 and releasing the tree clean rather than
+    /// quarantining it.
     #[cfg(unix)]
     #[sqlx::test]
     async fn failed_close_restores_the_issue_when_hold_budget_remains(pool: PgPool) {
         let owner = "did:key:zISSUERESTOREOKAAAAAAAAAAAAAAAAAAAAA";
         let repo_name = "restore-ok";
+        use crate::git::repo_store::tests as rs_tests;
+
+        // Run with an object store behind the guard so the clean-release
+        // (non-quarantine) assertion below is non-vacuous.
+        let mock = rs_tests::S3Mock::start().await;
         let (state, live, full_id, open_json, _disk, bin_dir) = failed_close_fixture(
             &pool,
             owner,
             repo_name,
-            std::time::Duration::from_secs(20),
-            1,
-            None,
+            std::time::Duration::from_secs(10),
+            25,
+            Some(rs_tests::mock_tigris(&mock)),
+            "exit 1",
         )
         .await;
 
@@ -2071,14 +2090,14 @@ exec git "$@"
             crate::auth::LedgerTicket::already_spent(),
         )
         .await;
-        let err = res.expect_err("a close whose ref write was killed must fail");
+        let err = res.expect_err("a close whose ref write failed must error");
         assert_eq!(
             err.into_response().status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::INTERNAL_SERVER_ERROR
         );
         assert!(
             bin_dir.path().join("seen").exists(),
-            "the ref write must have committed before the kill, or this proves nothing"
+            "the ref write must have committed before failing, or this proves nothing"
         );
         assert_eq!(
             git_issues::get_issue(&live, &full_id)
@@ -2091,6 +2110,8 @@ exec git "$@"
             !crate::git::repo_store::live_tree_publish_unresolved(&live),
             "a restored tree is released clean, not quarantined"
         );
+
+        mock.shutdown();
     }
 
     /// #282: when the hold budget is spent by the time the failed close would
@@ -2113,6 +2134,7 @@ exec git "$@"
             std::time::Duration::from_secs(1),
             25,
             Some(rs_tests::mock_tigris(&mock)),
+            "exec sleep 30",
         )
         .await;
 
@@ -2140,6 +2162,61 @@ exec git "$@"
         );
 
         mock.shutdown();
+    }
+
+    /// #282: on a local-only node (`NoBackend`), a close whose update-ref
+    /// committed and was then killed at the hold deadline has no remaining hold
+    /// budget to restore, drops the guard unreleased without writing a
+    /// quarantine marker, leaves the committed close as the durable ref, and
+    /// returns 503.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn failed_close_local_only_killed_after_commit_leaves_closed_ref_and_503(pool: PgPool) {
+        let owner = "did:key:zISSUELOCALONLYKILLEDAAAAAAAAAAAAAAA";
+        let repo_name = "local-killed";
+        let (state, live, full_id, _open_json, _disk, bin_dir) = failed_close_fixture(
+            &pool,
+            owner,
+            repo_name,
+            std::time::Duration::from_secs(1),
+            25,
+            None,
+            "exec sleep 30",
+        )
+        .await;
+
+        let res = close_issue(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), repo_name.to_string(), full_id.clone())),
+            axum::http::HeaderMap::new(),
+            crate::rate_limit::PeerAddr(None),
+            crate::auth::LedgerTicket::already_spent(),
+        )
+        .await;
+        let err = res.expect_err("a close whose ref write was killed must fail");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            bin_dir.path().join("seen").exists(),
+            "the ref write must have committed before the kill, or this proves nothing"
+        );
+        let raw = git_issues::get_issue(&live, &full_id)
+            .expect("read the ref")
+            .expect("the committed issue ref must still exist");
+        let stored: serde_json::Value =
+            serde_json::from_str(&raw).expect("stored issue ref must be valid JSON");
+        assert_eq!(
+            stored["status"],
+            "closed",
+            "on a local-only node, the committed close remains the durable copy"
+        );
+        assert!(
+            !crate::git::repo_store::live_tree_publish_unresolved(&live),
+            "no quarantine marker is written on a local-only (NoBackend) node"
+        );
     }
 
     /// The positive twin of the hold tests: a normal close on a store whose

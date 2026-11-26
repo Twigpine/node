@@ -548,8 +548,9 @@ pub struct Config {
     /// the process group dies, or merge writes, which take their guards
     /// without this deadline and run unbounded git under them. Issue writes
     /// keep the deadline: an expired one refuses the write before the ref is
-    /// touched, and both the create's and the close's git children are clamped
-    /// to it. Must be positive and at most
+    /// touched, and the create's ref write and every git child of the close
+    /// are clamped to it. Create's rollback after a refused publish keeps its
+    /// own git-timeout budget. Must be positive and at most
     /// `git_service_timeout_secs` (a hold bound above the git timeout can
     /// never bind before it). Unset (the default) the effective bound is
     /// `git_service_timeout_secs` itself (600s shipped), so every push keeps
