@@ -527,20 +527,12 @@ pub async fn notify_sync(
         Err(e) => return Err(AppError::BadRequest(format!("invalid repo field: {e}"))),
     };
 
-    match crate::sync::sync_origin_row_verdict(&state.db, owner_short, repo_name, &req.node_did)
-        .await?
-    {
-        crate::sync::SyncOriginRowVerdict::Denied(reason) => {
-            return Err(AppError::Forbidden(reason.into()));
-        }
-        crate::sync::SyncOriginRowVerdict::FirstSync
-        | crate::sync::SyncOriginRowVerdict::PinnedOrigin => {}
-    }
-
+    let canonical_owner = crate::db::normalize_owner_key(owner_short);
+    let canonical_repo = format!("{canonical_owner}/{repo_name}");
     state
         .db
         .enqueue_sync(
-            &req.repo,
+            &canonical_repo,
             &req.node_did,
             &req.ref_name,
             &req.new_sha,
@@ -1335,6 +1327,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"status":"ok","queued":true,"repo":"z6Mkfoo/hello"})
+        );
         let queued = db.dequeue_pending_syncs(100).await.unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].repo, "z6Mkfoo/hello");
@@ -1351,7 +1351,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn sync_notify_rejects_a_peer_that_is_not_the_recorded_origin(pool: PgPool) {
+    async fn sync_notify_queues_a_wrong_origin_for_the_workers_decision(pool: PgPool) {
         let state = test_state(pool.clone()).await;
         let attacker_did = seed_peer(&state).await;
         let origin_did = "did:key:z6MkRecordedOrigin";
@@ -1376,7 +1376,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
         let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue")
             .fetch_one(&pool)
             .await
@@ -1385,8 +1385,8 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(queued, 0, "unauthorized notify must not enqueue sync work");
-        assert_eq!(feed, 0, "unauthorized notify must not seed the feed");
+        assert_eq!(queued, 1, "notify acceptance must not reveal mirror state");
+        assert_eq!(feed, 1, "notify acceptance must not reveal mirror state");
     }
 
     #[sqlx::test]
@@ -1423,7 +1423,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn sync_notify_rejects_peer_sync_into_a_canonical_repo(pool: PgPool) {
+    async fn sync_notify_queues_canonical_collision_for_the_workers_decision(pool: PgPool) {
         let state = test_state(pool.clone()).await;
         let peer_did = seed_peer(&state).await;
         let now = chrono::Utc::now().to_rfc3339();
@@ -1450,12 +1450,109 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
         let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(queued, 0, "canonical repo sync must not enqueue");
+        assert_eq!(
+            queued, 1,
+            "notify acceptance must not reveal canonical state"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_response_does_not_distinguish_mirror_state(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state.clone());
+        let mut responses = Vec::new();
+        for (i, ip) in [
+            "198.51.100.30:5000",
+            "198.51.100.31:5000",
+            "198.51.100.32:5000",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if i == 1 {
+                state
+                    .db
+                    .upsert_mirror_repo_with_origin(
+                        "z6Mkfoo",
+                        "states",
+                        "/mirror/states.git",
+                        None,
+                        false,
+                        Some("did:key:z6MkOtherOrigin"),
+                    )
+                    .await
+                    .unwrap();
+            } else if i == 2 {
+                sqlx::query("DELETE FROM repos WHERE id = 'z6Mkfoo/states'")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let now = chrono::Utc::now().to_rfc3339();
+                sqlx::query(
+                    "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
+                                        created_at, updated_at, disk_path)
+                     VALUES ($1, 'states', 'did:key:z6Mkfoo', 'canonical', TRUE, 'main', $2, $2, '/canonical/states.git')",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&now)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let resp = router
+                .clone()
+                .oneshot(unsigned_post(
+                    "/api/v1/sync/notify",
+                    &notify_body("z6Mkfoo/states", &peer_did),
+                    ip,
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            responses.push((status, body));
+        }
+        assert_eq!(responses[0].0, StatusCode::OK);
+        assert_eq!(responses[0], responses[1]);
+        assert_eq!(responses[0], responses[2]);
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_canonicalizes_a_full_did_queue_spelling(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let db = state.db.clone();
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("did:key:z6Mkfoo/hello", &peer_did),
+                "198.51.100.33:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let queued = db.dequeue_pending_syncs(100).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].repo, "z6Mkfoo/hello");
+        let feed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM received_ref_updates WHERE repo = $1")
+                .bind("did:key:z6Mkfoo/hello")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            feed, 1,
+            "the feed must keep the wire spelling exactly as gossip ingest does"
+        );
     }
 
     #[sqlx::test]

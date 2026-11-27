@@ -2883,13 +2883,19 @@ const MIGRATIONS: &[Migration] = &[
         name: "sync_mirror_origin_pin",
         stmts: &[
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS origin_node_did TEXT",
+        ],
+    },
+    Migration {
+        version: 54,
+        name: "sync_mirror_origin_backfill",
+        stmts: &[
             r#"UPDATE repos
              SET origin_node_did = provenance.node_did
              FROM (
                  SELECT DISTINCT ON (repo) repo, node_did
                  FROM sync_queue
                  WHERE status = 'done'
-                 ORDER BY repo, enqueued_at ASC, id ASC
+                 ORDER BY repo, processed_at ASC NULLS LAST, enqueued_at ASC, id ASC
              ) AS provenance
              WHERE repos.id = provenance.repo
                AND position('/' in repos.id) > 0
@@ -3411,6 +3417,7 @@ impl Db {
                 "mirror repo name exceeds {MAX_REPO_NAME_LEN} bytes: refusing to register"
             );
         }
+        let owner_short = normalize_owner_key(owner_short);
         let now = Utc::now().to_rfc3339();
         let id = format!("{owner_short}/{name}");
         // Slug the purge cascade keys on. Take the shared advisory lock on it inside a
@@ -4580,10 +4587,11 @@ pub(crate) enum MirrorOriginState {
 
 impl Db {
     pub(crate) async fn mirror_origin_state(&self, mirror_id: &str) -> Result<MirrorOriginState> {
+        let mirror_id = normalize_repo_slug(mirror_id);
         let origin = sqlx::query_scalar::<_, Option<String>>(
             "SELECT origin_node_did FROM repos WHERE id = $1",
         )
-        .bind(mirror_id)
+        .bind(&mirror_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(match origin {
@@ -4591,6 +4599,59 @@ impl Db {
             Some(Some(did)) => MirrorOriginState::Pinned(did),
             Some(None) => MirrorOriginState::Unpinned,
         })
+    }
+
+    pub(crate) async fn canonical_repo_blocks_sync_owner(
+        &self,
+        canonical_sync_owner: &str,
+        repo_name: &str,
+    ) -> Result<bool> {
+        let sql = format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM repos
+                 WHERE name = $2
+                   AND position('/' in id) = 0
+                   AND (({key}) = $1
+                        OR replace(replace(owner_did, ':', '_'), '/', '_') = $1)
+             )",
+            key = OWNER_KEY_CASE_SQL
+        );
+        Ok(sqlx::query_scalar(&sql)
+            .bind(canonical_sync_owner)
+            .bind(repo_name)
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    pub(crate) async fn repair_mirror_origin_from_history(
+        &self,
+        mirror_id: &str,
+    ) -> Result<Option<String>> {
+        let mirror_id = normalize_repo_slug(mirror_id);
+        Ok(sqlx::query_scalar::<_, String>(
+            r#"UPDATE repos r
+             SET origin_node_did = repair.node_did
+             FROM (
+                 SELECT DISTINCT ON (sq.repo) sq.repo, sq.node_did
+                 FROM sync_queue sq
+                 JOIN repos mirror ON mirror.id = sq.repo
+                 WHERE sq.status = 'done'
+                   AND mirror.id = $1
+                   AND mirror.origin_node_did IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM schema_migrations sm
+                       WHERE sm.version = 53
+                         AND mirror.created_at >= sm.applied_at
+                   )
+                 ORDER BY sq.repo, sq.processed_at ASC NULLS LAST, sq.enqueued_at ASC, sq.id ASC
+             ) AS repair
+             WHERE r.id = repair.repo
+               AND r.origin_node_did IS NULL
+             RETURNING r.origin_node_did"#,
+        )
+        .bind(&mirror_id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn enqueue_sync(
@@ -4615,7 +4676,7 @@ impl Db {
              ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::new_v4().to_string())
-        .bind(repo)
+        .bind(&slug)
         .bind(node_did)
         .bind(ref_name)
         .bind(new_sha)
@@ -12249,14 +12310,61 @@ mod migration_tests {
     }
 
     #[sqlx::test]
-    async fn migration_v53_backfills_mirror_origin_from_earliest_done_sync(pool: sqlx::PgPool) {
+    async fn canonical_repo_blocks_sync_owner_matches_logical_and_filesystem_collisions(
+        pool: sqlx::PgPool,
+    ) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        for (owner, name) in [
+            ("did:key:z6Mkfoo", "keyed"),
+            ("did:web:squatter.example.com", "webbed"),
+        ] {
+            sqlx::query(
+                "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
+                                    created_at, updated_at, disk_path, machine_id, quarantined)
+                 VALUES ($1, $2, $3, 'canonical', TRUE, 'main', $4, $4, $5, NULL, FALSE)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(name)
+            .bind(owner)
+            .bind(&now)
+            .bind(format!("/canonical/{name}.git"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        for (sync_owner, repo_name) in [
+            ("z6Mkfoo", "keyed"),
+            ("did_key_z6Mkfoo", "keyed"),
+            ("did:web:squatter.example.com", "webbed"),
+            ("did_web_squatter.example.com", "webbed"),
+        ] {
+            assert!(
+                db.canonical_repo_blocks_sync_owner(sync_owner, repo_name)
+                    .await
+                    .unwrap(),
+                "{sync_owner}/{repo_name} must be denied as a canonical collision"
+            );
+        }
+        assert!(
+            !db.canonical_repo_blocks_sync_owner("did_web_other.example.com", "webbed")
+                .await
+                .unwrap(),
+            "an unrelated owner must not be denied"
+        );
+    }
+
+    #[sqlx::test]
+    async fn migration_v54_backfills_mirror_origin_from_first_completed_sync(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
         sqlx::query("ALTER TABLE repos DROP COLUMN origin_node_did")
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 53")
+        sqlx::query("DELETE FROM schema_migrations WHERE version IN (53, 54)")
             .execute(db.pool())
             .await
             .unwrap();
@@ -12290,18 +12398,39 @@ mod migration_tests {
         .execute(db.pool())
         .await
         .unwrap();
-        for (id, did, enqueued) in [
-            ("late", "did:key:zOriginLate", "2026-11-26T00:02:00Z"),
-            ("early", "did:key:zOriginEarly", "2026-11-26T00:01:00Z"),
+        for (id, did, enqueued, status, processed) in [
+            (
+                "completion-late",
+                "did:key:zOriginLate",
+                "2026-11-26T00:01:00Z",
+                "done",
+                "2026-11-26T00:03:00Z",
+            ),
+            (
+                "completion-first",
+                "did:key:zOriginFirst",
+                "2026-11-26T00:02:00Z",
+                "done",
+                "2026-11-26T00:02:00Z",
+            ),
+            (
+                "pending-earlier",
+                "did:key:zOriginPending",
+                "2026-11-26T00:00:00Z",
+                "pending",
+                "2026-11-26T00:01:00Z",
+            ),
         ] {
             sqlx::query(
-                "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, status, enqueued_at)
-                 VALUES ($1, 'z6Mkfoo/hello', $2, 'refs/heads/main', $3, 'done', $4)",
+                "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, status, enqueued_at, processed_at)
+                 VALUES ($1, 'z6Mkfoo/hello', $2, 'refs/heads/main', $3, $4, $5, $6)",
             )
             .bind(id)
             .bind(did)
             .bind("0".repeat(40))
+            .bind(status)
             .bind(enqueued)
+            .bind(processed)
             .execute(db.pool())
             .await
             .unwrap();
@@ -12314,7 +12443,7 @@ mod migration_tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(pin.as_deref(), Some("did:key:zOriginEarly"));
+        assert_eq!(pin.as_deref(), Some("did:key:zOriginFirst"));
         let orphan_pin: Option<String> =
             sqlx::query_scalar("SELECT origin_node_did FROM repos WHERE id = 'z6Mkfoo/orphan'")
                 .fetch_one(db.pool())
@@ -12352,9 +12481,87 @@ mod migration_tests {
                 .unwrap();
         assert_eq!(
             pin_after.as_deref(),
-            Some("did:key:zOriginEarly"),
+            Some("did:key:zOriginFirst"),
             "an ordinary re-sync must never overwrite the recorded origin"
         );
+    }
+
+    #[sqlx::test]
+    async fn mirror_origin_repair_uses_only_completed_sync_history(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        for name in ["rolling", "legacy", "pendingonly"] {
+            db.upsert_mirror_repo("z6Mkfoo", name, &format!("/mirror/{name}.git"), None, false)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE repos SET created_at = '2000-01-01T00:00:00Z' WHERE id = 'z6Mkfoo/legacy'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (repo, did, status) in [
+            ("z6Mkfoo/rolling", "did:key:zRollingOrigin", "done"),
+            ("z6Mkfoo/legacy", "did:key:zLegacyOrigin", "done"),
+            ("z6Mkfoo/pendingonly", "did:key:zPendingOrigin", "pending"),
+        ] {
+            db.enqueue_sync(repo, did, "refs/heads/main", &"0".repeat(40), None, None)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE sync_queue SET status = $1, processed_at = $2 WHERE repo = $3")
+                .bind(status)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(repo)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+
+        let repaired = db
+            .repair_mirror_origin_from_history("z6Mkfoo/rolling")
+            .await
+            .unwrap();
+        assert_eq!(repaired.as_deref(), Some("did:key:zRollingOrigin"));
+        let pin: Option<String> =
+            sqlx::query_scalar("SELECT origin_node_did FROM repos WHERE id = 'z6Mkfoo/rolling'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(pin.as_deref(), Some("did:key:zRollingOrigin"));
+
+        for (repo, reason) in [
+            (
+                "z6Mkfoo/legacy",
+                "a mirror that existed before the pin migration stays fail closed",
+            ),
+            (
+                "z6Mkfoo/pendingonly",
+                "a pending sync is not provenance for an unpinned mirror",
+            ),
+        ] {
+            let repaired = db.repair_mirror_origin_from_history(repo).await.unwrap();
+            assert_eq!(repaired, None, "{reason}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn enqueue_sync_stores_the_canonical_owner_spelling(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        db.enqueue_sync(
+            "did:key:z6Mkfoo/hello",
+            "did:key:z6MkOrigin",
+            "refs/heads/main",
+            &"0".repeat(40),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let rows = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repo, "z6Mkfoo/hello");
     }
 
     /// Simulate an existing node at v9 with populated received_ref_updates,
