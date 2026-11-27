@@ -3015,7 +3015,11 @@ mod tests {
         enqueue_raw(&pool, "did:key:z6Mkfoo/hello", victim_did).await;
         run_batch(&state, &repos_dir).await;
 
-        assert_eq!(rev_parse(&mirror, "HEAD"), third_victim_tip);
+        assert_eq!(
+            rev_parse(&mirror, "HEAD"),
+            third_victim_tip,
+            "the full-DID spelling of the recorded origin must update the canonical mirror"
+        );
         assert_eq!(
             sync_status_for(&pool, "did:key:z6Mkfoo/hello", victim_did).await,
             "done"
