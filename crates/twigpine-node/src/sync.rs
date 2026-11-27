@@ -144,10 +144,11 @@ pub fn start(
     db: Arc<Db>,
     config: Arc<Config>,
     keypair: Arc<Keypair>,
+    repo_store: crate::git::repo_store::RepoStore,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
-        run(db, config, keypair, &mut shutdown_rx).await;
+        run(db, config, keypair, repo_store, &mut shutdown_rx).await;
     });
 }
 
@@ -183,6 +184,7 @@ async fn run(
     db: Arc<Db>,
     config: Arc<Config>,
     keypair: Arc<Keypair>,
+    repo_store: crate::git::repo_store::RepoStore,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
@@ -200,6 +202,7 @@ async fn run(
                     machine_id.as_deref(),
                     &client,
                     &git_source,
+                    &repo_store,
                 )
                 .await;
             }
@@ -253,6 +256,9 @@ enum GitSource {
     /// Local-path and file:// tests only. No production code can build this.
     #[cfg(test)]
     Unhardened,
+    /// Same local-path test lane, with a test-controlled git binary.
+    #[cfg(test)]
+    UnhardenedWithGit(String),
 }
 
 impl GitSource {
@@ -270,6 +276,11 @@ impl GitSource {
             }
             #[cfg(test)]
             GitSource::Unhardened => Ok(NetworkGit::unhardened(&format!("{origin_url}/{repo}"))),
+            #[cfg(test)]
+            GitSource::UnhardenedWithGit(git_bin) => Ok(NetworkGit::unhardened_with_git(
+                &format!("{origin_url}/{repo}"),
+                git_bin,
+            )),
         }
     }
 }
@@ -542,8 +553,13 @@ impl NetworkGit {
     /// `file://` URLs. It does not exist outside test builds.
     #[cfg(test)]
     fn unhardened(remote: &str) -> Self {
+        Self::unhardened_with_git(remote, "git")
+    }
+
+    #[cfg(test)]
+    fn unhardened_with_git(remote: &str, git_bin: &str) -> Self {
         Self {
-            git_bin: "git".to_string(),
+            git_bin: git_bin.to_string(),
             remote: remote.to_string(),
             config: Vec::new(),
         }
@@ -634,6 +650,7 @@ async fn process_batch(
     machine_id: Option<&str>,
     client: &reqwest::Client,
     git_source: &GitSource,
+    repo_store: &crate::git::repo_store::RepoStore,
 ) {
     let items = match db.dequeue_pending_syncs(10).await {
         Ok(v) => v,
@@ -723,6 +740,7 @@ async fn process_batch(
         let registration_id = mirror_row
             .map(|row| row.id.clone())
             .unwrap_or_else(|| canonical_repo_slug.clone());
+        let first_sync = row_verdict == SyncOriginRowVerdict::FirstSync;
         let origin_rejection = match row_verdict {
             SyncOriginRowVerdict::Denied(reason) => Some(reason),
             SyncOriginRowVerdict::FirstSync if local_path.exists() => {
@@ -731,6 +749,10 @@ async fn process_batch(
             SyncOriginRowVerdict::FirstSync | SyncOriginRowVerdict::PinnedOrigin => None,
         };
         if let Some(reason) = origin_rejection {
+            // Denied rows deliberately make no peer contact. The
+            // non-disclosure contract covers the HTTP acceptance response;
+            // network-indistinguishable denial would require attacker-controlled
+            // decoy fetches and would break the pre-contact authorization boundary.
             warn!(id = %item.id, repo = %item.repo, node_did = %item.node_did, reason, "rejecting unauthorized sync origin");
             let _ = db.mark_sync_failed(&item.id).await;
             crate::metrics::record_sync_processed("rejected");
@@ -834,7 +856,11 @@ async fn process_batch(
         };
 
         let withheld = fetch_withheld(client, &origin_url, owner_short, repo_name).await;
-        let exists = local_path.exists();
+        // Freeze the first-sync decision made by authorization. A path that
+        // appears while the peer is being contacted must not turn this item
+        // into a fetch into whoever won that race; the staged-clone install
+        // re-authorizes under the repo namespace lock before it can land.
+        let exists = local_path.exists() && !first_sync;
         let lookup_unknown = withheld.is_none();
         // Only probe the on-disk promisor state when the lookup is unknown and the
         // repo already exists — the sole case where it changes the resolved mode.
@@ -905,6 +931,68 @@ async fn process_batch(
                 } else {
                     false
                 };
+                // A first sync authorized while the namespace looked empty has
+                // to re-prove that decision under the same advisory lock
+                // create_repo holds. The lock key uses the full did:key spelling
+                // because that is the owner spelling canonical creation locks;
+                // the mirror path itself keeps the normalized bare-owner form.
+                let _first_sync_lock = if first_sync {
+                    let lock_owner = crate::db::canonical_did(owner_short);
+                    match repo_store
+                        .lock_repo_blocking(lock_owner.as_ref(), repo_name)
+                        .await
+                    {
+                        Ok(Some(guard)) => Some(guard),
+                        Ok(None) => {
+                            warn!(repo = %item.repo, "repo namespace is busy before first mirror registration; leaving the sync row pending");
+                            let _ = remove_staging_path(&staging_path);
+                            crate::metrics::record_sync_processed("deferred");
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(repo = %item.repo, err = %e, "cannot lock repo namespace before first mirror registration; leaving the sync row pending");
+                            let _ = remove_staging_path(&staging_path);
+                            crate::metrics::record_sync_processed("deferred");
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                if first_sync {
+                    let recheck =
+                        sync_origin_row_verdict(db, owner_short, repo_name, &item.node_did).await;
+                    match recheck {
+                        Ok((SyncOriginRowVerdict::FirstSync, _)) if !local_path.exists() => {}
+                        Ok((SyncOriginRowVerdict::PinnedOrigin, _)) if !local_path.exists() => {}
+                        Ok((SyncOriginRowVerdict::PinnedOrigin, _)) => {
+                            warn!(repo = %item.repo, path = %local_path.display(), "mirror completed concurrently before staged clone installation; leaving the sync row pending");
+                            let _ = remove_staging_path(&staging_path);
+                            crate::metrics::record_sync_processed("deferred");
+                            continue;
+                        }
+                        Ok((SyncOriginRowVerdict::FirstSync, _)) => {
+                            warn!(repo = %item.repo, path = %local_path.display(), "unproven mirror path appeared under the namespace lock; rejecting first sync");
+                            let _ = remove_staging_path(&staging_path);
+                            let _ = db.mark_sync_failed(&item.id).await;
+                            crate::metrics::record_sync_processed("rejected");
+                            continue;
+                        }
+                        Ok((SyncOriginRowVerdict::Denied(reason), _)) => {
+                            warn!(id = %item.id, repo = %item.repo, node_did = %item.node_did, reason, "sync origin authorization changed before registration");
+                            let _ = remove_staging_path(&staging_path);
+                            let _ = db.mark_sync_failed(&item.id).await;
+                            crate::metrics::record_sync_processed("rejected");
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(id = %item.id, repo = %item.repo, err = %e, "cannot re-read sync origin authorization under the namespace lock; leaving the sync row pending");
+                            let _ = remove_staging_path(&staging_path);
+                            crate::metrics::record_sync_processed("deferred");
+                            continue;
+                        }
+                    }
+                }
                 // Register in DB so git smart HTTP can serve the mirrored repo
                 if let Err(e) = db
                     .upsert_mirror_repo_with_origin_id(
@@ -1864,6 +1952,7 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn resolve_promisor_when_withheld_nonempty() {
@@ -2610,6 +2699,7 @@ mod tests {
             None,
             client,
             git_source,
+            &state.repo_store,
         )
         .await;
     }
@@ -3293,6 +3383,149 @@ mod tests {
             "denial happened after peer contact"
         );
         assert!(mirrors_under(&repos_dir).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn process_batch_rechecks_first_sync_namespace_before_registration(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let (remote, _fixture_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let fixture_bare = remote
+            .path()
+            .join("r1")
+            .join("r2")
+            .join("root")
+            .join("z6Mkfoo")
+            .join("hello");
+        let did = "did:key:z6MkOrigin";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        seed_local_peer(&pool, did, &format!("http://127.0.0.1:{port}")).await;
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+
+        let git_dir = TempDir::new().unwrap();
+        let request_seen = git_dir.path().join("request-seen");
+        let release_response = git_dir.path().join("release-response");
+        let server_seen = request_seen.clone();
+        let server_release = release_response.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = socket.read(&mut buf).await.unwrap();
+            std::fs::write(&server_seen, b"request").unwrap();
+            for _ in 0..400 {
+                if server_release.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            socket
+                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let bin = git_dir.path().join("git-under-test");
+        let record = git_dir.path().join("record");
+        write_fake_git(
+            &bin,
+            &format!(
+                r##"#!/bin/sh
+echo "INVOKED $*" >> '{}'
+if [ "$1" = "clone" ]; then
+for last; do :; done
+git clone --mirror -- '{}' "$last"
+exit $?
+fi
+git "$@"
+"##,
+                record.display(),
+                fixture_bare.display()
+            ),
+        );
+
+        let insert_pool = pool.clone();
+        let mirror = repos_dir.join("z6Mkfoo").join("hello.git");
+        let racer_mirror = mirror.clone();
+        let racer_fixture = fixture_bare.clone();
+        let racer_seen = request_seen.clone();
+        let racer_release = release_response.clone();
+        let racer_repos_dir = repos_dir.clone();
+        let racer = tokio::spawn(async move {
+            for _ in 0..200 {
+                if racer_seen.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                racer_seen.exists(),
+                "the withheld lookup did not reach the injected race window"
+            );
+            g(
+                &[
+                    "clone",
+                    "-q",
+                    "--mirror",
+                    racer_fixture.to_str().unwrap(),
+                    racer_mirror.to_str().unwrap(),
+                ],
+                &racer_repos_dir,
+            );
+            let now = chrono::Utc::now().to_rfc3339();
+            sqlx::query(
+                "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
+                                    created_at, updated_at, disk_path)
+                 VALUES ($1, 'hello', 'z6Mkfoo', 'canonical', TRUE, 'main', $2, $2, $3)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&now)
+            .bind(racer_mirror.to_str().unwrap())
+            .execute(&insert_pool)
+            .await
+            .unwrap();
+            std::fs::write(&racer_release, b"created").unwrap();
+        });
+
+        run_batch_with(
+            &state,
+            &repos_dir,
+            &reqwest::Client::new(),
+            &GitSource::UnhardenedWithGit(bin.to_str().unwrap().to_string()),
+        )
+        .await;
+        racer.await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+        let invoked = std::fs::read_to_string(&record).unwrap();
+        assert!(
+            invoked.contains("INVOKED clone"),
+            "the first sync must keep its staged-clone decision: {invoked}"
+        );
+        assert!(
+            !invoked.lines().any(|line| line.contains(" fetch")),
+            "a canonical path that appears during peer contact must not be fetched into: {invoked}"
+        );
+        let mirror_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM repos WHERE id = 'z6Mkfoo/hello'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            mirror_rows, 0,
+            "the first sync must be re-authorized before mirror registration"
+        );
+        let owner_entries = dir_entries(&repos_dir.join("z6Mkfoo"));
+        assert_eq!(
+            owner_entries,
+            vec!["hello.git".to_string()],
+            "the rejected race must remove its staged clone and leave only the canonical path"
+        );
     }
 
     #[sqlx::test]

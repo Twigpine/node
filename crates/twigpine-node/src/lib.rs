@@ -792,6 +792,7 @@ pub async fn run() -> Result<()> {
             Arc::clone(&state.db),
             Arc::clone(&state.config),
             Arc::clone(&state.node_keypair),
+            state.repo_store.clone(),
             state.subscribe_shutdown(),
         );
         info!("auto-sync worker started");

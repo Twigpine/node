@@ -4697,10 +4697,20 @@ impl Db {
                  WHERE sq.status = 'done'
                    AND mirror.id = $1
                    AND mirror.origin_node_did IS NULL
-                   AND EXISTS (
-                       SELECT 1 FROM schema_migrations sm
-                       WHERE sm.version = 53
-                         AND mirror.created_at >= sm.applied_at
+                   AND (
+                       EXISTS (
+                           SELECT 1 FROM schema_migrations sm
+                           WHERE sm.version = 53
+                             AND mirror.created_at >= sm.applied_at
+                       )
+                       OR sq.enqueued_at <= mirror.created_at
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM sync_queue other
+                       WHERE other.repo = sq.repo
+                         AND other.status = 'done'
+                         AND other.node_did <> sq.node_did
+                         AND other.enqueued_at <= mirror.created_at
                    )
                  ORDER BY sq.repo, sq.processed_at ASC NULLS LAST, sq.enqueued_at ASC, sq.id ASC
              ) AS repair
@@ -12620,13 +12630,13 @@ mod migration_tests {
     async fn mirror_origin_repair_uses_only_completed_sync_history(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
-        for name in ["rolling", "legacy", "pendingonly"] {
+        for name in ["rolling", "legacy", "pendingonly", "inflight", "ambiguous"] {
             db.upsert_mirror_repo("z6Mkfoo", name, &format!("/mirror/{name}.git"), None, false)
                 .await
                 .unwrap();
         }
         sqlx::query(
-            "UPDATE repos SET created_at = '2000-01-01T00:00:00Z' WHERE id = 'z6Mkfoo/legacy'",
+            "UPDATE repos SET created_at = '2000-01-01T00:00:00Z' WHERE id IN ('z6Mkfoo/legacy', 'z6Mkfoo/inflight', 'z6Mkfoo/ambiguous')",
         )
         .execute(db.pool())
         .await
@@ -12635,6 +12645,7 @@ mod migration_tests {
             ("z6Mkfoo/rolling", "did:key:zRollingOrigin", "done"),
             ("z6Mkfoo/legacy", "did:key:zLegacyOrigin", "done"),
             ("z6Mkfoo/pendingonly", "did:key:zPendingOrigin", "pending"),
+            ("z6Mkfoo/inflight", "did:key:zInFlightOrigin", "done"),
         ] {
             db.enqueue_sync(repo, did, "refs/heads/main", &"0".repeat(40), None, None)
                 .await
@@ -12647,6 +12658,31 @@ mod migration_tests {
                 .await
                 .unwrap();
         }
+        sqlx::query(
+            "UPDATE sync_queue SET enqueued_at = '1999-12-31T23:59:59Z' WHERE repo = 'z6Mkfoo/inflight'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for did in ["did:key:zFirstRacingOrigin", "did:key:zSecondRacingOrigin"] {
+            db.enqueue_sync(
+                "z6Mkfoo/ambiguous",
+                did,
+                "refs/heads/main",
+                &"0".repeat(40),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "UPDATE sync_queue SET status = 'done', processed_at = $1, enqueued_at = '1999-12-31T23:59:59Z' WHERE repo = 'z6Mkfoo/ambiguous'",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
 
         let repaired = db
             .repair_mirror_origin_from_history("z6Mkfoo/rolling")
@@ -12660,14 +12696,28 @@ mod migration_tests {
                 .unwrap();
         assert_eq!(pin.as_deref(), Some("did:key:zRollingOrigin"));
 
+        let inflight = db
+            .repair_mirror_origin_from_history("z6Mkfoo/inflight")
+            .await
+            .unwrap();
+        assert_eq!(
+            inflight.as_deref(),
+            Some("did:key:zInFlightOrigin"),
+            "a first sync already in flight before the mirror row was created must be allowed to finish pinning its origin"
+        );
+
         for (repo, reason) in [
             (
                 "z6Mkfoo/legacy",
-                "a mirror that existed before the pin migration stays fail closed",
+                "a mirror that existed before the pin migration stays fail closed when its completed sync was not already in flight",
             ),
             (
                 "z6Mkfoo/pendingonly",
                 "a pending sync is not provenance for an unpinned mirror",
+            ),
+            (
+                "z6Mkfoo/ambiguous",
+                "racing first syncs from different origins never choose a winner after the fact",
             ),
         ] {
             let repaired = db.repair_mirror_origin_from_history(repo).await.unwrap();
