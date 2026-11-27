@@ -2879,18 +2879,10 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        // v53 is the next contiguous ledger version. If the in-flight
-        // ref-update ingest work lands first, this entry must be renumbered
-        // before merge rather than leaving a gap or editing applied history.
         version: 53,
         name: "sync_mirror_origin_pin",
         stmts: &[
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS origin_node_did TEXT",
-            // Existing mirrors predate the column. The only local provenance
-            // they can have is this node's own successful sync history: the
-            // earliest done row for the slash-form mirror id. Rows without
-            // that history stay NULL, and the worker fails closed rather than
-            // adopting whichever peer asks next.
             r#"UPDATE repos
              SET origin_node_did = provenance.node_did
              FROM (
@@ -4587,20 +4579,17 @@ pub(crate) enum MirrorOriginState {
 }
 
 impl Db {
-    /// Read the exact slash-form mirror row for one sync slug. Canonical rows
-    /// deliberately do not answer here: they are locally authoritative and are
-    /// checked separately before peer sync may touch the shared disk path.
     pub(crate) async fn mirror_origin_state(&self, mirror_id: &str) -> Result<MirrorOriginState> {
-        let row = sqlx::query("SELECT origin_node_did FROM repos WHERE id = $1")
-            .bind(mirror_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(match row {
+        let origin = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT origin_node_did FROM repos WHERE id = $1",
+        )
+        .bind(mirror_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match origin {
             None => MirrorOriginState::NoMirror,
-            Some(row) => match row.try_get::<Option<String>, _>("origin_node_did")? {
-                Some(did) => MirrorOriginState::Pinned(did),
-                None => MirrorOriginState::Unpinned,
-            },
+            Some(Some(did)) => MirrorOriginState::Pinned(did),
+            Some(None) => MirrorOriginState::Unpinned,
         })
     }
 

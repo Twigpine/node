@@ -586,15 +586,10 @@ pub(crate) enum SyncOriginRowVerdict {
     Denied(&'static str),
 }
 
-/// Authorize one peer DID against the locally recorded repo row for a sync
-/// slug. This answers only durable row state. The worker additionally treats
-/// a pre-existing disk path with no row as an existing mirror without
-/// provenance, because the database cannot prove which peer created it.
 pub(crate) async fn sync_origin_row_verdict(
     db: &Db,
     owner_short: &str,
     repo_name: &str,
-    mirror_id: &str,
     node_did: &str,
 ) -> anyhow::Result<SyncOriginRowVerdict> {
     if let Some(row) = db.get_repo(owner_short, repo_name).await? {
@@ -604,7 +599,8 @@ pub(crate) async fn sync_origin_row_verdict(
             ));
         }
     }
-    Ok(match db.mirror_origin_state(mirror_id).await? {
+    let mirror_id = format!("{owner_short}/{repo_name}");
+    Ok(match db.mirror_origin_state(&mirror_id).await? {
         crate::db::MirrorOriginState::Pinned(pin) if pin != node_did => {
             SyncOriginRowVerdict::Denied("sync peer does not match the mirror's recorded origin")
         }
@@ -762,18 +758,8 @@ async fn process_batch(
             }
         }
 
-        // Repo-specific origin authorization is a local provenance check, not
-        // proof derived from the peer's wire fields. Rows that have no
-        // recoverable provenance fail closed: trusting the next caller would
-        // reproduce the force-fetch this gate exists to stop.
-        let row_verdict = match sync_origin_row_verdict(
-            db,
-            owner_short,
-            repo_name,
-            &item.repo,
-            &item.node_did,
-        )
-        .await
+        let row_verdict = match sync_origin_row_verdict(db, owner_short, repo_name, &item.node_did)
+            .await
         {
             Ok(verdict) => verdict,
             Err(e) => {
@@ -2321,14 +2307,12 @@ mod tests {
     }
 
     async fn sync_status_for(pool: &PgPool, repo: &str, did: &str) -> String {
-        let row: (String,) =
-            sqlx::query_as("SELECT status FROM sync_queue WHERE repo = $1 AND node_did = $2")
-                .bind(repo)
-                .bind(did)
-                .fetch_one(pool)
-                .await
-                .unwrap();
-        row.0
+        sqlx::query_scalar("SELECT status FROM sync_queue WHERE repo = $1 AND node_did = $2")
+            .bind(repo)
+            .bind(did)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     async fn enqueue(db: &Db, repo: &str, did: &str) {
@@ -2874,10 +2858,6 @@ mod tests {
 
     #[sqlx::test]
     async fn process_batch_refuses_to_repoint_an_existing_mirror(pool: PgPool) {
-        // Issue #432: knowing the slug and being a known peer is not authority
-        // to rewrite a mirror another peer created. The first successful sync
-        // records its origin; a different peer's row is terminally rejected,
-        // while the recorded origin can still update the mirror.
         let state = crate::test_support::test_state(pool.clone()).await;
         let home = TempDir::new().unwrap();
         let repos_dir = home.path().join("repos");
@@ -2927,7 +2907,6 @@ mod tests {
             "failed"
         );
 
-        // Positive control: the recorded origin remains able to update its mirror.
         let victim_origin = victim_remote.path().join("origin");
         let victim_bare = victim_remote
             .path()
@@ -2961,9 +2940,6 @@ mod tests {
 
     #[sqlx::test]
     async fn process_batch_fails_closed_for_an_unpinned_existing_mirror(pool: PgPool) {
-        // Upgrade edge: a mirror row with no backfillable history has no local
-        // fact that can authorize the next caller. Trusting that caller would
-        // reopen the original repointing bug.
         let state = crate::test_support::test_state(pool.clone()).await;
         let home = TempDir::new().unwrap();
         let repos_dir = home.path().join("repos");
@@ -2989,9 +2965,6 @@ mod tests {
 
     #[sqlx::test]
     async fn process_batch_fails_closed_for_a_disk_mirror_without_a_row(pool: PgPool) {
-        // Crash-recovery ambiguity: the path exists but the DB has no mirror
-        // row, so neither the queue row nor the wire data can prove which peer
-        // created it. The safe answer is operator intervention, not adoption.
         let state = crate::test_support::test_state(pool.clone()).await;
         let home = TempDir::new().unwrap();
         let repos_dir = home.path().join("repos");

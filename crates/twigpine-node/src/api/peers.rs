@@ -527,18 +527,8 @@ pub async fn notify_sync(
         Err(e) => return Err(AppError::BadRequest(format!("invalid repo field: {e}"))),
     };
 
-    // The worker remains authoritative because gossip and manual trigger write
-    // the same queue. This early answer keeps an unauthorized notifier from
-    // enqueueing work or seeding the feed when durable row state already proves
-    // the outcome. First-sync ambiguity is left to the worker.
-    match crate::sync::sync_origin_row_verdict(
-        &state.db,
-        owner_short,
-        repo_name,
-        &req.repo,
-        &req.node_did,
-    )
-    .await?
+    match crate::sync::sync_origin_row_verdict(&state.db, owner_short, repo_name, &req.node_did)
+        .await?
     {
         crate::sync::SyncOriginRowVerdict::Denied(reason) => {
             return Err(AppError::Forbidden(reason.into()));
@@ -1362,9 +1352,6 @@ mod tests {
 
     #[sqlx::test]
     async fn sync_notify_rejects_a_peer_that_is_not_the_recorded_origin(pool: PgPool) {
-        // Issue #432: HTTP must not enqueue or feed-record a row the worker is
-        // certain to reject. The wrong peer learns 403; the recorded origin's
-        // positive control below proves this is not a deny-everything gate.
         let state = test_state(pool.clone()).await;
         let attacker_did = seed_peer(&state).await;
         let origin_did = "did:key:z6MkRecordedOrigin";
@@ -1437,8 +1424,6 @@ mod tests {
 
     #[sqlx::test]
     async fn sync_notify_rejects_peer_sync_into_a_canonical_repo(pool: PgPool) {
-        // A canonical row is this node's authoritative copy. A peer mirror
-        // notification must not queue a force-fetch into the shared disk path.
         let state = test_state(pool.clone()).await;
         let peer_did = seed_peer(&state).await;
         let now = chrono::Utc::now().to_rfc3339();
