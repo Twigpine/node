@@ -12512,7 +12512,7 @@ mod migration_tests {
         }
         sqlx::query(
             "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, status, enqueued_at, processed_at)
-             VALUES ('legacyfull-completion', 'z6Mkfoo/legacyfull', 'did:key:zLegacyFullOrigin', 'refs/heads/main', $1, 'done', '2026-11-26T00:02:30Z', '2026-11-26T00:02:30Z')",
+             VALUES ('legacyfull-completion', 'did:key:z6Mkfoo/legacyfull', 'did:key:zLegacyFullOrigin', 'refs/heads/main', $1, 'done', '2026-11-26T00:02:30Z', '2026-11-26T00:02:30Z')",
         )
         .bind("0".repeat(40))
         .execute(db.pool())
