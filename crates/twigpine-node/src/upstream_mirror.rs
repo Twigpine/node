@@ -70,17 +70,9 @@ impl EgressPolicy {
         let addresses: Vec<IpAddr> = addresses.into_iter().collect();
         self.validate_addresses(&policy_host, &addresses)?;
 
-        let pinned = addresses
-            .iter()
-            .map(|ip| match ip {
-                IpAddr::V4(v4) => v4.to_string(),
-                IpAddr::V6(v6) => format!("[{v6}]"),
-            })
-            .collect::<Vec<_>>()
-            .join(",");
         Ok(PinnedUpstream {
             url: url.to_string(),
-            curlopt_resolve: Some(format!("+{connect_host}:{port}:{pinned}")),
+            curlopt_resolve: Some(resolve_pin(&connect_host, port, addresses)),
         })
     }
 
@@ -97,6 +89,24 @@ impl EgressPolicy {
         }
         Ok(())
     }
+}
+
+/// The `http.curloptResolve` entry pinning `host:port` to `addrs`.
+/// There is deliberately no `+` prefix: that expiring-entry form arrived in
+/// libcurl 7.75, and an older libcurl reads the `+` as part of the hostname,
+/// so the entry never matches and git falls back to DNS at connect time. The
+/// worker's Git 2.37 floor does not imply a libcurl that understands `+`.
+fn resolve_pin(host: &str, port: u16, mut addrs: Vec<IpAddr>) -> String {
+    addrs.sort_unstable();
+    let list = addrs
+        .iter()
+        .map(|ip| match ip {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => format!("[{v6}]"),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{host}:{port}:{list}")
 }
 
 fn normalize_policy_host(host: &str) -> String {
@@ -685,6 +695,25 @@ esac
     }
 
     #[test]
+    fn resolve_pin_is_honored_by_libcurl_older_than_75() {
+        // A leading `+` is parsed as part of the hostname until libcurl 7.75,
+        // so the pin never matches and git re-resolves at connect time.
+        let pin = resolve_pin(
+            "github.example",
+            443,
+            vec![
+                "2606:4700:4700::1111".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+            ],
+        );
+        assert_eq!(pin, "github.example:443:8.8.8.8,[2606:4700:4700::1111]");
+        assert!(!pin.starts_with('+'));
+
+        let single = resolve_pin("forge.example", 8080, vec!["8.8.4.4".parse().unwrap()]);
+        assert_eq!(single, "forge.example:8080:8.8.4.4");
+    }
+
+    #[test]
     fn every_resolved_address_must_be_public() {
         let policy = EgressPolicy;
         let public_v4: IpAddr = "8.8.8.8".parse().unwrap();
@@ -753,7 +782,7 @@ esac
     fn fetch_command_pins_dns_and_only_updates_branches_and_tags() {
         let upstream = PinnedUpstream {
             url: "https://github.example/org/repo.git".to_string(),
-            curlopt_resolve: Some("+github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string()),
+            curlopt_resolve: Some("github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string()),
         };
         let command = fetch_command(&upstream);
         let has_config = |key: &str, value: &str| {
@@ -769,7 +798,7 @@ esac
         assert!(has_config("http.sslVerify", "true"));
         assert!(has_config(
             "http.curloptResolve",
-            "+github.example:443:8.8.8.8,[2606:4700:4700::1111]"
+            "github.example:443:8.8.8.8,[2606:4700:4700::1111]"
         ));
         assert!(has_config(
             "http.https://github.example/org/repo.git.followRedirects",
@@ -785,8 +814,13 @@ esac
         ));
         assert!(has_config(
             "http.https://github.example/org/repo.git.curloptResolve",
-            "+github.example:443:8.8.8.8,[2606:4700:4700::1111]"
+            "github.example:443:8.8.8.8,[2606:4700:4700::1111]"
         ));
+        assert!(command
+            .config
+            .iter()
+            .filter(|(key, value)| key.ends_with("curloptResolve") && !value.is_empty())
+            .all(|(_, value)| !value.starts_with('+')));
         assert!(has_config(
             "credential.https://github.example/org/repo.git.helper",
             ""
