@@ -522,8 +522,29 @@ pub async fn notify_sync(
     // separator or a traversal segment places the mirror outside repos_dir. Reject
     // it here, before the queue row and the ref-update row are written. The message
     // names the field and nothing about where repos live on disk.
-    if let Err(e) = crate::git::repo_store::validate_repo_slug(&req.repo) {
-        return Err(AppError::BadRequest(format!("invalid repo field: {e}")));
+    let (owner_short, repo_name) = match crate::git::repo_store::validate_repo_slug(&req.repo) {
+        Ok(parts) => parts,
+        Err(e) => return Err(AppError::BadRequest(format!("invalid repo field: {e}"))),
+    };
+
+    // The worker remains authoritative because gossip and manual trigger write
+    // the same queue. This early answer keeps an unauthorized notifier from
+    // enqueueing work or seeding the feed when durable row state already proves
+    // the outcome. First-sync ambiguity is left to the worker.
+    match crate::sync::sync_origin_row_verdict(
+        &state.db,
+        owner_short,
+        repo_name,
+        &req.repo,
+        &req.node_did,
+    )
+    .await?
+    {
+        crate::sync::SyncOriginRowVerdict::Denied(reason) => {
+            return Err(AppError::Forbidden(reason.into()));
+        }
+        crate::sync::SyncOriginRowVerdict::FirstSync
+        | crate::sync::SyncOriginRowVerdict::PinnedOrigin => {}
     }
 
     state
@@ -1337,6 +1358,119 @@ mod tests {
             count, 1,
             "the valid path must still write the ref-update row"
         );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_rejects_a_peer_that_is_not_the_recorded_origin(pool: PgPool) {
+        // Issue #432: HTTP must not enqueue or feed-record a row the worker is
+        // certain to reject. The wrong peer learns 403; the recorded origin's
+        // positive control below proves this is not a deny-everything gate.
+        let state = test_state(pool.clone()).await;
+        let attacker_did = seed_peer(&state).await;
+        let origin_did = "did:key:z6MkRecordedOrigin";
+        state
+            .db
+            .upsert_mirror_repo_with_origin(
+                "z6Mkfoo",
+                "hello",
+                "/mirror/hello.git",
+                None,
+                false,
+                Some(origin_did),
+            )
+            .await
+            .unwrap();
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("z6Mkfoo/hello", &attacker_did),
+                "198.51.100.23:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let feed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM received_ref_updates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0, "unauthorized notify must not enqueue sync work");
+        assert_eq!(feed, 0, "unauthorized notify must not seed the feed");
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_accepts_the_recorded_origin(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let origin_did = seed_peer(&state).await;
+        state
+            .db
+            .upsert_mirror_repo_with_origin(
+                "z6Mkfoo",
+                "hello",
+                "/mirror/hello.git",
+                None,
+                false,
+                Some(&origin_did),
+            )
+            .await
+            .unwrap();
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("z6Mkfoo/hello", &origin_did),
+                "198.51.100.24:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 1, "the recorded origin must still enqueue");
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_rejects_peer_sync_into_a_canonical_repo(pool: PgPool) {
+        // A canonical row is this node's authoritative copy. A peer mirror
+        // notification must not queue a force-fetch into the shared disk path.
+        let state = test_state(pool.clone()).await;
+        let peer_did = seed_peer(&state).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
+                                created_at, updated_at, disk_path)
+             VALUES ($1, $2, $3, $4, TRUE, 'main', $5, $5, $6)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind("hello")
+        .bind("did:key:z6Mkfoo")
+        .bind("canonical")
+        .bind(&now)
+        .bind("/canonical/hello.git")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("z6Mkfoo/hello", &peer_did),
+                "198.51.100.25:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0, "canonical repo sync must not enqueue");
     }
 
     #[sqlx::test]

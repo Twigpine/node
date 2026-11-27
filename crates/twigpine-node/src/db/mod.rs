@@ -2878,6 +2878,32 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE model_blocks ADD COLUMN IF NOT EXISTS payer_did TEXT",
         ],
     },
+    Migration {
+        // v53 is the next contiguous ledger version. If the in-flight
+        // ref-update ingest work lands first, this entry must be renumbered
+        // before merge rather than leaving a gap or editing applied history.
+        version: 53,
+        name: "sync_mirror_origin_pin",
+        stmts: &[
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS origin_node_did TEXT",
+            // Existing mirrors predate the column. The only local provenance
+            // they can have is this node's own successful sync history: the
+            // earliest done row for the slash-form mirror id. Rows without
+            // that history stay NULL, and the worker fails closed rather than
+            // adopting whichever peer asks next.
+            r#"UPDATE repos
+             SET origin_node_did = provenance.node_did
+             FROM (
+                 SELECT DISTINCT ON (repo) repo, node_did
+                 FROM sync_queue
+                 WHERE status = 'done'
+                 ORDER BY repo, enqueued_at ASC, id ASC
+             ) AS provenance
+             WHERE repos.id = provenance.repo
+               AND position('/' in repos.id) > 0
+               AND repos.origin_node_did IS NULL"#,
+        ],
+    },
 ];
 
 // ── HTTP-signature replay ledger ──────────────────────────────────────────────
@@ -3363,6 +3389,26 @@ impl Db {
         machine_id: Option<&str>,
         quarantined: bool,
     ) -> Result<()> {
+        self.upsert_mirror_repo_with_origin(
+            owner_short,
+            name,
+            disk_path,
+            machine_id,
+            quarantined,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn upsert_mirror_repo_with_origin(
+        &self,
+        owner_short: &str,
+        name: &str,
+        disk_path: &str,
+        machine_id: Option<&str>,
+        quarantined: bool,
+        origin_node_did: Option<&str>,
+    ) -> Result<()> {
         // Peer-supplied names are bound like the local write paths: an
         // unbounded name would make reposPage emit a cursor longer than the
         // 4096-byte parse limit, dead-ending pagination for every caller past
@@ -3388,9 +3434,10 @@ impl Db {
         // once, and an operator's later release must not be silently reverted.
         sqlx::query(
             "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
-                                created_at, updated_at, disk_path, machine_id, quarantined)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-             ON CONFLICT (id) DO UPDATE SET updated_at = $8, disk_path = $9, machine_id = $10",
+                                created_at, updated_at, disk_path, machine_id, quarantined, origin_node_did)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             ON CONFLICT (id) DO UPDATE SET updated_at = $8, disk_path = $9, machine_id = $10,
+                origin_node_did = COALESCE(repos.origin_node_did, EXCLUDED.origin_node_did)",
         )
         .bind(&id)
         .bind(name)
@@ -3403,6 +3450,7 @@ impl Db {
         .bind(disk_path)
         .bind(machine_id)
         .bind(quarantined)
+        .bind(origin_node_did)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -4531,7 +4579,31 @@ pub struct SyncQueueItem {
     pub enqueued_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MirrorOriginState {
+    NoMirror,
+    Unpinned,
+    Pinned(String),
+}
+
 impl Db {
+    /// Read the exact slash-form mirror row for one sync slug. Canonical rows
+    /// deliberately do not answer here: they are locally authoritative and are
+    /// checked separately before peer sync may touch the shared disk path.
+    pub(crate) async fn mirror_origin_state(&self, mirror_id: &str) -> Result<MirrorOriginState> {
+        let row = sqlx::query("SELECT origin_node_did FROM repos WHERE id = $1")
+            .bind(mirror_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            None => MirrorOriginState::NoMirror,
+            Some(row) => match row.try_get::<Option<String>, _>("origin_node_did")? {
+                Some(did) => MirrorOriginState::Pinned(did),
+                None => MirrorOriginState::Unpinned,
+            },
+        })
+    }
+
     pub async fn enqueue_sync(
         &self,
         repo: &str,
@@ -12185,6 +12257,115 @@ mod migration_tests {
         // `schema_migrations` when an existing node upgrades. If you rename
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
+    }
+
+    #[sqlx::test]
+    async fn migration_v53_backfills_mirror_origin_from_earliest_done_sync(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        sqlx::query("ALTER TABLE repos DROP COLUMN origin_node_did")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 53")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let now = "2026-11-26T00:00:00Z";
+        for (id, owner, name, disk) in [
+            ("z6Mkfoo/hello", "z6Mkfoo", "hello", "/mirror/hello.git"),
+            ("z6Mkfoo/orphan", "z6Mkfoo", "orphan", "/mirror/orphan.git"),
+        ] {
+            sqlx::query(
+                "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
+                                    created_at, updated_at, disk_path, machine_id, quarantined)
+                 VALUES ($1, $2, $3, 'mirrored', TRUE, 'main', $4, $4, $5, NULL, FALSE)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(owner)
+            .bind(now)
+            .bind(disk)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
+                                created_at, updated_at, disk_path, machine_id, quarantined)
+             VALUES ($1, 'hello', 'did:key:z6Mkfoo', 'canonical', TRUE, 'main', $2, $2, '/canonical/hello.git', NULL, FALSE)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (id, did, enqueued) in [
+            ("late", "did:key:zOriginLate", "2026-11-26T00:02:00Z"),
+            ("early", "did:key:zOriginEarly", "2026-11-26T00:01:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, status, enqueued_at)
+                 VALUES ($1, 'z6Mkfoo/hello', $2, 'refs/heads/main', $3, 'done', $4)",
+            )
+            .bind(id)
+            .bind(did)
+            .bind("0".repeat(40))
+            .bind(enqueued)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        db.migrate().await.unwrap();
+
+        let pin: Option<String> =
+            sqlx::query_scalar("SELECT origin_node_did FROM repos WHERE id = 'z6Mkfoo/hello'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(pin.as_deref(), Some("did:key:zOriginEarly"));
+        let orphan_pin: Option<String> =
+            sqlx::query_scalar("SELECT origin_node_did FROM repos WHERE id = 'z6Mkfoo/orphan'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            orphan_pin, None,
+            "a mirror without sync history stays unpinned"
+        );
+        let canonical_nulls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repos WHERE position('/' in id) = 0 AND origin_node_did IS NOT NULL",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            canonical_nulls, 0,
+            "canonical rows must not receive mirror pins"
+        );
+
+        db.upsert_mirror_repo_with_origin(
+            "z6Mkfoo",
+            "hello",
+            "/mirror/hello.git",
+            None,
+            false,
+            Some("did:key:zAttacker"),
+        )
+        .await
+        .unwrap();
+        let pin_after: Option<String> =
+            sqlx::query_scalar("SELECT origin_node_did FROM repos WHERE id = 'z6Mkfoo/hello'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            pin_after.as_deref(),
+            Some("did:key:zOriginEarly"),
+            "an ordinary re-sync must never overwrite the recorded origin"
+        );
     }
 
     /// Simulate an existing node at v9 with populated received_ref_updates,

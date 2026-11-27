@@ -579,6 +579,43 @@ impl NetworkGit {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SyncOriginRowVerdict {
+    FirstSync,
+    PinnedOrigin,
+    Denied(&'static str),
+}
+
+/// Authorize one peer DID against the locally recorded repo row for a sync
+/// slug. This answers only durable row state. The worker additionally treats
+/// a pre-existing disk path with no row as an existing mirror without
+/// provenance, because the database cannot prove which peer created it.
+pub(crate) async fn sync_origin_row_verdict(
+    db: &Db,
+    owner_short: &str,
+    repo_name: &str,
+    mirror_id: &str,
+    node_did: &str,
+) -> anyhow::Result<SyncOriginRowVerdict> {
+    if let Some(row) = db.get_repo(owner_short, repo_name).await? {
+        if !row.is_mirror_row() {
+            return Ok(SyncOriginRowVerdict::Denied(
+                "refusing to sync peer content into a canonical local repo",
+            ));
+        }
+    }
+    Ok(match db.mirror_origin_state(mirror_id).await? {
+        crate::db::MirrorOriginState::Pinned(pin) if pin != node_did => {
+            SyncOriginRowVerdict::Denied("sync peer does not match the mirror's recorded origin")
+        }
+        crate::db::MirrorOriginState::Pinned(_) => SyncOriginRowVerdict::PinnedOrigin,
+        crate::db::MirrorOriginState::Unpinned => {
+            SyncOriginRowVerdict::Denied("mirror has no recorded sync origin")
+        }
+        crate::db::MirrorOriginState::NoMirror => SyncOriginRowVerdict::FirstSync,
+    })
+}
+
 async fn process_batch(
     db: &Db,
     config: &Config,
@@ -725,6 +762,40 @@ async fn process_batch(
             }
         }
 
+        // Repo-specific origin authorization is a local provenance check, not
+        // proof derived from the peer's wire fields. Rows that have no
+        // recoverable provenance fail closed: trusting the next caller would
+        // reproduce the force-fetch this gate exists to stop.
+        let row_verdict = match sync_origin_row_verdict(
+            db,
+            owner_short,
+            repo_name,
+            &item.repo,
+            &item.node_did,
+        )
+        .await
+        {
+            Ok(verdict) => verdict,
+            Err(e) => {
+                warn!(id = %item.id, repo = %item.repo, err = %e, "cannot read sync origin authorization; leaving the sync row pending");
+                crate::metrics::record_sync_processed("deferred");
+                continue;
+            }
+        };
+        let origin_rejection = match row_verdict {
+            SyncOriginRowVerdict::Denied(reason) => Some(reason),
+            SyncOriginRowVerdict::FirstSync if local_path.exists() => {
+                Some("existing mirror path has no recorded sync origin")
+            }
+            SyncOriginRowVerdict::FirstSync | SyncOriginRowVerdict::PinnedOrigin => None,
+        };
+        if let Some(reason) = origin_rejection {
+            warn!(id = %item.id, repo = %item.repo, node_did = %item.node_did, reason, "rejecting unauthorized sync origin");
+            let _ = db.mark_sync_failed(&item.id).await;
+            crate::metrics::record_sync_processed("rejected");
+            continue;
+        }
+
         // The remote matches twigpine-node git smart HTTP route: /{owner}/{repo}
         // (no .git suffix, the server routes don't include it). Git is handed the
         // canonical form built here, never the stored peer string. A refusal
@@ -807,12 +878,13 @@ async fn process_batch(
                 };
                 // Register in DB so git smart HTTP can serve the mirrored repo
                 let mirror_visible = match db
-                    .upsert_mirror_repo(
+                    .upsert_mirror_repo_with_origin(
                         owner_short,
                         repo_name,
                         local_path.to_str().unwrap_or(""),
                         machine_id,
                         quarantined,
+                        Some(&item.node_did),
                     )
                     .await
                 {
@@ -1914,6 +1986,15 @@ mod tests {
             .count()
     }
 
+    fn rev_parse(repo: &Path, rev: &str) -> String {
+        let out = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     #[tokio::test]
     async fn promisor_clone_marks_promisor_and_keeps_objects() {
         let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
@@ -2236,6 +2317,17 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap();
+        row.0
+    }
+
+    async fn sync_status_for(pool: &PgPool, repo: &str, did: &str) -> String {
+        let row: (String,) =
+            sqlx::query_as("SELECT status FROM sync_queue WHERE repo = $1 AND node_did = $2")
+                .bind(repo)
+                .bind(did)
+                .fetch_one(pool)
+                .await
+                .unwrap();
         row.0
     }
 
@@ -2777,6 +2869,145 @@ mod tests {
         assert!(
             object_count(&mirror) > before,
             "fetch pulled nothing into the existing mirror"
+        );
+    }
+
+    #[sqlx::test]
+    async fn process_batch_refuses_to_repoint_an_existing_mirror(pool: PgPool) {
+        // Issue #432: knowing the slug and being a known peer is not authority
+        // to rewrite a mirror another peer created. The first successful sync
+        // records its origin; a different peer's row is terminally rejected,
+        // while the recorded origin can still update the mirror.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        let (victim_remote, victim_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let (attacker_remote, attacker_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let victim_did = "did:key:z6MkVictimOrigin";
+        let attacker_did = "did:key:z6MkAttackerOrigin";
+        seed_local_peer(&pool, victim_did, &victim_url).await;
+        seed_local_peer(&pool, attacker_did, &attacker_url).await;
+
+        enqueue(&state.db, "z6Mkfoo/hello", victim_did).await;
+        run_batch(&state, &repos_dir).await;
+        let mirror = repos_dir.join("z6Mkfoo").join("hello.git");
+        assert!(mirror.is_dir(), "first sync did not clone");
+        let victim_tip = rev_parse(&mirror, "HEAD");
+
+        let attacker_origin = attacker_remote.path().join("origin");
+        let attacker_bare = attacker_remote
+            .path()
+            .join("r1")
+            .join("r2")
+            .join("root")
+            .join("z6Mkfoo")
+            .join("hello");
+        std::fs::write(attacker_origin.join("attacker.txt"), b"attacker\n").unwrap();
+        g(&["add", "."], &attacker_origin);
+        g(&["commit", "-qm", "attacker"], &attacker_origin);
+        g(
+            &["push", "-q", attacker_bare.to_str().unwrap(), "HEAD"],
+            &attacker_origin,
+        );
+        let attacker_tip = rev_parse(&attacker_bare, "HEAD");
+        assert_ne!(victim_tip, attacker_tip, "fixture tips must differ");
+
+        enqueue(&state.db, "z6Mkfoo/hello", attacker_did).await;
+        run_batch(&state, &repos_dir).await;
+
+        assert_eq!(
+            rev_parse(&mirror, "HEAD"),
+            victim_tip,
+            "attacker peer rewrote the existing mirror"
+        );
+        assert_eq!(
+            sync_status_for(&pool, "z6Mkfoo/hello", attacker_did).await,
+            "failed"
+        );
+
+        // Positive control: the recorded origin remains able to update its mirror.
+        let victim_origin = victim_remote.path().join("origin");
+        let victim_bare = victim_remote
+            .path()
+            .join("r1")
+            .join("r2")
+            .join("root")
+            .join("z6Mkfoo")
+            .join("hello");
+        std::fs::write(victim_origin.join("victim-second.txt"), b"victim\n").unwrap();
+        g(&["add", "."], &victim_origin);
+        g(&["commit", "-qm", "victim second"], &victim_origin);
+        g(
+            &["push", "-q", victim_bare.to_str().unwrap(), "HEAD"],
+            &victim_origin,
+        );
+        let updated_victim_tip = rev_parse(&victim_bare, "HEAD");
+        sqlx::query("UPDATE sync_queue SET status = 'pending' WHERE repo = $1 AND node_did = $2")
+            .bind("z6Mkfoo/hello")
+            .bind(victim_did)
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_batch(&state, &repos_dir).await;
+
+        assert_eq!(rev_parse(&mirror, "HEAD"), updated_victim_tip);
+        assert_eq!(
+            sync_status_for(&pool, "z6Mkfoo/hello", victim_did).await,
+            "done"
+        );
+    }
+
+    #[sqlx::test]
+    async fn process_batch_fails_closed_for_an_unpinned_existing_mirror(pool: PgPool) {
+        // Upgrade edge: a mirror row with no backfillable history has no local
+        // fact that can authorize the next caller. Trusting that caller would
+        // reopen the original repointing bug.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let did = "did:key:z6MkUnknownOrigin";
+        seed_local_peer(&pool, did, &peer_url).await;
+        state
+            .db
+            .upsert_mirror_repo("z6Mkfoo", "hello", "/mirror/hello.git", None, false)
+            .await
+            .unwrap();
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+
+        run_batch(&state, &repos_dir).await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+        assert!(
+            !repos_dir.join("z6Mkfoo").join("hello.git").exists(),
+            "an unpinned mirror row must not authorize a fetch"
+        );
+    }
+
+    #[sqlx::test]
+    async fn process_batch_fails_closed_for_a_disk_mirror_without_a_row(pool: PgPool) {
+        // Crash-recovery ambiguity: the path exists but the DB has no mirror
+        // row, so neither the queue row nor the wire data can prove which peer
+        // created it. The safe answer is operator intervention, not adoption.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        let mirror = repos_dir.join("z6Mkfoo").join("hello.git");
+        std::fs::create_dir_all(&mirror).unwrap();
+        let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let did = "did:key:z6MkUnknownOrigin";
+        seed_local_peer(&pool, did, &peer_url).await;
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+
+        run_batch(&state, &repos_dir).await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+        assert!(
+            object_count(&mirror) == 0,
+            "an unproven disk mirror must not be populated"
         );
     }
 
