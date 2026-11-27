@@ -2943,6 +2943,10 @@ mod tests {
         let mirror = repos_dir.join("z6Mkfoo").join("hello.git");
         assert!(mirror.is_dir(), "first sync did not clone");
         let victim_tip = rev_parse(&mirror, "HEAD");
+        sqlx::query("DELETE FROM sync_queue WHERE repo = 'z6Mkfoo/hello'")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let attacker_origin = attacker_remote.path().join("origin");
         let attacker_bare = attacker_remote
@@ -2991,12 +2995,7 @@ mod tests {
             &victim_origin,
         );
         let updated_victim_tip = rev_parse(&victim_bare, "HEAD");
-        sqlx::query("UPDATE sync_queue SET status = 'pending' WHERE repo = $1 AND node_did = $2")
-            .bind("z6Mkfoo/hello")
-            .bind(victim_did)
-            .execute(&pool)
-            .await
-            .unwrap();
+        enqueue(&state.db, "z6Mkfoo/hello", victim_did).await;
         run_batch(&state, &repos_dir).await;
 
         assert_eq!(rev_parse(&mirror, "HEAD"), updated_victim_tip);
