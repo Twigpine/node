@@ -4718,7 +4718,7 @@ impl Db {
                AND r.origin_node_did IS NULL
              RETURNING r.origin_node_did"#,
         )
-        .bind(&mirror_id)
+        .bind(mirror_id)
         .fetch_optional(&self.pool)
         .await?)
     }
