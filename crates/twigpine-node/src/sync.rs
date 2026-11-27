@@ -1025,6 +1025,7 @@ async fn process_batch(
                         continue;
                     }
                 }
+                drop(_first_sync_lock);
                 // The lag is push-to-visible: sample at registration, before
                 // the encrypted-blob tail and mark_sync_done. A quarantined
                 // mirror is admitted but withheld from readers, so it reports
