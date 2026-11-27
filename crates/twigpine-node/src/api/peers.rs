@@ -522,17 +522,14 @@ pub async fn notify_sync(
     // separator or a traversal segment places the mirror outside repos_dir. Reject
     // it here, before the queue row and the ref-update row are written. The message
     // names the field and nothing about where repos live on disk.
-    let (owner_short, repo_name) = match crate::git::repo_store::validate_repo_slug(&req.repo) {
-        Ok(parts) => parts,
-        Err(e) => return Err(AppError::BadRequest(format!("invalid repo field: {e}"))),
-    };
+    if let Err(e) = crate::git::repo_store::validate_repo_slug(&req.repo) {
+        return Err(AppError::BadRequest(format!("invalid repo field: {e}")));
+    }
 
-    let canonical_owner = crate::db::normalize_owner_key(owner_short);
-    let canonical_repo = format!("{canonical_owner}/{repo_name}");
     state
         .db
         .enqueue_sync(
-            &canonical_repo,
+            &req.repo,
             &req.node_did,
             &req.ref_name,
             &req.new_sha,
@@ -1483,7 +1480,7 @@ mod tests {
                         "states",
                         "/mirror/states.git",
                         None,
-                        false,
+                        true,
                         Some("did:key:z6MkOtherOrigin"),
                     )
                     .await
@@ -1497,7 +1494,7 @@ mod tests {
                 sqlx::query(
                     "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
                                         created_at, updated_at, disk_path)
-                     VALUES ($1, 'states', 'did:key:z6Mkfoo', 'canonical', TRUE, 'main', $2, $2, '/canonical/states.git')",
+                     VALUES ($1, 'states', 'did:key:z6Mkfoo', 'canonical', FALSE, 'main', $2, $2, '/canonical/states.git')",
                 )
                 .bind(uuid::Uuid::new_v4().to_string())
                 .bind(&now)
