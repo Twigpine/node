@@ -132,6 +132,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         webhook_secret_key: Arc::new(webhook_secret_key),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
+        push_limiter_trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         federated_rate_limiter: RateLimiter::new_bounded(12, Duration::from_secs(60), 10_000),
@@ -8827,7 +8828,7 @@ mod tests {
         let mut state = test_state(pool).await;
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         // One PRIVATE source, recorded cleanly: the set is non-empty, below cap and
         // unmarked, so nothing but the peek can keep the request off the queries.
@@ -15731,7 +15732,7 @@ mod tests {
         let mut state = test_state(pool).await;
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         let fx = seed_cid_repos(&slug, &short, &["provthrottle"]);
         let bare = std::path::PathBuf::from("/tmp")
@@ -15958,7 +15959,7 @@ mod tests {
         // that sets the limiter by hand has to do the arithmetic itself.
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         let fx = seed_cid_repos(&slug, &short, &["fanout"]);
         let bare = std::path::PathBuf::from("/tmp")
@@ -16024,7 +16025,7 @@ mod tests {
         // `AppState::ipfs_work_budget`; only a hand-set limiter does this arithmetic.
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(5, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         let names = ["a0", "a1", "a2", "a3"];
         let _fx = seed_cid_repos(&slug, &short, &names);
@@ -16088,7 +16089,7 @@ mod tests {
         // Budget 1, keyed on XFF so `oneshot` can choose the source IP.
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         let _fx = seed_cid_repos(&slug, &short, &["r0"]);
         state
@@ -16344,6 +16345,21 @@ mod tests {
         );
     }
 
+    /// The fixed socket peer used by forwarded-header test requests. Tests opt it
+    /// into the trusted boundary explicitly; production behavior never trusts a
+    /// forwarded header merely because the header mode is configured.
+    fn enable_xff_test_proxy(state: &mut AppState) {
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        state.push_limiter_trusted_peers =
+            crate::rate_limit::TrustedProxyPeers::from_env_value("10.0.0.1").unwrap();
+    }
+
+    fn insert_test_proxy_peer(req: &mut Request<Body>) {
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "10.0.0.1:1".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+    }
+
     fn cid_router(state: &AppState) -> Router {
         Router::new()
             .route(
@@ -16385,16 +16401,18 @@ mod tests {
             .body(Body::empty())
             .unwrap()
     }
-    /// Anonymous CID request carrying `x-forwarded-for: <ip>` — an anon caller with a
-    /// resolvable source IP, so the per-IP walk brake keys on it (the walk still
-    /// denies anon at a path rule).
+    /// Anonymous CID request carrying `x-forwarded-for: <ip>` through the fixed
+    /// trusted test proxy peer. The state must opt that peer in with
+    /// `enable_xff_test_proxy` before the forwarded value resolves as the source.
     fn cid_anon_xff(cid: &str, xff_ip: &str) -> Request<Body> {
-        Request::builder()
+        let mut req = Request::builder()
             .method(Method::GET)
             .uri(format!("/ipfs/{cid}"))
             .header("x-forwarded-for", xff_ip)
             .body(Body::empty())
-            .unwrap()
+            .unwrap();
+        insert_test_proxy_peer(&mut req);
+        req
     }
     fn cid_signed(kp: &twigpine_core::identity::Keypair, cid: &str) -> Request<Body> {
         let path = format!("/ipfs/{cid}");
@@ -16408,10 +16426,9 @@ mod tests {
             .body(Body::empty())
             .unwrap()
     }
-    /// Signed CID request carrying `x-forwarded-for: <ip>`. Used by the walk
-    /// rate-limit test to key the per-IP limiter off a chosen source under
-    /// `TrustedProxy::XForwardedFor` (the request goes through `oneshot`, which
-    /// leaves no socket peer, so the header is the only key source).
+    /// Signed CID request carrying `x-forwarded-for: <ip>` through the fixed
+    /// trusted test proxy peer. Used by the walk rate-limit tests to key the
+    /// per-IP limiter off a chosen client source under `TrustedProxy::XForwardedFor`.
     fn cid_signed_xff(
         kp: &twigpine_core::identity::Keypair,
         cid: &str,
@@ -16419,7 +16436,7 @@ mod tests {
     ) -> Request<Body> {
         let path = format!("/ipfs/{cid}");
         let s = twigpine_core::http_sig::sign_request(kp, "GET", &path, b"");
-        Request::builder()
+        let mut req = Request::builder()
             .method(Method::GET)
             .uri(&path)
             .header("content-digest", s.content_digest)
@@ -16427,7 +16444,9 @@ mod tests {
             .header("signature", s.signature)
             .header("x-forwarded-for", xff_ip)
             .body(Body::empty())
-            .unwrap()
+            .unwrap();
+        insert_test_proxy_peer(&mut req);
+        req
     }
 
     /// #110: `GET /ipfs/{cid}` must gate a withheld blob by per-caller visibility.
@@ -17776,7 +17795,7 @@ mod tests {
         // probes + pages by `AppState::ipfs_work_budget`; a hand-set limiter is not.
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(3, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         let fx = seed_cid_repos(&slug, &short, &["walklimit"]);
         let bare = std::path::PathBuf::from("/tmp")
@@ -17986,7 +18005,7 @@ mod tests {
         // `AppState::ipfs_work_budget`, so only a hand-set limiter counts this out.
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(3, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         // Identical secret-blob content in both bare clones → one CID resolves to
         // `secret_oid` in each. A NEWER path-scoped denier (walk-and-deny anon) and an
@@ -18270,7 +18289,7 @@ mod tests {
         let mut state = test_state(pool).await;
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         let fx = seed_cid_repos(&slug, &short, &["w0", "w1"]);
         let bare = std::path::PathBuf::from("/tmp").join(&slug).join("w0.git");
@@ -18408,7 +18427,7 @@ mod tests {
         state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(600, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         // Seed a public, walk-free CID so /ipfs/{cid} serves cheaply. This
         // matters because the proof half of the test fires a real CID request
@@ -18429,7 +18448,7 @@ mod tests {
         let pins_path = "/api/v1/ipfs/pins";
         let pins_signed = sign_request(&kp, "GET", pins_path, b"");
         for i in 0..5 {
-            let req = Request::builder()
+            let mut req = Request::builder()
                 .method(Method::GET)
                 .uri(pins_path)
                 .header("content-digest", &pins_signed.content_digest)
@@ -18438,6 +18457,7 @@ mod tests {
                 .header("x-forwarded-for", peer_ip)
                 .body(Body::empty())
                 .unwrap();
+            insert_test_proxy_peer(&mut req);
             let resp = router.clone().oneshot(req).await.unwrap();
             assert_eq!(
                 resp.status(),
@@ -18451,7 +18471,7 @@ mod tests {
         // debited it, the bucket would be empty and the CID request would 429.)
         let cid_path = format!("/ipfs/{cid}");
         let cid_signed = sign_request(&kp, "GET", &cid_path, b"");
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::GET)
             .uri(&cid_path)
             .header("content-digest", cid_signed.content_digest)
@@ -18460,6 +18480,7 @@ mod tests {
             .header("x-forwarded-for", peer_ip)
             .body(Body::empty())
             .unwrap();
+        insert_test_proxy_peer(&mut req);
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
@@ -18489,7 +18510,7 @@ mod tests {
         state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
         state.ipfs_work_rate_limiter =
             crate::rate_limit::RateLimiter::new(600, Duration::from_secs(3600));
-        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        enable_xff_test_proxy(&mut state);
 
         let fx = seed_cid_repos(&slug, &short, &["pinsexh"]);
         let bare = std::path::PathBuf::from("/tmp")
@@ -18505,7 +18526,7 @@ mod tests {
         // First /ipfs/{cid} request — debits the single CID token, serves 200.
         let cid_path = format!("/ipfs/{cid}");
         let cid_signed = sign_request(&kp, "GET", &cid_path, b"");
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::GET)
             .uri(&cid_path)
             .header("content-digest", cid_signed.content_digest)
@@ -18514,6 +18535,7 @@ mod tests {
             .header("x-forwarded-for", peer_ip)
             .body(Body::empty())
             .unwrap();
+        insert_test_proxy_peer(&mut req);
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
@@ -18525,7 +18547,7 @@ mod tests {
         // exhaustion is real and observable on this router). Re-sign because
         // `SignedHeaders` holds owned `String`s.
         let cid_signed_2 = sign_request(&kp, "GET", &cid_path, b"");
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::GET)
             .uri(&cid_path)
             .header("content-digest", cid_signed_2.content_digest)
@@ -18534,6 +18556,7 @@ mod tests {
             .header("x-forwarded-for", peer_ip)
             .body(Body::empty())
             .unwrap();
+        insert_test_proxy_peer(&mut req);
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
@@ -18545,7 +18568,7 @@ mod tests {
         // serve 200 — pins are auth-only and never see this bucket.
         let pins_path = "/api/v1/ipfs/pins";
         let pins_signed = sign_request(&kp, "GET", pins_path, b"");
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::GET)
             .uri(pins_path)
             .header("content-digest", pins_signed.content_digest)
@@ -18554,6 +18577,7 @@ mod tests {
             .header("x-forwarded-for", peer_ip)
             .body(Body::empty())
             .unwrap();
+        insert_test_proxy_peer(&mut req);
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),

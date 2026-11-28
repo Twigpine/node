@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -408,38 +408,141 @@ impl TrustedProxy {
     }
 }
 
+/// Key used when no socket peer is available to verify. The angle brackets cannot
+/// collide with the string form of a socket IP, so one reserved bucket covers
+/// synthetic or misintegrated transports instead of letting them bypass the limiter.
+pub const UNKNOWN_PEER_KEY: &str = "<unknown-peer>";
+
+/// Error for one malformed entry in `TWIGPINE_TRUSTED_PROXY_CIDRS`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedProxyPeersError {
+    entry: String,
+}
+
+impl std::fmt::Display for TrustedProxyPeersError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid trusted proxy peer entry {:?}; expected an IP address or CIDR",
+            self.entry
+        )
+    }
+}
+
+impl std::error::Error for TrustedProxyPeersError {}
+
+/// Operator-configured socket peers allowed to assert forwarded client identity.
+/// Empty trusts no proxy. Parsing is all-or-nothing so one typo cannot silently
+/// leave a partial trust boundary in force.
+#[derive(Clone, Debug, Default)]
+pub struct TrustedProxyPeers {
+    networks: Arc<Vec<ipnet::IpNet>>,
+}
+
+impl TrustedProxyPeers {
+    /// Parse `TWIGPINE_TRUSTED_PROXY_CIDRS`: comma-separated exact IPs or CIDRs.
+    pub fn from_env_value(s: &str) -> Result<Self, TrustedProxyPeersError> {
+        let mut networks = Vec::new();
+        for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let network = entry.parse::<ipnet::IpNet>().or_else(|_| {
+                entry.parse::<IpAddr>().map(|ip| {
+                    let prefix = match ip {
+                        IpAddr::V4(_) => 32,
+                        IpAddr::V6(_) => 128,
+                    };
+                    ipnet::IpNet::new(ip, prefix).expect("host prefix is valid")
+                })
+            });
+            match network {
+                Ok(network) => networks.push(canonical_net(network)),
+                Err(_) => {
+                    return Err(TrustedProxyPeersError {
+                        entry: entry.to_string(),
+                    })
+                }
+            }
+        }
+        Ok(Self {
+            networks: Arc::new(networks),
+        })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.networks.iter().any(|network| network.contains(&ip))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.networks.is_empty()
+    }
+}
+
+/// IPv4-mapped IPv6 peers are the IPv4 host for trust matching and keying.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+/// An allowlist entry inside the IPv4-mapped subspace (`::ffff:0:0/96`) is the
+/// matching IPv4 network, because `client_key` matches peers after
+/// `canonical_ip`. Native IPv6 entries are kept as written.
+fn canonical_net(net: ipnet::IpNet) -> ipnet::IpNet {
+    match net {
+        ipnet::IpNet::V6(v6) if v6.prefix_len() >= 96 => match v6.network().to_ipv4_mapped() {
+            Some(v4) => ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96)
+                .expect("a prefix of 96..=128 maps to 0..=32")
+                .into(),
+            None => net,
+        },
+        other => other,
+    }
+}
+
 fn trimmed_nonempty(v: &str) -> Option<String> {
     let t = v.trim();
     (!t.is_empty()).then(|| t.to_string())
 }
 
 /// Resolve the rate-limit key for a request. In a trusted-proxy mode the
-/// operator's edge header is preferred; when that header is missing or empty we
-/// fall back to the socket peer address rather than skipping the limiter (a
-/// malformed header must never disable the brake). With no trusted proxy the
-/// socket peer is always used and forwarded headers are ignored entirely.
-/// Returns `None` only when neither a trusted header nor a peer address is
-/// available (e.g. a synthetic test request with no `ConnectInfo`).
+/// operator's edge header is used only when the socket peer is in the configured
+/// trusted-proxy allowlist. When that proof is absent, or the header is missing
+/// or empty, the key falls back to the socket peer address rather than skipping
+/// the limiter (a malformed header must never disable the brake). With no trusted
+/// proxy the socket peer is always used and forwarded headers are ignored entirely.
+/// With no socket peer, the request shares the reserved unknown-peer bucket.
 pub fn client_key(
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
     trust: TrustedProxy,
-) -> Option<String> {
-    let from_header = match trust {
-        TrustedProxy::None => None,
-        TrustedProxy::Fly => headers
-            .get("fly-client-ip")
-            .and_then(|v| v.to_str().ok())
-            .and_then(trimmed_nonempty),
-        // Rightmost hop = the value appended by the immediately-upstream trusted
-        // proxy. The leftmost hop is client-controlled and must not be trusted.
-        TrustedProxy::XForwardedFor => headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit(',').next())
-            .and_then(trimmed_nonempty),
+    trusted_peers: &TrustedProxyPeers,
+) -> String {
+    let peer_ip = peer.map(|p| canonical_ip(p.ip()));
+    let peer_is_trusted_proxy = peer_ip.is_some_and(|ip| trusted_peers.contains(ip));
+    let from_header = if peer_is_trusted_proxy {
+        match trust {
+            TrustedProxy::None => None,
+            TrustedProxy::Fly => headers
+                .get("fly-client-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(trimmed_nonempty),
+            // Rightmost hop = the value appended by the immediately-upstream trusted
+            // proxy. The leftmost hop is client-controlled and must not be trusted.
+            TrustedProxy::XForwardedFor => headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit(',').next())
+                .and_then(trimmed_nonempty),
+        }
+    } else {
+        None
     };
-    from_header.or_else(|| peer.map(|p| p.ip().to_string()))
+    from_header
+        .or_else(|| peer_ip.map(|ip| ip.to_string()))
+        .unwrap_or_else(|| UNKNOWN_PEER_KEY.to_string())
 }
 
 /// Per-client-IP limiter for the git push path, carrying the trusted-proxy
@@ -451,6 +554,7 @@ pub fn client_key(
 pub struct IpRateLimiter {
     pub limiter: RateLimiter,
     pub trust: TrustedProxy,
+    pub trusted_peers: TrustedProxyPeers,
 }
 
 /// Infallible extractor for the socket peer address from `ConnectInfo`. Yields
@@ -523,19 +627,17 @@ pub const MAX_GRAPHQL_TASK_READS_PER_REQUEST: usize = 5;
 #[derive(Clone)]
 pub struct TaskReadBrake {
     pub limiter: RateLimiter,
-    /// `None` when no key could be resolved at all (no trusted header and no
-    /// `ConnectInfo`, e.g. a synthetic test request). Never braked, matching
-    /// [`rate_limit_by_ip`].
-    pub key: Option<String>,
+    /// Resolved once at the connection or request boundary. A missing socket peer
+    /// is the reserved unknown-peer bucket, so unattributable requests are braked
+    /// together rather than skipped.
+    pub key: String,
     pub request_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TaskReadBrake {
     /// Debit one slot for one task-read field. `true` = proceed.
     pub async fn check(&self, field: &str) -> bool {
-        let Some(key) = self.key.as_deref() else {
-            return true;
-        };
+        let key = self.key.as_str();
         let count = self
             .request_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -558,7 +660,7 @@ impl TaskReadBrake {
 
 /// Throttle the git push path by resolved client IP. The socket peer address is
 /// read from `ConnectInfo` (see `into_make_service_with_connect_info` in
-/// `main`). Only skips the limiter when no key can be resolved at all.
+/// `main`). A missing peer resolves to the reserved unknown-peer bucket.
 pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
     let limiter = request.extensions().get::<IpRateLimiter>().cloned();
     let peer = request
@@ -567,11 +669,15 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
         .map(|c| c.0);
 
     if let Some(limiter) = limiter {
-        if let Some(key) = client_key(request.headers(), peer, limiter.trust) {
-            if let Some(retry_after) = limiter.limiter.check_retry(&key).await {
-                tracing::warn!(key = %key, path = %request.uri().path(), "per-IP rate limit exceeded");
-                return too_many_requests(retry_after);
-            }
+        let key = client_key(
+            request.headers(),
+            peer,
+            limiter.trust,
+            &limiter.trusted_peers,
+        );
+        if let Some(retry_after) = limiter.limiter.check_retry(&key).await {
+            tracing::warn!(key = %key, path = %request.uri().path(), "per-IP rate limit exceeded");
+            return too_many_requests(retry_after);
         }
     }
 
@@ -798,36 +904,174 @@ mod tests {
         Some(s.parse().unwrap())
     }
 
+    fn peers(s: &str) -> TrustedProxyPeers {
+        TrustedProxyPeers::from_env_value(s).unwrap()
+    }
+
     #[test]
     fn none_mode_ignores_headers_and_uses_peer() {
         // Even a well-formed Fly header is ignored without a trusted proxy.
         let h = headers(&[("fly-client-ip", "203.0.113.7")]);
         assert_eq!(
-            client_key(&h, peer("198.51.100.9:4000"), TrustedProxy::None).as_deref(),
-            Some("198.51.100.9")
+            client_key(
+                &h,
+                peer("198.51.100.9:4000"),
+                TrustedProxy::None,
+                &peers("198.51.100.9"),
+            ),
+            "198.51.100.9"
         );
     }
 
     #[test]
-    fn fly_mode_trusts_fly_header() {
+    fn fly_mode_ignores_header_from_untrusted_peer() {
+        // The issue-207 exploit: direct reachability must not let a client choose
+        // a fresh bucket by rotating Fly-Client-IP.
         let h = headers(&[
             ("fly-client-ip", "203.0.113.7"),
             ("x-forwarded-for", "1.2.3.4"),
         ]);
         assert_eq!(
-            client_key(&h, peer("10.0.0.1:1"), TrustedProxy::Fly).as_deref(),
-            Some("203.0.113.7")
+            client_key(
+                &h,
+                peer("198.51.100.9:4000"),
+                TrustedProxy::Fly,
+                &peers("10.0.0.1")
+            ),
+            "198.51.100.9"
+        );
+    }
+
+    #[test]
+    fn fly_mode_trusts_header_from_configured_proxy_peer() {
+        let h = headers(&[
+            ("fly-client-ip", "203.0.113.7"),
+            ("x-forwarded-for", "1.2.3.4"),
+        ]);
+        assert_eq!(
+            client_key(
+                &h,
+                peer("10.0.0.1:1"),
+                TrustedProxy::Fly,
+                &peers("10.0.0.0/24")
+            ),
+            "203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn mapped_allowlist_entries_match_the_ipv4_peer() {
+        // client_key canonicalizes an IPv4-mapped socket peer to IPv4, so a
+        // mapped host or mapped-subspace CIDR in the allowlist must match too.
+        let h = headers(&[("fly-client-ip", "203.0.113.7")]);
+        for entry in ["::ffff:10.0.0.1", "::ffff:10.0.0.0/120"] {
+            for p in ["[::ffff:10.0.0.1]:4000", "10.0.0.1:4000"] {
+                assert_eq!(
+                    client_key(&h, peer(p), TrustedProxy::Fly, &peers(entry)),
+                    "203.0.113.7",
+                    "entry {entry} must trust peer {p}"
+                );
+            }
+        }
+        // The mapped /120 covers 10.0.0.0/24 and nothing outside it.
+        assert_eq!(
+            client_key(
+                &h,
+                peer("[::ffff:10.0.1.1]:4000"),
+                TrustedProxy::Fly,
+                &peers("::ffff:10.0.0.0/120"),
+            ),
+            "10.0.1.1"
+        );
+        // A mapped host entry trusts only that host.
+        assert_eq!(
+            client_key(
+                &h,
+                peer("10.0.0.2:4000"),
+                TrustedProxy::Fly,
+                &peers("::ffff:10.0.0.1"),
+            ),
+            "10.0.0.2"
+        );
+    }
+
+    #[test]
+    fn native_ipv6_allowlist_entries_still_match() {
+        let h = headers(&[("fly-client-ip", "203.0.113.7")]);
+        for entry in ["2001:db8::1", "2001:db8::/64"] {
+            assert_eq!(
+                client_key(
+                    &h,
+                    peer("[2001:db8::1]:4000"),
+                    TrustedProxy::Fly,
+                    &peers(entry)
+                ),
+                "203.0.113.7",
+                "native entry {entry}"
+            );
+        }
+        assert_eq!(
+            client_key(
+                &h,
+                peer("[2001:db9::1]:4000"),
+                TrustedProxy::Fly,
+                &peers("2001:db8::/64"),
+            ),
+            "2001:db9::1"
+        );
+    }
+
+    #[test]
+    fn empty_allowlist_never_trusts_forwarded_header() {
+        let h = headers(&[("fly-client-ip", "203.0.113.7")]);
+        assert_eq!(
+            client_key(
+                &h,
+                peer("10.0.0.1:1"),
+                TrustedProxy::Fly,
+                &TrustedProxyPeers::default(),
+            ),
+            "10.0.0.1",
+            "an empty trusted proxy peer list must ignore forwarded headers"
+        );
+    }
+
+    #[test]
+    fn missing_peer_uses_reserved_unknown_bucket() {
+        let h = headers(&[("fly-client-ip", "203.0.113.7")]);
+        assert_eq!(
+            client_key(&h, None, TrustedProxy::Fly, &peers("10.0.0.1")),
+            UNKNOWN_PEER_KEY
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_proxy_matches_ipv4_allowlist() {
+        let h = headers(&[("x-forwarded-for", "203.0.113.7")]);
+        assert_eq!(
+            client_key(
+                &h,
+                peer("[::ffff:10.0.0.1]:1"),
+                TrustedProxy::XForwardedFor,
+                &peers("10.0.0.0/24"),
+            ),
+            "203.0.113.7"
         );
     }
 
     #[test]
     fn fly_mode_empty_header_falls_back_to_peer_not_skip() {
-        // Empty Fly-Client-IP must NOT collapse traffic onto Some("") nor skip
-        // the limiter — it falls back to the real peer.
+        // Empty Fly-Client-IP must not collapse traffic onto Some("") nor skip
+        // the limiter; it falls back to the real peer.
         let h = headers(&[("fly-client-ip", "")]);
         assert_eq!(
-            client_key(&h, peer("198.51.100.9:4000"), TrustedProxy::Fly).as_deref(),
-            Some("198.51.100.9")
+            client_key(
+                &h,
+                peer("10.0.0.1:4000"),
+                TrustedProxy::Fly,
+                &peers("10.0.0.1")
+            ),
+            "10.0.0.1"
         );
     }
 
@@ -836,18 +1080,28 @@ mod tests {
         // Client prepends spoofed hops; only the rightmost (proxy-appended) is trusted.
         let h = headers(&[("x-forwarded-for", "9.9.9.9, 8.8.8.8, 198.51.100.9")]);
         assert_eq!(
-            client_key(&h, peer("10.0.0.1:1"), TrustedProxy::XForwardedFor).as_deref(),
-            Some("198.51.100.9")
+            client_key(
+                &h,
+                peer("10.0.0.1:1"),
+                TrustedProxy::XForwardedFor,
+                &peers("10.0.0.1"),
+            ),
+            "198.51.100.9"
         );
     }
 
     #[test]
     fn xff_mode_empty_leading_hop_does_not_disable_brake() {
-        // "X-Forwarded-For: ,1.2.3.4" — rightmost hop is used; never None-skips.
+        // "X-Forwarded-For: ,1.2.3.4": rightmost hop is used; never None-skips.
         let h = headers(&[("x-forwarded-for", ",1.2.3.4")]);
         assert_eq!(
-            client_key(&h, peer("10.0.0.1:1"), TrustedProxy::XForwardedFor).as_deref(),
-            Some("1.2.3.4")
+            client_key(
+                &h,
+                peer("10.0.0.1:1"),
+                TrustedProxy::XForwardedFor,
+                &peers("10.0.0.1"),
+            ),
+            "1.2.3.4"
         );
     }
 
@@ -855,9 +1109,61 @@ mod tests {
     fn malformed_xff_falls_back_to_peer() {
         let h = headers(&[("x-forwarded-for", " , ")]);
         assert_eq!(
-            client_key(&h, peer("198.51.100.9:4000"), TrustedProxy::XForwardedFor).as_deref(),
-            Some("198.51.100.9")
+            client_key(
+                &h,
+                peer("10.0.0.1:4000"),
+                TrustedProxy::XForwardedFor,
+                &peers("10.0.0.1"),
+            ),
+            "10.0.0.1"
         );
+    }
+
+    #[test]
+    fn trusted_exact_ipv6_peer_can_assert_fly_header() {
+        let h = headers(&[("fly-client-ip", "203.0.113.7")]);
+        assert_eq!(
+            client_key(
+                &h,
+                peer("[2001:db8::10]:443"),
+                TrustedProxy::Fly,
+                &peers("2001:db8::10"),
+            ),
+            "203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_fallback_key_is_canonical_ipv4() {
+        assert_eq!(
+            client_key(
+                &HeaderMap::new(),
+                peer("[::ffff:10.0.0.1]:1"),
+                TrustedProxy::None,
+                &TrustedProxyPeers::default(),
+            ),
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_peer_parsing_accepts_ips_and_cidrs() {
+        assert!(TrustedProxyPeers::from_env_value("  , ")
+            .unwrap()
+            .is_empty());
+        let parsed = peers(" 10.0.0.1, 192.168.0.0/16,2001:db8::1, 2001:db8::/32 ");
+        assert!(parsed.contains("10.0.0.1".parse().unwrap()));
+        assert!(!parsed.contains("10.0.0.2".parse().unwrap()));
+        assert!(parsed.contains("192.168.4.5".parse().unwrap()));
+        assert!(parsed.contains("2001:db8::1".parse().unwrap()));
+        assert!(parsed.contains("2001:db8::ffff".parse().unwrap()));
+        assert!(!parsed.contains("2001:db9::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_peer_parsing_rejects_whole_list_on_one_bad_entry() {
+        let err = TrustedProxyPeers::from_env_value("10.0.0.1, not-an-ip").unwrap_err();
+        assert!(err.to_string().contains("not-an-ip"));
     }
 
     #[test]
@@ -901,11 +1207,22 @@ mod tests {
         router.clone().oneshot(req).await.unwrap().status()
     }
 
+    async fn post_without_peer(router: &axum::Router) -> StatusCode {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/o/r/git-receive-pack")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
     #[tokio::test]
     async fn middleware_returns_429_over_limit() {
         let router = ip_limited_router(IpRateLimiter {
             limiter: RateLimiter::new(2, Duration::from_secs(60)),
             trust: TrustedProxy::None,
+            trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
         });
         let peer: SocketAddr = "203.0.113.7:5000".parse().unwrap();
         // Two requests inside the budget, the third over it (shared Arc state).
@@ -922,6 +1239,7 @@ mod tests {
         let router = ip_limited_router(IpRateLimiter {
             limiter: RateLimiter::new(1, Duration::from_secs(60)),
             trust: TrustedProxy::None,
+            trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
         });
         let a: SocketAddr = "203.0.113.1:1".parse().unwrap();
         let b: SocketAddr = "203.0.113.2:1".parse().unwrap();
@@ -975,6 +1293,7 @@ mod tests {
         let router = ip_limited_over_auth_router(IpRateLimiter {
             limiter: RateLimiter::new(1, Duration::from_secs(60)),
             trust: TrustedProxy::None,
+            trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
         });
         let peer: SocketAddr = "203.0.113.42:7000".parse().unwrap();
 
@@ -1023,6 +1342,7 @@ mod tests {
         let router = ip_limited_over_auth_router(IpRateLimiter {
             limiter: RateLimiter::new(1, Duration::from_secs(60)),
             trust: TrustedProxy::XForwardedFor,
+            trusted_peers: peers("10.0.0.0/24,172.16.0.1"),
         });
         let p1: SocketAddr = "10.0.0.1:1".parse().unwrap();
         let p2: SocketAddr = "10.0.0.2:1".parse().unwrap();
@@ -1047,6 +1367,7 @@ mod tests {
         let router = ip_limited_over_auth_router(IpRateLimiter {
             limiter: RateLimiter::new(1, Duration::from_secs(60)),
             trust: TrustedProxy::XForwardedFor,
+            trusted_peers: peers("10.0.0.0/24,172.16.0.1"),
         });
         let peer: SocketAddr = "10.0.0.9:1".parse().unwrap();
         assert_eq!(
@@ -1071,6 +1392,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_client_cannot_rotate_xff_bucket() {
+        // A direct client is not in the trusted proxy range. Rotating the
+        // forwarded value must leave the key on the real socket peer, so the
+        // second request hits the same exhausted bucket.
+        let router = ip_limited_over_auth_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::XForwardedFor,
+            trusted_peers: peers("10.0.0.0/24"),
+        });
+        let direct: SocketAddr = "203.0.113.99:1".parse().unwrap();
+        assert_eq!(
+            post_with(&router, direct, &[("x-forwarded-for", "198.51.100.1")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_with(&router, direct, &[("x-forwarded-for", "198.51.100.2")]).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "an untrusted peer must not rotate its bucket through X-Forwarded-For"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_client_cannot_rotate_fly_bucket() {
+        let router = ip_limited_over_auth_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::Fly,
+            trusted_peers: peers("10.0.0.0/24"),
+        });
+        let direct: SocketAddr = "203.0.113.99:1".parse().unwrap();
+        assert_eq!(
+            post_with(&router, direct, &[("fly-client-ip", "198.51.100.1")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_with(&router, direct, &[("fly-client-ip", "198.51.100.2")]).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "an untrusted peer must not rotate its bucket through Fly-Client-IP"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_connect_info_shares_unknown_peer_bucket() {
+        let router = ip_limited_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::XForwardedFor,
+            trusted_peers: peers("10.0.0.0/24"),
+        });
+        assert_eq!(post_without_peer(&router).await, StatusCode::OK);
+        assert_eq!(
+            post_without_peer(&router).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "requests without a verifiable socket peer share one braked bucket"
+        );
+    }
+
+    #[tokio::test]
     async fn absent_trusted_header_collapses_to_socket_peer() {
         // The documented fallback: in a trusted-proxy mode, a request with no
         // forwarded header keys on the socket peer. Behind a real edge every
@@ -1079,6 +1456,7 @@ mod tests {
         let router = ip_limited_over_auth_router(IpRateLimiter {
             limiter: RateLimiter::new(1, Duration::from_secs(60)),
             trust: TrustedProxy::XForwardedFor,
+            trusted_peers: peers("10.0.0.0/24,172.16.0.1"),
         });
         let proxy: SocketAddr = "172.16.0.1:1".parse().unwrap();
         assert_eq!(
@@ -1125,6 +1503,7 @@ mod tests {
         let router = ip_limited_router(IpRateLimiter {
             limiter: RateLimiter::new(1, Duration::from_secs(100)),
             trust: TrustedProxy::None,
+            trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
         });
         let peer: SocketAddr = "203.0.113.50:6000".parse().unwrap();
         assert_eq!(resp_from(&router, peer).await.status(), StatusCode::OK);
@@ -1150,6 +1529,7 @@ mod tests {
         let router = ip_limited_router(IpRateLimiter {
             limiter,
             trust: TrustedProxy::None,
+            trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
         });
         let resp = resp_from(&router, peer).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1173,6 +1553,7 @@ mod tests {
         let router = ip_limited_router(IpRateLimiter {
             limiter,
             trust: TrustedProxy::None,
+            trusted_peers: crate::rate_limit::TrustedProxyPeers::default(),
         });
         let resp = resp_from(&router, peer).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);

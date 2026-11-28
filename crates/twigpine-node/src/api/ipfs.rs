@@ -459,7 +459,7 @@ const SCAN_TOKEN_TTL_SECS: i64 = 3600;
 /// lifetime of the future that requested it.
 struct WalkAdmission {
     _global: tokio::sync::OwnedSemaphorePermit,
-    _per_source: Option<crate::rate_limit::PerCallerPermit>,
+    _per_source: crate::rate_limit::PerCallerPermit,
 }
 
 pub async fn get_by_cid(
@@ -518,9 +518,8 @@ pub async fn get_by_cid(
     // (`*_bounded` + `run_bounded_git` teardown), so a hung git cannot pin the slot
     // past `git_service_timeout_secs`. On unavailability shed a clean 503. The
     // per-source key is the resolved source IP (`client_key`), never the DID (`/ipfs`
-    // admits any `did:key` unthrottled, so a DID key would be free to mint around); a
-    // `None` key (no trusted header, no peer) is bounded by the global pool only,
-    // never the per-source sub-cap.
+    // admits any `did:key` unthrottled, so a DID key would be free to mint around). A
+    // missing socket peer shares the reserved unknown-peer bucket under the same cap.
     let global_permit = state
         .git_ipfs_walk_semaphore
         .clone()
@@ -529,14 +528,11 @@ pub async fn get_by_cid(
             tracing::warn!("/ipfs walk concurrency cap reached; shedding request with 503");
             AppError::Overloaded("ipfs service at capacity, retry shortly".into())
         })?;
-    let source_key = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust);
-    let caller_permit = match &source_key {
-        Some(ip) => Some(state.git_ipfs_walk_per_caller.try_acquire(ip).ok_or_else(|| {
-            tracing::warn!(key = %ip, "/ipfs per-source walk cap reached; shedding request with 503");
-            AppError::Overloaded("ipfs service at capacity for this source, retry shortly".into())
-        })?),
-        None => None,
-    };
+    let source_key = state.client_key(&headers, peer);
+    let caller_permit = state.git_ipfs_walk_per_caller.try_acquire(&source_key).ok_or_else(|| {
+        tracing::warn!(key = %source_key, "/ipfs per-source walk cap reached; shedding request with 503");
+        AppError::Overloaded("ipfs service at capacity for this source, retry shortly".into())
+    })?;
     // Share the admission rather than holding it as a handler local (#174 U1). A
     // clone goes into every `spawn_blocking` closure below, so the permits release
     // only when the LAST holder drops. That makes the two failure directions one
@@ -939,18 +935,15 @@ pub async fn get_by_cid(
         // the 404 tail. That is the honest answer (its search never ran), and it drops
         // an oracle, since the old order let a throttled caller tell a complete source
         // set from an incomplete one by 404 vs 429.
-        if let Some(key) =
-            crate::rate_limit::client_key(rctx.headers, rctx.peer, state.push_limiter_trust)
-        {
-            if state.ipfs_work_rate_limiter.is_throttled(&key).await {
-                throttled = true;
-                // Skipped for a spent bucket is NOT finished: no scan ran, so nothing was
-                // covered. Leaving it unfinished keeps the proposer role here, so the
-                // caller's existing token resumes this candidate once the bucket refills
-                // instead of the ladder advancing past work that never happened.
-                earlier_all_finished = false;
-                continue;
-            }
+        let key = state.client_key(rctx.headers, rctx.peer);
+        if state.ipfs_work_rate_limiter.is_throttled(&key).await {
+            throttled = true;
+            // Skipped for a spent bucket is NOT finished: no scan ran, so nothing was
+            // covered. Leaving it unfinished keeps the proposer role here, so the
+            // caller's existing token resumes this candidate once the bucket refills
+            // instead of the ladder advancing past work that never happened.
+            earlier_all_finished = false;
+            continue;
         }
         // Earlier candidates were finished by earlier rungs, so their scans are owed
         // nothing. The skip sits HERE on purpose: above it the provenance phase can still
@@ -1106,19 +1099,16 @@ pub async fn get_by_cid(
                     // for. Without it a denial-only inventory could be re-paged for free
                     // by re-requesting, which is the across-request half of the same
                     // amplification. Reuses the `source_key` already resolved at
-                    // admission; no resolvable key (a test oneshot with no peer or
-                    // trusted header) skips the charge, exactly as the walk and probe
-                    // brakes do.
+                    // admission; a missing peer charges the reserved unknown-peer bucket,
+                    // exactly as the walk and probe brakes do.
                     //
                     // A spent bucket sets `throttled` and breaks WITHOUT tainting and
                     // WITHOUT a token: the caller's own bucket stopped them, their
                     // previous token still resumes them after it refills, and the tail
                     // renders the 429 when nothing else tainted.
-                    if let Some(key) = &source_key {
-                        if !state.ipfs_work_rate_limiter.check(key).await {
-                            throttled = true;
-                            break;
-                        }
+                    if !state.ipfs_work_rate_limiter.check(&source_key).await {
+                        throttled = true;
+                        break;
                     }
                     pager
                         .fetch_next_page(&state, request_deadline, &cid_str)
@@ -1657,7 +1647,7 @@ async fn gate_and_serve(
     // as the second bound (a single request's ceiling). A spent quota is the same non-fatal Throttled as the
     // walk brake: keep scanning for a walk-free copy, and only a wholly-unservable
     // request becomes the 429. No resolvable key (a test oneshot with no peer/header)
-    // skips the brake, as the walk brake does. The provenance path targets one repo
+    // shares the unknown-peer bucket. The provenance path targets one repo
     // (no fan-out) and is exempt (`legacy_scan == false`).
     if legacy_scan {
         if walk.probes >= state.ipfs_max_legacy_probes {
@@ -1667,12 +1657,9 @@ async fn gate_and_serve(
             // refused and only the caller knows it.
             return GateOutcome::CeilingStop("probe-ceiling");
         }
-        if let Some(key) =
-            crate::rate_limit::client_key(ctx.headers, ctx.peer, state.push_limiter_trust)
-        {
-            if !state.ipfs_work_rate_limiter.check(&key).await {
-                return GateOutcome::Throttled;
-            }
+        let key = state.client_key(ctx.headers, ctx.peer);
+        if !state.ipfs_work_rate_limiter.check(&key).await {
+            return GateOutcome::Throttled;
         }
         walk.probes += 1;
     }
@@ -1886,18 +1873,15 @@ async fn gate_and_serve(
             // Brake each spawned walk on the source IP (#173, F3, INV-15), BEFORE
             // spending walk budget: a throttled candidate neither walks nor consumes
             // budget and must not end the request — skip it and keep scanning
-            // (#173 review, F-C). No key (a test oneshot with no peer/header) skips the
-            // brake, as the other IP brakes do. On the LEGACY path the probe brake
+            // (#173 review, F-C). A missing peer uses the unknown-peer bucket, as the
+            // other IP brakes do. On the LEGACY path the probe brake
             // above already charged THIS candidate to the source (#173, F3, jatmn), so
             // the walk brake must not double-charge it: only the provenance path
             // (`legacy_scan == false`, no probe toll) charges here.
             if !legacy_scan {
-                if let Some(key) =
-                    crate::rate_limit::client_key(ctx.headers, ctx.peer, state.push_limiter_trust)
-                {
-                    if !state.ipfs_work_rate_limiter.check(&key).await {
-                        return GateOutcome::Throttled;
-                    }
+                let key = state.client_key(ctx.headers, ctx.peer);
+                if !state.ipfs_work_rate_limiter.check(&key).await {
+                    return GateOutcome::Throttled;
                 }
             }
             if legacy_scan {
@@ -2924,10 +2908,11 @@ mod tests {
     //! admission (a global pool + per-source sub-cap) held through the `spawn_blocking`
     //! walk, plus a per-IP route rate limit. These are handler-layer proofs: mount the
     //! real handler/router, drive one request, assert the exact 503 shed, then name the
-    //! mutation that turns each RED. The per-source key resolves an IP only (`Some(ip)`
-    //! vs `None`), never a DID — both arms are driven so neither is vacuous. The
+    //! mutation that turns each RED. The per-source key is the resolved client IP or the
+    //! reserved unknown-peer bucket, never a DID. The
     //! CID-resolution / visibility-gate behavior of the handler itself is covered by the
-    //! `#[sqlx::test]` suite in `test_support.rs`.
+    //! `#[sqlx::test]` suite in `test_support.rs`. A request without a verifiable socket
+    //! peer shares the reserved unknown-peer bucket rather than bypassing the sub-cap.
 
     use super::{arm_marker_query_stall, disarm_marker_query_stall, MarkerQuery};
     use axum::body::Body;
@@ -8832,19 +8817,18 @@ mod tests {
         );
     }
 
-    /// The `None`-key arm: a request with no resolvable source key (no trusted-proxy
-    /// header, no `ConnectInfo`) is bounded by the GLOBAL pool only, never the per-source
-    /// sub-cap. With the global pool exhausted it still sheds 503 (the counterpart to the
-    /// `Some(ip)` arm above, so neither arm is vacuous).
+    /// With the global pool exhausted, a request whose peer cannot be verified still
+    /// sheds 503 even though the per-source cap is permissive. The reserved unknown-peer
+    /// bucket is bounded by both caps; this test isolates the global one.
     #[tokio::test]
-    async fn get_by_cid_none_key_arm_sheds_on_global_pool() {
+    async fn get_by_cid_unknown_peer_sheds_on_global_pool() {
         let mut state = crate::test_support::test_state_lazy();
         state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(0));
         // Per-source cap permissive so only the global pool can shed.
         state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
 
-        // No ConnectInfo + no trusted header -> client_key resolves None.
+        // No ConnectInfo means the reserved unknown-peer key.
         let resp = ipfs_router(state)
             .oneshot(get_cid(&valid_cid(), None))
             .await
@@ -8852,7 +8836,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "a None-key request must still shed 503 on the exhausted GLOBAL /ipfs walk pool"
+            "an unknown-peer request must still shed 503 on the exhausted GLOBAL /ipfs walk pool"
         );
     }
 
@@ -9506,6 +9490,83 @@ mod tests {
             resp.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "a different IP must not be braked by another IP's exhausted bucket"
+        );
+    }
+
+    /// #207 server wiring: the production router must pass the state's trusted proxy
+    /// peer policy into the mounted IP limiter. A verified proxy gets distinct
+    /// forwarded-client buckets; a direct peer rotating the same header stays on its
+    /// socket-peer bucket and is throttled.
+    #[sqlx::test]
+    async fn server_ip_rate_limiter_uses_verified_proxy_peer_policy(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        state.ipfs_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, std::time::Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+        state.push_limiter_trusted_peers =
+            crate::rate_limit::TrustedProxyPeers::from_env_value("10.0.0.1").unwrap();
+
+        let router = crate::server::build_router(state);
+        let cid = valid_cid();
+        let make = |peer: SocketAddr, xff: &str| {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/ipfs/{cid}"))
+                .header("x-forwarded-for", xff)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+        let proxy: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(make(proxy, "198.51.100.1"))
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first request for one forwarded client must pass the brake"
+        );
+        let resp = router
+            .clone()
+            .oneshot(make(proxy, "198.51.100.1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the same forwarded client must exhaust its own bucket"
+        );
+        let resp = router
+            .clone()
+            .oneshot(make(proxy, "198.51.100.2"))
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a verified proxy peer must receive distinct forwarded-client buckets"
+        );
+
+        let direct: SocketAddr = "203.0.113.99:5000".parse().unwrap();
+        let resp = router
+            .clone()
+            .oneshot(make(direct, "198.51.100.3"))
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first direct-client request must pass the brake"
+        );
+        let resp = router.oneshot(make(direct, "198.51.100.4")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an unverified direct client must not rotate its bucket through XFF"
         );
     }
 

@@ -3,6 +3,18 @@
 # image instead of building, and binds data dirs to the dedicated EBS volume.
 # `$${VAR}` entries are resolved by docker compose from /opt/gitlawb/.env at runtime.
 
+# A tiny benchmarking-range subnet gives Caddy a deterministic source address.
+# The node trusts that exact address, and only that address, to assert XFF.
+# ip_range keeps dynamic allocation (node, postgres) off Caddy's .2, which they
+# would otherwise take first because Caddy starts after node is healthy.
+networks:
+  gitlawb_internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 198.18.0.0/29
+          ip_range: 198.18.0.4/30
+
 services:
 %{ if domain_name != "" ~}
   caddy:
@@ -16,6 +28,9 @@ services:
     command: caddy reverse-proxy --from ${domain_name} --to node:${gitlawb_port}
     volumes:
       - /mnt/data/caddy:/data
+    networks:
+      gitlawb_internal:
+        ipv4_address: 198.18.0.2
     restart: unless-stopped
 
 %{ endif ~}
@@ -33,6 +48,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - gitlawb_internal
     restart: unless-stopped
 
 %{ endif ~}
@@ -51,6 +68,8 @@ services:
 %{ endif ~}
     volumes:
       - /mnt/data/node:/data
+    networks:
+      - gitlawb_internal
     environment:
       DATABASE_URL: postgresql://${pg_user}:$${POSTGRES_PASSWORD}@${db_host != "" ? db_host : "postgres"}:5432/${pg_db}
       GITLAWB_HOST: 0.0.0.0
@@ -59,11 +78,12 @@ services:
       GITLAWB_REPOS_DIR: /data/repos
       GITLAWB_KEY: /data/keys/identity.pem
       # Only trust X-Forwarded-For when the Caddy sidecar above is actually
-      # deployed (domain_name != ""). Caddy appends the real client as the
-      # rightmost hop, letting the push rate limiter key on the true client IP
-      # rather than Caddy's container address. Without Caddy, this header is
-      # fully client-controlled and must not be trusted.
+      # deployed (domain_name != ""). Caddy has the fixed service-network
+      # address below, and the node honors the forwarded client only when the
+      # socket peer is that exact address. Without Caddy both settings are
+      # empty, so the header is fully client-controlled and ignored.
       GITLAWB_TRUSTED_PROXY: "${domain_name != "" ? "x-forwarded-for" : ""}"
+      GITLAWB_TRUSTED_PROXY_CIDRS: "${domain_name != "" ? "198.18.0.2/32" : ""}"
       # iCaptcha proof-of-intelligence gate (spam protection on create/fork/register)
       ICAPTCHA_MODE: ${icaptcha_mode}
       ICAPTCHA_PUBKEY: ${icaptcha_pubkey}

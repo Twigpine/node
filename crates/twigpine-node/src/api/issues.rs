@@ -224,11 +224,10 @@ pub async fn create_issue_comment(
     // distinguish a hidden repo from a missing one (INV-12 — the same
     // placement close_issue uses for its brake). The route group carries no
     // outer brake for exactly this reason.
-    if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
-        if let Some(retry_after) = state.write_rate_limiter.check_retry(&key).await {
-            tracing::warn!(repo = %repo, key = %key, "create_issue_comment rate limited");
-            return Err(AppError::RateLimited(retry_after));
-        }
+    let key = state.client_key(&headers, peer);
+    if let Some(retry_after) = state.write_rate_limiter.check_retry(&key).await {
+        tracing::warn!(repo = %repo, key = %key, "create_issue_comment rate limited");
+        return Err(AppError::RateLimited(retry_after));
     }
 
     // Spend the signature only now. The route group has no outer brake, so a row
@@ -333,28 +332,27 @@ pub async fn close_issue(
     // let disposable identities drive unbounded transfer/CPU/disk with parallel
     // close requests for arbitrary issue ids. Applied after the read gate so a
     // denied reader still sees 404, not 429.
-    if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
-        // Both buckets debit here, after the read gate (INV-12): the shared
-        // per-IP write brake — the route group deliberately carries no outer
-        // brake — and this route's own close budget.
-        //
-        // A close refused by either cap spends nothing from the other bucket.
-        // The write bucket is debited first, and refunded when the close cap
-        // then refuses, so the guarantee holds even when a concurrent close
-        // takes the last close slot between the two checks. A write-bucket
-        // refusal advertises its window's Retry-After; the close-cap refusal
-        // keeps the plain 429 it has always returned.
-        if let Some(retry_after) = state.write_rate_limiter.check_retry(&key).await {
-            tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
-            return Err(AppError::RateLimited(retry_after));
-        }
-        if !state.close_issue_rate_limiter.check(&key).await {
-            state.write_rate_limiter.refund(&key).await;
-            tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
-            return Err(AppError::TooManyRequests(
-                "rate limit exceeded — try again later".into(),
-            ));
-        }
+    let key = state.client_key(&headers, peer);
+    // Both buckets debit here, after the read gate (INV-12): the shared
+    // per-IP write brake (the route group deliberately carries no outer
+    // brake) and this route's own close budget.
+    //
+    // A close refused by either cap spends nothing from the other bucket.
+    // The write bucket is debited first, and refunded when the close cap
+    // then refuses, so the guarantee holds even when a concurrent close
+    // takes the last close slot between the two checks. A write-bucket
+    // refusal advertises its window's Retry-After; the close-cap refusal
+    // keeps the plain 429 it has always returned.
+    if let Some(retry_after) = state.write_rate_limiter.check_retry(&key).await {
+        tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
+        return Err(AppError::RateLimited(retry_after));
+    }
+    if !state.close_issue_rate_limiter.check(&key).await {
+        state.write_rate_limiter.refund(&key).await;
+        tracing::warn!(repo = %repo, key = %key, "close_issue rate limited");
+        return Err(AppError::TooManyRequests(
+            "rate limit exceeded, try again later".into(),
+        ));
     }
 
     // Spend the signature only now, after the read gate and both debits, for the
@@ -2017,8 +2015,7 @@ mod lock_pool_shed_tests {
 
         let headers = axum::http::HeaderMap::new();
         let peer = || crate::rate_limit::PeerAddr(Some("203.0.113.77:5000".parse().unwrap()));
-        let key = crate::rate_limit::client_key(&headers, peer().0, state.push_limiter_trust)
-            .expect("a peer addr yields a brake key");
+        let key = state.client_key(&headers, peer().0);
         assert!(state.write_rate_limiter.check(&key).await);
         assert!(
             !state.write_rate_limiter.check(&key).await,

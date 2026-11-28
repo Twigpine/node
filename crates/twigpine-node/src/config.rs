@@ -723,10 +723,11 @@ pub struct Config {
     /// cannot monopolize the `max_concurrent_git_ops` read pool (#174). Callers are
     /// keyed on the RESOLVED SOURCE IP, never the DID — a signature does not move a
     /// caller off this cap, so an authenticated client cannot mint DIDs to escape it.
-    /// IMPORTANT: the source-IP key is only as granular as `TWIGPINE_TRUSTED_PROXY`.
-    /// Left unset (the default), a node behind an edge/NAT keys all callers on the
+    /// IMPORTANT: the source-IP key is only as granular as the verified
+    /// `TWIGPINE_TRUSTED_PROXY` plus `TWIGPINE_TRUSTED_PROXY_CIDRS` pair.
+    /// Without a verified proxy peer, a node behind an edge/NAT keys all callers on the
     /// edge IP, so this cap collapses to a single global cap rather than per-client.
-    /// Set `TWIGPINE_TRUSTED_PROXY` to key on the real client; a high-fanout caller (a
+    /// Configure both settings to key on the real client; a high-fanout caller (a
     /// CI fleet behind one NAT) then needs the operator to raise this. Over-cap for a
     /// caller sheds a clean 503 + Retry-After.
     ///
@@ -761,11 +762,11 @@ pub struct Config {
 
     /// Maximum concurrent `/ipfs/{cid}` walk requests a single source may hold at
     /// once, so one source cannot monopolize `max_concurrent_ipfs_walks` (#174).
-    /// Callers are keyed on the RESOLVED SOURCE IP (`client_key`/`TWIGPINE_TRUSTED_PROXY`),
-    /// never the DID — `/ipfs` accepts any `did:key` via `optional_signature` with no
-    /// admission step, so keying on the DID would let one host mint disposable DIDs to
-    /// multiply its budget. A request with no resolvable key (no trusted header, no
-    /// peer) is bounded by the global pool only, never this sub-cap. Over-cap sheds a
+    /// Callers are keyed on the RESOLVED SOURCE IP (`client_key` and the verified
+    /// trusted-proxy configuration), never the DID: `/ipfs` accepts any `did:key` via
+    /// `optional_signature` with no admission step, so keying on the DID would let one
+    /// host mint disposable DIDs to multiply its budget. A request with no verifiable
+    /// socket peer shares the reserved unknown-peer bucket under this sub-cap. Over-cap sheds a
     /// clean 503 + Retry-After. Must be between 1 and 1_048_576. Default: 4.
     #[arg(
         long,
@@ -956,8 +957,8 @@ pub struct Config {
     /// route is publicly reachable (`optional_signature`) and each request can drive
     /// a full-history git walk, so it carries a per-IP flood brake in addition to the
     /// concurrency cap above (a rate limit bounds request *rate*, the semaphore
-    /// bounds concurrent slow holds — different axes). Keyed on the resolved client
-    /// IP via `TWIGPINE_TRUSTED_PROXY`. `0` disables. Default: 600.
+    /// bounds concurrent slow holds, different axes). Keyed on the client IP resolved
+    /// through the verified trusted-proxy configuration. `0` disables. Default: 600.
     ///
     /// This is the pure once-per-request ROUTE brake. The resolver's internal
     /// per-probe/per-walk WORK budget is a SEPARATE bucket whose capacity is DERIVED
@@ -1045,8 +1046,8 @@ pub struct Config {
     /// `GET /api/v1/tasks/{id}` runs `get_visible_task` and returns an opaque 404
     /// when the task is hidden or missing. These reads can require task,
     /// repository, and visibility-rule queries even when no task is returned,
-    /// so the brake bounds the cost of anonymous probes. Keyed on the resolved
-    /// client IP via `TWIGPINE_TRUSTED_PROXY`. `0` disables. Default: 1200 (a list page
+    /// so the brake bounds the cost of anonymous probes. Keyed on the client IP resolved
+    /// through the verified trusted-proxy configuration. `0` disables. Default: 1200 (a list page
     /// followed by per-task reads is a normal client pattern, so this sits above
     /// the `/ipfs` budget). GraphQL `tasks` / `task` queries, including WebSocket
     /// operations, share this per-IP budget with REST task reads.
@@ -1057,7 +1058,7 @@ pub struct Config {
     /// (`/hf/api/models/...` and `/hf/.../resolve/...`), in requests per hour.
     /// These reads run the publicity gate plus release and manifest lookups
     /// before any answer, so the brake bounds the cost of anonymous probes.
-    /// Keyed on the resolved client IP via `TWIGPINE_TRUSTED_PROXY`.
+    /// Keyed on the client IP resolved through the verified trusted-proxy configuration.
     /// `0` disables. Default: 600.
     #[arg(long, env = "TWIGPINE_HF_READ_RATE_LIMIT", default_value_t = 600)]
     pub hf_read_rate_limit: usize,

@@ -490,13 +490,29 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    // Which forwarded header the edge is trusted to set. Default None (trust
-    // nothing, key on the socket peer). Fly nodes set TWIGPINE_TRUSTED_PROXY=fly;
-    // a node behind Caddy/NGINX sets it to x-forwarded-for.
+    // Which forwarded header a verified edge peer may assert. Default None
+    // (trust nothing, key on the socket peer). The peer allowlist is separate:
+    // the header mode alone never proves the connection came from that edge.
     let push_limiter_trust = rate_limit::TrustedProxy::from_env_value(
         &std::env::var("TWIGPINE_TRUSTED_PROXY").unwrap_or_default(),
     );
-    tracing::info!(trust = ?push_limiter_trust, "push rate limiter trust configured");
+    let push_limiter_trusted_peers = match rate_limit::TrustedProxyPeers::from_env_value(
+        &std::env::var("TWIGPINE_TRUSTED_PROXY_CIDRS").unwrap_or_default(),
+    ) {
+        Ok(peers) => peers,
+        Err(err) => {
+            tracing::error!(error = %err, "trusted proxy peer configuration invalid; trusting no proxy peers");
+            rate_limit::TrustedProxyPeers::default()
+        }
+    };
+    if push_limiter_trust != rate_limit::TrustedProxy::None && push_limiter_trusted_peers.is_empty()
+    {
+        tracing::warn!(
+            trust = ?push_limiter_trust,
+            "TWIGPINE_TRUSTED_PROXY is set but TWIGPINE_TRUSTED_PROXY_CIDRS is empty; forwarded headers are ignored and clients share the proxy peer bucket"
+        );
+    }
+    tracing::info!(trust = ?push_limiter_trust, trusted_proxy_peers_empty = push_limiter_trusted_peers.is_empty(), "push rate limiter trust configured");
 
     // Peer-sync flood brakes, keyed on the resolved client IP (per-DID is useless
     // here — a did:key farm self-registers). Two buckets so an unsigned notify
@@ -554,6 +570,7 @@ pub async fn run() -> Result<()> {
         webhook_secret_key: Arc::new(webhook_secret_key),
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
+        push_limiter_trusted_peers,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
         federated_rate_limiter,
