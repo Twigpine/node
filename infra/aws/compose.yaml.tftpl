@@ -5,12 +5,15 @@
 
 # A tiny benchmarking-range subnet gives Caddy a deterministic source address.
 # The node trusts that exact address, and only that address, to assert XFF.
+# ip_range keeps dynamic allocation (node, postgres) off Caddy's .2, which they
+# would otherwise take first because Caddy starts after node is healthy.
 networks:
   gitlawb_internal:
     driver: bridge
     ipam:
       config:
         - subnet: 198.18.0.0/29
+          ip_range: 198.18.0.4/30
 
 services:
 %{ if domain_name != "" ~}

@@ -454,7 +454,7 @@ impl TrustedProxyPeers {
                 })
             });
             match network {
-                Ok(network) => networks.push(network),
+                Ok(network) => networks.push(canonical_net(network)),
                 Err(_) => {
                     return Err(TrustedProxyPeersError {
                         entry: entry.to_string(),
@@ -484,6 +484,21 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
+    }
+}
+
+/// An allowlist entry inside the IPv4-mapped subspace (`::ffff:0:0/96`) is the
+/// matching IPv4 network, because `client_key` matches peers after
+/// `canonical_ip`. Native IPv6 entries are kept as written.
+fn canonical_net(net: ipnet::IpNet) -> ipnet::IpNet {
+    match net {
+        ipnet::IpNet::V6(v6) if v6.prefix_len() >= 96 => match v6.network().to_ipv4_mapped() {
+            Some(v4) => ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96)
+                .expect("a prefix of 96..=128 maps to 0..=32")
+                .into(),
+            None => net,
+        },
+        other => other,
     }
 }
 
@@ -941,6 +956,68 @@ mod tests {
                 &peers("10.0.0.0/24")
             ),
             "203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn mapped_allowlist_entries_match_the_ipv4_peer() {
+        // client_key canonicalizes an IPv4-mapped socket peer to IPv4, so a
+        // mapped host or mapped-subspace CIDR in the allowlist must match too.
+        let h = headers(&[("fly-client-ip", "203.0.113.7")]);
+        for entry in ["::ffff:10.0.0.1", "::ffff:10.0.0.0/120"] {
+            for p in ["[::ffff:10.0.0.1]:4000", "10.0.0.1:4000"] {
+                assert_eq!(
+                    client_key(&h, peer(p), TrustedProxy::Fly, &peers(entry)),
+                    "203.0.113.7",
+                    "entry {entry} must trust peer {p}"
+                );
+            }
+        }
+        // The mapped /120 covers 10.0.0.0/24 and nothing outside it.
+        assert_eq!(
+            client_key(
+                &h,
+                peer("[::ffff:10.0.1.1]:4000"),
+                TrustedProxy::Fly,
+                &peers("::ffff:10.0.0.0/120"),
+            ),
+            "10.0.1.1"
+        );
+        // A mapped host entry trusts only that host.
+        assert_eq!(
+            client_key(
+                &h,
+                peer("10.0.0.2:4000"),
+                TrustedProxy::Fly,
+                &peers("::ffff:10.0.0.1"),
+            ),
+            "10.0.0.2"
+        );
+    }
+
+    #[test]
+    fn native_ipv6_allowlist_entries_still_match() {
+        let h = headers(&[("fly-client-ip", "203.0.113.7")]);
+        for entry in ["2001:db8::1", "2001:db8::/64"] {
+            assert_eq!(
+                client_key(
+                    &h,
+                    peer("[2001:db8::1]:4000"),
+                    TrustedProxy::Fly,
+                    &peers(entry)
+                ),
+                "203.0.113.7",
+                "native entry {entry}"
+            );
+        }
+        assert_eq!(
+            client_key(
+                &h,
+                peer("[2001:db9::1]:4000"),
+                TrustedProxy::Fly,
+                &peers("2001:db8::/64"),
+            ),
+            "2001:db9::1"
         );
     }
 
