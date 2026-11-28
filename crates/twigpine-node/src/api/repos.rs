@@ -747,7 +747,7 @@ where
         .min(MAX_GIT_READ_DEADLINE);
     let deadline = std::time::Instant::now() + budget;
     let repo = record.name.clone();
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let _held = (permit, caller_permit);
         work(&git_bin, &disk_path, deadline)
     })
@@ -755,7 +755,31 @@ where
     .map_err(|e| {
         tracing::error!(repo = %repo, err = %e, "git read task failed");
         AppError::Git(GIT_READ_FAILED_MESSAGE.into())
-    })?
+    })?;
+
+    // The pre-work re-check cannot cover a replacement that lands while the
+    // git children run: disk identity is owner+name only, so results computed
+    // across the delete+recreate can serve the new row's data on the old row's
+    // authorization. Re-read the row after the work has finished and discard
+    // anything computed under a row that no longer matches: a missing or
+    // replaced row answers like the missing-repo case the gate produces,
+    // exactly as the pre-work check does.
+    if result.is_ok() {
+        match state.db.get_repo(&record.owner_did, &record.name).await {
+            Ok(Some(current)) if current.id == record.id => {}
+            Ok(_) => {
+                return Err(AppError::RepoNotFound(format!(
+                    "{}/{}",
+                    record.owner_did, record.name
+                )));
+            }
+            Err(e) => {
+                tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo row post-read re-check failed");
+                return Err(AppError::Git(GIT_READ_FAILED_MESSAGE.into()));
+            }
+        }
+    }
+    result
 }
 
 /// GET /api/v1/repos/:owner/:repo/commits
@@ -6686,12 +6710,21 @@ fn validate_homepage(raw: &str) -> Result<&str> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(bad("must not contain credentials"));
     }
+    let lower = raw.to_ascii_lowercase();
+    let after_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .ok_or_else(|| bad("must be an absolute http or https URL"))?;
+    // `https:///example.com/docs` and `http:////example.com` carry an empty
+    // authority in the stored bytes, yet WHATWG parsing normalizes them to
+    // host `example.com`, so the parse and the public-host check both accept
+    // a value whose bytes name no host. A '/' immediately after the scheme
+    // prefix means the authority is empty.
+    if after_scheme.starts_with('/') {
+        return Err(bad("must not have an empty authority"));
+    }
     if !crate::api::peers::is_public_http_url(raw) {
         return Err(bad(crate::api::peers::PUBLIC_HTTP_URL_REQUIREMENT));
-    }
-    let lower = raw.to_ascii_lowercase();
-    if !lower.starts_with("http://") && !lower.starts_with("https://") {
-        return Err(bad("must be an absolute http or https URL"));
     }
     Ok(raw)
 }
@@ -6730,6 +6763,15 @@ mod tests {
             "http:example.com",
             "https:/example.com",
         ] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_an_empty_authority() {
+        // WHATWG parsing normalizes both of these to host `example.com`,
+        // while the stored bytes carry an empty authority.
+        for bad in ["https:///example.com/docs", "http:////example.com"] {
             assert!(homepage_rejected(bad), "{bad}");
         }
     }
@@ -20249,6 +20291,103 @@ exit 0
         .await
         .expect("the live record runs the read");
         assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The pre-work identity re-check cannot cover a replacement that lands
+    /// while the git work is in progress: the disk path is keyed on
+    /// owner+name only, so the children can read the replacement row's data
+    /// under the old row's authorization. The post-completion re-check must
+    /// discard those results and answer with the same missing-repo response.
+    /// Here the row is deleted and recreated under the same owner/name after
+    /// the work closure has started, and the closure only completes once the
+    /// replacement is in place.
+    #[sqlx::test]
+    async fn run_repo_git_read_refuses_results_across_a_row_replacement(pool: sqlx::PgPool) {
+        let owner = "did:key:zMIDREADREPLACEAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let now = chrono::Utc::now();
+        let seed = |name: &str| crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        let name = "replaced";
+        let repo_dir = dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let record = seed(name);
+        state.db.create_repo(&record).await.unwrap();
+
+        // The closure announces it is in progress, then holds until the test
+        // has replaced the row, so the replacement is guaranteed to land
+        // inside the git-work window.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let state_clone = state.clone();
+        let record_clone = record.clone();
+        let read = tokio::spawn(async move {
+            super::run_repo_git_read::<(), _>(
+                &state_clone,
+                &axum::http::HeaderMap::new(),
+                None,
+                &record_clone,
+                "test",
+                move |_git_bin, _path, _deadline| {
+                    let _ = started_tx.send(());
+                    release_rx
+                        .recv()
+                        .expect("the test releases the in-progress work");
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        started_rx.await.expect("the work closure starts");
+        state.db.delete_repo_by_id(&record.id).await.unwrap();
+        let fresh = seed(name);
+        state.db.create_repo(&fresh).await.unwrap();
+        assert_ne!(fresh.id, record.id, "a recreation carries a fresh row id");
+        release_tx.send(()).unwrap();
+
+        let res = read.await.expect("the read task joins");
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "results computed across a row replacement must be discarded; got {res:?}"
+        );
+
+        // The live replacement row itself reads fine: only the stale
+        // authorization is refused.
+        let res: Result<()> = super::run_repo_git_read(
+            &state,
+            &axum::http::HeaderMap::new(),
+            None,
+            &fresh,
+            "test",
+            move |_git_bin, _path, _deadline| Ok(()),
+        )
+        .await;
+        assert!(res.is_ok(), "the live record runs the read; got {res:?}");
     }
     /// #282 REPRO (RED on main): a push's write guard pins one dedicated
     /// lock-pool connection for the WHOLE op: taken at `acquire_write`, held

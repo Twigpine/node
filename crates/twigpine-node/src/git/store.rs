@@ -1267,27 +1267,65 @@ pub fn resolve_head_id_bounded(
     if let Some(id) = rev_parse_commit_bounded(git_bin, repo_path, &preferred, deadline)? {
         return Ok(Some(id));
     }
-    let listed = crate::git::visibility_pack::run_bounded_git(
+    let (status, listed, scan_err) = crate::git::visibility_pack::run_bounded_git_raw(
         git_bin,
-        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/",
+        ],
         repo_path,
         b"",
         deadline,
     )?;
-    let listed = String::from_utf8_lossy(&listed);
-    let branches: Vec<&str> = listed
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let chosen = ["refs/heads/main", "refs/heads/master", "refs/heads/develop"]
-        .into_iter()
-        .find(|name| branches.contains(name))
-        .or_else(|| branches.first().copied());
-    if let Some(name) = chosen {
-        return match rev_parse_commit_bounded(git_bin, repo_path, name, deadline)? {
+    if !status.success() {
+        bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&scan_err).trim()
+        );
+    }
+    if scan_err.iter().any(|b| !b.is_ascii_whitespace()) {
+        bail!(
+            "git for-each-ref reported an incomplete branch scan: {}",
+            String::from_utf8_lossy(&scan_err).trim()
+        );
+    }
+    let mut branches: Vec<(&[u8], &[u8])> = Vec::new();
+    for line in listed.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(space) = line.iter().position(|b| *b == b' ') else {
+            bail!("git for-each-ref printed a malformed branch row");
+        };
+        let (name, object) = line.split_at(space);
+        let object = &object[1..];
+        if object.len() != 40 && object.len() != 64 || !object.iter().all(|b| b.is_ascii_hexdigit())
+        {
+            bail!(
+                "git for-each-ref printed an unexpected object id for {}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        branches.push((name, object));
+    }
+    let preferred_names: [&[u8]; 3] = [
+        b"refs/heads/main",
+        b"refs/heads/master",
+        b"refs/heads/develop",
+    ];
+    let chosen = preferred_names
+        .iter()
+        .find_map(|wanted| branches.iter().find(|branch| branch.0 == *wanted))
+        .or_else(|| branches.first());
+    if let Some(&(name, object)) = chosen {
+        let object = std::str::from_utf8(object).expect("a validated object id is ASCII hex");
+        return match rev_parse_commit_bounded(git_bin, repo_path, object, deadline)? {
             Some(id) => Ok(Some(id)),
-            None => bail!("{name} is present but does not resolve to a commit"),
+            None => bail!(
+                "{} is present but does not resolve to a commit",
+                String::from_utf8_lossy(name)
+            ),
         };
     }
     if head_is_genuinely_absent_bounded(git_bin, repo_path, deadline)? {
@@ -1420,6 +1458,7 @@ pub fn log_bounded(
         git_bin,
         &[
             "log",
+            "--no-show-signature",
             LOG_FORMAT,
             &format!("--skip={skip}"),
             "-n",
@@ -4674,6 +4713,37 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_log_passes_no_show_signature() {
+        let td = tempfile::TempDir::new().unwrap();
+        let fake = td.path().join("loggit");
+        write_fake_git(
+            &fake,
+            "#!/bin/sh\n\
+             found=0\n\
+             for arg in \"$@\"; do\n\
+             \x20 if [ \"$arg\" = \"--no-show-signature\" ]; then found=1; fi\n\
+             done\n\
+             if [ \"$found\" != 1 ]; then echo missing-no-show-signature >&2; exit 1; fi\n\
+             printf '%s\\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'Test Author' 'author@example.com' '1700000100' 'signed row'\n",
+        );
+
+        let rows = super::log_bounded(
+            fake.to_str().unwrap(),
+            td.path(),
+            "head",
+            0,
+            1,
+            far_deadline(),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "a".repeat(40));
+        assert_eq!(rows[0].subject, "signed row");
+        assert_eq!(rows[0].timestamp, T0 + 100);
+    }
+
     /// base, then A1/A2 on branch `a` and B1/B2 on `main`, then merge M of `a`
     /// into `main`. Committer dates make the history order exactly
     /// M, B2, A2, B1, A1, base. Returns [M, B2, A2, B1, A1, base] ids.
@@ -4868,6 +4938,54 @@ mod tests {
         assert!(
             out.is_err(),
             "a damaged branch ref must not read as an empty history: {out:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_head_id_branch_scan_with_a_broken_ref_errors_not_empty() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        commit_at(&work, "c1", T0 + 100);
+        let git_dir = work.join(".git");
+
+        // HEAD is unborn, so resolution reaches the refs/heads scan. The scan
+        // omits the broken main ref and reports it only on stderr.
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/unborn\n").unwrap();
+        std::fs::write(git_dir.join("refs/heads/main"), b"garbage\n").unwrap();
+
+        let err = super::resolve_head_id_bounded("git", &git_dir, "missing", far_deadline())
+            .expect_err("a scan diagnostic must not read as an empty repository");
+        assert!(
+            format!("{err:#}").contains("incomplete branch scan"),
+            "got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_head_id_branch_scan_preserves_a_non_utf8_branch_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let commit = commit_at(&work, "c1", T0 + 100);
+        let git_dir = work.join(".git");
+
+        // Keep the only branch under a non-UTF-8 file name and make HEAD
+        // unborn, forcing the branch scan to select it by its raw bytes.
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/unborn\n").unwrap();
+        let raw_ref = git_dir
+            .join("refs/heads")
+            .join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+        std::fs::write(&raw_ref, format!("{commit}\n")).unwrap();
+        git_at(&work, &["update-ref", "-d", "refs/heads/main"], T0 + 110);
+
+        assert_eq!(
+            super::resolve_head_id_bounded("git", &git_dir, "missing", far_deadline()).unwrap(),
+            Some(commit),
+            "the scan must resolve the object id from the raw listing row"
         );
     }
 

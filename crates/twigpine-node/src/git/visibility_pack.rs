@@ -6758,26 +6758,65 @@ exec yes abcdefgh\n";
         let pgid = read_pid("pid");
         let desc = read_pid("desc.pid");
         assert_ne!(pgid, desc, "the descendant must be a separate process");
-        let mut gone = false;
+        // On Linux a killed descendant can linger as a zombie until init reaps
+        // it, and a zombie still answers the process-group probe even though it
+        // no longer runs the fixture loop. Absent or zombie therefore counts as
+        // stopped; the group probe below only gates the cleanup signals.
+        #[cfg(target_os = "linux")]
+        fn absent_or_zombie(pid: i32) -> bool {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                // The state field follows the parenthesized comm, which can
+                // itself contain spaces and parens, so split at the last ')'.
+                Ok(stat) => match stat.rfind(')') {
+                    Some(close) => {
+                        let state = stat[close + 1..].trim_start();
+                        state.starts_with('Z') || state.starts_with('X')
+                    }
+                    None => false,
+                },
+                Err(_) => true,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        fn absent_or_zombie(pid: i32) -> bool {
+            // SAFETY: kill(2) with signal 0 only probes existence.
+            let rc = unsafe { libc::kill(pid, 0) };
+            rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+        let mut group_gone = false;
+        let mut stopped = false;
         for _ in 0..300 {
+            if absent_or_zombie(desc) {
+                stopped = true;
+            }
             // SAFETY: kill(2) with signal 0 only probes existence; ESRCH means no
             // process is left in the group.
             let rc = unsafe { libc::kill(-pgid, 0) };
             if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                gone = true;
+                group_gone = true;
+                break;
+            }
+            if stopped {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        // Kill whatever is left so a RED run leaks no orphan.
-        unsafe {
-            libc::kill(desc, libc::SIGKILL);
-            libc::kill(-pgid, libc::SIGKILL);
+        // Kill whatever is left so a RED run leaks no orphan, but only when the
+        // probe never observed the group as gone: after ESRCH the pid and pgid
+        // can be reused by unrelated processes.
+        if !group_gone {
+            // SAFETY: the probe never reported the group gone, so these ids are
+            // still held by fixture processes (live or zombie) and the signals
+            // cannot hit a reused, unrelated process.
+            unsafe {
+                libc::kill(desc, libc::SIGKILL);
+                libc::kill(-pgid, libc::SIGKILL);
+            }
         }
         assert!(
-            gone,
-            "the stopped child's process group (pgid {pgid}, descendant {desc}) must be gone, \
-             not just its leader"
+            stopped,
+            "the stopped child's descendant (pid {desc}, pgid {pgid}) must be absent or a zombie, \
+             not still running its loop"
         );
     }
 
