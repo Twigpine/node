@@ -99,12 +99,12 @@ impl EgressPolicy {
 /// worker's Git 2.37 floor does not imply a libcurl that understands `+`.
 ///
 /// A comma-separated address list needs libcurl 7.59; older versions reject
-/// the whole entry and would re-resolve at connect time. Emit a single checked
-/// address first: on those versions it is the only accepted entry, so the
-/// connection stays pinned to a validated address. Versions that override an
-/// existing host:port entry then replace it with the full list, keeping every
-/// validated address. The single entry is therefore only a fallback, never a
-/// path to connect-time DNS.
+/// the whole entry and would re-resolve at connect time. Duplicate host:port
+/// entries also have opposite semantics: libcurl 7.59/7.60 keep the first one,
+/// while 7.61+ keep the last. Emit the full list at both ends with a single
+/// checked address in the middle, so each generation keeps a valid pin:
+/// pre-7.59 rejects both lists and keeps the single address, 7.59/7.60 keep
+/// the first list, and 7.61+ keep the last. None can fall back to DNS.
 fn resolve_pins(host: &str, port: u16, mut addrs: Vec<IpAddr>) -> Vec<String> {
     addrs.sort_unstable();
     let formatted = addrs
@@ -114,11 +114,13 @@ fn resolve_pins(host: &str, port: u16, mut addrs: Vec<IpAddr>) -> Vec<String> {
             IpAddr::V6(v6) => format!("[{v6}]"),
         })
         .collect::<Vec<_>>();
-    let mut pins = Vec::with_capacity(2);
+    let full = format!("{host}:{port}:{}", formatted.join(","));
+    let mut pins = Vec::with_capacity(3);
     if formatted.len() > 1 {
+        pins.push(full.clone());
         pins.push(format!("{host}:{port}:{}", formatted[0]));
     }
-    pins.push(format!("{host}:{port}:{}", formatted.join(",")));
+    pins.push(full);
     pins
 }
 
@@ -708,10 +710,11 @@ esac
     }
 
     #[test]
-    fn resolve_pins_work_on_libcurl_before_75_and_59() {
+    fn resolve_pins_work_across_libcurl_duplicate_semantics() {
         // No leading `+`: it is parsed as part of the hostname before libcurl
-        // 7.75. A single checked address comes first so libcurl before 7.59,
-        // which rejects the comma-separated list, still has a valid pin.
+        // 7.75. The full list is repeated at both ends so first-wins (7.59/
+        // 7.60) and last-wins (7.61+) libcurl both keep every checked address;
+        // the single address in the middle is what pre-7.59 keeps.
         let pins = resolve_pins(
             "github.example",
             443,
@@ -723,6 +726,7 @@ esac
         assert_eq!(
             pins,
             vec![
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string(),
                 "github.example:443:8.8.8.8".to_string(),
                 "github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string(),
             ]
@@ -803,6 +807,7 @@ esac
         let upstream = PinnedUpstream {
             url: "https://github.example/org/repo.git".to_string(),
             curlopt_resolve: vec![
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string(),
                 "github.example:443:8.8.8.8".to_string(),
                 "github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string(),
             ],
@@ -827,11 +832,12 @@ esac
         assert!(has_config("http.cookieFile", ""));
         assert!(has_config("http.saveCookies", "false"));
         assert!(has_config("http.sslVerify", "true"));
-        // The single-address fallback must come first: older libcurl keeps the
-        // first entry, while newer libcurl replaces it with the full list.
+        // The full list is first and last so both duplicate-entry generations
+        // keep it; pre-7.59 libcurl rejects those and keeps the single pin.
         assert_eq!(
             pins_for("http.curloptResolve"),
             vec![
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]",
                 "github.example:443:8.8.8.8",
                 "github.example:443:8.8.8.8,[2606:4700:4700::1111]",
             ]
@@ -851,6 +857,7 @@ esac
         assert_eq!(
             pins_for("http.https://github.example/org/repo.git.curloptResolve"),
             vec![
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]",
                 "github.example:443:8.8.8.8",
                 "github.example:443:8.8.8.8,[2606:4700:4700::1111]",
             ]
