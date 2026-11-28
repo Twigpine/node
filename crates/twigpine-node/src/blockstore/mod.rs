@@ -111,6 +111,11 @@ pub enum BlockStoreError {
     Backend(String),
 }
 
+// `#[async_trait]` puts `#[must_use]` on the boxed futures it generates, which
+// clippy 1.99 reports as `double_must_use` on the already-must-use futures.
+// The attribute is macro-generated, so silence it here rather than in the
+// trait's method signatures.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait BlockStore: Send + Sync {
     /// Stream `body` into the store under `id`, hashing as it goes. The body

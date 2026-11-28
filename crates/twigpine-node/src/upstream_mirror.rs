@@ -30,7 +30,7 @@ struct EgressPolicy;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PinnedUpstream {
     url: String,
-    curlopt_resolve: Option<String>,
+    curlopt_resolve: Vec<String>,
 }
 
 impl EgressPolicy {
@@ -52,7 +52,7 @@ impl EgressPolicy {
                 url: url.to_string(),
                 // An IP literal performs no DNS lookup, so there is no rebinding
                 // window to pin. TLS still verifies the literal from the URL.
-                curlopt_resolve: None,
+                curlopt_resolve: Vec::new(),
             });
         }
 
@@ -70,17 +70,9 @@ impl EgressPolicy {
         let addresses: Vec<IpAddr> = addresses.into_iter().collect();
         self.validate_addresses(&policy_host, &addresses)?;
 
-        let pinned = addresses
-            .iter()
-            .map(|ip| match ip {
-                IpAddr::V4(v4) => v4.to_string(),
-                IpAddr::V6(v6) => format!("[{v6}]"),
-            })
-            .collect::<Vec<_>>()
-            .join(",");
         Ok(PinnedUpstream {
             url: url.to_string(),
-            curlopt_resolve: Some(format!("+{connect_host}:{port}:{pinned}")),
+            curlopt_resolve: resolve_pins(&connect_host, port, addresses),
         })
     }
 
@@ -97,6 +89,39 @@ impl EgressPolicy {
         }
         Ok(())
     }
+}
+
+/// The `http.curloptResolve` entries pinning `host:port` to `addrs`.
+///
+/// There is deliberately no `+` prefix: that expiring-entry form arrived in
+/// libcurl 7.75, and an older libcurl reads the `+` as part of the hostname,
+/// so the entry never matches and git falls back to DNS at connect time. The
+/// worker's Git 2.37 floor does not imply a libcurl that understands `+`.
+///
+/// A comma-separated address list needs libcurl 7.59; older versions reject
+/// the whole entry and would re-resolve at connect time. Duplicate host:port
+/// entries also have opposite semantics: libcurl 7.59/7.60 keep the first one,
+/// while 7.61+ keep the last. Emit the full list at both ends with a single
+/// checked address in the middle, so each generation keeps a valid pin:
+/// pre-7.59 rejects both lists and keeps the single address, 7.59/7.60 keep
+/// the first list, and 7.61+ keep the last. None can fall back to DNS.
+fn resolve_pins(host: &str, port: u16, mut addrs: Vec<IpAddr>) -> Vec<String> {
+    addrs.sort_unstable();
+    let formatted = addrs
+        .iter()
+        .map(|ip| match ip {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => format!("[{v6}]"),
+        })
+        .collect::<Vec<_>>();
+    let full = format!("{host}:{port}:{}", formatted.join(","));
+    let mut pins = Vec::with_capacity(3);
+    if formatted.len() > 1 {
+        pins.push(full.clone());
+        pins.push(format!("{host}:{port}:{}", formatted[0]));
+    }
+    pins.push(full);
+    pins
 }
 
 fn normalize_policy_host(host: &str) -> String {
@@ -196,10 +221,10 @@ fn fetch_command(upstream: &PinnedUpstream) -> FetchCommand {
         (http_scope("saveCookies"), "false".to_string()),
         (http_scope("sslVerify"), "true".to_string()),
     ];
-    if let Some(resolve) = &upstream.curlopt_resolve {
+    for pin in &upstream.curlopt_resolve {
         config.extend([
-            ("http.curloptResolve".to_string(), resolve.clone()),
-            (http_scope("curloptResolve"), resolve.clone()),
+            ("http.curloptResolve".to_string(), pin.clone()),
+            (http_scope("curloptResolve"), pin.clone()),
         ]);
     }
     config.extend([
@@ -685,6 +710,34 @@ esac
     }
 
     #[test]
+    fn resolve_pins_work_across_libcurl_duplicate_semantics() {
+        // No leading `+`: it is parsed as part of the hostname before libcurl
+        // 7.75. The full list is repeated at both ends so first-wins (7.59/
+        // 7.60) and last-wins (7.61+) libcurl both keep every checked address;
+        // the single address in the middle is what pre-7.59 keeps.
+        let pins = resolve_pins(
+            "github.example",
+            443,
+            vec![
+                "2606:4700:4700::1111".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+            ],
+        );
+        assert_eq!(
+            pins,
+            vec![
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string(),
+                "github.example:443:8.8.8.8".to_string(),
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string(),
+            ]
+        );
+        assert!(pins.iter().all(|pin| !pin.starts_with('+')));
+
+        let single = resolve_pins("forge.example", 8080, vec!["8.8.4.4".parse().unwrap()]);
+        assert_eq!(single, vec!["forge.example:8080:8.8.4.4".to_string()]);
+    }
+
+    #[test]
     fn every_resolved_address_must_be_public() {
         let policy = EgressPolicy;
         let public_v4: IpAddr = "8.8.8.8".parse().unwrap();
@@ -753,7 +806,11 @@ esac
     fn fetch_command_pins_dns_and_only_updates_branches_and_tags() {
         let upstream = PinnedUpstream {
             url: "https://github.example/org/repo.git".to_string(),
-            curlopt_resolve: Some("+github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string()),
+            curlopt_resolve: vec![
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string(),
+                "github.example:443:8.8.8.8".to_string(),
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]".to_string(),
+            ],
         };
         let command = fetch_command(&upstream);
         let has_config = |key: &str, value: &str| {
@@ -761,16 +818,30 @@ esac
                 .config
                 .contains(&(key.to_string(), value.to_string()))
         };
+        let pins_for = |key: &str| -> Vec<&str> {
+            command
+                .config
+                .iter()
+                .filter(|(config_key, value)| config_key == key && !value.is_empty())
+                .map(|(_, value)| value.as_str())
+                .collect()
+        };
         assert!(has_config("http.followRedirects", "false"));
         assert!(has_config("http.proxy", ""));
         assert!(has_config("http.extraHeader", ""));
         assert!(has_config("http.cookieFile", ""));
         assert!(has_config("http.saveCookies", "false"));
         assert!(has_config("http.sslVerify", "true"));
-        assert!(has_config(
-            "http.curloptResolve",
-            "+github.example:443:8.8.8.8,[2606:4700:4700::1111]"
-        ));
+        // The full list is first and last so both duplicate-entry generations
+        // keep it; pre-7.59 libcurl rejects those and keeps the single pin.
+        assert_eq!(
+            pins_for("http.curloptResolve"),
+            vec![
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]",
+                "github.example:443:8.8.8.8",
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]",
+            ]
+        );
         assert!(has_config(
             "http.https://github.example/org/repo.git.followRedirects",
             "false"
@@ -783,10 +854,19 @@ esac
             "http.https://github.example/org/repo.git.extraHeader",
             ""
         ));
-        assert!(has_config(
-            "http.https://github.example/org/repo.git.curloptResolve",
-            "+github.example:443:8.8.8.8,[2606:4700:4700::1111]"
-        ));
+        assert_eq!(
+            pins_for("http.https://github.example/org/repo.git.curloptResolve"),
+            vec![
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]",
+                "github.example:443:8.8.8.8",
+                "github.example:443:8.8.8.8,[2606:4700:4700::1111]",
+            ]
+        );
+        assert!(command
+            .config
+            .iter()
+            .filter(|(key, value)| key.ends_with("curloptResolve") && !value.is_empty())
+            .all(|(_, value)| !value.starts_with('+')));
         assert!(has_config(
             "credential.https://github.example/org/repo.git.helper",
             ""
@@ -922,7 +1002,7 @@ esac
         });
         let upstream = PinnedUpstream {
             url: format!("https://127.0.0.1:{port}/org/repo=mirror.git"),
-            curlopt_resolve: None,
+            curlopt_resolve: Vec::new(),
         };
         let error = run_fetch(
             "git",
@@ -948,7 +1028,7 @@ esac
             .resolve(reqwest::Url::parse("https://8.8.8.8/org/repo.git").unwrap())
             .await
             .unwrap();
-        assert_eq!(allowed.curlopt_resolve, None);
+        assert!(allowed.curlopt_resolve.is_empty());
 
         for denied in [
             "127.0.0.1",
