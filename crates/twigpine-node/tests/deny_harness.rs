@@ -1448,6 +1448,28 @@ mod completeness {
             "get_model_reconstruction",
             NotDrivenReason::ExternalDependencyUnavailable,
         ),
+        // The HF-compatible read surface (U9/U10): every handler read-gates
+        // the repo and fails closed on publicity before any release lookup,
+        // so the hostile anon/stranger 404 on the private repo is exactly
+        // what a caller sees. Their 2xx twins need a published release — a
+        // signed manifest commit in the repo's real git dir plus, for
+        // hf_resolve, real block-store content — substrate the fixture
+        // cannot seed through the public API.
+        (
+            "hf_model_info",
+            NotDrivenReason::ExternalDependencyUnavailable,
+        ),
+        (
+            "hf_revision_info",
+            NotDrivenReason::ExternalDependencyUnavailable,
+        ),
+        ("hf_tree", NotDrivenReason::ExternalDependencyUnavailable),
+        (
+            "hf_tree_path",
+            NotDrivenReason::ExternalDependencyUnavailable,
+        ),
+        ("hf_refs", NotDrivenReason::ExternalDependencyUnavailable),
+        ("hf_resolve", NotDrivenReason::ExternalDependencyUnavailable),
     ];
 
     /// Every `.route("<path>", <method>(<handler>)…)` mount in `src`, as

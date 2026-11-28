@@ -73,6 +73,17 @@ pub struct RepoRecord {
     pub machine_id: Option<String>,
 }
 
+impl RepoRecord {
+    /// Whether this row is a peer-mirror row: `upsert_mirror_repo` writes ids in
+    /// the `{owner_short}/{name}` slash form (canonical ids are UUIDs), with
+    /// `is_public = true` and no visibility rules. A mirror row's empty ruleset
+    /// means "rules were never synced", not "nothing is withheld", so
+    /// replication paths must treat it as undetermined rather than announceable.
+    pub fn is_mirror_row(&self) -> bool {
+        self.id.contains('/')
+    }
+}
+
 /// Which side is authoritative for a continuously mirrored repository.
 ///
 /// A repository without an `upstream_url` has no mirror status. Transitioning

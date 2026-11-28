@@ -33,6 +33,16 @@ name = "models_api"
 path = "tests/models_api.rs"
 required-features = ["test-harness"]
 
+[[test]]
+name = "hf_api"
+path = "tests/hf_api.rs"
+required-features = ["test-harness"]
+
+[[test]]
+name = "model_hosting_e2e"
+path = "tests/model_hosting_e2e.rs"
+required-features = ["test-harness"]
+
 [dependencies]
 twigpine-core = { path = "../twigpine-core" }
 async-trait = "0.1"
@@ -119,3 +129,6 @@ tokio = { workspace = true, features = ["test-util"] }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "macros", "migrate"] }
 reqwest = { workspace = true }
 hex = "0.4"
+# The model-hosting e2e drives `twigpine_cli::model::fetch_model` in-process
+# after the node stops serving.
+twigpine-cli = { path = "../twigpine-cli" }

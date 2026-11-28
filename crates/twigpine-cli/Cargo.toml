@@ -42,6 +42,8 @@ alloy = { version = "1", default-features = false, features = [
 ] }
 
 ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 mockito = "1"

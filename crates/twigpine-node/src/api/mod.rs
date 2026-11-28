@@ -10,6 +10,7 @@ pub mod certs;
 pub mod changelog;
 pub mod encrypted;
 pub mod events;
+pub mod hf;
 pub mod ipfs;
 pub mod issues;
 pub mod labels;
@@ -1207,6 +1208,7 @@ mod tests { async fn t() { let _ = did_matches(x, y); } }
             (include_str!("changelog.rs"), "changelog.rs"),
             (include_str!("encrypted.rs"), "encrypted.rs"),
             (include_str!("events.rs"), "events.rs"),
+            (include_str!("hf.rs"), "hf.rs"),
             (include_str!("issues.rs"), "issues.rs"),
             (include_str!("labels.rs"), "labels.rs"),
             (include_str!("models.rs"), "models.rs"),

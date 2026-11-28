@@ -286,12 +286,16 @@ short lifetimes reissued often are safer than one long-lived grant.
 
 ---
 
-## Model hosting (experimental)
+## Model hosting
 
-Off by default: keep it off unless you intend to serve models, since it adds
-storage, quota, and a background sweep to the node. When it is on, a model is
-a public repo whose releases are signed manifests, and weights are stored as
-content-addressed blocks outside git.
+A node can host open-weight models: a model is a fully public repo whose
+releases are signed manifests, with weights stored as content-addressed
+blocks outside git. Off by default. Enabling it also mounts an
+HF-compatible read surface and, once a release's durability jobs pin and
+anchor it, independent consumer fetch from Arweave and IPFS with no node in
+the loop. The full operator and consumer guide, including the warm
+tier/Irys configuration off-node fetch needs, is
+[docs/MODEL-HOSTING.md](MODEL-HOSTING.md).
 
 The model routes mount only when hosting is enabled and a block store
 initialized (the filesystem dir above, or the S3 bucket). They are the upload
@@ -313,6 +317,7 @@ bill forever.
 - `TWIGPINE_MODEL_MAX_SESSION_BYTES` - optional cap on one identity's open sessions (defaults to the quota).
 - `TWIGPINE_BLOCKSTORE_DIR` - where blocks live on disk (default `./data/model-blocks`).
 - `TWIGPINE_BLOCKSTORE_S3_BUCKET` - set to store blocks in S3 instead; reuses the same `AWS_*` endpoint and credentials as the Tigris repo backend.
+- `TWIGPINE_IRYS_URL` - Irys endpoint for the Arweave release anchor consumers discover with `twigpine model fetch` (empty disables anchoring; `https://devnet.irys.xyz` for devnet).
 
 ---
 

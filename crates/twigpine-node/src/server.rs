@@ -14,7 +14,7 @@ use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use crate::api::{
-    agents, arweave, bounties, certs, changelog, events, ipfs, issues, labels, models, peers,
+    agents, arweave, bounties, certs, changelog, events, hf, ipfs, issues, labels, models, peers,
     profiles, protect, pulls, register, replicas, repos, resolve, stars, status, tasks, visibility,
     webhooks,
 };
@@ -829,7 +829,38 @@ pub fn build_router(state: AppState) -> Router {
                 auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
                 auth::optional_signature,
             ));
-        signed.merge(claims).merge(blocks).merge(reads)
+        // HF-compatible read surface (KTD8/KTD9): anonymous reads of a fully
+        // public repo, optional signature for owner reads, own per-IP brake
+        // so a prober flood cannot burn the publicity lookups of every other
+        // read surface. HF bearer tokens carry no signature headers and read
+        // as anonymous, never a 401.
+        let hf_limiter = rate_limit::IpRateLimiter {
+            limiter: state.hf_read_rate_limiter.clone(),
+            trust: state.push_limiter_trust,
+        };
+        let hf = Router::new()
+            .route("/hf/api/models/{owner}/{repo}", get(hf::hf_model_info))
+            .route(
+                "/hf/api/models/{owner}/{repo}/revision/{rev}",
+                get(hf::hf_revision_info),
+            )
+            .route("/hf/api/models/{owner}/{repo}/tree/{rev}", get(hf::hf_tree))
+            .route(
+                "/hf/api/models/{owner}/{repo}/tree/{rev}/{*path}",
+                get(hf::hf_tree_path),
+            )
+            .route("/hf/api/models/{owner}/{repo}/refs", get(hf::hf_refs))
+            .route(
+                "/hf/{owner}/{repo}/resolve/{rev}/{*path}",
+                get(hf::hf_resolve),
+            )
+            .layer(middleware::from_fn_with_state(
+                auth::SignatureBodyLimit(SIGNED_BODY_LIMIT),
+                auth::optional_signature,
+            ))
+            .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+            .layer(axum::Extension(hf_limiter));
+        signed.merge(claims).merge(blocks).merge(reads).merge(hf)
     } else {
         Router::new()
     };
