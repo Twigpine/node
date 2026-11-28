@@ -252,6 +252,8 @@ mod authz_guard {
             (labels, "add_label", "require_repo_owner("),
             (labels, "remove_label", "authorize_repo_read("),
             (labels, "remove_label", "require_repo_owner("),
+            (repos, "set_homepage", "authorize_repo_read("),
+            (repos, "set_homepage", "require_repo_owner("),
             // Bucket A' — owner OR author (did_matches against the author),
             // also behind the shared read gate first.
             (pulls, "close_pr", "authorize_repo_read("),
@@ -359,6 +361,7 @@ mod authz_guard {
             (webhooks, "delete_webhook", "require_repo_owner("),
             (labels, "add_label", "require_repo_owner("),
             (labels, "remove_label", "require_repo_owner("),
+            (repos, "set_homepage", "require_repo_owner("),
             (pulls, "close_pr", "did_matches("),
             (issues, "close_issue", "did_matches("),
             (protect, "protect_branch", "did_matches("),

@@ -1098,13 +1098,7 @@ fn ref_is_genuinely_absent(repo_path: &Path, refname: &str) -> Result<bool> {
 /// Get commit log for a ref (up to `limit` entries).
 pub fn log(repo_path: &Path, refname: &str, limit: usize) -> Result<Vec<CommitInfo>> {
     let output = Command::new("git")
-        .args([
-            "log",
-            "--format=%H%n%an%n%ae%n%at%n%s",
-            "-n",
-            &limit.to_string(),
-            refname,
-        ])
+        .args(["log", LOG_FORMAT, "-n", &limit.to_string(), refname])
         .current_dir(repo_path)
         .output()
         .context("failed to run git log")?;
@@ -1143,7 +1137,13 @@ pub fn log(repo_path: &Path, refname: &str, limit: usize) -> Result<Vec<CommitIn
         anyhow::bail!("git log failed for {refname}: {}", stderr.trim());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_log_output(&output.stdout))
+}
+
+const LOG_FORMAT: &str = "--format=%H%n%an%n%ae%n%at%n%s";
+
+fn parse_log_output(stdout: &[u8]) -> Vec<CommitInfo> {
+    let stdout = String::from_utf8_lossy(stdout);
     let mut commits = Vec::new();
     let mut lines = stdout.lines();
 
@@ -1166,7 +1166,594 @@ pub fn log(repo_path: &Path, refname: &str, limit: usize) -> Result<Vec<CommitIn
         });
     }
 
-    Ok(commits)
+    commits
+}
+
+/// Resolve `name` to the id of the commit it names. `None` is rev-parse's exit 1,
+/// which an absent ref and a ref file holding garbage share; any other failure is
+/// an error.
+fn rev_parse_commit_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    name: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<String>> {
+    let spec = format!("{name}^{{commit}}");
+    let (status, out, err) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &["rev-parse", "--verify", "--quiet", &spec],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    match status.code() {
+        Some(0) => {
+            let id = String::from_utf8_lossy(&out).trim().to_string();
+            if id.len() != 40 && id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                bail!("git rev-parse printed an unexpected object id for {name}");
+            }
+            Ok(Some(id))
+        }
+        Some(1) => Ok(None),
+        _ => bail!(
+            "git rev-parse failed for {name}: {}",
+            String::from_utf8_lossy(&err).trim()
+        ),
+    }
+}
+
+/// Bounded form of [`ref_is_genuinely_absent`], for the head ref only.
+fn head_is_genuinely_absent_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    deadline: std::time::Instant,
+) -> Result<bool> {
+    use crate::git::visibility_pack::run_bounded_git_raw;
+    let (status, out, _) = run_bounded_git_raw(
+        git_bin,
+        &["symbolic-ref", "-q", "HEAD"],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    if !status.success() {
+        return Ok(false);
+    }
+    let target = String::from_utf8_lossy(&out).trim().to_string();
+    if !target.starts_with("refs/") {
+        return Ok(true);
+    }
+    let (status, out, err) = run_bounded_git_raw(
+        git_bin,
+        &["for-each-ref", "--format=%(refname)", &target],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    if !status.success() {
+        bail!(
+            "git for-each-ref failed for {target}: {}",
+            String::from_utf8_lossy(&err).trim()
+        );
+    }
+    // for-each-ref matches `target` as a pattern, so it also lists refs below
+    // `target/`. Only a line equal to `target` proves the ref itself exists.
+    let exact = String::from_utf8_lossy(&out)
+        .lines()
+        .any(|l| l.trim() == target);
+    Ok(!exact && err.iter().all(u8::is_ascii_whitespace))
+}
+
+/// Resolve the served head to one commit id, every git child bounded by `deadline`.
+///
+/// Decision order is [`resolve_head`]'s: HEAD, then `refs/heads/<preferred_branch>`,
+/// then the branch scan (main, master, develop, else the first branch). `None`
+/// means the head ref is genuinely absent (an unborn branch); a head that is
+/// present but unreadable is an error, as in [`log`] (#400). Both later steps of a
+/// paged read use the returned id, so a push between them cannot shift the page.
+pub fn resolve_head_id_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    preferred_branch: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<String>> {
+    if let Some(id) = rev_parse_commit_bounded(git_bin, repo_path, "HEAD", deadline)? {
+        return Ok(Some(id));
+    }
+    if !head_is_genuinely_absent_bounded(git_bin, repo_path, deadline)? {
+        bail!("git log failed for HEAD: ref is present but unreadable");
+    }
+    let preferred = format!("refs/heads/{preferred_branch}");
+    if let Some(id) = rev_parse_commit_bounded(git_bin, repo_path, &preferred, deadline)? {
+        return Ok(Some(id));
+    }
+    let (status, listed, scan_err) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/",
+        ],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    if !status.success() {
+        bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&scan_err).trim()
+        );
+    }
+    if scan_err.iter().any(|b| !b.is_ascii_whitespace()) {
+        bail!(
+            "git for-each-ref reported an incomplete branch scan: {}",
+            String::from_utf8_lossy(&scan_err).trim()
+        );
+    }
+    let mut branches: Vec<(&[u8], &[u8])> = Vec::new();
+    for line in listed.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(space) = line.iter().position(|b| *b == b' ') else {
+            bail!("git for-each-ref printed a malformed branch row");
+        };
+        let (name, object) = line.split_at(space);
+        let object = &object[1..];
+        if object.len() != 40 && object.len() != 64 || !object.iter().all(|b| b.is_ascii_hexdigit())
+        {
+            bail!(
+                "git for-each-ref printed an unexpected object id for {}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        branches.push((name, object));
+    }
+    let preferred_names: [&[u8]; 3] = [
+        b"refs/heads/main",
+        b"refs/heads/master",
+        b"refs/heads/develop",
+    ];
+    let chosen = preferred_names
+        .iter()
+        .find_map(|wanted| branches.iter().find(|branch| branch.0 == *wanted))
+        .or_else(|| branches.first());
+    if let Some(&(name, object)) = chosen {
+        let object = std::str::from_utf8(object).expect("a validated object id is ASCII hex");
+        return match rev_parse_commit_bounded(git_bin, repo_path, object, deadline)? {
+            Some(id) => Ok(Some(id)),
+            None => bail!(
+                "{} is present but does not resolve to a commit",
+                String::from_utf8_lossy(name)
+            ),
+        };
+    }
+    if head_is_genuinely_absent_bounded(git_bin, repo_path, deadline)? {
+        return Ok(None);
+    }
+    bail!("git log failed for HEAD: ref is present but unreadable")
+}
+
+/// Longest line a `rev-list` of object ids can have (a SHA-256 id is 64 hex
+/// digits). Anything longer without a line break is not rev-list output.
+const MAX_REV_LIST_LINE: usize = 128;
+
+/// Line scanner for `rev-list` output: finds the zero-based line equal to a target
+/// id while holding at most one partial line, however long the output is.
+struct PositionScan<'a> {
+    target: &'a [u8],
+    line: usize,
+    partial: Vec<u8>,
+    found: Option<usize>,
+}
+
+impl<'a> PositionScan<'a> {
+    fn new(target: &'a [u8]) -> Self {
+        Self {
+            target,
+            line: 0,
+            partial: Vec::new(),
+            found: None,
+        }
+    }
+
+    /// Feed the next chunk. `Ok(false)` means the target was found and the caller
+    /// can stop reading.
+    fn feed(&mut self, chunk: &[u8]) -> Result<bool> {
+        let mut rest = chunk;
+        while let Some(nl) = rest.iter().position(|b| *b == b'\n') {
+            let (head, tail) = rest.split_at(nl);
+            rest = &tail[1..];
+            if self.partial.len() + head.len() > MAX_REV_LIST_LINE {
+                bail!("git rev-list printed a line longer than an object id");
+            }
+            let matched = if self.partial.is_empty() {
+                head == self.target
+            } else {
+                self.partial.extend_from_slice(head);
+                let m = self.partial == self.target;
+                self.partial.clear();
+                m
+            };
+            if matched {
+                self.found = Some(self.line);
+                return Ok(false);
+            }
+            self.line += 1;
+        }
+        if self.partial.len() + rest.len() > MAX_REV_LIST_LINE {
+            bail!("git rev-list printed a line longer than an object id");
+        }
+        self.partial.extend_from_slice(rest);
+        Ok(true)
+    }
+
+    /// Account for a final line with no trailing line break.
+    fn finish(&mut self) {
+        if self.found.is_none() && !self.partial.is_empty() && self.partial == self.target {
+            self.found = Some(self.line);
+        }
+    }
+
+    fn found(&self) -> Option<usize> {
+        self.found
+    }
+}
+
+/// Zero-based position of `commit_id` in the order of `git rev-list <head_id>`,
+/// which is the order [`log_bounded`] pages in. `None` means the id is not in that
+/// history: an id naming nothing, a non-commit, or a commit the head does not
+/// contain. `commit_id` is compared here against output lines and never passed to
+/// git. The output is read as it arrives and the child is killed as soon as the
+/// id is found, so memory stays at one chunk however long the history is; a
+/// history that never contains the id is read to its end or to `deadline`.
+pub fn commit_position_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    head_id: &str,
+    commit_id: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<usize>> {
+    let mut scan = PositionScan::new(commit_id.as_bytes());
+    let mut scan_error = None;
+    let (status, err, _stopped) = crate::git::visibility_pack::run_bounded_git_streaming(
+        git_bin,
+        &["rev-list", head_id],
+        repo_path,
+        b"",
+        deadline,
+        &mut |chunk| match scan.feed(chunk) {
+            Ok(keep_reading) => keep_reading,
+            Err(e) => {
+                scan_error = Some(e);
+                false
+            }
+        },
+    )?;
+    if let Some(e) = scan_error {
+        return Err(e);
+    }
+    if scan.found().is_some() {
+        return Ok(scan.found());
+    }
+    if !status.success() {
+        bail!(
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&err).trim()
+        );
+    }
+    scan.finish();
+    Ok(scan.found())
+}
+
+/// One page of commits reachable from `head_id`: skip `skip`, then take `limit`.
+/// `head_id` is an id from [`resolve_head_id_bounded`], so a failing `git log` is a
+/// read failure and never an empty page; the absent-ref case was settled there.
+pub fn log_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    head_id: &str,
+    skip: usize,
+    limit: usize,
+    deadline: std::time::Instant,
+) -> Result<Vec<CommitInfo>> {
+    let (status, out, err) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &[
+            "log",
+            "--no-show-signature",
+            LOG_FORMAT,
+            &format!("--skip={skip}"),
+            "-n",
+            &limit.to_string(),
+            head_id,
+        ],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    if !status.success() {
+        bail!(
+            "git log failed for {head_id}: {}",
+            String::from_utf8_lossy(&err).trim()
+        );
+    }
+    Ok(parse_log_output(&out))
+}
+
+/// One row of a tag listing. `target` and `target_type` are what the tag points
+/// at: for an annotated tag, the object the tag object names (one level, read
+/// from the tag object's own header, so a tag of a tag reports the inner tag
+/// object with type `tag`), not the tag object itself.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagInfo {
+    pub name: String,
+    pub target: String,
+    pub target_type: String,
+    pub annotated: bool,
+}
+
+/// Streaming parser for `cat-file --batch` output over tag objects. Each record
+/// is `"<oid> <type> <size>\n"` followed by `size` content bytes and a newline.
+/// Only the leading content bytes are kept (enough for the tag's `object` and
+/// `type` header lines), so an oversized tag message crosses the pipe without
+/// being retained.
+struct TagTargetsScan {
+    line: Vec<u8>,
+    content_left: usize,
+    capture: Vec<u8>,
+    after_content: bool,
+    targets: Vec<(String, String)>,
+}
+
+/// Bytes of an object's content the scan retains. A valid tag object's `object`
+/// and `type` lines sit in its first two lines, far under this.
+const TAG_HEADER_CAPTURE: usize = 512;
+
+impl TagTargetsScan {
+    fn new() -> Self {
+        Self {
+            line: Vec::new(),
+            content_left: 0,
+            capture: Vec::new(),
+            after_content: false,
+            targets: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Result<bool> {
+        let mut i = 0;
+        while i < chunk.len() {
+            if self.after_content {
+                if chunk[i] != b'\n' {
+                    bail!("cat-file --batch record missing its trailing newline");
+                }
+                self.after_content = false;
+                i += 1;
+                continue;
+            }
+            if self.content_left > 0 {
+                let take = self.content_left.min(chunk.len() - i);
+                let room = TAG_HEADER_CAPTURE.saturating_sub(self.capture.len());
+                self.capture
+                    .extend_from_slice(&chunk[i..i + take.min(room)]);
+                self.content_left -= take;
+                i += take;
+                if self.content_left == 0 {
+                    self.after_content = true;
+                    self.targets.push(parse_tag_header(&self.capture)?);
+                }
+                continue;
+            }
+            match chunk[i..].iter().position(|b| *b == b'\n') {
+                Some(j) => {
+                    self.line.extend_from_slice(&chunk[i..i + j]);
+                    i += j + 1;
+                    let line = std::mem::take(&mut self.line);
+                    self.content_left = parse_batch_header(&line)?;
+                    self.capture.clear();
+                }
+                None => {
+                    self.line.extend_from_slice(&chunk[i..]);
+                    i = chunk.len();
+                    if self.line.len() > 256 {
+                        bail!("cat-file --batch printed an oversized record header");
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// The stream must end at a record boundary: mid-line or mid-content is a
+    /// truncated answer, not a partial listing.
+    fn finish(self) -> Result<Vec<(String, String)>> {
+        if self.after_content || self.content_left > 0 || !self.line.is_empty() {
+            bail!("cat-file --batch output ended mid-record");
+        }
+        Ok(self.targets)
+    }
+}
+
+/// The `"<oid> <type> <size>"` line opening a `cat-file --batch` record; the
+/// `"<oid> missing"` form is an error, matching the missing-object rule.
+fn parse_batch_header(line: &[u8]) -> Result<usize> {
+    if line.ends_with(b" missing") {
+        bail!(
+            "cat-file --batch reported a missing object: {}",
+            String::from_utf8_lossy(line)
+        );
+    }
+    let size = line
+        .rsplit(|b| *b == b' ')
+        .next()
+        .and_then(|s| std::str::from_utf8(s).ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .context("cat-file --batch printed a malformed record header")?;
+    Ok(size)
+}
+
+/// The first two lines of a tag object are always `object <oid>` and `type
+/// <kind>`; that pair is the one-level target.
+fn parse_tag_header(bytes: &[u8]) -> Result<(String, String)> {
+    let mut lines = bytes.split(|b| *b == b'\n');
+    let object = lines
+        .next()
+        .filter(|l| l.starts_with(b"object "))
+        .map(|l| &l[b"object ".len()..]);
+    let kind = lines
+        .next()
+        .filter(|l| l.starts_with(b"type "))
+        .map(|l| &l[b"type ".len()..]);
+    let (Some(object), Some(kind)) = (object, kind) else {
+        bail!("cat-file --batch printed a malformed tag object");
+    };
+    let object = std::str::from_utf8(object).context("tag header object is not utf-8")?;
+    let kind = std::str::from_utf8(kind).context("tag header type is not utf-8")?;
+    if !matches!(object.len(), 40 | 64) || !object.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("tag header object is not an object id");
+    }
+    if kind.is_empty() || !kind.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        bail!("tag header type is malformed");
+    }
+    Ok((object.to_string(), kind.to_string()))
+}
+
+/// List up to `max` tags, newest version first by tag name, and whether more
+/// exist. The bounded `for-each-ref` child is asked for `max + 1` rows so the
+/// extra one only sets the flag. `version:refname` sorts on names alone, so the
+/// cost does not grow with tag-object reads. Tags on trees and blobs are listed
+/// with their type and never dereferenced. A name that is not UTF-8 cannot be
+/// carried in JSON and is left out. A ref whose object is missing makes git
+/// fail, which is an error here rather than a listing without that tag.
+///
+/// `%(*objectname)`/`%(*objecttype)` are not used: their peel depth changed
+/// with the git version (2.43 stops one level, 2.56 peels to the first non-tag),
+/// while the contract is exactly one level. Instead a row whose object type is
+/// `tag` is resolved by one `cat-file --batch` child (all such oids fed on its
+/// stdin) and the tag object's own `object`/`type` header lines are the target.
+pub fn list_tags_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    max: usize,
+    deadline: std::time::Instant,
+) -> Result<(Vec<TagInfo>, bool)> {
+    let (status, out, scan_err) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &[
+            "for-each-ref",
+            "--sort=-version:refname",
+            &format!("--count={}", max + 1),
+            "--format=%(refname:strip=2)%00%(objectname)%00%(objecttype)",
+            "refs/tags",
+        ],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    if !status.success() {
+        bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&scan_err).trim()
+        );
+    }
+    // git skips a broken tag ref with only a warning and still exits 0.
+    if scan_err.iter().any(|b| !b.is_ascii_whitespace()) {
+        bail!(
+            "git for-each-ref reported an incomplete tag scan: {}",
+            String::from_utf8_lossy(&scan_err).trim()
+        );
+    }
+    let mut records: Vec<&[u8]> = out
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
+    let truncated = records.len() > max;
+    records.truncate(max);
+    let mut rows = Vec::with_capacity(records.len());
+    for record in records {
+        let fields: Vec<&[u8]> = record.split(|b| *b == 0).collect();
+        let [name, object, object_type] = fields[..] else {
+            bail!("git for-each-ref printed an unexpected tag record");
+        };
+        rows.push((name, object, object_type));
+    }
+
+    // One-level targets for the annotated rows, filled by the batch child below.
+    let mut targets: Vec<Option<(String, String)>> = Vec::with_capacity(rows.len());
+    let mut tag_oids: Vec<String> = Vec::new();
+    for (_, object, object_type) in &rows {
+        if *object_type == b"tag" {
+            let oid = std::str::from_utf8(object)
+                .context("git for-each-ref printed a non-utf-8 object id")?;
+            tag_oids.push(oid.to_string());
+            targets.push(None);
+        } else {
+            targets.push(Some((
+                String::from_utf8_lossy(object).into_owned(),
+                String::from_utf8_lossy(object_type).into_owned(),
+            )));
+        }
+    }
+
+    if !tag_oids.is_empty() {
+        let mut scan = TagTargetsScan::new();
+        let mut scan_error = None;
+        let mut stdin = tag_oids.join("\n");
+        stdin.push('\n');
+        let (status, err, _stopped) = crate::git::visibility_pack::run_bounded_git_streaming(
+            git_bin,
+            &["cat-file", "--batch"],
+            repo_path,
+            stdin.as_bytes(),
+            deadline,
+            &mut |chunk| match scan.feed(chunk) {
+                Ok(keep_reading) => keep_reading,
+                Err(e) => {
+                    scan_error = Some(e);
+                    false
+                }
+            },
+        )?;
+        if let Some(e) = scan_error {
+            return Err(e);
+        }
+        if !status.success() {
+            bail!(
+                "git cat-file failed: {}",
+                String::from_utf8_lossy(&err).trim()
+            );
+        }
+        let resolved = scan.finish()?;
+        if resolved.len() != tag_oids.len() {
+            bail!(
+                "git cat-file answered {} of {} tag objects",
+                resolved.len(),
+                tag_oids.len()
+            );
+        }
+        let mut resolved = resolved.into_iter();
+        for slot in &mut targets {
+            if slot.is_none() {
+                *slot = Some(resolved.next().expect("counted above"));
+            }
+        }
+    }
+
+    let mut tags = Vec::with_capacity(rows.len());
+    for ((name, _, object_type), target) in rows.into_iter().zip(targets) {
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        let (target, target_type) = target.expect("every row has a target");
+        tags.push(TagInfo {
+            name: name.to_string(),
+            target,
+            target_type,
+            annotated: object_type == b"tag",
+        });
+    }
+    Ok((tags, truncated))
 }
 
 /// List files in a tree at the given ref and path.
@@ -4029,6 +4616,560 @@ mod tests {
         );
     }
 
+    // ---- bounded head resolution, position lookup, and paged log ----
+
+    fn far_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    /// Run real git in `dir` with fixed identity and a fixed commit date, and
+    /// return trimmed stdout. The developer's git config and default hash are
+    /// shut out so a global setting (commit signing, sha256) cannot change the
+    /// fixture.
+    fn git_at(dir: &Path, args: &[&str], date: i64) -> String {
+        let when = format!("{date} +0000");
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DEFAULT_HASH")
+            .env("GIT_AUTHOR_NAME", "Test Author")
+            .env("GIT_AUTHOR_EMAIL", "author@example.com")
+            .env("GIT_COMMITTER_NAME", "Test Committer")
+            .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+            .env("GIT_AUTHOR_DATE", &when)
+            .env("GIT_COMMITTER_DATE", &when)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Empty commit with `subject` at time `t`; returns its id.
+    fn commit_at(dir: &Path, subject: &str, t: i64) -> String {
+        git_at(dir, &["commit", "--allow-empty", "-q", "-m", subject], t);
+        git_at(dir, &["rev-parse", "HEAD"], t)
+    }
+
+    const T0: i64 = 1_700_000_000;
+
+    /// A working repo with `main` holding c1..c5 (c5 newest). Returns the
+    /// tempdir, the repo's git dir (laid out like a bare repo for the
+    /// functions under test), and the ids c1..c5 in that order.
+    fn linear_repo() -> (tempfile::TempDir, std::path::PathBuf, Vec<String>) {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let ids = (1..=5)
+            .map(|i| commit_at(&work, &format!("c{i}"), T0 + i * 100))
+            .collect();
+        let git_dir = work.join(".git");
+        (td, git_dir, ids)
+    }
+
+    fn hashes(commits: Vec<super::CommitInfo>) -> Vec<String> {
+        commits.into_iter().map(|c| c.hash).collect()
+    }
+
+    #[test]
+    fn bounded_log_pages_a_linear_history_by_position() {
+        let (_td, git_dir, ids) = linear_repo();
+        let head = super::resolve_head_id_bounded("git", &git_dir, "main", far_deadline())
+            .unwrap()
+            .expect("a populated repo has a head");
+        assert_eq!(head, ids[4], "head is the newest commit");
+
+        let page = |skip: usize, limit: usize| {
+            hashes(super::log_bounded("git", &git_dir, &head, skip, limit, far_deadline()).unwrap())
+        };
+        let pos = |id: &str| {
+            super::commit_position_bounded("git", &git_dir, &head, id, far_deadline()).unwrap()
+        };
+
+        assert_eq!(page(0, 2), vec![ids[4].clone(), ids[3].clone()]);
+        assert_eq!(pos(&ids[3]), Some(1));
+        assert_eq!(page(2, 2), vec![ids[2].clone(), ids[1].clone()]);
+        assert_eq!(pos(&ids[1]), Some(3));
+        assert_eq!(page(4, 2), vec![ids[0].clone()]);
+        assert_eq!(pos(&ids[0]), Some(4));
+        assert_eq!(page(5, 2), Vec::<String>::new());
+        assert_eq!(pos(&ids[4]), Some(0));
+
+        // The row format is the one `log` serves.
+        let first = super::log_bounded("git", &git_dir, &head, 0, 1, far_deadline()).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].subject, "c5");
+        assert_eq!(first[0].author_name, "Test Author");
+        assert_eq!(first[0].author_email, "author@example.com");
+        assert_eq!(first[0].timestamp, T0 + 500);
+    }
+
+    #[test]
+    fn bounded_log_matches_the_unbounded_log_rows() {
+        let (_td, git_dir, ids) = linear_repo();
+        let head = super::resolve_head_id_bounded("git", &git_dir, "main", far_deadline())
+            .unwrap()
+            .unwrap();
+        let bounded = super::log_bounded("git", &git_dir, &head, 0, 3, far_deadline()).unwrap();
+        let unbounded = super::log(&git_dir, "HEAD", 3).unwrap();
+        assert_eq!(hashes(bounded.clone()), hashes(unbounded.clone()));
+        assert_eq!(
+            hashes(bounded),
+            vec![ids[4].clone(), ids[3].clone(), ids[2].clone()]
+        );
+        for (b, u) in super::log_bounded("git", &git_dir, &head, 0, 3, far_deadline())
+            .unwrap()
+            .iter()
+            .zip(unbounded.iter())
+        {
+            assert_eq!(
+                (&b.author_name, &b.author_email, b.timestamp, &b.subject),
+                (&u.author_name, &u.author_email, u.timestamp, &u.subject)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_log_passes_no_show_signature() {
+        let td = tempfile::TempDir::new().unwrap();
+        let fake = td.path().join("loggit");
+        write_fake_git(
+            &fake,
+            "#!/bin/sh\n\
+             found=0\n\
+             for arg in \"$@\"; do\n\
+             \x20 if [ \"$arg\" = \"--no-show-signature\" ]; then found=1; fi\n\
+             done\n\
+             if [ \"$found\" != 1 ]; then echo missing-no-show-signature >&2; exit 1; fi\n\
+             printf '%s\\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'Test Author' 'author@example.com' '1700000100' 'signed row'\n",
+        );
+
+        let rows = super::log_bounded(
+            fake.to_str().unwrap(),
+            td.path(),
+            "head",
+            0,
+            1,
+            far_deadline(),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, "a".repeat(40));
+        assert_eq!(rows[0].subject, "signed row");
+        assert_eq!(rows[0].timestamp, T0 + 100);
+    }
+
+    /// base, then A1/A2 on branch `a` and B1/B2 on `main`, then merge M of `a`
+    /// into `main`. Committer dates make the history order exactly
+    /// M, B2, A2, B1, A1, base. Returns [M, B2, A2, B1, A1, base] ids.
+    fn merge_repo() -> (tempfile::TempDir, std::path::PathBuf, Vec<String>) {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let base = commit_at(&work, "base", T0 + 100);
+        git_at(&work, &["checkout", "-q", "-b", "a"], T0 + 110);
+        let a1 = commit_at(&work, "A1", T0 + 200);
+        git_at(&work, &["checkout", "-q", "main"], T0 + 210);
+        let b1 = commit_at(&work, "B1", T0 + 300);
+        git_at(&work, &["checkout", "-q", "a"], T0 + 310);
+        let a2 = commit_at(&work, "A2", T0 + 400);
+        git_at(&work, &["checkout", "-q", "main"], T0 + 410);
+        let b2 = commit_at(&work, "B2", T0 + 500);
+        git_at(&work, &["merge", "--no-ff", "-q", "-m", "M", "a"], T0 + 600);
+        let m = git_at(&work, &["rev-parse", "HEAD"], T0 + 600);
+        let git_dir = work.join(".git");
+        (td, git_dir, vec![m, b2, a2, b1, a1, base])
+    }
+
+    #[test]
+    fn bounded_log_pages_a_merge_history_exactly_once_each() {
+        let (_td, git_dir, order) = merge_repo();
+        let head = super::resolve_head_id_bounded("git", &git_dir, "main", far_deadline())
+            .unwrap()
+            .unwrap();
+        assert_eq!(head, order[0]);
+
+        // The positions are the documented order, not derived from the code.
+        for (i, id) in order.iter().enumerate() {
+            assert_eq!(
+                super::commit_position_bounded("git", &git_dir, &head, id, far_deadline()).unwrap(),
+                Some(i),
+                "position of {id}"
+            );
+        }
+
+        // Page by the last row's id, as a client would.
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        let mut skip = 0usize;
+        loop {
+            let page = hashes(
+                super::log_bounded("git", &git_dir, &head, skip, 2, far_deadline()).unwrap(),
+            );
+            if page.is_empty() {
+                seen.push(page);
+                break;
+            }
+            let last = page.last().unwrap().clone();
+            seen.push(page);
+            skip = super::commit_position_bounded("git", &git_dir, &head, &last, far_deadline())
+                .unwrap()
+                .unwrap()
+                + 1;
+        }
+        assert_eq!(
+            seen,
+            vec![
+                vec![order[0].clone(), order[1].clone()],
+                vec![order[2].clone(), order[3].clone()],
+                vec![order[4].clone(), order[5].clone()],
+                vec![],
+            ]
+        );
+    }
+
+    #[test]
+    fn commit_position_is_not_found_for_commits_outside_the_head_history() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        commit_at(&work, "m1", T0 + 100);
+        // A commit only on a branch that is then deleted: it stays in the object store.
+        git_at(&work, &["checkout", "-q", "-b", "gone"], T0 + 150);
+        let deleted = commit_at(&work, "gone1", T0 + 200);
+        // A commit on another live branch that main does not contain.
+        git_at(&work, &["checkout", "-q", "main"], T0 + 250);
+        git_at(&work, &["checkout", "-q", "-b", "other"], T0 + 260);
+        let other = commit_at(&work, "other1", T0 + 300);
+        git_at(&work, &["checkout", "-q", "main"], T0 + 350);
+        let m2 = commit_at(&work, "m2", T0 + 400);
+        git_at(&work, &["branch", "-D", "gone"], T0 + 450);
+        let tree = git_at(&work, &["rev-parse", "HEAD^{tree}"], T0);
+        let git_dir = work.join(".git");
+
+        // The ids really are in the store, so "not found" is about history, not absence.
+        assert_eq!(git_at(&work, &["cat-file", "-t", &deleted], T0), "commit");
+        assert_eq!(git_at(&work, &["cat-file", "-t", &other], T0), "commit");
+        assert_eq!(git_at(&work, &["cat-file", "-t", &tree], T0), "tree");
+
+        let head = super::resolve_head_id_bounded("git", &git_dir, "main", far_deadline())
+            .unwrap()
+            .unwrap();
+        assert_eq!(head, m2);
+        for (label, id) in [
+            ("deleted branch", deleted.as_str()),
+            ("other live branch", other.as_str()),
+            ("tree id", tree.as_str()),
+            ("well-formed id naming nothing", &"a".repeat(40)),
+        ] {
+            assert_eq!(
+                super::commit_position_bounded("git", &git_dir, &head, id, far_deadline()).unwrap(),
+                None,
+                "{label} must read as not found"
+            );
+        }
+        // Control: a commit in the history is found.
+        assert!(
+            super::commit_position_bounded("git", &git_dir, &head, &m2, far_deadline())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn resolve_head_id_follows_head_then_preferred_then_the_branch_scan() {
+        // HEAD resolves: it wins over the preferred branch.
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let main_id = commit_at(&work, "m", T0 + 100);
+        git_at(&work, &["checkout", "-q", "-b", "side"], T0 + 150);
+        let side_id = commit_at(&work, "s", T0 + 200);
+        git_at(&work, &["checkout", "-q", "main"], T0 + 250);
+        let git_dir = work.join(".git");
+        let resolve = |preferred: &str| {
+            super::resolve_head_id_bounded("git", &git_dir, preferred, far_deadline()).unwrap()
+        };
+        assert_eq!(resolve("side"), Some(main_id.clone()));
+
+        // HEAD unborn: the preferred branch is used when it exists.
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/unborn\n").unwrap();
+        assert_eq!(resolve("side"), Some(side_id.clone()));
+        // Preferred missing: the scan prefers main over other names.
+        assert_eq!(resolve("nope"), Some(main_id.clone()));
+        // No main/master/develop: the first branch alphabetically.
+        git_at(&work, &["branch", "-m", "main", "zeta"], T0 + 300);
+        git_at(&work, &["branch", "-m", "side", "alpha"], T0 + 310);
+        assert_eq!(resolve("nope"), Some(side_id));
+        let _ = main_id;
+    }
+
+    #[test]
+    fn resolve_head_id_head_ref_present_but_commit_missing_is_an_error() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let main_id = commit_at(&work, "m", T0 + 100);
+        git_at(&work, &["checkout", "-q", "-b", "side"], T0 + 150);
+        let side_id = commit_at(&work, "s", T0 + 200);
+        git_at(&work, &["checkout", "-q", "main"], T0 + 250);
+        let git_dir = work.join(".git");
+
+        // main's ref still names the commit, but the object is gone: HEAD is
+        // present yet unreadable, which is an error (#400), not a fallback to
+        // the preferred branch's history.
+        let (dir, file) = main_id.split_at(2);
+        std::fs::remove_file(git_dir.join("objects").join(dir).join(file)).unwrap();
+
+        let out = super::resolve_head_id_bounded("git", &git_dir, "side", far_deadline());
+        assert!(
+            out.is_err(),
+            "a present-but-unreadable HEAD must not serve another branch: {out:?}"
+        );
+        let _ = side_id;
+    }
+
+    #[test]
+    fn resolve_head_id_unborn_head_with_an_absent_ref_is_none() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let git_dir = work.join(".git");
+        assert_eq!(
+            super::resolve_head_id_bounded("git", &git_dir, "main", far_deadline()).unwrap(),
+            None,
+            "an unborn HEAD is an empty history, not an error"
+        );
+    }
+
+    #[test]
+    fn resolve_head_id_ref_file_holding_garbage_is_an_error_not_empty() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        commit_at(&work, "c1", T0 + 100);
+        let git_dir = work.join(".git");
+        std::fs::write(git_dir.join("refs/heads/main"), b"garbage\n").unwrap();
+        let out = super::resolve_head_id_bounded("git", &git_dir, "main", far_deadline());
+        assert!(
+            out.is_err(),
+            "a damaged branch ref must not read as an empty history: {out:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_head_id_branch_scan_with_a_broken_ref_errors_not_empty() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        commit_at(&work, "c1", T0 + 100);
+        let git_dir = work.join(".git");
+
+        // HEAD is unborn, so resolution reaches the refs/heads scan. The scan
+        // omits the broken main ref and reports it only on stderr.
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/unborn\n").unwrap();
+        std::fs::write(git_dir.join("refs/heads/main"), b"garbage\n").unwrap();
+
+        let err = super::resolve_head_id_bounded("git", &git_dir, "missing", far_deadline())
+            .expect_err("a scan diagnostic must not read as an empty repository");
+        assert!(
+            format!("{err:#}").contains("incomplete branch scan"),
+            "got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_head_id_branch_scan_preserves_a_non_utf8_branch_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let commit = commit_at(&work, "c1", T0 + 100);
+        let git_dir = work.join(".git");
+
+        // Keep the only branch under a non-UTF-8 file name and make HEAD
+        // unborn, forcing the branch scan to select it by its raw bytes.
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/unborn\n").unwrap();
+        let raw_ref = git_dir
+            .join("refs/heads")
+            .join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+        std::fs::write(&raw_ref, format!("{commit}\n")).unwrap();
+        git_at(&work, &["update-ref", "-d", "refs/heads/main"], T0 + 110);
+
+        assert_eq!(
+            super::resolve_head_id_bounded("git", &git_dir, "missing", far_deadline()).unwrap(),
+            Some(commit),
+            "the scan must resolve the object id from the raw listing row"
+        );
+    }
+
+    #[test]
+    fn resolve_head_id_on_a_non_repo_is_an_error_not_empty() {
+        let td = tempfile::TempDir::new().unwrap();
+        let not_a_repo = td.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        let out = super::resolve_head_id_bounded("git", &not_a_repo, "main", far_deadline());
+        assert!(
+            out.is_err(),
+            "a failed probe must not read as empty: {out:?}"
+        );
+    }
+
+    #[test]
+    fn log_bounded_failure_is_an_error_not_an_empty_page() {
+        let (_td, git_dir, _ids) = linear_repo();
+        let missing = "b".repeat(40);
+        let out = super::log_bounded("git", &git_dir, &missing, 0, 5, far_deadline());
+        assert!(out.is_err(), "an unreadable head is an error: {out:?}");
+        let out =
+            super::commit_position_bounded("git", &git_dir, &missing, &missing, far_deadline());
+        assert!(out.is_err(), "a failed rev-list is an error: {out:?}");
+    }
+
+    /// Fake git that sleeps on `slow` and hands every other subcommand to real git.
+    #[cfg(unix)]
+    fn slow_on(dir: &Path, slow: &str) -> String {
+        let p = dir.join("slowgit");
+        write_fake_git(
+            &p,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  {slow}) sleep 30 ;;\n  *) exec git \"$@\" ;;\nesac\n"
+            ),
+        );
+        p.to_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    fn is_service_timeout(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<crate::git::smart_http::GitServiceTimeout>()
+            .is_some()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn head_resolution_times_out_when_rev_parse_hangs() {
+        let (td, git_dir, _ids) = linear_repo();
+        let fake = slow_on(td.path(), "rev-parse");
+        let started = std::time::Instant::now();
+        let err = super::resolve_head_id_bounded(
+            &fake,
+            &git_dir,
+            "main",
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .expect_err("a hung rev-parse must time out");
+        assert!(is_service_timeout(&err), "got: {err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn position_scan_times_out_when_rev_list_hangs() {
+        let (td, git_dir, ids) = linear_repo();
+        let fake = slow_on(td.path(), "rev-list");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let head = super::resolve_head_id_bounded(&fake, &git_dir, "main", deadline)
+            .unwrap()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = super::commit_position_bounded(&fake, &git_dir, &head, &ids[0], deadline)
+            .expect_err("a hung rev-list must time out");
+        assert!(is_service_timeout(&err), "got: {err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_page_times_out_when_log_hangs() {
+        let (td, git_dir, _ids) = linear_repo();
+        let fake = slow_on(td.path(), "log");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let head = super::resolve_head_id_bounded(&fake, &git_dir, "main", deadline)
+            .unwrap()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = super::log_bounded(&fake, &git_dir, &head, 0, 5, deadline)
+            .expect_err("a hung log must time out");
+        assert!(is_service_timeout(&err), "got: {err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// A rev-list that prints the target on its second line and then never stops:
+    /// the scan must return as soon as it sees the target, not read to the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn position_scan_stops_reading_once_the_commit_is_found() {
+        let td = tempfile::TempDir::new().unwrap();
+        let fake = td.path().join("endless");
+        write_fake_git(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo aaaa; echo bbbb; exec yes cccc ;;\nesac\n",
+        );
+        let started = std::time::Instant::now();
+        let found = super::commit_position_bounded(
+            fake.to_str().unwrap(),
+            td.path(),
+            "head",
+            "bbbb",
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+        )
+        .unwrap();
+        assert_eq!(found, Some(1));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the scan kept reading after it found the commit"
+        );
+    }
+
+    /// Output with no line break cannot be a rev-list: the scan must fail rather
+    /// than buffer it without bound.
+    #[cfg(unix)]
+    #[test]
+    fn position_scan_rejects_an_unbounded_line_instead_of_buffering_it() {
+        let td = tempfile::TempDir::new().unwrap();
+        let fake = td.path().join("noline");
+        write_fake_git(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in\n  rev-list) yes x | tr -d '\\n' ;;\nesac\n",
+        );
+        let started = std::time::Instant::now();
+        let err = super::commit_position_bounded(
+            fake.to_str().unwrap(),
+            td.path(),
+            "head",
+            "bbbb",
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+        )
+        .expect_err("a line with no end must be refused");
+        assert!(!is_service_timeout(&err), "got: {err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn position_scan_matches_a_line_split_across_chunks() {
+        let mut scan = super::PositionScan::new(b"bbb");
+        for byte in b"aa\nbb" {
+            assert!(scan.feed(&[*byte]).unwrap());
+        }
+        assert!(scan.feed(b"b").unwrap());
+        // The id is complete but its line has not ended: not yet a match.
+        assert_eq!(scan.found(), None);
+        assert!(!scan.feed(b"\ncc\n").unwrap());
+        assert_eq!(scan.found(), Some(1));
+
+        // A longer line that merely starts with the target is not a match.
+        let mut scan = super::PositionScan::new(b"bbb");
+        assert!(!scan.feed(b"bbbb\nbbb\n").unwrap());
+        assert_eq!(scan.found(), Some(1));
+    }
+
     /// `run_git_blob_digest` answers `None` only for a proven-absent path:
     /// a missing name inside a valid commit. A real blob with git broken
     /// underneath it is an `Err`, so the verifier's retry sees a failure,
@@ -4083,6 +5224,103 @@ mod tests {
             super::run_git_blob_digest("git", work, "HEAD:nope.txt", timeout, 8)
                 .await
                 .is_err()
+        );
+    }
+
+    /// Fake git that delegates to real git but reports `%(*objectname)` /
+    /// `%(*objecttype)` the way git 2.56 does (peeled to the first non-tag)
+    /// where the installed git peels only one level. The listing must report a
+    /// tag of a tag at one level under either report.
+    #[cfg(unix)]
+    fn fully_peeling_git(dir: &Path) -> String {
+        let p = dir.join("peelgit");
+        write_fake_git(
+            &p,
+            "#!/usr/bin/env bash\n\
+             set -euo pipefail\n\
+             if [ \"$1\" != \"for-each-ref\" ]; then exec git \"$@\"; fi\n\
+             git \"$@\" | tr '\\0' '\\t' | while IFS= read -r line; do\n\
+             \x20 peeled=$(cut -f4 <<< \"$line\")\n\
+             \x20 if [ -n \"$peeled\" ]; then\n\
+             \x20   peeled=$(git rev-parse \"$peeled^{}\")\n\
+             \x20   line=$(cut -f1-3 <<< \"$line\")$'\\t'\"$peeled\"$'\\t'\"$(git cat-file -t \"$peeled\")\"\n\
+             \x20 fi\n\
+             \x20 echo \"$line\"\n\
+             done | tr '\\t' '\\0'\n",
+        );
+        p.to_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tag_of_a_tag_reports_one_level_deep_whatever_git_peels() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        let c = commit_at(&work, "c1", T0 + 100);
+        git_at(&work, &["tag", "-a", "-m", "inner", "inner", &c], T0 + 110);
+        let inner = git_at(&work, &["rev-parse", "refs/tags/inner"], T0);
+        git_at(
+            &work,
+            &["tag", "-a", "-m", "outer", "outer", &inner],
+            T0 + 120,
+        );
+        git_at(&work, &["tag", "light", &c], T0);
+        let git_dir = work.join(".git");
+
+        let fake = fully_peeling_git(td.path());
+        let (tags, truncated) =
+            super::list_tags_bounded(&fake, &git_dir, 100, far_deadline()).unwrap();
+        assert!(!truncated);
+        let row = |name: &str| tags.iter().find(|t| t.name == name).unwrap();
+
+        // The contract is one level: `outer` reports the inner tag object with
+        // type `tag`, never the commit a full peel would reach.
+        let outer = row("outer");
+        assert_eq!(outer.target, inner, "outer must name the inner tag object");
+        assert_eq!(outer.target_type, "tag");
+        assert!(outer.annotated);
+        assert_eq!(row("inner").target, c);
+        assert_eq!(row("inner").target_type, "commit");
+        assert_eq!(row("light").target, c);
+        assert!(!row("light").annotated);
+    }
+
+    /// A complete line longer than an object id is refused the same way whether
+    /// its bytes arrive in one chunk or split across several.
+    #[test]
+    fn position_scan_rejects_an_overlong_complete_line_in_one_chunk() {
+        let mut scan = super::PositionScan::new(b"bbb");
+        let mut chunk = vec![b'x'; super::MAX_REV_LIST_LINE + 1];
+        chunk.extend_from_slice(b"\nbbb\n");
+        assert!(
+            scan.feed(&chunk).is_err(),
+            "an overlong line must be refused before the target is compared"
+        );
+    }
+
+    /// git skips a broken tag ref with only a warning on stderr and exits 0;
+    /// the listing must fail rather than return the tags without it. A repo
+    /// with no tags at all is still an empty listing.
+    #[test]
+    fn tag_listing_fails_on_a_broken_tag_ref_instead_of_skipping_it() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        commit_at(&work, "c1", T0 + 100);
+        let git_dir = work.join(".git");
+
+        let (tags, truncated) =
+            super::list_tags_bounded("git", &git_dir, 100, far_deadline()).unwrap();
+        assert!(tags.is_empty() && !truncated, "no tags is an empty listing");
+
+        git_at(&work, &["tag", "good"], T0);
+        std::fs::write(git_dir.join("refs/tags/broken"), b"not-an-oid\n").unwrap();
+        let err = super::list_tags_bounded("git", &git_dir, 100, far_deadline())
+            .expect_err("a broken tag ref must not be silently skipped");
+        assert!(
+            format!("{err:#}").contains("incomplete tag scan"),
+            "got: {err:#}"
         );
     }
 }

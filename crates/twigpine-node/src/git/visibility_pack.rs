@@ -137,6 +137,39 @@ fn run_bounded_git_raw_impl(
     isolated_https: bool,
     isolated_config: &[(&str, &str)],
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let (status, err, _stopped) = run_bounded_git_sink_impl(
+        git_bin,
+        args,
+        repo_path,
+        stdin_bytes,
+        deadline,
+        isolated_https,
+        isolated_config,
+        &mut |chunk| {
+            out.extend_from_slice(chunk);
+            true
+        },
+    )?;
+    Ok((status, out, err))
+}
+
+/// The bounded runner proper. Stdout is handed to `on_chunk` as it arrives; when
+/// it returns false the child's whole process group is SIGKILLed at once and the
+/// call returns `stopped == true` with whatever status the killed child had. A
+/// stop is a result, never a timeout.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_git_sink_impl(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+    isolated_https: bool,
+    isolated_config: &[(&str, &str)],
+    on_chunk: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<(std::process::ExitStatus, Vec<u8>, bool)> {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc::RecvTimeoutError;
@@ -208,14 +241,35 @@ fn run_bounded_git_raw_impl(
         err
     });
     let mut stdout = child.stdout.take().context("git stdout was not piped")?;
-    let mut out = Vec::new();
     // Blocking drain, unblocked by the child closing stdout on exit. The watchdog's
     // SIGTERM/SIGKILL is what makes a hung child exit; a git wedged in uninterruptible
     // (D-state) I/O survives even SIGKILL, so this drain and the wait below can block
     // until the kernel returns, pinning the walk thread and its permit. That residual
     // is unreachable in userspace (no signal reaps a D-state process) and matches the
     // async `reap_group_on_timeout`, which likewise only warns and gives up there.
-    let read_result = stdout.read_to_end(&mut out);
+    let mut stopped = false;
+    let mut read_result: std::io::Result<()> = Ok(());
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match stdout.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if !on_chunk(&buf[..n]) {
+                    // The caller has what it needs. SIGKILL the group now: the
+                    // leader is still unreaped, so the pgid cannot be recycled.
+                    stopped = true;
+                    // SAFETY: kill(2) takes only integers and borrows no Rust memory.
+                    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                read_result = Err(e);
+                break;
+            }
+        }
+    }
     // The drain has returned, but that only means all stdout write ends are closed —
     // NOT that the child has exited. A group member, or the leader itself, can close
     // stdout and keep running; standing the watchdog down on the drain alone (as the
@@ -247,10 +301,10 @@ fn run_bounded_git_raw_impl(
     // deadline. A child that exited on its own (success) is not a timeout even if the
     // watchdog fired late; only a child that did not exit successfully is a genuine
     // timeout, which keeps a walk completing at its budget from a spurious 504.
-    if killed && !status.success() {
+    if killed && !status.success() && !stopped {
         return Err(crate::git::smart_http::GitServiceTimeout.into());
     }
-    Ok((status, out, err))
+    Ok((status, err, stopped))
 }
 
 pub(crate) fn run_bounded_git_raw(
@@ -261,6 +315,49 @@ pub(crate) fn run_bounded_git_raw(
     deadline: Instant,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     run_bounded_git_raw_impl(git_bin, args, repo_path, stdin_bytes, deadline, false, &[])
+}
+
+/// Bounded git whose stdout is handed to `on_chunk` as it arrives instead of
+/// being collected, so a caller that only needs a prefix of a long output holds
+/// none of the rest in memory. `on_chunk` returns false to stop: the child is
+/// then killed with its process group and the third tuple element is true.
+/// Returns the status, the child's stderr, and whether the sink stopped it. The
+/// deadline and teardown are those of [`run_bounded_git_raw`].
+#[cfg(unix)]
+pub(crate) fn run_bounded_git_streaming(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+    on_chunk: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<(std::process::ExitStatus, Vec<u8>, bool)> {
+    run_bounded_git_sink_impl(
+        git_bin,
+        args,
+        repo_path,
+        stdin_bytes,
+        deadline,
+        false,
+        &[],
+        on_chunk,
+    )
+}
+
+/// Non-Unix fallback: the bounded runner there buffers, so the output is
+/// delivered to the sink in one piece after the child exits.
+#[cfg(not(unix))]
+pub(crate) fn run_bounded_git_streaming(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+    on_chunk: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<(std::process::ExitStatus, Vec<u8>, bool)> {
+    let (status, out, err) = run_bounded_git_raw(git_bin, args, repo_path, stdin_bytes, deadline)?;
+    let stopped = !on_chunk(&out);
+    Ok((status, err, stopped))
 }
 
 /// Run a bounded Git child without inheriting ambient Git/proxy/credential
@@ -6587,5 +6684,168 @@ esac\n";
              not be a recipient of direct_blob (empty-path allow shape is owner-only); \
              got {direct_recipients:?}"
         );
+    }
+
+    /// The streaming runner hands every byte to the sink, in order, and reports
+    /// the child's own status when the sink never stops it.
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_git_streaming_delivers_all_output_when_the_sink_continues() {
+        let tmp = TempDir::new().unwrap();
+        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\nprintf 'one\\ntwo\\n'\n");
+        let mut got = Vec::new();
+        let (status, _err, stopped) = run_bounded_git_streaming(
+            &git_bin,
+            &["rev-list"],
+            tmp.path(),
+            b"",
+            Instant::now() + SH_STARTUP_HEADROOM,
+            &mut |chunk| {
+                got.extend_from_slice(chunk);
+                true
+            },
+        )
+        .unwrap();
+        assert!(status.success());
+        assert!(!stopped);
+        assert_eq!(got, b"one\ntwo\n");
+    }
+
+    /// A sink that stops ends an endless child at once, and the child's whole
+    /// process group is gone afterwards, including a descendant that ignores
+    /// SIGTERM and has closed its inherited stdout and stderr. This is not a
+    /// timeout. A stop path that killed only the leader would leave that descendant
+    /// alive, and its group with it.
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_git_streaming_stops_and_reaps_an_endless_child() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        // The leader starts the descendant and waits for it to record its pid before
+        // it begins to produce output, so the stop can never beat the descendant's
+        // start. The descendant's loop is bounded so a broken stop path cannot leak
+        // a permanent orphan; the assertion fires well before then.
+        let body = "#!/bin/sh\n\
+echo $$ > pid\n\
+sh -c 'trap \"\" TERM; echo $$ > desc.pid; exec 1>&- 2>&-; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done' &\n\
+while [ ! -s desc.pid ]; do sleep 0.01; done\n\
+exec yes abcdefgh\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let started = Instant::now();
+        let mut seen = 0usize;
+        let (_status, _err, stopped) = run_bounded_git_streaming(
+            &git_bin,
+            &["rev-list"],
+            tmp.path(),
+            b"",
+            Instant::now() + Duration::from_secs(30),
+            &mut |chunk| {
+                seen += chunk.len();
+                seen < 1000
+            },
+        )
+        .expect("a sink stop is a result, not an error");
+        assert!(stopped);
+        assert!(seen >= 1000);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let read_pid = |name: &str| -> i32 {
+            std::fs::read_to_string(tmp.path().join(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let pgid = read_pid("pid");
+        let desc = read_pid("desc.pid");
+        assert_ne!(pgid, desc, "the descendant must be a separate process");
+        // On Linux a killed descendant can linger as a zombie until init reaps
+        // it, and a zombie still answers the process-group probe even though it
+        // no longer runs the fixture loop. Absent or zombie therefore counts as
+        // stopped; the group probe below only gates the cleanup signals.
+        #[cfg(target_os = "linux")]
+        fn absent_or_zombie(pid: i32) -> bool {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                // The state field follows the parenthesized comm, which can
+                // itself contain spaces and parens, so split at the last ')'.
+                Ok(stat) => match stat.rfind(')') {
+                    Some(close) => {
+                        let state = stat[close + 1..].trim_start();
+                        state.starts_with('Z') || state.starts_with('X')
+                    }
+                    None => false,
+                },
+                Err(_) => true,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        fn absent_or_zombie(pid: i32) -> bool {
+            // SAFETY: kill(2) with signal 0 only probes existence.
+            let rc = unsafe { libc::kill(pid, 0) };
+            rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+        let mut group_gone = false;
+        let mut stopped = false;
+        for _ in 0..300 {
+            if absent_or_zombie(desc) {
+                stopped = true;
+            }
+            // SAFETY: kill(2) with signal 0 only probes existence; ESRCH means no
+            // process is left in the group.
+            let rc = unsafe { libc::kill(-pgid, 0) };
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                // The fixture descendant never leaves the group, so an empty group
+                // means it is gone too, even if it exited after the check above.
+                group_gone = true;
+                stopped = true;
+                break;
+            }
+            if stopped {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Kill whatever is left so a RED run leaks no orphan, but only when the
+        // probe never observed the group as gone: after ESRCH the pgid can be
+        // reused by unrelated processes. The descendant is not signalled by pid:
+        // the loop can end on `stopped` after it was reaped, and its pid may then
+        // belong to an unrelated process. It never leaves the group, so the group
+        // kill reaches it while it lives.
+        if !group_gone {
+            // SAFETY: the last probe in the loop found the group still populated,
+            // so the pgid is held by fixture processes (live or zombie) and this
+            // signal cannot reach an unrelated group. The remaining window is the
+            // last member being reaped between that probe and this call, which
+            // would need the pgid reused within that interval.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            stopped,
+            "the stopped child's descendant (pid {desc}, pgid {pgid}) must be absent or a zombie, \
+             not still running its loop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_git_streaming_times_out_a_silent_child() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\nsleep 30\n");
+        let started = Instant::now();
+        let err = run_bounded_git_streaming(
+            &git_bin,
+            &["rev-list"],
+            tmp.path(),
+            b"",
+            Instant::now() + SH_STARTUP_HEADROOM,
+            &mut |_| true,
+        )
+        .expect_err("a silent child must hit the deadline");
+        assert!(err
+            .downcast_ref::<crate::git::smart_http::GitServiceTimeout>()
+            .is_some());
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

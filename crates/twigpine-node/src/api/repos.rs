@@ -240,6 +240,16 @@ pub struct RepoResponse {
     pub forked_from: Option<String>,
 }
 
+/// `GET /api/v1/repos/:owner/:repo`: the repo plus its owner-set homepage.
+/// Only this route carries `homepage`; the list, federated, create, and fork
+/// responses keep `RepoResponse` as is.
+#[derive(Debug, Serialize)]
+pub struct RepoDetailResponse {
+    #[serde(flatten)]
+    repo: RepoResponse,
+    homepage: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct InfoRefsQuery {
     pub service: Option<String>,
@@ -504,36 +514,417 @@ pub async fn get_repo(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
     auth: Option<Extension<AuthenticatedDid>>,
-) -> Result<Json<RepoResponse>> {
+) -> Result<Json<RepoDetailResponse>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
-    let count = state.db.count_stars(&record.id).await.unwrap_or(0);
-    Ok(Json(to_response(&record, &state, count)))
+    let (count, homepage) = tokio::join!(
+        state.db.count_stars(&record.id),
+        state.db.get_repo_homepage(&record.id),
+    );
+    let count = count.unwrap_or(0);
+    let homepage = homepage?;
+    Ok(Json(RepoDetailResponse {
+        repo: to_response(&record, &state, count),
+        homepage,
+    }))
+}
+
+/// Body of `PUT /api/v1/repos/:owner/:repo/homepage`. A null or absent
+/// `homepage` clears it. Unknown fields are refused, so a typo such as
+/// `homepage_url` is an error instead of a silent clear. The impl is written
+/// by hand because a derived `Deserialize` also accepts a JSON array through
+/// `visit_seq`, so `[null]` would read as a clear.
+#[derive(Debug)]
+pub struct HomepageRequest {
+    homepage: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for HomepageRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HomepageVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HomepageVisitor {
+            type Value = HomepageRequest;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object with a \"homepage\" string or null")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut homepage = None;
+                let mut seen_homepage = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "homepage" {
+                        if seen_homepage {
+                            return Err(serde::de::Error::duplicate_field("homepage"));
+                        }
+                        seen_homepage = true;
+                        homepage = map.next_value()?;
+                    } else {
+                        return Err(serde::de::Error::unknown_field(&key, &["homepage"]));
+                    }
+                }
+                Ok(HomepageRequest { homepage })
+            }
+        }
+
+        deserializer.deserialize_map(HomepageVisitor)
+    }
+}
+
+/// Write the homepage for an already-gated repo. Zero rows matched means the
+/// repo was deleted after the gate ran, which reads as the missing-repo 404
+/// rather than a success.
+pub(crate) async fn store_homepage(
+    db: &crate::db::Db,
+    record: &RepoRecord,
+    homepage: Option<&str>,
+) -> Result<()> {
+    if db.set_repo_homepage(&record.id, homepage).await? == 0 {
+        return Err(AppError::RepoNotFound(format!(
+            "{}/{}",
+            record.owner_did, record.name
+        )));
+    }
+    Ok(())
+}
+
+/// PUT /api/v1/repos/:owner/:repo/homepage
+///
+/// Owner-only. The body is checked first because that check reads no repo
+/// state, so a malformed request answers the same for every caller and repo.
+/// Then the read gate (an unreadable repo is the missing-repo 404), then the
+/// owner gate (403), then the write.
+pub async fn set_homepage(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
+    Path((owner, name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>> {
+    // Parsed here rather than by the `Json` extractor, which answers a wrong
+    // field type or an unknown field with 422 and a wrong content type with
+    // 415; every malformed body is the same 400.
+    let req: HomepageRequest = serde_json::from_slice(&body)
+        .map_err(|_| AppError::BadRequest("body must be {\"homepage\": string | null}".into()))?;
+    let homepage = req.homepage.as_deref().map(validate_homepage).transpose()?;
+
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
+    crate::api::require_repo_owner(&record, &auth.0)?;
+
+    // A mirror row (slash-form id) belongs to the node that owns the repo; an
+    // edit here would be overwritten by the next sync.
+    if record.id.contains('/') {
+        return Err(AppError::Conflict(
+            "a mirrored repo's homepage is set on its origin node".into(),
+        ));
+    }
+
+    store_homepage(&state.db, &record, homepage).await?;
+    Ok(Json(serde_json::json!({ "homepage": homepage })))
+}
+
+const DEFAULT_COMMITS_PAGE: i64 = 30;
+const MAX_COMMITS_PAGE: i64 = 100;
+/// The one message for every `before` that cannot name a position in the served
+/// history: malformed, unknown, not a commit, or a commit the head does not reach.
+const BAD_BEFORE_MESSAGE: &str =
+    "before must be the full id of a commit in the served head's history";
+const GIT_READ_FAILED_MESSAGE: &str = "git read failed";
+/// Cap on the git-read deadline so the `Instant` addition cannot overflow.
+const MAX_GIT_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+
+/// Query of `GET /api/v1/repos/:owner/:repo/commits`. Unknown keys are ignored on
+/// purpose: `gl repo commits` sends `branch`, which the server has never honored.
+#[derive(Debug, Deserialize)]
+pub struct CommitsQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    before: Option<String>,
+}
+
+/// 40 or 64 ASCII hex digits: a full SHA-1 or SHA-256 object id and nothing else,
+/// so a revision expression or option never gets past the shape check.
+fn is_full_hex_object_id(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Map a bounded git read failure to a client error: a deadline is a 504, anything
+/// else a fixed-message 500 with the detail logged, never sent.
+fn git_read_app_error(err: &anyhow::Error, repo: &str) -> AppError {
+    if err
+        .downcast_ref::<smart_http::GitServiceTimeout>()
+        .is_some()
+    {
+        tracing::warn!(repo = %repo, "git read timed out");
+        AppError::Timeout("git service timed out".into())
+    } else {
+        tracing::error!(repo = %repo, err = %format!("{err:#}"), "git read failed");
+        AppError::Git(GIT_READ_FAILED_MESSAGE.into())
+    }
+}
+
+/// Run `work` against a repo's disk path under the same admission the clone path
+/// uses: the per-caller read permit, then the shared read permit (a refusal of
+/// either is a 503), then the repo acquire bounded by `git_acquire_timeout_secs`.
+/// `work` runs on a blocking thread with one deadline of `git_service_timeout_secs`
+/// and owns both permits, so they are released only after its last git child is
+/// reaped, even when the client disconnects first.
+async fn run_repo_git_read<T, F>(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    record: &RepoRecord,
+    handler: &str,
+    work: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&str, &std::path::Path, std::time::Instant) -> Result<T> + Send + 'static,
+{
+    let caller_key = read_caller_key(headers, peer, state.push_limiter_trust);
+    let caller_permit = acquire_read_caller_permit(
+        &state.git_read_per_caller,
+        caller_key.as_deref(),
+        &record.name,
+        handler,
+    )?;
+    let permit = git_permit(&state.git_read_semaphore)?;
+
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let disk_path = tokio::time::timeout(
+        acquire_deadline,
+        state.repo_store.acquire(&record.owner_did, &record.name),
+    )
+    .await
+    .map_err(|_elapsed| {
+        tracing::warn!(repo = %record.name, "repo acquire timed out; shedding with 503");
+        AppError::Overloaded("git service acquisition timed out, retry shortly".into())
+    })?
+    .map_err(|e| {
+        if is_expected_transient_acquire_failure(&e) {
+            tracing::warn!(repo = %record.name, err = %format!("{e:#}"), "repo acquire failed");
+        } else {
+            tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo acquire failed");
+        }
+        // A typed refusal is a retryable 503 with a fixed body, the same as the
+        // clone path; anything else is the fixed-message 500, detail logged only.
+        if e.is::<crate::git::repo_store::RepoUnavailable>() {
+            AppError::from(e)
+        } else {
+            AppError::Git(GIT_READ_FAILED_MESSAGE.into())
+        }
+    })?;
+
+    // The deadline starts before the re-check below: that query runs while both
+    // permits are held and the pool sets no statement timeout, so it spends the
+    // same budget the git work then runs on.
+    let budget = std::time::Duration::from_secs(state.config.git_service_timeout_secs)
+        .min(MAX_GIT_READ_DEADLINE);
+    let deadline = std::time::Instant::now() + budget;
+
+    // The gate authorized this row, but the disk identity is owner+name only:
+    // a row deleted and recreated under the same name since then would serve a
+    // different repo on this authorization. Re-read and require the same row;
+    // anything else answers like the missing-repo case the gate produces.
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        state.db.get_repo(&record.owner_did, &record.name),
+    )
+    .await
+    {
+        Ok(Ok(Some(current))) if current.id == record.id => {}
+        Ok(Ok(_)) => {
+            return Err(AppError::RepoNotFound(format!(
+                "{}/{}",
+                record.owner_did, record.name
+            )));
+        }
+        Ok(Err(e)) => {
+            tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo row re-check failed");
+            return Err(AppError::Git(GIT_READ_FAILED_MESSAGE.into()));
+        }
+        Err(_elapsed) => {
+            tracing::warn!(repo = %record.name, "repo row re-check timed out");
+            return Err(AppError::Git(GIT_READ_FAILED_MESSAGE.into()));
+        }
+    }
+
+    let git_bin = state.git_bin.clone();
+    let repo = record.name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _held = (permit, caller_permit);
+        work(&git_bin, &disk_path, deadline)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(repo = %repo, err = %e, "git read task failed");
+        AppError::Git(GIT_READ_FAILED_MESSAGE.into())
+    })?;
+
+    // The pre-work re-check cannot cover a replacement that lands while the
+    // git children run: disk identity is owner+name only, so results computed
+    // across the delete+recreate can serve the new row's data on the old row's
+    // authorization. Re-read the row after the work has finished and discard
+    // anything computed under a row that no longer matches, an error included
+    // (a `before` cursor missing from the replacement's history is a 400 about
+    // the replacement): a missing or replaced row answers like the missing-repo
+    // case the gate produces, exactly as the pre-work check does. The permits
+    // went with the blocking work, so this query holds no read slot.
+    match state.db.get_repo(&record.owner_did, &record.name).await {
+        Ok(Some(current)) if current.id == record.id => {}
+        Ok(_) => {
+            return Err(AppError::RepoNotFound(format!(
+                "{}/{}",
+                record.owner_did, record.name
+            )));
+        }
+        Err(e) => {
+            tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo row post-read re-check failed");
+            return Err(AppError::Git(GIT_READ_FAILED_MESSAGE.into()));
+        }
+    }
+    result
 }
 
 /// GET /api/v1/repos/:owner/:repo/commits
+///
+/// `limit` (default 30, clamped into 1..=100) and `before=<commit id>`. `before`
+/// is a position in the served head's own history order: the page is what follows
+/// that commit in the order an unpaged listing prints. Within one head the walk
+/// visits every commit once, including history reachable only through a merge's
+/// second parent. Paging is not a snapshot: each request resolves the head again,
+/// so a head change between pages can skip or repeat commits. `before` is compared
+/// against `git rev-list` output and never handed to git. Head resolution,
+/// position lookup and the page read run under one deadline on a blocking thread
+/// that holds the read permits.
 pub async fn list_commits(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<CommitsQuery>,
     auth: Option<Extension<AuthenticatedDid>>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
-    let disk_path = state
-        .repo_store
-        .acquire(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
-    let head_ref = store::resolve_head(&disk_path, &record.default_branch);
-    // A read failure is not an empty history: report it rather than answering
-    // a 200 with no commits (#400).
-    let commits =
-        store::log(&disk_path, &head_ref, 30).map_err(|e| AppError::Git(e.to_string()))?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_COMMITS_PAGE)
+        .clamp(1, MAX_COMMITS_PAGE) as usize;
+    let before = match query.before {
+        Some(b) if is_full_hex_object_id(&b) => Some(b.to_ascii_lowercase()),
+        Some(_) => return Err(AppError::BadRequest(BAD_BEFORE_MESSAGE.into())),
+        None => None,
+    };
+
+    let default_branch = record.default_branch.clone();
+    let repo = record.name.clone();
+    let commits = run_repo_git_read(
+        &state,
+        &headers,
+        peer,
+        &record,
+        "commits",
+        move |git_bin, path, deadline| {
+            let fail = |e: anyhow::Error| git_read_app_error(&e, &repo);
+            let bad_before = || AppError::BadRequest(BAD_BEFORE_MESSAGE.into());
+            // A read failure is not an empty history (#400): only an unborn head
+            // is empty, and it has no commit a `before` could name.
+            let Some(head) =
+                store::resolve_head_id_bounded(git_bin, path, &default_branch, deadline)
+                    .map_err(fail)?
+            else {
+                return match before {
+                    Some(_) => Err(bad_before()),
+                    None => Ok(Vec::new()),
+                };
+            };
+            let skip = match &before {
+                Some(b) => {
+                    match store::commit_position_bounded(git_bin, path, &head, b, deadline)
+                        .map_err(fail)?
+                    {
+                        Some(position) => position + 1,
+                        None => return Err(bad_before()),
+                    }
+                }
+                None => 0,
+            };
+            store::log_bounded(git_bin, path, &head, skip, limit, deadline).map_err(fail)
+        },
+    )
+    .await?;
 
     Ok(Json(serde_json::json!({ "commits": commits })))
+}
+
+/// Most tags one listing returns; `truncated` is set when more exist.
+const MAX_TAGS: usize = 500;
+
+/// GET /api/v1/repos/:owner/:repo/tags
+///
+/// `{"tags": [{name, target, target_type, annotated}], "truncated": bool}`, newest
+/// version first by name and capped at 500. An annotated tag reports the object
+/// its tag object names (one level: a tag of a tag reports the inner tag object
+/// with `target_type` `tag`). Same read gate and admission as the commits listing,
+/// and the same unborn-head rule: no head commit means no tags.
+pub async fn list_tags(
+    State(state): State<AppState>,
+    Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
+
+    let default_branch = record.default_branch.clone();
+    let repo = record.name.clone();
+    let (mut tags, truncated) = run_repo_git_read(
+        &state,
+        &headers,
+        peer,
+        &record,
+        "tags",
+        move |git_bin, path, deadline| {
+            let fail = |e: anyhow::Error| git_read_app_error(&e, &repo);
+            // A read failure is not an empty list (#400): only an unborn head
+            // is empty, and tag refs on disk cannot resurrect it.
+            if store::resolve_head_id_bounded(git_bin, path, &default_branch, deadline)
+                .map_err(fail)?
+                .is_none()
+            {
+                return Ok((Vec::new(), false));
+            }
+            store::list_tags_bounded(git_bin, path, MAX_TAGS, deadline).map_err(fail)
+        },
+    )
+    .await?;
+
+    // The id of a tree or blob can name content a path rule withholds, so a repo
+    // with any rule lists commit targets only, for every caller. A tag of a tag
+    // reports a tag object and is dropped with the rest. `truncated` stays as git
+    // reported it (driven by its record count, before this filter), so a
+    // rule-bearing repo can return fewer than MAX_TAGS rows with it set.
+    if !rules.is_empty() {
+        tags.retain(|t| t.target_type == "commit");
+    }
+
+    Ok(Json(
+        serde_json::json!({ "tags": tags, "truncated": truncated }),
+    ))
 }
 
 /// GET /api/v1/repos/:owner/:repo/blob/*path
@@ -6295,9 +6686,165 @@ fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)
         .collect()
 }
 
+const MAX_HOMEPAGE_BYTES: usize = 2048;
+
+/// Accept a repo homepage only when it is an absolute http(s) URL on a public
+/// host, at most `MAX_HOMEPAGE_BYTES`, with no credentials and no control,
+/// whitespace, backslash, or bidi-format characters. Returns the input
+/// unchanged: callers store these exact bytes, because `Url::parse` silently
+/// strips tabs and newlines, so storing a normalized form (or validating one
+/// and storing another) would let a value through that was never checked.
+fn validate_homepage(raw: &str) -> Result<&str> {
+    let bad = |why: &str| AppError::BadRequest(format!("homepage {why}"));
+    if raw.is_empty() {
+        return Err(bad("must not be empty"));
+    }
+    if raw.len() > MAX_HOMEPAGE_BYTES {
+        return Err(bad(&format!("must be at most {MAX_HOMEPAGE_BYTES} bytes")));
+    }
+    // A backslash is refused outright: the WHATWG parser reads
+    // `https://example.com\@127.0.0.1/` as host `example.com`, while an RFC 3986
+    // parser reads host `127.0.0.1`, and a consumer of the stored string may
+    // use either.
+    if raw.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || c == '\\'
+            || twigpine_core::sanitize::is_bidi_format(c)
+    }) {
+        return Err(bad(
+            "must not contain control, whitespace, backslash, or bidi-format characters",
+        ));
+    }
+    let url = reqwest::Url::parse(raw).map_err(|_| bad("must be an absolute http or https URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(bad("must be an absolute http or https URL"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(bad("must not contain credentials"));
+    }
+    let lower = raw.to_ascii_lowercase();
+    let after_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .ok_or_else(|| bad("must be an absolute http or https URL"))?;
+    // `https:///example.com/docs` and `http:////example.com` carry an empty
+    // authority in the stored bytes, yet WHATWG parsing normalizes them to
+    // host `example.com`, so the parse and the public-host check both accept
+    // a value whose bytes name no host. A '/' immediately after the scheme
+    // prefix means the authority is empty.
+    if after_scheme.starts_with('/') {
+        return Err(bad("must not have an empty authority"));
+    }
+    if !crate::api::peers::is_public_http_url(raw) {
+        return Err(bad(crate::api::peers::PUBLIC_HTTP_URL_REQUIREMENT));
+    }
+    Ok(raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Homepage validation ──────────────────────────────────────────────────
+
+    fn homepage_rejected(raw: &str) -> bool {
+        matches!(validate_homepage(raw), Err(AppError::BadRequest(_)))
+    }
+
+    #[test]
+    fn homepage_accepts_public_http_urls_unchanged() {
+        for ok in [
+            "https://example.com",
+            "http://example.com/docs?ref=twigpine#start",
+            "HTTPS://Example.com",
+        ] {
+            assert_eq!(validate_homepage(ok).unwrap(), ok, "{ok}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_non_http_schemes_and_relative_urls() {
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "file:///etc/passwd",
+            "ftp://example.com",
+            "//example.com",
+            "example.com",
+            "https:example.com/docs",
+            "http:example.com",
+            "https:/example.com",
+        ] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_an_empty_authority() {
+        // WHATWG parsing normalizes both of these to host `example.com`,
+        // while the stored bytes carry an empty authority.
+        for bad in ["https:///example.com/docs", "http:////example.com"] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_embedded_credentials() {
+        for bad in ["https://user:pw@example.com", "https://user@example.com"] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_control_whitespace_and_bidi_characters() {
+        for bad in [
+            "https://exam\nple.com",
+            " https://example.com",
+            "https://example.com\t",
+            "https://exam\u{202E}ple.com",
+            "https://example.com/a b",
+            "https://example.com/\u{0}",
+        ] {
+            assert!(homepage_rejected(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_a_backslash_anywhere() {
+        for bad in [
+            "https://example.com\\@127.0.0.1/",
+            "https://example.com\\@evil.internal/",
+            "https://example.com/a\\b",
+        ] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_rejects_non_public_hosts() {
+        for bad in [
+            "http://localhost",
+            "http://127.0.0.1",
+            "http://10.0.0.1",
+            "http://169.254.169.254",
+            "http://intranet",
+            "http://box.internal",
+        ] {
+            assert!(homepage_rejected(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn homepage_enforces_length_cap_and_rejects_empty() {
+        assert!(homepage_rejected(""));
+        let prefix = "https://example.com/";
+        let at_cap = format!("{prefix}{}", "a".repeat(MAX_HOMEPAGE_BYTES - prefix.len()));
+        assert_eq!(at_cap.len(), MAX_HOMEPAGE_BYTES);
+        assert_eq!(validate_homepage(&at_cap).unwrap(), at_cap);
+        let over = format!("{at_cap}a");
+        assert!(homepage_rejected(&over));
+    }
 
     /// #374: the fork path builds its own `git clone --mirror` argv. Driven
     /// through real git so a missing or misplaced `--` fails, matching the
@@ -19625,7 +20172,13 @@ exit 0
                 super::list_commits(
                     axum::extract::State(state),
                     axum::extract::Path((owner.to_string(), name)),
+                    axum::extract::Query(super::CommitsQuery {
+                        limit: None,
+                        before: None,
+                    }),
                     None,
+                    crate::rate_limit::PeerAddr(None),
+                    axum::http::HeaderMap::new(),
                 )
                 .await
             }
@@ -19663,6 +20216,371 @@ exit 0
         assert!(
             matches!(res, Err(crate::error::AppError::Git(_))),
             "a damaged ref must surface as a git error, not an empty listing"
+        );
+    }
+
+    /// The record the read gate authorized is only an owner+name on disk: if the
+    /// row is deleted and recreated under that name before the acquire, serving
+    /// would hand the new row's git data out on the old row's authorization.
+    /// The helper must answer with the same opaque not-found the gate returns
+    /// for a missing repo, and the read itself must never run.
+    #[sqlx::test]
+    async fn run_repo_git_read_refuses_a_stale_record(pool: sqlx::PgPool) {
+        let owner = "did:key:zSTALEGITREADAAAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let now = chrono::Utc::now();
+        let seed = |name: &str| crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        let name = "stale";
+        let repo_dir = dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let stale = seed(name);
+        state.db.create_repo(&stale).await.unwrap();
+        // The authorized row is replaced by a new row under the same owner/name.
+        state.db.delete_repo_by_id(&stale.id).await.unwrap();
+        let fresh = seed(name);
+        state.db.create_repo(&fresh).await.unwrap();
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_inner = ran.clone();
+        let res: Result<()> = super::run_repo_git_read(
+            &state,
+            &axum::http::HeaderMap::new(),
+            None,
+            &stale,
+            "test",
+            move |_git_bin, _path, _deadline| {
+                ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "a stale record must get the missing-repo response; got {res:?}"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the read must never run on a stale record"
+        );
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_inner = ran.clone();
+        super::run_repo_git_read::<(), _>(
+            &state,
+            &axum::http::HeaderMap::new(),
+            None,
+            &fresh,
+            "test",
+            move |_git_bin, _path, _deadline| {
+                ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("the live record runs the read");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The pre-work identity re-check cannot cover a replacement that lands
+    /// while the git work is in progress: the disk path is keyed on
+    /// owner+name only, so the children can read the replacement row's data
+    /// under the old row's authorization. The post-completion re-check must
+    /// discard those results and answer with the same missing-repo response.
+    /// Here the row is deleted and recreated under the same owner/name after
+    /// the work closure has started, and the closure only completes once the
+    /// replacement is in place.
+    #[sqlx::test]
+    async fn run_repo_git_read_refuses_results_across_a_row_replacement(pool: sqlx::PgPool) {
+        let owner = "did:key:zMIDREADREPLACEAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let now = chrono::Utc::now();
+        let seed = |name: &str| crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        let name = "replaced";
+        let repo_dir = dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let record = seed(name);
+        state.db.create_repo(&record).await.unwrap();
+
+        // The closure announces it is in progress, then holds until the test
+        // has replaced the row, so the replacement is guaranteed to land
+        // inside the git-work window.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let state_clone = state.clone();
+        let record_clone = record.clone();
+        let read = tokio::spawn(async move {
+            super::run_repo_git_read::<(), _>(
+                &state_clone,
+                &axum::http::HeaderMap::new(),
+                None,
+                &record_clone,
+                "test",
+                move |_git_bin, _path, _deadline| {
+                    let _ = started_tx.send(());
+                    release_rx
+                        .recv()
+                        .expect("the test releases the in-progress work");
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        started_rx.await.expect("the work closure starts");
+        state.db.delete_repo_by_id(&record.id).await.unwrap();
+        let fresh = seed(name);
+        state.db.create_repo(&fresh).await.unwrap();
+        assert_ne!(fresh.id, record.id, "a recreation carries a fresh row id");
+        release_tx.send(()).unwrap();
+
+        let res = read.await.expect("the read task joins");
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "results computed across a row replacement must be discarded; got {res:?}"
+        );
+
+        // The live replacement row itself reads fine: only the stale
+        // authorization is refused.
+        let res: Result<()> = super::run_repo_git_read(
+            &state,
+            &axum::http::HeaderMap::new(),
+            None,
+            &fresh,
+            "test",
+            move |_git_bin, _path, _deadline| Ok(()),
+        )
+        .await;
+        assert!(res.is_ok(), "the live record runs the read; got {res:?}");
+    }
+
+    /// A git-work error must not skip the post-work identity re-check: an error
+    /// computed across a row replacement (a `before` cursor missing from the new
+    /// row's history, say) would otherwise leak a 400 about the replacement's
+    /// data on the old row's authorization. The replaced row answers 404; the
+    /// unchanged row still returns the work's own error.
+    #[sqlx::test]
+    async fn run_repo_git_read_rechecks_the_row_after_a_failed_read(pool: sqlx::PgPool) {
+        let owner = "did:key:zERRREADREPLACEAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let now = chrono::Utc::now();
+        let seed = |name: &str| crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        let name = "replacederr";
+        let repo_dir = dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let record = seed(name);
+        state.db.create_repo(&record).await.unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let state_clone = state.clone();
+        let record_clone = record.clone();
+        let read = tokio::spawn(async move {
+            super::run_repo_git_read::<(), _>(
+                &state_clone,
+                &axum::http::HeaderMap::new(),
+                None,
+                &record_clone,
+                "test",
+                move |_git_bin, _path, _deadline| {
+                    let _ = started_tx.send(());
+                    release_rx
+                        .recv()
+                        .expect("the test releases the in-progress work");
+                    Err(crate::error::AppError::BadRequest(
+                        "before is not in this history".into(),
+                    ))
+                },
+            )
+            .await
+        });
+
+        started_rx.await.expect("the work closure starts");
+        state.db.delete_repo_by_id(&record.id).await.unwrap();
+        let fresh = seed(name);
+        state.db.create_repo(&fresh).await.unwrap();
+        release_tx.send(()).unwrap();
+
+        let res = read.await.expect("the read task joins");
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "an error computed across a row replacement must be discarded; got {res:?}"
+        );
+
+        // On the unchanged row the work's own error comes back as it was.
+        let res: Result<()> = super::run_repo_git_read(
+            &state,
+            &axum::http::HeaderMap::new(),
+            None,
+            &fresh,
+            "test",
+            move |_git_bin, _path, _deadline| {
+                Err(crate::error::AppError::BadRequest(
+                    "before is not in this history".into(),
+                ))
+            },
+        )
+        .await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::BadRequest(_))),
+            "the live record keeps the work's error; got {res:?}"
+        );
+    }
+
+    /// The pre-work identity re-check runs while both read permits are held, and
+    /// the pool has no statement timeout, so it must be bounded by the git
+    /// deadline. A lock held on `repos` stalls the re-check; the helper must
+    /// give up at the deadline with the fixed git failure and never run the work.
+    #[sqlx::test]
+    async fn run_repo_git_read_bounds_the_pre_work_recheck_by_the_deadline(pool: sqlx::PgPool) {
+        let owner = "did:key:zSTALLRECHECKAAAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let mut cfg = (*state.config).clone();
+        cfg.git_service_timeout_secs = 1;
+        state.config = std::sync::Arc::new(cfg);
+        state.git_read_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let now = chrono::Utc::now();
+        let record = crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "stall".to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/stall".to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        let repo_dir = dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join("stall.git");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap()
+            .success());
+        state.db.create_repo(&record).await.unwrap();
+
+        let mut lock_tx = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE repos IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await
+            .unwrap();
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_inner = ran.clone();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::run_repo_git_read::<(), _>(
+                &state,
+                &axum::http::HeaderMap::new(),
+                None,
+                &record,
+                "test",
+                move |_git_bin, _path, _deadline| {
+                    ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            ),
+        )
+        .await;
+        lock_tx.rollback().await.unwrap();
+
+        let res = res.expect("a stalled re-check must give up at the git deadline");
+        assert!(
+            matches!(&res, Err(crate::error::AppError::Git(m)) if m == super::GIT_READ_FAILED_MESSAGE),
+            "a stalled re-check is the fixed git failure; got {res:?}"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the read must not run after the re-check gave up"
+        );
+        assert_eq!(
+            state.git_read_semaphore.available_permits(),
+            1,
+            "the shared read permit is returned"
         );
     }
     /// #282 REPRO (RED on main): a push's write guard pins one dedicated
@@ -20237,5 +21155,1239 @@ mod push_event_wiring_tests {
             "a local push must not be written into received_ref_updates, which the \
              anonymous /api/v1/events/ref-updates feed also reads"
         );
+    }
+}
+
+/// Handler tests for the paged commits listing and the tags listing, driven through
+/// a real router so extractors, the read gate, both permits and the error mapping
+/// are all in the path.
+#[cfg(test)]
+mod commits_tags_tests {
+    use crate::auth::AuthenticatedDid;
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{HeaderMap, Request, StatusCode};
+    use std::net::SocketAddr;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const OWNER: &str = "did:key:zCTOwner0000000000000000000000000000000000";
+    const OWNER_SHORT: &str = "zCTOwner0000000000000000000000000000000000";
+    const STRANGER: &str = "did:key:zCTStranger000000000000000000000000000000";
+    const T0: i64 = 1_700_000_000;
+    const PEER: &str = "203.0.113.5:4000";
+
+    struct Fx {
+        dir: tempfile::TempDir,
+        state: AppState,
+    }
+
+    impl Fx {
+        async fn new(pool: sqlx::PgPool) -> Fx {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut state = crate::test_support::test_state(pool.clone()).await;
+            state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+                dir.path().to_path_buf(),
+                pool.clone(),
+            );
+            state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+            Fx { dir, state }
+        }
+
+        /// Seed a repo row plus an initialized working repo at its disk path.
+        async fn repo(&self, name: &str, is_public: bool) -> PathBuf {
+            let now = chrono::Utc::now();
+            self.state
+                .db
+                .create_repo(&crate::db::RepoRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: name.to_string(),
+                    owner_did: OWNER.to_string(),
+                    description: None,
+                    is_public,
+                    default_branch: "main".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                    disk_path: format!("/tmp/{name}"),
+                    forked_from: None,
+                    machine_id: None,
+                })
+                .await
+                .unwrap();
+            let record = self
+                .state
+                .db
+                .get_repo(OWNER_SHORT, name)
+                .await
+                .unwrap()
+                .unwrap();
+            let path =
+                crate::git::store::repo_disk_path(self.dir.path(), &record.owner_did, &record.name);
+            std::fs::create_dir_all(&path).unwrap();
+            git_at(&path, &["init", "-q", "-b", "main"], T0);
+            path
+        }
+
+        async fn repo_id(&self, name: &str) -> String {
+            self.state
+                .db
+                .get_repo(OWNER_SHORT, name)
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        }
+
+        fn set_deadline_secs(&mut self, secs: u64) {
+            let mut cfg = (*self.state.config).clone();
+            cfg.git_service_timeout_secs = secs;
+            self.state.config = Arc::new(cfg);
+        }
+    }
+
+    fn git_at(dir: &Path, args: &[&str], date: i64) -> String {
+        let when = format!("{date} +0000");
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Test Author")
+            .env("GIT_AUTHOR_EMAIL", "author@example.com")
+            .env("GIT_COMMITTER_NAME", "Test Committer")
+            .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+            .env("GIT_AUTHOR_DATE", &when)
+            .env("GIT_COMMITTER_DATE", &when)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DEFAULT_HASH")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn commit_at(dir: &Path, subject: &str, t: i64) -> String {
+        git_at(dir, &["commit", "--allow-empty", "-q", "-m", subject], t);
+        git_at(dir, &["rev-parse", "HEAD"], t)
+    }
+
+    /// c1..c5 on main, c5 newest. Returns the ids in that order.
+    fn linear(dir: &Path) -> Vec<String> {
+        (1..=5)
+            .map(|i| commit_at(dir, &format!("c{i}"), T0 + i * 100))
+            .collect()
+    }
+
+    /// base, then A1 and A2 on branch a and B1 and B2 on branch b with dates
+    /// interleaved, then main = A2 merged with B2. Returns the ids in the order an
+    /// unpaged listing prints them: M, B2, A2, B1, A1, base.
+    fn merge_history(dir: &Path) -> Vec<String> {
+        let base = commit_at(dir, "base", T0 + 100);
+        git_at(dir, &["checkout", "-q", "-b", "a"], T0 + 150);
+        let a1 = commit_at(dir, "A1", T0 + 200);
+        git_at(dir, &["checkout", "-q", "-b", "b", &base], T0 + 250);
+        let b1 = commit_at(dir, "B1", T0 + 300);
+        git_at(dir, &["checkout", "-q", "a"], T0 + 350);
+        let a2 = commit_at(dir, "A2", T0 + 400);
+        git_at(dir, &["checkout", "-q", "b"], T0 + 450);
+        let b2 = commit_at(dir, "B2", T0 + 500);
+        git_at(dir, &["checkout", "-q", "-B", "main", "a"], T0 + 550);
+        git_at(dir, &["merge", "--no-ff", "-q", "-m", "M", "b"], T0 + 600);
+        let m = git_at(dir, &["rev-parse", "HEAD"], T0 + 600);
+        vec![m, b2, a2, b1, a1, base]
+    }
+
+    /// `n` linear commits on main through `git fast-import`.
+    fn fast_import_linear(dir: &Path, n: i64) {
+        use std::io::Write;
+        let mut stream = String::new();
+        for i in 1..=n {
+            let msg = format!("c{i}");
+            stream.push_str(&format!(
+                "commit refs/heads/main\nmark :{i}\ncommitter T <t@example.com> {} +0000\ndata {}\n{msg}\n",
+                T0 + i,
+                msg.len()
+            ));
+            if i > 1 {
+                stream.push_str(&format!("from :{}\n", i - 1));
+            }
+            stream.push('\n');
+        }
+        let mut child = std::process::Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    fn fake_git(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("fakegit");
+        std::fs::write(&p, body).unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    fn router(state: &AppState, did: Option<&str>) -> axum::Router {
+        let mut r = axum::Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/commits",
+                axum::routing::get(super::list_commits),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/tags",
+                axum::routing::get(super::list_tags),
+            )
+            .with_state(state.clone());
+        if let Some(d) = did {
+            r = r.layer(axum::Extension(AuthenticatedDid(d.to_string())));
+        }
+        r
+    }
+
+    async fn call(
+        state: &AppState,
+        did: Option<&str>,
+        peer: Option<&str>,
+        uri: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        if let Some(p) = peer {
+            req.extensions_mut()
+                .insert(ConnectInfo(p.parse::<SocketAddr>().unwrap()));
+        }
+        let resp = router(state, did).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    fn commits_uri(repo: &str, query: &str) -> String {
+        let sep = if query.is_empty() { "" } else { "?" };
+        format!("/api/v1/repos/{OWNER_SHORT}/{repo}/commits{sep}{query}")
+    }
+
+    async fn commits(fx: &Fx, repo: &str, query: &str) -> (StatusCode, HeaderMap, String) {
+        call(&fx.state, None, Some(PEER), &commits_uri(repo, query)).await
+    }
+
+    fn hashes(body: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["commits"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no commits array in {body}"))
+            .iter()
+            .map(|c| c["hash"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Page `limit` at a time, feeding each page's last hash back as `before`.
+    async fn page_to_exhaustion(fx: &Fx, repo: &str, limit: usize) -> Vec<Vec<String>> {
+        let mut pages = Vec::new();
+        let mut before: Option<String> = None;
+        loop {
+            let query = match &before {
+                Some(b) => format!("limit={limit}&before={b}"),
+                None => format!("limit={limit}"),
+            };
+            let (status, _, body) = commits(fx, repo, &query).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            let page = hashes(&body);
+            let done = page.is_empty();
+            if let Some(last) = page.last() {
+                before = Some(last.clone());
+            }
+            pages.push(page);
+            assert!(pages.len() < 50, "paging did not terminate");
+            if done {
+                return pages;
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn commits_without_parameters_return_30_rows_with_the_known_keys(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("many", true).await;
+        fast_import_linear(&dir, 150);
+        let (status, _, body) = commits(&fx, "many", "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rows = v["commits"].as_array().unwrap();
+        assert_eq!(rows.len(), 30);
+        let mut keys: Vec<&str> = rows[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["author", "date", "hash", "message"]);
+        assert_eq!(rows[0]["message"], "c150", "newest first");
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            1,
+            "response stays {{commits}} only"
+        );
+    }
+
+    #[sqlx::test]
+    async fn commits_limit_is_clamped_into_one_to_one_hundred(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("many", true).await;
+        fast_import_linear(&dir, 150);
+        for (query, want) in [
+            ("limit=10", 10),
+            ("limit=1", 1),
+            ("limit=0", 1),
+            ("limit=-5", 1),
+            ("limit=100", 100),
+            ("limit=101", 100),
+            ("limit=100000", 100),
+            ("limit=9223372036854775807", 100),
+            ("limit=-9223372036854775808", 1),
+            ("limit=20&branch=dev", 20),
+        ] {
+            let (status, _, body) = commits(&fx, "many", query).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            assert_eq!(hashes(&body).len(), want, "{query}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn commits_unparseable_limit_is_400(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("many", true).await;
+        commit_at(&dir, "c1", T0);
+        for query in [
+            "limit=abc",
+            "limit=",
+            "limit=99999999999999999999",
+            "limit=1.5",
+        ] {
+            let (status, _, body) = commits(&fx, "many", query).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn commits_paging_a_linear_history_returns_every_commit_once(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("lin", true).await;
+        let ids = linear(&dir);
+        let pages = page_to_exhaustion(&fx, "lin", 2).await;
+        assert_eq!(
+            pages,
+            vec![
+                vec![ids[4].clone(), ids[3].clone()],
+                vec![ids[2].clone(), ids[1].clone()],
+                vec![ids[0].clone()],
+                vec![],
+            ]
+        );
+    }
+
+    #[sqlx::test]
+    async fn commits_paging_a_merge_history_returns_every_commit_once(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("merge", true).await;
+        // order: M, B2, A2, B1, A1, base
+        let ids = merge_history(&dir);
+        let (status, _, body) = commits(&fx, "merge", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hashes(&body),
+            ids,
+            "the unpaged order is what paging follows"
+        );
+        let pages = page_to_exhaustion(&fx, "merge", 2).await;
+        assert_eq!(
+            pages,
+            vec![
+                vec![ids[0].clone(), ids[1].clone()],
+                vec![ids[2].clone(), ids[3].clone()],
+                vec![ids[4].clone(), ids[5].clone()],
+                vec![],
+            ]
+        );
+    }
+
+    #[sqlx::test]
+    async fn commits_before_the_last_commit_is_an_empty_200_and_case_is_ignored(
+        pool: sqlx::PgPool,
+    ) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("lin", true).await;
+        let ids = linear(&dir);
+        let (status, _, body) = commits(&fx, "lin", &format!("before={}", ids[0])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(hashes(&body).is_empty());
+
+        let lower = commits(&fx, "lin", &format!("limit=2&before={}", ids[3])).await;
+        let upper = commits(
+            &fx,
+            "lin",
+            &format!("limit=2&before={}", ids[3].to_ascii_uppercase()),
+        )
+        .await;
+        assert_eq!(lower.0, StatusCode::OK);
+        assert_eq!(hashes(&lower.2), vec![ids[2].clone(), ids[1].clone()]);
+        assert_eq!(upper.0, StatusCode::OK);
+        assert_eq!(upper.2, lower.2);
+    }
+
+    #[sqlx::test]
+    async fn commits_hostile_before_values_are_400_even_with_the_pool_exhausted(
+        pool: sqlx::PgPool,
+    ) {
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("lin", true).await;
+        let ids = linear(&dir);
+        fx.state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let short = &ids[3][..7];
+        let too_long = format!("{}a", ids[3]);
+        let non_hex = "g".repeat(40);
+        for before in [
+            "HEAD",
+            "main~1",
+            "--all",
+            "-n1",
+            short,
+            too_long.as_str(),
+            non_hex.as_str(),
+            "",
+        ] {
+            let (status, _, body) = commits(&fx, "lin", &format!("before={before}")).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "before={before:?} must be 400, never 503 or a page: {body}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn commits_before_that_is_not_in_history_order_is_the_same_400(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("lin", true).await;
+        let ids = linear(&dir);
+        let tree = git_at(&dir, &["rev-parse", &format!("{}^{{tree}}", ids[4])], T0);
+        let blob = {
+            std::fs::write(dir.join("f.txt"), "hello").unwrap();
+            git_at(&dir, &["hash-object", "-w", "f.txt"], T0)
+        };
+        git_at(
+            &dir,
+            &["tag", "-a", "-m", "release", "v1", &ids[2]],
+            T0 + 900,
+        );
+        let tag_object = git_at(&dir, &["rev-parse", "refs/tags/v1"], T0);
+        // AE: a commit that lived on a branch the owner deleted.
+        git_at(&dir, &["checkout", "-q", "-b", "doomed"], T0 + 950);
+        let doomed = commit_at(&dir, "doomed", T0 + 1000);
+        git_at(&dir, &["checkout", "-q", "main"], T0 + 1100);
+        git_at(&dir, &["branch", "-D", "doomed"], T0 + 1100);
+        // A commit on another live branch that main does not contain.
+        git_at(&dir, &["checkout", "-q", "-b", "other"], T0 + 1150);
+        let other = commit_at(&dir, "other", T0 + 1200);
+        git_at(&dir, &["checkout", "-q", "main"], T0 + 1300);
+
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        let (status, _, baseline) = commits(&fx, "lin", &format!("before={absent}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{baseline}");
+        for (what, before) in [
+            ("tree", tree),
+            ("blob", blob),
+            ("annotated tag object", tag_object),
+            ("commit only on a deleted branch", doomed),
+            ("commit only on another live branch", other),
+        ] {
+            let (status, _, body) = commits(&fx, "lin", &format!("before={before}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+            assert_eq!(body, baseline, "{what}: same body as an unknown sha");
+        }
+    }
+
+    #[sqlx::test]
+    async fn commits_before_on_an_empty_repo_or_without_a_branch_is_400_not_empty_or_500(
+        pool: sqlx::PgPool,
+    ) {
+        let fx = Fx::new(pool).await;
+        fx.repo("empty", true).await;
+        let (status, _, body) = commits(&fx, "empty", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(hashes(&body).is_empty(), "unborn HEAD lists nothing");
+        let (status, _, body) = commits(
+            &fx,
+            "empty",
+            "before=0123456789abcdef0123456789abcdef01234567",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // Only branch deleted: the commit still exists in the object store.
+        let dir = fx.repo("nobranch", true).await;
+        let ids = linear(&dir);
+        git_at(&dir, &["update-ref", "-d", "refs/heads/main"], T0);
+        let (status, _, body) = commits(&fx, "nobranch", &format!("before={}", ids[2])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, _, body) = commits(&fx, "nobranch", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(hashes(&body).is_empty());
+    }
+
+    #[sqlx::test]
+    async fn commits_malformed_query_is_400_for_every_repo_but_before_head_follows_the_gate(
+        pool: sqlx::PgPool,
+    ) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("pub", true).await;
+        commit_at(&dir, "c1", T0);
+        fx.repo("priv", false).await;
+        let bad_limit: Vec<_> = {
+            let mut v = Vec::new();
+            for repo in ["priv", "nothing", "pub"] {
+                v.push(commits(&fx, repo, "limit=abc").await);
+            }
+            v
+        };
+        for r in &bad_limit {
+            assert_eq!(r.0, StatusCode::BAD_REQUEST);
+            assert_eq!(r.2, bad_limit[0].2, "same body whatever the repo");
+        }
+        assert_eq!(
+            commits(&fx, "priv", "before=HEAD").await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            commits(&fx, "nothing", "before=HEAD").await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            commits(&fx, "pub", "before=HEAD").await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[sqlx::test]
+    async fn commits_shed_503_with_retry_after_when_the_read_pool_is_exhausted(pool: sqlx::PgPool) {
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("lin", true).await;
+        linear(&dir);
+        fx.state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let (status, headers, _) = commits(&fx, "lin", "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(headers.get("retry-after").is_some());
+    }
+
+    #[sqlx::test]
+    async fn commits_one_caller_at_its_cap_is_shed_while_another_is_served(pool: sqlx::PgPool) {
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("lin", true).await;
+        linear(&dir);
+        fx.state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let _held = fx
+            .state
+            .git_read_per_caller
+            .try_acquire("203.0.113.9")
+            .expect("fill the caller's only slot");
+        let uri = commits_uri("lin", "");
+        let capped = call(&fx.state, None, Some("203.0.113.9:5000"), &uri).await;
+        assert_eq!(capped.0, StatusCode::SERVICE_UNAVAILABLE, "{}", capped.2);
+        assert!(capped.1.get("retry-after").is_some());
+        let other = call(&fx.state, None, Some("203.0.113.10:5000"), &uri).await;
+        assert_eq!(other.0, StatusCode::OK, "{}", other.2);
+    }
+
+    /// Requests that must read exactly like a missing repo: private, hidden by a
+    /// visibility rule, quarantined. `suffix` picks the route, `queries` the query
+    /// variants, `token` is a string present in each repo's git data that must not
+    /// appear in any response body.
+    async fn assert_denied_like_missing(
+        fx: &Fx,
+        route: &str,
+        queries: &[String],
+        tokens: &[String],
+    ) {
+        let uri = |repo: &str, q: &str| {
+            let sep = if q.is_empty() { "" } else { "?" };
+            format!("/api/v1/repos/{OWNER_SHORT}/{repo}/{route}{sep}{q}")
+        };
+        let missing = call(&fx.state, None, Some(PEER), &uri("ct-nothing", "")).await;
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert!(missing.2.contains("repo_not_found"), "{}", missing.2);
+        let expected = missing.2.replace("ct-nothing", "<repo>");
+        for repo in ["ct-private", "ct-hidden", "ct-quar", "ct-nothing"] {
+            for did in [None, Some(STRANGER)] {
+                for q in queries {
+                    let (status, headers, body) =
+                        call(&fx.state, did, Some(PEER), &uri(repo, q)).await;
+                    assert_eq!(status, StatusCode::NOT_FOUND, "{repo} {did:?} {q}: {body}");
+                    assert_eq!(body.replace(repo, "<repo>"), expected, "{repo} {did:?} {q}");
+                    let headers = format!("{headers:?}");
+                    for token in tokens {
+                        assert!(
+                            !body.contains(token),
+                            "{repo} {did:?} {q}: body leaks {token}"
+                        );
+                        assert!(!headers.contains(token), "{repo}: headers leak {token}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Seed the three unreadable repos with a commit carrying `token` in its
+    /// subject. Returns the commit ids so the caller can assert none leaks.
+    async fn seed_unreadable(fx: &Fx, token: &str) -> Vec<String> {
+        use crate::db::VisibilityMode;
+        let mut ids = Vec::new();
+        for (name, public) in [
+            ("ct-private", false),
+            ("ct-hidden", true),
+            ("ct-quar", true),
+        ] {
+            let dir = fx.repo(name, public).await;
+            ids.push(commit_at(&dir, token, T0));
+        }
+        let hidden = fx.repo_id("ct-hidden").await;
+        fx.state
+            .db
+            .set_visibility_rule(&hidden, "/", VisibilityMode::B, &[], OWNER)
+            .await
+            .unwrap();
+        let quar = fx.repo_id("ct-quar").await;
+        fx.state.db.set_repo_quarantine(&quar, true).await.unwrap();
+        ids
+    }
+
+    #[sqlx::test]
+    async fn commits_unreadable_repos_read_exactly_like_a_missing_one(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let token = "private-fixture-token-7731";
+        let ids = seed_unreadable(&fx, token).await;
+        let mut queries = vec![String::new(), format!("before={}", ids[0])];
+        queries.push("limit=5".to_string());
+        let mut tokens = vec![token.to_string()];
+        tokens.extend(ids);
+        assert_denied_like_missing(&fx, "commits", &queries, &tokens).await;
+    }
+
+    #[sqlx::test]
+    async fn commits_a_corrupt_head_ref_is_a_fixed_500_without_the_path(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("badref", true).await;
+        commit_at(&dir, "c1", T0);
+        std::fs::write(dir.join(".git/refs/heads/main"), b"garbage-ref-content\n").unwrap();
+        let (status, _, body) = commits(&fx, "badref", "").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("git_error"), "{body}");
+        assert!(body.contains("git read failed"), "{body}");
+        let path = dir.to_string_lossy().to_string();
+        assert!(!body.contains(&path), "body leaks the repo path: {body}");
+        assert!(!body.contains("garbage-ref-content"), "{body}");
+        assert!(!body.contains("refs/heads"), "{body}");
+        // The same through a page request.
+        let (status, _, body) = commits(&fx, "badref", "limit=3").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn commits_a_git_child_past_the_deadline_is_504_in_head_resolution(pool: sqlx::PgPool) {
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("slow", true).await;
+        linear(&dir);
+        let shim = tempfile::TempDir::new().unwrap();
+        fx.state.git_bin = fake_git(
+            shim.path(),
+            "#!/bin/sh\ncase \" $*\" in *rev-parse*) sleep 30;; esac\nexec git \"$@\"\n",
+        );
+        fx.set_deadline_secs(1);
+        let started = std::time::Instant::now();
+        let (status, _, body) = commits(&fx, "slow", "").await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    fn tags_uri(repo: &str) -> String {
+        format!("/api/v1/repos/{OWNER_SHORT}/{repo}/tags")
+    }
+
+    async fn tags(fx: &Fx, repo: &str) -> (StatusCode, HeaderMap, String) {
+        call(&fx.state, None, Some(PEER), &tags_uri(repo)).await
+    }
+
+    async fn tags_ok(fx: &Fx, repo: &str) -> serde_json::Value {
+        let (status, _, body) = tags(fx, repo).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    fn tag_row<'a>(v: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        v["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("no tag {name} in {v}"))
+    }
+
+    fn tag_names(v: &serde_json::Value) -> Vec<String> {
+        v["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Point `refs/tags/<name>` at `sha` without git's tag-name checks, so awkward
+    /// and non-UTF-8 names can exist.
+    #[cfg(unix)]
+    fn raw_tag(dir: &Path, name: &[u8], sha: &str) {
+        use std::os::unix::ffi::OsStrExt;
+        let mut refname = b"refs/tags/".to_vec();
+        refname.extend_from_slice(name);
+        let out = std::process::Command::new("git")
+            .arg("update-ref")
+            .arg(std::ffi::OsStr::from_bytes(&refname))
+            .arg(sha)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "update-ref failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[sqlx::test]
+    async fn tags_report_lightweight_and_annotated_tags_by_their_target(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        git_at(&dir, &["tag", "v1"], T0);
+        git_at(&dir, &["tag", "-a", "-m", "second", "v2"], T0 + 10);
+        let tag_object = git_at(&dir, &["rev-parse", "refs/tags/v2"], T0);
+        assert_ne!(tag_object, c, "fixture: v2 is a real tag object");
+        let v = tags_ok(&fx, "t").await;
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "tags": [
+                    {"name": "v2", "target": c, "target_type": "commit", "annotated": true},
+                    {"name": "v1", "target": c, "target_type": "commit", "annotated": false},
+                ],
+                "truncated": false,
+            })
+        );
+    }
+
+    #[sqlx::test]
+    async fn tags_on_a_tree_a_blob_and_another_tag_report_what_git_peels(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        let tree = git_at(&dir, &["rev-parse", &format!("{c}^{{tree}}")], T0);
+        std::fs::write(dir.join("f.txt"), "hello").unwrap();
+        let blob = git_at(&dir, &["hash-object", "-w", "f.txt"], T0);
+        git_at(&dir, &["tag", "on-tree", &tree], T0);
+        git_at(&dir, &["tag", "on-blob", &blob], T0);
+        git_at(&dir, &["tag", "-a", "-m", "inner", "inner", &c], T0 + 10);
+        let inner_object = git_at(&dir, &["rev-parse", "refs/tags/inner"], T0);
+        git_at(
+            &dir,
+            &["tag", "-a", "-m", "outer", "outer", &inner_object],
+            T0 + 20,
+        );
+        let v = tags_ok(&fx, "t").await;
+        assert_eq!(
+            *tag_row(&v, "on-tree"),
+            serde_json::json!({"name": "on-tree", "target": tree, "target_type": "tree", "annotated": false})
+        );
+        assert_eq!(
+            *tag_row(&v, "on-blob"),
+            serde_json::json!({"name": "on-blob", "target": blob, "target_type": "blob", "annotated": false})
+        );
+        assert_eq!(
+            *tag_row(&v, "inner"),
+            serde_json::json!({"name": "inner", "target": c, "target_type": "commit", "annotated": true})
+        );
+        // git 2.43 peels one level: a tag of a tag reports the inner tag object.
+        assert_eq!(
+            *tag_row(&v, "outer"),
+            serde_json::json!({"name": "outer", "target": inner_object, "target_type": "tag", "annotated": true})
+        );
+    }
+
+    /// An unborn head means no served history, so the tag listing is empty even
+    /// though tag refs on disk still resolve, matching the commits listing.
+    #[sqlx::test]
+    async fn tags_on_an_unborn_head_list_nothing_even_with_tags_present(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        git_at(&dir, &["tag", "-a", "-m", "v1", "v1", &c], T0 + 10);
+        // HEAD now names a branch that does not exist and main goes away, so
+        // head resolution answers None while refs/tags/v1 still resolves.
+        git_at(
+            &dir,
+            &["symbolic-ref", "HEAD", "refs/heads/unborn-main"],
+            T0,
+        );
+        git_at(&dir, &["branch", "-D", "main"], T0);
+        assert_eq!(
+            git_at(&dir, &["rev-parse", "--verify", "refs/tags/v1"], T0).len(),
+            40,
+            "fixture: the tag ref itself still resolves"
+        );
+        let v = tags_ok(&fx, "t").await;
+        assert_eq!(v, serde_json::json!({"tags": [], "truncated": false}));
+    }
+
+    /// A head ref that exists but does not resolve is a read failure (#400),
+    /// never the same empty 200 an unborn head gets.
+    #[sqlx::test]
+    async fn tags_on_a_damaged_head_ref_is_an_error_not_an_empty_list(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        git_at(&dir, &["tag", "v1", &c], T0);
+        std::fs::write(dir.join(".git/refs/heads/main"), b"garbage\n").unwrap();
+        let (status, _, body) = tags(&fx, "t").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    }
+
+    #[sqlx::test]
+    async fn tags_on_a_repo_with_path_rules_list_only_commit_targets(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        let tree = git_at(&dir, &["rev-parse", &format!("{c}^{{tree}}")], T0);
+        std::fs::write(dir.join("f.txt"), "hello rule fixture").unwrap();
+        let blob = git_at(&dir, &["hash-object", "-w", "f.txt"], T0);
+        git_at(&dir, &["tag", "light", &c], T0);
+        git_at(&dir, &["tag", "-a", "-m", "ann", "ann", &c], T0 + 10);
+        git_at(&dir, &["tag", "on-tree", &tree], T0);
+        git_at(&dir, &["tag", "on-blob", &blob], T0);
+        let inner_object = git_at(&dir, &["rev-parse", "refs/tags/ann"], T0);
+        git_at(
+            &dir,
+            &["tag", "-a", "-m", "outer", "outer", &inner_object],
+            T0 + 20,
+        );
+
+        // No rules: tree and blob tags are listed as before.
+        let v = tags_ok(&fx, "t").await;
+        let mut names = tag_names(&v);
+        names.sort();
+        assert_eq!(names, ["ann", "light", "on-blob", "on-tree", "outer"]);
+
+        let id = fx.repo_id("t").await;
+        fx.state
+            .db
+            .set_visibility_rule(&id, "/secret/**", crate::db::VisibilityMode::B, &[], OWNER)
+            .await
+            .unwrap();
+
+        for caller in [None, Some(STRANGER), Some(OWNER)] {
+            let (status, _, body) = call(&fx.state, caller, Some(PEER), &tags_uri("t")).await;
+            assert_eq!(status, StatusCode::OK, "{caller:?}: {body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let mut names = tag_names(&v);
+            names.sort();
+            assert_eq!(names, ["ann", "light"], "{caller:?}: {body}");
+            assert_eq!(v["truncated"], false, "{caller:?}");
+            for hidden in [&tree, &blob] {
+                assert!(
+                    !body.contains(hidden.as_str()),
+                    "{caller:?}: body names a non-commit object: {body}"
+                );
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn tags_come_back_newest_version_first(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        commit_at(&dir, "c1", T0);
+        for name in ["v1.9", "v2.0", "v1.10"] {
+            git_at(&dir, &["tag", name], T0);
+        }
+        let v = tags_ok(&fx, "t").await;
+        assert_eq!(tag_names(&v), ["v2.0", "v1.10", "v1.9"]);
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn tags_with_awkward_names_are_listed_as_named_and_non_utf8_names_are_omitted(
+        pool: sqlx::PgPool,
+    ) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        raw_tag(&dir, b"-n", &c);
+        raw_tag(&dir, b"a/b", &c);
+        raw_tag(&dir, "v\u{202E}x".as_bytes(), &c);
+        raw_tag(&dir, b"bad\xffname", &c);
+        let v = tags_ok(&fx, "t").await;
+        let mut names = tag_names(&v);
+        names.sort();
+        assert_eq!(names, ["-n", "a/b", "v\u{202E}x"]);
+    }
+
+    #[sqlx::test]
+    async fn tags_of_a_repo_with_none_or_no_commits_is_an_empty_200(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("some", true).await;
+        commit_at(&dir, "c1", T0);
+        fx.repo("empty", true).await;
+        for repo in ["some", "empty"] {
+            let (status, _, body) = tags(&fx, repo).await;
+            assert_eq!(status, StatusCode::OK, "{repo}: {body}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({"tags": [], "truncated": false}),
+                "{repo}"
+            );
+        }
+    }
+
+    fn make_tags(dir: &Path, sha: &str, n: usize) {
+        use std::io::Write;
+        let mut script = String::new();
+        for i in 1..=n {
+            script.push_str(&format!("create refs/tags/t{i:04} {sha}\n"));
+        }
+        let mut child = std::process::Command::new("git")
+            .args(["update-ref", "--stdin"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[sqlx::test]
+    async fn tags_are_capped_at_500_and_truncated_is_set_only_past_the_cap(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let at_cap = fx.repo("cap", true).await;
+        let c = commit_at(&at_cap, "c1", T0);
+        make_tags(&at_cap, &c, 500);
+        let v = tags_ok(&fx, "cap").await;
+        assert_eq!(v["tags"].as_array().unwrap().len(), 500);
+        assert_eq!(v["truncated"], false);
+
+        let over = fx.repo("over", true).await;
+        let c = commit_at(&over, "c1", T0);
+        make_tags(&over, &c, 501);
+        let v = tags_ok(&fx, "over").await;
+        let names = tag_names(&v);
+        assert_eq!(names.len(), 500);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(names.first().unwrap(), "t0501", "newest first");
+        assert_eq!(names.last().unwrap(), "t0002", "the oldest is the one cut");
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn tags_a_ref_to_a_missing_object_is_never_a_silent_drop(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("ghost", true).await;
+        let c = commit_at(&dir, "c1", T0);
+        git_at(&dir, &["tag", "good"], T0);
+        std::fs::write(
+            dir.join(".git/refs/tags/ghost"),
+            b"0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        let (status, _, body) = tags(&fx, "ghost").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("git read failed"), "{body}");
+        assert!(
+            !body.contains("ghost"),
+            "no ref name or path in the body: {body}"
+        );
+        assert!(!body.contains(&c), "{body}");
+    }
+
+    #[sqlx::test]
+    async fn tags_shed_503_when_the_read_pool_is_exhausted(pool: sqlx::PgPool) {
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        commit_at(&dir, "c1", T0);
+        fx.state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let (status, headers, _) = tags(&fx, "t").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(headers.get("retry-after").is_some());
+    }
+
+    #[sqlx::test]
+    async fn tags_one_caller_at_its_cap_is_shed_while_another_is_served(pool: sqlx::PgPool) {
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("t", true).await;
+        commit_at(&dir, "c1", T0);
+        fx.state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let _held = fx
+            .state
+            .git_read_per_caller
+            .try_acquire("203.0.113.9")
+            .expect("fill the caller's only slot");
+        let uri = tags_uri("t");
+        let capped = call(&fx.state, None, Some("203.0.113.9:5000"), &uri).await;
+        assert_eq!(capped.0, StatusCode::SERVICE_UNAVAILABLE, "{}", capped.2);
+        let other = call(&fx.state, None, Some("203.0.113.10:5000"), &uri).await;
+        assert_eq!(other.0, StatusCode::OK, "{}", other.2);
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn tags_a_git_child_past_the_deadline_is_504(pool: sqlx::PgPool) {
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("slow", true).await;
+        commit_at(&dir, "c1", T0);
+        let shim = tempfile::TempDir::new().unwrap();
+        fx.state.git_bin = fake_git(
+            shim.path(),
+            "#!/bin/sh\ncase \" $*\" in *for-each-ref*) sleep 30;; esac\nexec git \"$@\"\n",
+        );
+        fx.set_deadline_secs(1);
+        let started = std::time::Instant::now();
+        let (status, _, body) = tags(&fx, "slow").await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    /// A body that must not name where the repo lives or what the store said.
+    fn assert_no_repo_detail(body: &str, dir: &Path) {
+        let path = dir.to_string_lossy().to_string();
+        assert!(!body.contains(&path), "body leaks the repo path: {body}");
+        assert!(
+            !body.contains("quarantine"),
+            "body leaks store detail: {body}"
+        );
+    }
+
+    /// A live tree whose quarantine sidecar cannot be parsed: the store refuses it
+    /// with a typed `RepoUnavailable` that no reconciliation can lift.
+    fn quarantine_unreadable(dir: &Path) {
+        let marker = crate::git::repo_store::quarantine_path(dir).expect("sidecar path");
+        std::fs::write(marker, b"not json").unwrap();
+    }
+
+    /// The status, header and body the clone path gives for the same refusal.
+    fn assert_repo_unavailable_503(status: StatusCode, headers: &HeaderMap, body: &str) {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(
+            headers.get("retry-after").map(|v| v.to_str().unwrap()),
+            Some("1"),
+            "{body}"
+        );
+        assert!(body.contains("repo_unavailable"), "{body}");
+        assert!(
+            body.contains("repository is temporarily unavailable, retry"),
+            "{body}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn commits_an_unreconcilable_quarantined_tree_is_a_retryable_503(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("held", true).await;
+        linear(&dir);
+        quarantine_unreadable(&dir);
+        for query in ["", "limit=3"] {
+            let (status, headers, body) = commits(&fx, "held", query).await;
+            assert_repo_unavailable_503(status, &headers, &body);
+            assert_no_repo_detail(&body, &dir);
+        }
+    }
+
+    #[sqlx::test]
+    async fn tags_an_unreconcilable_quarantined_tree_is_a_retryable_503(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("held", true).await;
+        commit_at(&dir, "c1", T0);
+        quarantine_unreadable(&dir);
+        let (status, headers, body) = tags(&fx, "held").await;
+        assert_repo_unavailable_503(status, &headers, &body);
+        assert_no_repo_detail(&body, &dir);
+    }
+
+    /// An acquire failure with no typed marker keeps the fixed-message 500.
+    #[sqlx::test]
+    async fn an_unexpected_acquire_error_stays_a_fixed_500_without_detail(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let dir = fx.repo("gone", true).await;
+        commit_at(&dir, "c1", T0);
+        // A live path that is a file, not a directory: an acquire failure with no
+        // typed marker.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a repo").unwrap();
+        let path = dir.to_string_lossy().to_string();
+        let (status, _, body) = commits(&fx, "gone", "").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("git read failed"), "{body}");
+        assert!(!body.contains(&path), "body leaks the repo path: {body}");
+        let (status, _, body) = tags(&fx, "gone").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("git read failed"), "{body}");
+        assert!(!body.contains(&path), "body leaks the repo path: {body}");
+    }
+
+    /// Pool and per-caller limits of one, so both guards read as taken or free.
+    fn single_slot_pools(fx: &mut Fx) {
+        fx.state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        fx.state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+    }
+
+    fn caller_slot_is_taken(fx: &Fx) -> bool {
+        fx.state
+            .git_read_per_caller
+            .try_acquire("203.0.113.5")
+            .is_none()
+    }
+
+    #[sqlx::test]
+    async fn a_served_read_returns_both_permits(pool: sqlx::PgPool) {
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("lin", true).await;
+        linear(&dir);
+        single_slot_pools(&mut fx);
+        for uri in [commits_uri("lin", ""), tags_uri("lin")] {
+            let (status, _, body) = call(&fx.state, None, Some(PEER), &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_eq!(fx.state.git_read_semaphore.available_permits(), 1, "{uri}");
+            assert!(!caller_slot_is_taken(&fx), "{uri}");
+        }
+    }
+
+    /// The permits belong to the blocking work, not the handler future: a client that
+    /// disconnects while git is running must not free the slots until git has exited.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn a_disconnect_keeps_both_permits_until_the_git_child_exits(pool: sqlx::PgPool) {
+        use std::time::Duration;
+        let mut fx = Fx::new(pool).await;
+        let dir = fx.repo("slow", true).await;
+        commit_at(&dir, "c1", T0);
+        single_slot_pools(&mut fx);
+        fx.set_deadline_secs(30);
+        let shim = tempfile::TempDir::new().unwrap();
+        let pid_file = shim.path().join("pid");
+        fx.state.git_bin = fake_git(
+            shim.path(),
+            &format!(
+                "#!/bin/sh\ncase \" $*\" in *for-each-ref*) echo $$ > '{}'; sleep 2;; esac\nexec git \"$@\"\n",
+                pid_file.display()
+            ),
+        );
+
+        let uri = tags_uri("slow");
+        let mut fut = Box::pin(call(&fx.state, None, Some(PEER), &uri));
+        let mut spawned = false;
+        for _ in 0..500 {
+            if tokio::time::timeout(Duration::from_millis(20), &mut fut)
+                .await
+                .is_ok()
+            {
+                panic!("the request finished before the git child could be observed");
+            }
+            if pid_file.exists() {
+                spawned = true;
+                break;
+            }
+        }
+        assert!(spawned, "the fake git child must have started");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(fx.state.git_read_semaphore.available_permits(), 0);
+        assert!(caller_slot_is_taken(&fx));
+
+        // The client disconnects: the handler future is dropped mid-request.
+        drop(fut);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "precondition: the git child must still be running, or this proves nothing"
+        );
+        assert_eq!(
+            fx.state.git_read_semaphore.available_permits(),
+            0,
+            "dropping the handler future must not free the shared read permit"
+        );
+        assert!(
+            caller_slot_is_taken(&fx),
+            "dropping the handler future must not free the per-caller slot"
+        );
+
+        let mut freed = false;
+        for _ in 0..400 {
+            if fx.state.git_read_semaphore.available_permits() == 1 && !caller_slot_is_taken(&fx) {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(freed, "both permits must return once the git child is done");
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "the permits must not be freed before the child has exited"
+        );
+    }
+
+    #[sqlx::test]
+    async fn tags_unreadable_repos_read_exactly_like_a_missing_one(pool: sqlx::PgPool) {
+        let fx = Fx::new(pool).await;
+        let token = "private-fixture-token-5521";
+        let ids = seed_unreadable(&fx, token).await;
+        for name in ["ct-private", "ct-hidden", "ct-quar"] {
+            let dir = crate::git::store::repo_disk_path(fx.dir.path(), OWNER, name);
+            git_at(
+                &dir,
+                &["tag", "-a", "-m", token, "secret-tag-name-9917"],
+                T0 + 5,
+            );
+        }
+        let mut tokens = vec![token.to_string(), "secret-tag-name-9917".to_string()];
+        tokens.extend(ids);
+        assert_denied_like_missing(&fx, "tags", &[String::new()], &tokens).await;
     }
 }

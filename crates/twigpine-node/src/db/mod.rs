@@ -2878,6 +2878,12 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE model_blocks ADD COLUMN IF NOT EXISTS payer_did TEXT",
         ],
     },
+
+    Migration {
+        version: 53,
+        name: "repos_homepage",
+        stmts: &["ALTER TABLE repos ADD COLUMN IF NOT EXISTS homepage TEXT"],
+    },
 ];
 
 // ── HTTP-signature replay ledger ──────────────────────────────────────────────
@@ -3438,6 +3444,49 @@ impl Db {
             .await?;
 
         Ok(row.map(row_to_repo))
+    }
+
+    /// The owner-set homepage of one repo, or `None` when unset or the id is
+    /// unknown. Read separately from `RepoRecord` so the many repo queries do
+    /// not carry a column most callers never use.
+    pub async fn get_repo_homepage(&self, repo_id: &str) -> Result<Option<String>> {
+        let row: Option<Option<String>> =
+            sqlx::query_scalar("SELECT homepage FROM repos WHERE id = $1")
+                .bind(repo_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.flatten())
+    }
+
+    /// Homepages for a set of repos in one query, keyed by repo id. Repos with
+    /// no homepage, and unknown ids, are absent from the map.
+    pub async fn list_repo_homepages(
+        &self,
+        repo_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        if repo_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, homepage FROM repos WHERE id = ANY($1) AND homepage IS NOT NULL",
+        )
+        .bind(repo_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Set (`Some`) or clear (`None`) a repo's homepage and bump `updated_at`.
+    /// Returns the number of rows matched, so a caller can tell a repo deleted
+    /// after its gate from a successful write.
+    pub async fn set_repo_homepage(&self, repo_id: &str, homepage: Option<&str>) -> Result<u64> {
+        let res = sqlx::query("UPDATE repos SET homepage = $2, updated_at = $3 WHERE id = $1")
+            .bind(repo_id)
+            .bind(homepage)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 
     /// Fetch a repo by its stable `id`. Used by the `/ipfs/{cid}` provenance path,
@@ -14632,6 +14681,200 @@ mod migration_tests {
         .execute(&db.pool)
         .await
         .unwrap();
+    }
+
+    // ── Repo homepage (v53) ──────────────────────────────────────────────────
+
+    /// The version this branch's migration claims; the upgrade test derives its
+    /// rollback target from `MIGRATIONS` so a renumber is a one-line change.
+    const V53: i64 = 53;
+
+    fn homepage_repo(id: &str, name: &str) -> super::RepoRecord {
+        let now = chrono::Utc::now();
+        super::RepoRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            owner_did: "did:key:z6MkHomepageOwnerFixture".to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/srv/{id}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// Upgrade path: a fresh `#[sqlx::test]` database runs the whole chain, so
+    /// only a simulated existing node proves the column arrives through its own
+    /// entry rather than an already-applied one.
+    #[sqlx::test]
+    async fn migration_v53_upgrade_path_adds_nullable_homepage(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        sqlx::query("ALTER TABLE repos DROP COLUMN IF EXISTS homepage")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version >= $1")
+            .bind(V53)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let prior = MIGRATIONS
+            .iter()
+            .map(|m| m.version)
+            .filter(|v| *v < V53)
+            .max()
+            .expect("MIGRATIONS must declare a version below 53");
+        let recorded_max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_max, prior,
+            "the simulated node must sit at the highest version below {V53}"
+        );
+
+        let legacy = homepage_repo("11111111-1111-1111-1111-111111111111", "legacy");
+        db.create_repo(&legacy).await.unwrap();
+        assert!(!column_exists(&db, "repos", "homepage").await);
+
+        db.migrate().await.unwrap();
+
+        assert!(
+            column_exists(&db, "repos", "homepage").await,
+            "homepage missing after upgrade on an existing node"
+        );
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable FROM information_schema.columns
+             WHERE table_name = 'repos' AND column_name = 'homepage'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "homepage must be nullable");
+
+        assert_eq!(db.get_repo_homepage(&legacy.id).await.unwrap(), None);
+
+        let recorded: (i64,) = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = $1",
+        )
+        .bind(V53)
+        .fetch_one(&db.pool)
+        .await
+        .map(|n| (n,))
+        .unwrap();
+        assert_eq!(recorded.0, 1, "v53 must be recorded as applied once");
+
+        db.migrate().await.unwrap();
+        let again: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = $1")
+                .bind(V53)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(again, 1, "a second migrate must change nothing");
+    }
+
+    #[sqlx::test]
+    async fn homepage_round_trips_through_single_and_batched_reads(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let a = homepage_repo("aaaaaaaa-0000-0000-0000-000000000001", "a");
+        let b = homepage_repo("aaaaaaaa-0000-0000-0000-000000000002", "b");
+        db.create_repo(&a).await.unwrap();
+        db.create_repo(&b).await.unwrap();
+
+        // Unset for a new repo.
+        assert_eq!(db.get_repo_homepage(&a.id).await.unwrap(), None);
+
+        let url = "https://example.com/project?x=1#frag";
+        assert_eq!(db.set_repo_homepage(&a.id, Some(url)).await.unwrap(), 1);
+        assert_eq!(
+            db.get_repo_homepage(&a.id).await.unwrap().as_deref(),
+            Some(url)
+        );
+
+        // Batched read: only the repo with a homepage appears; an unknown id and
+        // the unset repo are absent.
+        let ids = vec![a.id.clone(), b.id.clone(), "no-such-id".to_string()];
+        let map = db.list_repo_homepages(&ids).await.unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&a.id).map(String::as_str), Some(url));
+        assert!(db.list_repo_homepages(&[]).await.unwrap().is_empty());
+
+        // Setting the same value twice still matches the row.
+        assert_eq!(db.set_repo_homepage(&a.id, Some(url)).await.unwrap(), 1);
+
+        // Clearing returns the field to null.
+        assert_eq!(db.set_repo_homepage(&a.id, None).await.unwrap(), 1);
+        assert_eq!(db.get_repo_homepage(&a.id).await.unwrap(), None);
+        assert!(db.list_repo_homepages(&ids).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn set_homepage_on_unknown_repo_affects_no_rows(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let n = db
+            .set_repo_homepage("missing", Some("https://example.com"))
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[sqlx::test]
+    async fn set_homepage_bumps_updated_at(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let mut r = homepage_repo("bbbbbbbb-0000-0000-0000-000000000001", "t");
+        r.updated_at = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        db.create_repo(&r).await.unwrap();
+        db.set_repo_homepage(&r.id, Some("https://example.com"))
+            .await
+            .unwrap();
+        let after = db.get_repo_by_id(&r.id).await.unwrap().unwrap();
+        assert!(after.updated_at > r.updated_at);
+    }
+
+    #[sqlx::test]
+    async fn upsert_mirror_repo_leaves_canonical_homepage_untouched(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let canon = homepage_repo("cccccccc-0000-0000-0000-000000000001", "shared");
+        db.create_repo(&canon).await.unwrap();
+        db.set_repo_homepage(&canon.id, Some("https://example.com/keep"))
+            .await
+            .unwrap();
+
+        db.upsert_mirror_repo("z6MkOther", "shared", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+        db.upsert_mirror_repo(
+            "z6MkHomepageOwnerFixture",
+            "shared",
+            "/srv/mirror2",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_repo_homepage(&canon.id).await.unwrap().as_deref(),
+            Some("https://example.com/keep")
+        );
+        assert_eq!(
+            db.get_repo_homepage("z6MkOther/shared").await.unwrap(),
+            None,
+            "a mirror row never carries a homepage"
+        );
     }
 }
 
