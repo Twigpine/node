@@ -1364,6 +1364,9 @@ impl<'a> PositionScan<'a> {
         while let Some(nl) = rest.iter().position(|b| *b == b'\n') {
             let (head, tail) = rest.split_at(nl);
             rest = &tail[1..];
+            if self.partial.len() + head.len() > MAX_REV_LIST_LINE {
+                bail!("git rev-list printed a line longer than an object id");
+            }
             let matched = if self.partial.is_empty() {
                 head == self.target
             } else {
@@ -1635,7 +1638,7 @@ pub fn list_tags_bounded(
     max: usize,
     deadline: std::time::Instant,
 ) -> Result<(Vec<TagInfo>, bool)> {
-    let out = crate::git::visibility_pack::run_bounded_git(
+    let (status, out, scan_err) = crate::git::visibility_pack::run_bounded_git_raw(
         git_bin,
         &[
             "for-each-ref",
@@ -1648,6 +1651,19 @@ pub fn list_tags_bounded(
         b"",
         deadline,
     )?;
+    if !status.success() {
+        bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&scan_err).trim()
+        );
+    }
+    // git skips a broken tag ref with only a warning and still exits 0.
+    if scan_err.iter().any(|b| !b.is_ascii_whitespace()) {
+        bail!(
+            "git for-each-ref reported an incomplete tag scan: {}",
+            String::from_utf8_lossy(&scan_err).trim()
+        );
+    }
     let mut records: Vec<&[u8]> = out
         .split(|b| *b == b'\n')
         .filter(|l| !l.is_empty())
@@ -4607,12 +4623,17 @@ mod tests {
     }
 
     /// Run real git in `dir` with fixed identity and a fixed commit date, and
-    /// return trimmed stdout.
+    /// return trimmed stdout. The developer's git config and default hash are
+    /// shut out so a global setting (commit signing, sha256) cannot change the
+    /// fixture.
     fn git_at(dir: &Path, args: &[&str], date: i64) -> String {
         let when = format!("{date} +0000");
         let out = Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DEFAULT_HASH")
             .env("GIT_AUTHOR_NAME", "Test Author")
             .env("GIT_AUTHOR_EMAIL", "author@example.com")
             .env("GIT_COMMITTER_NAME", "Test Committer")
@@ -5263,5 +5284,43 @@ mod tests {
         assert_eq!(row("inner").target_type, "commit");
         assert_eq!(row("light").target, c);
         assert!(!row("light").annotated);
+    }
+
+    /// A complete line longer than an object id is refused the same way whether
+    /// its bytes arrive in one chunk or split across several.
+    #[test]
+    fn position_scan_rejects_an_overlong_complete_line_in_one_chunk() {
+        let mut scan = super::PositionScan::new(b"bbb");
+        let mut chunk = vec![b'x'; super::MAX_REV_LIST_LINE + 1];
+        chunk.extend_from_slice(b"\nbbb\n");
+        assert!(
+            scan.feed(&chunk).is_err(),
+            "an overlong line must be refused before the target is compared"
+        );
+    }
+
+    /// git skips a broken tag ref with only a warning on stderr and exits 0;
+    /// the listing must fail rather than return the tags without it. A repo
+    /// with no tags at all is still an empty listing.
+    #[test]
+    fn tag_listing_fails_on_a_broken_tag_ref_instead_of_skipping_it() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().to_path_buf();
+        git_at(&work, &["init", "-q", "-b", "main"], T0);
+        commit_at(&work, "c1", T0 + 100);
+        let git_dir = work.join(".git");
+
+        let (tags, truncated) =
+            super::list_tags_bounded("git", &git_dir, 100, far_deadline()).unwrap();
+        assert!(tags.is_empty() && !truncated, "no tags is an empty listing");
+
+        git_at(&work, &["tag", "good"], T0);
+        std::fs::write(git_dir.join("refs/tags/broken"), b"not-an-oid\n").unwrap();
+        let err = super::list_tags_bounded("git", &git_dir, 100, far_deadline())
+            .expect_err("a broken tag ref must not be silently skipped");
+        assert!(
+            format!("{err:#}").contains("incomplete tag scan"),
+            "got: {err:#}"
+        );
     }
 }

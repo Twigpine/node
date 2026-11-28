@@ -6793,7 +6793,10 @@ exec yes abcdefgh\n";
             // process is left in the group.
             let rc = unsafe { libc::kill(-pgid, 0) };
             if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                // The fixture descendant never leaves the group, so an empty group
+                // means it is gone too, even if it exited after the check above.
                 group_gone = true;
+                stopped = true;
                 break;
             }
             if stopped {
@@ -6802,14 +6805,18 @@ exec yes abcdefgh\n";
             std::thread::sleep(Duration::from_millis(10));
         }
         // Kill whatever is left so a RED run leaks no orphan, but only when the
-        // probe never observed the group as gone: after ESRCH the pid and pgid
-        // can be reused by unrelated processes.
+        // probe never observed the group as gone: after ESRCH the pgid can be
+        // reused by unrelated processes. The descendant is not signalled by pid:
+        // the loop can end on `stopped` after it was reaped, and its pid may then
+        // belong to an unrelated process. It never leaves the group, so the group
+        // kill reaches it while it lives.
         if !group_gone {
-            // SAFETY: the probe never reported the group gone, so these ids are
-            // still held by fixture processes (live or zombie) and the signals
-            // cannot hit a reused, unrelated process.
+            // SAFETY: the last probe in the loop found the group still populated,
+            // so the pgid is held by fixture processes (live or zombie) and this
+            // signal cannot reach an unrelated group. The remaining window is the
+            // last member being reaped between that probe and this call, which
+            // would need the pgid reused within that interval.
             unsafe {
-                libc::kill(desc, libc::SIGKILL);
                 libc::kill(-pgid, libc::SIGKILL);
             }
         }

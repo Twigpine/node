@@ -724,28 +724,41 @@ where
         }
     })?;
 
+    // The deadline starts before the re-check below: that query runs while both
+    // permits are held and the pool sets no statement timeout, so it spends the
+    // same budget the git work then runs on.
+    let budget = std::time::Duration::from_secs(state.config.git_service_timeout_secs)
+        .min(MAX_GIT_READ_DEADLINE);
+    let deadline = std::time::Instant::now() + budget;
+
     // The gate authorized this row, but the disk identity is owner+name only:
     // a row deleted and recreated under the same name since then would serve a
     // different repo on this authorization. Re-read and require the same row;
     // anything else answers like the missing-repo case the gate produces.
-    match state.db.get_repo(&record.owner_did, &record.name).await {
-        Ok(Some(current)) if current.id == record.id => {}
-        Ok(_) => {
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        state.db.get_repo(&record.owner_did, &record.name),
+    )
+    .await
+    {
+        Ok(Ok(Some(current))) if current.id == record.id => {}
+        Ok(Ok(_)) => {
             return Err(AppError::RepoNotFound(format!(
                 "{}/{}",
                 record.owner_did, record.name
             )));
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo row re-check failed");
+            return Err(AppError::Git(GIT_READ_FAILED_MESSAGE.into()));
+        }
+        Err(_elapsed) => {
+            tracing::warn!(repo = %record.name, "repo row re-check timed out");
             return Err(AppError::Git(GIT_READ_FAILED_MESSAGE.into()));
         }
     }
 
     let git_bin = state.git_bin.clone();
-    let budget = std::time::Duration::from_secs(state.config.git_service_timeout_secs)
-        .min(MAX_GIT_READ_DEADLINE);
-    let deadline = std::time::Instant::now() + budget;
     let repo = record.name.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _held = (permit, caller_permit);
@@ -761,22 +774,22 @@ where
     // git children run: disk identity is owner+name only, so results computed
     // across the delete+recreate can serve the new row's data on the old row's
     // authorization. Re-read the row after the work has finished and discard
-    // anything computed under a row that no longer matches: a missing or
-    // replaced row answers like the missing-repo case the gate produces,
-    // exactly as the pre-work check does.
-    if result.is_ok() {
-        match state.db.get_repo(&record.owner_did, &record.name).await {
-            Ok(Some(current)) if current.id == record.id => {}
-            Ok(_) => {
-                return Err(AppError::RepoNotFound(format!(
-                    "{}/{}",
-                    record.owner_did, record.name
-                )));
-            }
-            Err(e) => {
-                tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo row post-read re-check failed");
-                return Err(AppError::Git(GIT_READ_FAILED_MESSAGE.into()));
-            }
+    // anything computed under a row that no longer matches, an error included
+    // (a `before` cursor missing from the replacement's history is a 400 about
+    // the replacement): a missing or replaced row answers like the missing-repo
+    // case the gate produces, exactly as the pre-work check does. The permits
+    // went with the blocking work, so this query holds no read slot.
+    match state.db.get_repo(&record.owner_did, &record.name).await {
+        Ok(Some(current)) if current.id == record.id => {}
+        Ok(_) => {
+            return Err(AppError::RepoNotFound(format!(
+                "{}/{}",
+                record.owner_did, record.name
+            )));
+        }
+        Err(e) => {
+            tracing::error!(repo = %record.name, err = %format!("{e:#}"), "repo row post-read re-check failed");
+            return Err(AppError::Git(GIT_READ_FAILED_MESSAGE.into()));
         }
     }
     result
@@ -20389,6 +20402,187 @@ exit 0
         .await;
         assert!(res.is_ok(), "the live record runs the read; got {res:?}");
     }
+
+    /// A git-work error must not skip the post-work identity re-check: an error
+    /// computed across a row replacement (a `before` cursor missing from the new
+    /// row's history, say) would otherwise leak a 400 about the replacement's
+    /// data on the old row's authorization. The replaced row answers 404; the
+    /// unchanged row still returns the work's own error.
+    #[sqlx::test]
+    async fn run_repo_git_read_rechecks_the_row_after_a_failed_read(pool: sqlx::PgPool) {
+        let owner = "did:key:zERRREADREPLACEAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let now = chrono::Utc::now();
+        let seed = |name: &str| crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        let name = "replacederr";
+        let repo_dir = dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let record = seed(name);
+        state.db.create_repo(&record).await.unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let state_clone = state.clone();
+        let record_clone = record.clone();
+        let read = tokio::spawn(async move {
+            super::run_repo_git_read::<(), _>(
+                &state_clone,
+                &axum::http::HeaderMap::new(),
+                None,
+                &record_clone,
+                "test",
+                move |_git_bin, _path, _deadline| {
+                    let _ = started_tx.send(());
+                    release_rx
+                        .recv()
+                        .expect("the test releases the in-progress work");
+                    Err(crate::error::AppError::BadRequest(
+                        "before is not in this history".into(),
+                    ))
+                },
+            )
+            .await
+        });
+
+        started_rx.await.expect("the work closure starts");
+        state.db.delete_repo_by_id(&record.id).await.unwrap();
+        let fresh = seed(name);
+        state.db.create_repo(&fresh).await.unwrap();
+        release_tx.send(()).unwrap();
+
+        let res = read.await.expect("the read task joins");
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "an error computed across a row replacement must be discarded; got {res:?}"
+        );
+
+        // On the unchanged row the work's own error comes back as it was.
+        let res: Result<()> = super::run_repo_git_read(
+            &state,
+            &axum::http::HeaderMap::new(),
+            None,
+            &fresh,
+            "test",
+            move |_git_bin, _path, _deadline| {
+                Err(crate::error::AppError::BadRequest(
+                    "before is not in this history".into(),
+                ))
+            },
+        )
+        .await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::BadRequest(_))),
+            "the live record keeps the work's error; got {res:?}"
+        );
+    }
+
+    /// The pre-work identity re-check runs while both read permits are held, and
+    /// the pool has no statement timeout, so it must be bounded by the git
+    /// deadline. A lock held on `repos` stalls the re-check; the helper must
+    /// give up at the deadline with the fixed git failure and never run the work.
+    #[sqlx::test]
+    async fn run_repo_git_read_bounds_the_pre_work_recheck_by_the_deadline(pool: sqlx::PgPool) {
+        let owner = "did:key:zSTALLRECHECKAAAAAAAAAAAAAAAAAAAAAAA";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let mut cfg = (*state.config).clone();
+        cfg.git_service_timeout_secs = 1;
+        state.config = std::sync::Arc::new(cfg);
+        state.git_read_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let now = chrono::Utc::now();
+        let record = crate::db::RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "stall".to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/stall".to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        let repo_dir = dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join("stall.git");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap()
+            .success());
+        state.db.create_repo(&record).await.unwrap();
+
+        let mut lock_tx = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE repos IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await
+            .unwrap();
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_inner = ran.clone();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::run_repo_git_read::<(), _>(
+                &state,
+                &axum::http::HeaderMap::new(),
+                None,
+                &record,
+                "test",
+                move |_git_bin, _path, _deadline| {
+                    ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            ),
+        )
+        .await;
+        lock_tx.rollback().await.unwrap();
+
+        let res = res.expect("a stalled re-check must give up at the git deadline");
+        assert!(
+            matches!(&res, Err(crate::error::AppError::Git(m)) if m == super::GIT_READ_FAILED_MESSAGE),
+            "a stalled re-check is the fixed git failure; got {res:?}"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the read must not run after the re-check gave up"
+        );
+        assert_eq!(
+            state.git_read_semaphore.available_permits(),
+            1,
+            "the shared read permit is returned"
+        );
+    }
     /// #282 REPRO (RED on main): a push's write guard pins one dedicated
     /// lock-pool connection for the WHOLE op: taken at `acquire_write`, held
     /// across `smart_http::receive_pack` under `git_service_timeout_secs`
@@ -21064,6 +21258,9 @@ mod commits_tags_tests {
             .env("GIT_COMMITTER_EMAIL", "committer@example.com")
             .env("GIT_AUTHOR_DATE", &when)
             .env("GIT_COMMITTER_DATE", &when)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DEFAULT_HASH")
             .output()
             .unwrap();
         assert!(
@@ -22113,7 +22310,7 @@ mod commits_tags_tests {
         fx.state.git_bin = fake_git(
             shim.path(),
             &format!(
-                "#!/bin/sh\ncase \" $*\" in *for-each-ref*) echo $$ > {}; sleep 2;; esac\nexec git \"$@\"\n",
+                "#!/bin/sh\ncase \" $*\" in *for-each-ref*) echo $$ > '{}'; sleep 2;; esac\nexec git \"$@\"\n",
                 pid_file.display()
             ),
         );
