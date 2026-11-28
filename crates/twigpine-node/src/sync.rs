@@ -993,24 +993,9 @@ async fn process_batch(
                         }
                     }
                 }
-                // Register in DB so git smart HTTP can serve the mirrored repo
-                if let Err(e) = db
-                    .upsert_mirror_repo_with_origin_id(
-                        &registration_id,
-                        local_path.to_str().unwrap_or(""),
-                        machine_id,
-                        quarantined,
-                        Some(&item.node_did),
-                    )
-                    .await
-                {
-                    warn!(repo = %item.repo, err = %e, "failed to register mirror repo; leaving the sync row pending");
-                    if !exists {
-                        let _ = remove_staging_path(&staging_path);
-                    }
-                    crate::metrics::record_sync_processed("deferred");
-                    continue;
-                }
+                // Install the staged clone before registering it, still under
+                // the namespace lock, so a registered row always names an
+                // installed directory.
                 if !exists {
                     if local_path.exists() {
                         warn!(repo = %item.repo, path = %local_path.display(), "mirror path appeared before staged clone installation; leaving the sync row pending");
@@ -1024,6 +1009,26 @@ async fn process_batch(
                         crate::metrics::record_sync_processed("deferred");
                         continue;
                     }
+                }
+                // Register in DB so git smart HTTP can serve the mirrored repo
+                if let Err(e) = db
+                    .upsert_mirror_repo_with_origin_id(
+                        &registration_id,
+                        local_path.to_str().unwrap_or(""),
+                        machine_id,
+                        quarantined,
+                        Some(&item.node_did),
+                    )
+                    .await
+                {
+                    warn!(repo = %item.repo, err = %e, "failed to register mirror repo; leaving the sync row pending");
+                    if !exists {
+                        // An installed directory with no row would read as an
+                        // unproven path to the retry's first-sync check.
+                        let _ = remove_staging_path(&local_path);
+                    }
+                    crate::metrics::record_sync_processed("deferred");
+                    continue;
                 }
                 drop(_first_sync_lock);
                 // The lag is push-to-visible: sample at registration, before
@@ -3597,6 +3602,53 @@ git "$@"
         assert!(
             !stale.exists(),
             "crash-stale staging must not survive beside the installed mirror"
+        );
+    }
+
+    #[sqlx::test]
+    async fn process_batch_registers_a_first_sync_only_after_its_clone_is_installed(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let did = "did:key:z6MkOrigin";
+        seed_local_peer(&pool, did, &peer_url).await;
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+        // Fail the registration insert, the step that now runs after install.
+        sqlx::query(
+            "CREATE FUNCTION fail_mirror_registration() RETURNS trigger AS $$
+             BEGIN RAISE EXCEPTION 'registration refused by test'; END $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_mirror_registration BEFORE INSERT ON repos
+             FOR EACH ROW EXECUTE FUNCTION fail_mirror_registration()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_batch(&state, &repos_dir).await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "pending");
+        let local_path = repos_dir.join("z6Mkfoo").join("hello.git");
+        assert!(
+            local_path.symlink_metadata().is_err(),
+            "a clone installed for a registration that failed must be removed, or the retry reads it as an unproven path"
+        );
+
+        sqlx::query("DROP TRIGGER fail_mirror_registration ON repos")
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_batch(&state, &repos_dir).await;
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
+        assert!(
+            local_path.is_dir(),
+            "the retried first sync installs and registers"
         );
     }
 
