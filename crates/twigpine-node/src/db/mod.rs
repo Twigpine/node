@@ -4687,38 +4687,49 @@ impl Db {
         &self,
         mirror_id: &str,
     ) -> Result<Option<String>> {
+        // History rows may carry either spelling of the slug: `enqueue_sync`
+        // stored it verbatim before it normalized, and a purge of one spelling
+        // keeps the shared rows while a sibling survives. Read both, as the v54
+        // backfill does, and write the pin to the mirror's physical id.
+        let canonical = normalize_repo_slug(mirror_id);
+        let spellings: Vec<String> = match canonical.split_once('/') {
+            Some((owner, name)) if !owner.contains(':') => {
+                vec![canonical.clone(), format!("did:key:{owner}/{name}")]
+            }
+            _ => vec![canonical.clone()],
+        };
         Ok(sqlx::query_scalar::<_, String>(
-            r#"UPDATE repos r
+            r#"WITH mirror AS (
+                 SELECT id, created_at,
+                        EXISTS (
+                            SELECT 1 FROM schema_migrations sm
+                            WHERE sm.version = 53
+                              AND repos.created_at >= sm.applied_at
+                        ) AS after_pin_migration
+                 FROM repos
+                 WHERE id = $1 AND origin_node_did IS NULL
+             ),
+             eligible AS (
+                 SELECT sq.node_did, sq.processed_at, sq.enqueued_at, sq.id
+                 FROM sync_queue sq, mirror
+                 WHERE sq.repo = ANY($2)
+                   AND sq.status = 'done'
+                   AND (mirror.after_pin_migration OR sq.enqueued_at <= mirror.created_at)
+             )
+             UPDATE repos r
              SET origin_node_did = repair.node_did
              FROM (
-                 SELECT DISTINCT ON (sq.repo) sq.repo, sq.node_did
-                 FROM sync_queue sq
-                 JOIN repos mirror ON mirror.id = sq.repo
-                 WHERE sq.status = 'done'
-                   AND mirror.id = $1
-                   AND mirror.origin_node_did IS NULL
-                   AND (
-                       EXISTS (
-                           SELECT 1 FROM schema_migrations sm
-                           WHERE sm.version = 53
-                             AND mirror.created_at >= sm.applied_at
-                       )
-                       OR sq.enqueued_at <= mirror.created_at
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM sync_queue other
-                       WHERE other.repo = sq.repo
-                         AND other.status = 'done'
-                         AND other.node_did <> sq.node_did
-                         AND other.enqueued_at <= mirror.created_at
-                   )
-                 ORDER BY sq.repo, sq.processed_at ASC NULLS LAST, sq.enqueued_at ASC, sq.id ASC
+                 SELECT node_did FROM eligible
+                 WHERE (SELECT count(DISTINCT node_did) FROM eligible) = 1
+                 ORDER BY processed_at ASC NULLS LAST, enqueued_at ASC, id ASC
+                 LIMIT 1
              ) AS repair
-             WHERE r.id = repair.repo
+             WHERE r.id = $1
                AND r.origin_node_did IS NULL
              RETURNING r.origin_node_did"#,
         )
         .bind(mirror_id)
+        .bind(&spellings)
         .fetch_optional(&self.pool)
         .await?)
     }
@@ -12718,6 +12729,94 @@ mod migration_tests {
             (
                 "z6Mkfoo/ambiguous",
                 "racing first syncs from different origins never choose a winner after the fact",
+            ),
+        ] {
+            let repaired = db.repair_mirror_origin_from_history(repo).await.unwrap();
+            assert_eq!(repaired, None, "{reason}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn mirror_origin_repair_reads_both_slug_spellings_and_every_eligible_competitor(
+        pool: sqlx::PgPool,
+    ) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let created = "2030-01-01T00:00:00Z";
+        let later = "2030-01-01T00:00:01Z";
+        for id in [
+            "did:key:z6Mkfoo/legacyspell",
+            "z6Mkfoo/rollingpair",
+            "z6Mkfoo/crossspell",
+        ] {
+            sqlx::query(
+                "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
+                                    created_at, updated_at, disk_path, machine_id, quarantined)
+                 VALUES ($1, split_part($1, '/', 2), split_part($1, '/', 1), 'mirrored', TRUE,
+                         'main', $2, $2, '/mirror/' || split_part($1, '/', 2) || '.git', NULL, FALSE)",
+            )
+            .bind(id)
+            .bind(created)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        // Rows inserted directly, so each keeps the spelling it was written
+        // with: before this change `enqueue_sync` stored the slug verbatim.
+        for (repo, did) in [
+            ("z6Mkfoo/legacyspell", "did:key:zLegacySpellOrigin"),
+            ("z6Mkfoo/rollingpair", "did:key:zRollingFirst"),
+            ("z6Mkfoo/rollingpair", "did:key:zRollingSecond"),
+            ("z6Mkfoo/crossspell", "did:key:zCrossFirst"),
+            ("did:key:z6Mkfoo/crossspell", "did:key:zCrossSecond"),
+        ] {
+            sqlx::query(
+                "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, status,
+                                         enqueued_at, processed_at)
+                 VALUES ($1, $2, $3, 'refs/heads/main', $4, 'done', $5, $5)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(repo)
+            .bind(did)
+            .bind("0".repeat(40))
+            .bind(later)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let repaired = db
+            .repair_mirror_origin_from_history("did:key:z6Mkfoo/legacyspell")
+            .await
+            .unwrap();
+        assert_eq!(
+            repaired.as_deref(),
+            Some("did:key:zLegacySpellOrigin"),
+            "history in the normalized spelling is provenance for a legacy full-DID mirror"
+        );
+        let legacy: (String, Option<String>) = sqlx::query_as(
+            "SELECT disk_path, origin_node_did FROM repos WHERE id = 'did:key:z6Mkfoo/legacyspell'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy,
+            (
+                "/mirror/legacyspell.git".to_string(),
+                Some("did:key:zLegacySpellOrigin".to_string())
+            ),
+            "the pin lands on the legacy row, which keeps its id and path"
+        );
+
+        for (repo, reason) in [
+            (
+                "z6Mkfoo/rollingpair",
+                "two completed origins admitted after a post-migration mirror was created are ambiguous",
+            ),
+            (
+                "z6Mkfoo/crossspell",
+                "a competing origin recorded under the other slug spelling still makes history ambiguous",
             ),
         ] {
             let repaired = db.repair_mirror_origin_from_history(repo).await.unwrap();
